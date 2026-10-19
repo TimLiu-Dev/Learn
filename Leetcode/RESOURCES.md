@@ -14,6 +14,10 @@
   An updated Blind 75 that can be customized by number of weeks. Use for: a second opinion on which problems matter most.
 - [Sean Prashad's LeetCode Patterns](https://seanprashad.com/leetcode-patterns/)
   179 problems tagged by pattern, plus a cheat sheet of the form "if the input is X, consider pattern Y". Use for: building pattern-recognition drills.
+- [NeetCode: Big-O Notation for Coding Interviews](https://www.youtube.com/watch?v=BgLTDT03QtU) (video, about 19 min)
+  Every complexity class you'll meet, explained with interview examples. Use for: Session 0's primary source.
+- [USACO Guide: Time Complexity](https://usaco.guide/bronze/time-comp)
+  The "about 10⁸ operations per second" rule of thumb and a table of input size n to acceptable complexity. Use for: turning a problem's constraints into a target complexity.
 - [Kotlin docs: Collections overview](https://kotlinlang.org/docs/collections-overview.html)
   Official reference for List, Set, Map, and ArrayDeque. Use for: the Kotlin toolkit session and code-review idioms.
 

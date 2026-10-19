@@ -14,5 +14,13 @@
 - macOS, OpenJDK 26, IntelliJ IDEA, Android Studio, Gradle (Homebrew).
 - Available: curl, dig, nc, tcpdump, traceroute. Not installed: Wireshark/tshark, standalone kotlinc.
 
+## Course conventions (decided 2026-10-18)
+- Every session, including reviews, has a sequential number; `lessons/NNNN-slug.html` matches it. Course home: `index.html`.
+- "No answers" rule applied as: hands-on observation questions (`li.observe`) are never answered on the page — the user brings them to chat. Quizzes give instant right/wrong feedback (the skill's feedback loop). Free-recall key points sit behind an explicit reveal button (= the user asking).
+- Spaced retrieval: every lesson from session 2 opens with a warm-up recalling earlier sessions.
+- Layer colours are fixed course-wide (app purple, transport blue, network green, link orange, physical grey).
+- Terminology: network-layer unit = "packet" (avoid "IP datagram"); TCP segment; UDP datagram; link frame.
+- Code: single-file Java runnable with `java File.java` (JDK 26) plus a Kotlin equivalent.
+
 ## Status
-- Curriculum draft v1 in CURRICULUM.md — shown to user, awaiting feedback before lesson 1.
+- 2026-10-18: user asked to generate all of Parts 0–1 (sessions 1–12) without answering the setup questions yet (Kotlin vs Java, interview timeline, prior knowledge). Defaults: Kotlin + Java side by side; no reordering.

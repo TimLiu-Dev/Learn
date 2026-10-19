@@ -172,6 +172,9 @@
     }
 
     window.addEventListener("resize", () => requestAnimationFrame(drawArrows));
+    // Arrows can't be measured while hidden, so redraw when an enclosing <details> opens
+    const details = root.closest("details");
+    if (details) details.addEventListener("toggle", () => requestAnimationFrame(drawArrows));
     render();
   });
 })();

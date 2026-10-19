@@ -41,7 +41,7 @@ document.querySelectorAll(".trace").forEach((fig) => {
     const [lo, hi] = step.win || [-1, -2];
     cellsEl.innerHTML = cells.map((v, i) => {
       const cls = ["cell"];
-      if (i >= lo && i <= hi) cls.push("win");
+      if (i >= lo && i <= hi) cls.push("in-window");
       if ((step.hl || []).includes(i)) cls.push("hl");
       if ((step.dim || []).includes(i)) cls.push("dim");
       return `<div class="${cls.join(" ")}">
