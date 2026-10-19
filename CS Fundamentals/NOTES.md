@@ -1,0 +1,28 @@
+# Notes
+
+## Teaching preferences
+- Teach at the level of a CS student with some basic programming experience.
+- Show **all code in both Kotlin and Java**, side by side. Always call out what Kotlin does automatically that Java makes explicit, e.g. getters, equals/hashCode, null checks and `final`.
+- The user wants to **code by hand without AI**. Exercises should make them type real code from a blank file. Suggest turning off AI completion in IntelliJ during practice.
+- Wants the curriculum ordered so each topic builds on the last. The roadmap lives at `reference/roadmap.html` and gets reordered as lessons reveal gaps.
+
+## Working notes
+- Destination after this course: Android and Spring Boot. Use "bridge" asides to show where a fundamental shows up in those frameworks, but never teach the framework itself.
+- Environment: JDK 26 (`/usr/bin/java`), Gradle (Homebrew), IntelliJ IDEA, Android Studio, VS Code. `kotlinc` isn't installed, so the setup lesson should cover `brew install kotlin`.
+- Pace: 4–7 hours/week, in 1–2 long sittings, so plan 1–2 session-sized lessons a week.
+- Roadmap v1 drafted 2026-10-17 and sent to the user for feedback.
+- Roadmap v2 (2026-10-17), per the user's feedback: merged the Workbench and Language Core into a 7-lesson "Foundations Sprint" of bigger (~30 min) lessons that opens with a placement check. Added a System Design & Caching phase (12), plus interop, Git branching and team workflow, the memory hierarchy, annotations and reflection, profiling, and HTTP caching.
+- The user said "add anything you think is useful", so they're open to me proposing extra scope. Still flag additions clearly (the NEW tags) so they can veto them.
+- Roadmap v3 (2026-10-17): the user studies **once or twice a week in long sittings**, so lessons are now session-sized: 47 lessons of 60–90 min. Each one has a ~10 min spaced-recall warm-up, 3–4 self-contained parts (15–20 min each, with their own exercise and check), a ~20 min final exercise, and a ~5 min exit quiz. There's an optional 10-min midweek recall card. Every part keeps the depth and citations of a standalone small lesson. The user explicitly asked that bigger lessons not mean thinner ones.
+- Lesson numbers L1–L47 on the roadmap match the `lessons/000N-*.html` file names.
+- On the basics, the user "knows some but isn't fluent". Don't re-teach what the placement check shows they have. Spend the time on fluency drills instead.
+- Roadmap v4 (2026-10-17), accepted by the user as "good enough". Added a blank-file problem-solving routine (L2), Kotlin delegation (L15), `Flow` (L29), CI (L40) and integration tests (L45). Replaced "left out" with a sketch of the next missions: A Frameworks (Spring Boot / Android) → B Containers/Cloud/DevOps → C Distributed systems, with D Compilers as optional enrichment.
+- L1 built 2026-10-17 (`lessons/0001-placement-check-and-workbench.html`), plus `reference/cli-git-cheatsheet.html`. Next: wait for the results summary the user pastes from L1, write learning records from it (what to skim or drill in L2–L3), then build L2.
+- L1 order differs slightly from the roadmap: tools first (CLI, kotlinc install), because the placement check needs `kotlinc`. Then placement, then Git (commits the placement code), then IntelliJ/Gradle.
+- Git `user.name` isn't set on the user's machine (email is). L1 Part 4 covers it.
+- Assets: `assets/course.css` (styles plus lesson components) and `assets/lesson.js` (quiz, rating, part-done, results summary, reset; usage documented in its header comment). Prism 1.29.0 from cdnjs for highlighting. Every reference solution was verified by running it (Java via `java X.java`, Kotlin via a scratch Gradle project).
+- 2026-10-18: The user asked for L2 and L3 to be built in full ("don't skim anything, cover all topics") *before* sending L1 placement results. Built `lessons/0002-values-numbers-and-text.html` and `lessons/0003-control-flow-functions-and-collections.html` (~100–120 min each), plus `reference/kotlin-java-basics.html`. When placement results arrive, use them to choose what to *emphasise* in review (warm-ups, recall cards), not to cut content.
+- Every code sample in L2/L3 was run: Java via `java X.java` on JDK 26, Kotlin via kotlinc 2.4.20 downloaded to the scratchpad. Expected outputs and compiler error messages in the lessons are real captures.
+- New assets: `assets/bits.js` (interactive two's-complement bit-flipper), plus CSS for `.warmup`, `pre.err`, `table.vs`, `.table-scroll` and `.sheet`/`main.sheet-page` (reference-sheet layout, now shared by both cheat sheets). Ligatures are disabled in code fonts so `==` and `===` render as typed.
+- L2 order: warm-up, (1) blank-file routine (Examples → Plan → Code → Check), (2) val/var/types/boxing/conversions, (3) binary, two's complement, overflow and floating point, (4) strings, Unicode and regex, then the final (storage converter). L3: warm-up, (1) if/when/switch and loops, (2) functions (defaults, named, varargs), (3) null safety, (4) collections and reading compiler errors, then the final (word frequency, the Phase 1 milestone).
+- Next lesson: L4 (The Stack & the Heap). It hasn't been built yet.

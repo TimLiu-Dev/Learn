@@ -1,0 +1,273 @@
+<title>One-Off Events in MVI</title>
+<link rel="stylesheet" href="../assets/style.css">
+
+<div class="kicker">MVI for Android · Lesson 3 · One-Off Events</div>
+<h1>One-Off Events: Toasts, Snackbars &amp; Navigation</h1>
+<p class="lede">MVI says the screen is one <code>State</code>. But "show a
+toast" and "go to Home" aren't facts about the screen. They're things that
+<em>happen</em>. Where do they go?</p>
+
+<p>Interviewers ask this a lot, because it's where MVI's "single state"
+promise meets messy UI. There are two defensible answers. A strong answer
+names both and explains the trade-off.</p>
+
+<h2>The bug, in MVVM you've probably written</h2>
+<pre><code>private val _toast = MutableStateFlow&lt;String?&gt;(null)
+val toast: StateFlow&lt;String?&gt; = _toast
+
+fun save() = viewModelScope.launch {
+    repo.save(profile)
+    _toast.value = "Saved!"
+}
+
+// UI
+val toast by viewModel.toast.collectAsStateWithLifecycle()
+toast?.let { msg -&gt; LaunchedEffect(msg) { snackbarHost.showSnackbar(msg) } }</code></pre>
+
+<p>Rotate the phone after saving and <strong>"Saved!" shows again</strong>.
+The composition is rebuilt, the new collector gets the <em>current</em>
+value (still <code>"Saved!"</code>), and the effect runs again.
+<code>StateFlow</code> is working as designed: it holds the latest value.
+That's correct for state and wrong for an event.</p>
+
+<p class="sidenote">In the LiveData era the usual workaround was a
+<code>SingleLiveEvent</code> subclass that delivers each value only once.
+If an interviewer mentions it, this is the same problem.</p>
+
+<h2>Answer A: reduce the event to State (Google's official guidance)</h2>
+<p>Google's guide says it plainly:
+<a href="https://developer.android.com/topic/architecture/ui-layer/events#handle-viewmodel-events">"ViewModel
+events should always result in a UI state update."</a> Rephrase the event as
+a fact: <em>"a message is currently on screen."</em> When the UI has shown
+it, the UI says so, and in MVI that acknowledgement is just another
+<strong>Intent</strong>.</p>
+
+<pre><code>data class Success(
+    val user: User,
+    val userMessage: String? = null      // "a message is on screen" is a fact
+) : ProfileState
+
+sealed interface ProfileIntent {
+    data class Load(val id: String) : ProfileIntent
+    object Save : ProfileIntent
+    object MessageShown : ProfileIntent  // UI: "I showed it"
+}
+
+// UI
+(state as? ProfileState.Success)?.userMessage?.let { msg -&gt;
+    LaunchedEffect(msg) {
+        snackbarHost.showSnackbar(msg)
+        viewModel.onIntent(ProfileIntent.MessageShown)
+    }
+}</code></pre>
+
+<p>Now rotation is correct. If the user rotates mid-snackbar, the
+<code>LaunchedEffect</code> is cancelled before <code>MessageShown</code>
+goes out, so the message is still in State and shows again. The user hadn't
+finished seeing it, so that's the right outcome. Because the event's whole
+lifecycle goes through the reducer, you can test it with plain JUnit, just
+like in <a href="0002-the-reducer.html">Lesson 2</a>:</p>
+
+<pre><code>@Test
+fun `message is cleared once shown`() {
+    val before = ProfileState.Success(ada, userMessage = "Saved!")
+    assertEquals(
+        ProfileState.Success(ada),
+        reduce(before, ProfileResult.MessageCleared)
+    )
+}</code></pre>
+
+<p class="sidenote">Notice that <code>reduce</code> now takes the current
+state as well. You can't clear one field without knowing the others. Lesson 2
+skipped this on purpose, and Lesson 4 covers it properly.</p>
+
+<p><strong>The cost:</strong> every event needs a reset. If you forget
+<code>MessageShown</code>, the toast repeats. If you forget to reset a
+"navigate to Home" flag, the user can get bounced back to Home every time
+they return. Critics call this flag bloat
+(<a href="https://dev.to/nek12/events-as-state-are-an-antipattern-in-mvi-and-mvvm-heres-why-15d2">Nek.12's
+rebuttal</a>).</p>
+
+<h2>Answer B: a separate effect stream (a <code>Channel</code>)</h2>
+<p>Many teams and libraries keep events out of State and send them down a
+second, one-shot pipe. Orbit MVI calls these <em>side effects</em>
+(<a href="https://github.com/orbit-mvi/orbit-mvi"><code>postSideEffect</code>
+/ <code>collectSideEffect</code></a>).</p>
+
+<pre><code>sealed interface ProfileEffect {
+    data class ShowMessage(val text: String) : ProfileEffect
+    object NavigateHome : ProfileEffect
+}
+
+private val _effects = Channel&lt;ProfileEffect&gt;(Channel.BUFFERED)
+val effects: Flow&lt;ProfileEffect&gt; = _effects.receiveAsFlow()
+// in save():  _effects.send(ProfileEffect.ShowMessage("Saved!"))
+
+// UI
+LaunchedEffect(viewModel, lifecycleOwner) {
+    lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+        withContext(Dispatchers.Main.immediate) {
+            viewModel.effects.collect { effect -&gt; /* show / navigate */ }
+        }
+    }
+}</code></pre>
+
+<p>Why a <code>Channel</code> and not a <code>SharedFlow</code>? A channel
+<strong>buffers</strong> an event until someone receives it, and each event
+goes to exactly one collector. A <code>SharedFlow(replay = 0)</code> with
+no subscriber (say, the app is in the background) <strong>drops the event
+silently</strong>.</p>
+
+<p><strong>The cost:</strong> it isn't airtight. The UI can
+<em>receive</em> an event and get cancelled (by a configuration change)
+before it <em>handles</em> it, and then the event is gone. Collecting on
+<code>Dispatchers.Main.immediate</code> makes that window very small, which
+is Roman Elizarov's suggested workaround. Manuel Vivo (Google) asked for a
+real guarantee in
+<a href="https://github.com/Kotlin/kotlinx.coroutines/issues/2886">kotlinx.coroutines
+#2886</a> in 2021, and that issue is still open. These events also bypass
+the reducer, so reducer tests can't cover them.</p>
+
+<h2>The interview answer</h2>
+<table class="contrast-table">
+  <tr><th></th><th>A: Reduce to State</th><th>B: Effect Channel</th></tr>
+  <tr><td>Can it be lost?</td><td>No. It sits in State until acknowledged.</td><td>Rarely, in the receive→handle window.</td></tr>
+  <tr><td>Reducer-testable?</td><td>Yes</td><td>No, it lives outside the reducer</td></tr>
+  <tr><td>Main cost</td><td>An acknowledge Intent for every event</td><td>A second stream and lifecycle-aware collection</td></tr>
+  <tr><td>Who backs it</td><td>Google's official architecture guide</td><td>Common in practice; Orbit's side effects</td></tr>
+</table>
+
+<p>A useful rule of thumb (my synthesis, not an official rule): <strong>if
+losing the event would be a bug, make it State.</strong> A payment result
+or a "your session expired" redirect belongs in State. If losing it would
+only be cosmetic, like a "Copied!" toast, a Channel is a defensible choice.
+Present this as a trade-off, not as dogma. Interviewers are checking
+whether you can see both sides.</p>
+
+<div class="callout win">
+After this lesson, you can explain why a <code>StateFlow</code> toast
+replays on rotation, show both fixes in MVI shape (acknowledge-Intent and
+effect <code>Channel</code>), and pick between them using the
+"would losing it be a bug?" test.
+</div>
+
+<h2>Drill: say it out loud</h2>
+<p>Close the code above. Out loud, in under 60 seconds, answer:
+<em>"In an MVI app, how do you handle one-off events like navigation or a
+snackbar?"</em> Then compare your answer with the model answer.</p>
+
+<details class="recall">
+<summary>Reveal model answer</summary>
+<p>"A one-off event can't be plain state on a StateFlow, because the latest
+value replays to every new collector and the toast shows again after
+rotation. There are two standard fixes. Google's guidance is to reduce the
+event to state: something like <code>userMessage</code> in the State, with
+the UI sending a <code>MessageShown</code> intent once it's displayed. It
+can't be lost and it's testable in the reducer, but every event needs a
+reset. The alternative is a separate effect stream, usually a buffered
+Channel collected on <code>Main.immediate</code>. That's what Orbit's side
+effects look like. It's more ergonomic, but there's a small window where an
+event can be lost. I use state for anything where losing it would be a bug,
+like a payment result, and I'm fine with a Channel for cosmetic toasts."</p>
+</details>
+
+<h2>Read the primary source</h2>
+<p class="source">Google's <a href="https://developer.android.com/topic/architecture/ui-layer/events">UI
+events</a> guide, especially "Handle ViewModel events" and the note on
+Channels under "Other use cases". For the background reasoning, read Manuel Vivo's
+<a href="https://medium.com/androiddevelopers/viewmodel-one-off-event-antipatterns-16a1da869b95">ViewModel:
+One-off event antipatterns</a>. For the opposing view, read
+<a href="https://dev.to/nek12/events-as-state-are-an-antipattern-in-mvi-and-mvvm-heres-why-15d2">Nek.12's
+rebuttal</a>. All of these are in <a href="../RESOURCES.md">RESOURCES.md</a>.</p>
+
+<h2>Check your retrieval</h2>
+<p>Answer from memory before you scroll up. The last question goes back to
+Lesson 2.</p>
+<div id="quiz1"></div>
+
+<p>Compressed version for interview review:
+<a href="../reference/mvi-one-off-events.html">reference/mvi-one-off-events.html</a>.</p>
+
+<footer class="ask">
+If something is unclear or you disagree, ask me directly. Good next questions:
+"how would Answer A handle a <em>queue</em> of messages?", "does Answer A
+survive process death?", or "why exactly does <code>Main.immediate</code>
+shrink the loss window?"
+</footer>
+
+<nav class="lesson-nav">
+  <span><a href="0002-the-reducer.html">&larr; Lesson 2</a></span>
+  <span><a href="0004-reducers-with-memory.html">Lesson 4: Reducers with memory &rarr;</a></span>
+</nav>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('quiz1', [
+  {
+    q: "A \"Saved!\" message exposed as StateFlow<String?> shows again after rotation. Why?",
+    options: [
+      "Rotation recreates the ViewModel from scratch",
+      "Toasts are queued by the system",
+      "New collectors receive the current value",
+      "StateFlow emits each value exactly twice"
+    ],
+    correct: 2,
+    why: "StateFlow always holds its latest value, and the rebuilt UI collects it again. The ViewModel survives rotation, which is why the stale value is still there."
+  },
+  {
+    q: "A SharedFlow(replay = 0) emits NavigateHome while the app is backgrounded and nothing is collecting. What happens?",
+    options: [
+      "It is delivered on next start",
+      "The event is silently dropped forever",
+      "The emit call throws an exception",
+      "It suspends until a collector arrives"
+    ],
+    correct: 1,
+    why: "With no subscribers and no replay, emit returns immediately and the value is discarded. A buffered Channel would keep it instead."
+  },
+  {
+    q: "In the \"reduce to State\" approach, what happens after the UI shows the snackbar?",
+    options: [
+      "ViewModel clears it after a timeout",
+      "Snackbar host removes it from state",
+      "Nothing; Compose forgets it on dismissal",
+      "UI sends a MessageShown intent back"
+    ],
+    correct: 3,
+    why: "Acknowledging the message is user input like any other, so it goes through the normal Intent → reducer path and clears userMessage."
+  },
+  {
+    q: "You use a Channel collected on Main.immediate. What risk remains?",
+    options: [
+      "Event received, then cancelled before handling",
+      "Every new collector replays old events",
+      "Events are delivered to all collectors",
+      "Buffer overflows after sixty-four pending events"
+    ],
+    correct: 0,
+    why: "Received isn't the same as handled. A cancellation between the two loses the event (kotlinx.coroutines #2886). Main.immediate makes that window small but doesn't remove it."
+  },
+  {
+    q: "A payment just succeeded and the confirmation must never be missed. Which approach fits best?",
+    options: [
+      "Channel, because it buffers until collected",
+      "SharedFlow, because it multicasts to everyone",
+      "State, because it cannot be lost",
+      "Toast, because users read it immediately"
+    ],
+    correct: 2,
+    why: "If losing the event would be a bug, make it State. It stays there until the UI acknowledges it."
+  },
+  {
+    q: "From Lesson 2: why does the reducer take a Result rather than the raw Intent?",
+    options: [
+      "Intents cannot hold any parameter data",
+      "Intents fire before the outcome exists",
+      "Results are cheaper to allocate quickly",
+      "Reducers must run on background threads"
+    ],
+    correct: 1,
+    why: "Load(id) is a request, and its outcome isn't known yet. The Result carries what actually happened."
+  }
+]);
+</script>

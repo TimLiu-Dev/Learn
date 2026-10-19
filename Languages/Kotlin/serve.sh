@@ -1,0 +1,3 @@
+#!/bin/sh
+# Serves the workspace so the Kotlin Playground "Run" buttons work.
+cd "$(dirname "$0")" && echo "Open http://localhost:8000" && python3 -m http.server 8000
