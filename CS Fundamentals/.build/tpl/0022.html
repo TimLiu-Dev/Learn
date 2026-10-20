@@ -1,0 +1,791 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L22 · The OS &amp; the Memory Hierarchy</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l22">
+<main>
+
+<div class="kicker">Lesson 22 · Phase 7 How the Machine Runs Your Code · <a href="../reference/roadmap.html#p7">roadmap</a></div>
+<h1>The OS &amp; the Memory Hierarchy</h1>
+<p class="subtitle">Your program is not alone on the machine. The operating system gives it the illusion of a private computer, the CPU's caches decide how fast its memory really is, and every file read is a request to the kernel. This lesson shows each one with real measurements.</p>
+
+<div class="lesson-meta">
+  <span><b>~110–125 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll inspect a running JVM with the tools the OS gives you, measure why an array beats a linked list even when Big O says they're equal, and write a log analyser that reads 50 MB in about 140 ms instead of an estimated 16 seconds, because you'll know where the time goes.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Processes, virtual memory, system calls</a><span class="t">30 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · CPU caches and the memory hierarchy</a><span class="t">30 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Files and I/O</a><span class="t">30 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: a log analyser</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l22/</code>. Every output on this page was captured from real runs on Kotlin 2.4 and JDK 26, on a Mac (Apple M5 Max, macOS 26). Timings and memory numbers are from my machine; yours will differ, and the point is the <em>ratios</em>. Several programs need a JVM flag such as <code>-Xmx1g</code>, so run them from the terminal: <code>java -Xmx1g Grid.java</code> for Java, and <code>kotlinc Grid.kt -include-runtime -d grid.jar &amp;&amp; java -Xmx1g -jar grid.jar</code> for Kotlin.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L4, L10, L17 and L21</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>You need fast lookup by key <em>and</em> insertion order. Which JDK collection, and what does Kotlin's <code>mutableMapOf()</code> give you? (L21)</li>
+    <li>In L17, iterating a <code>LinkedList</code> was slower than an <code>ArrayList</code> of the same size, even though both loops are O(n). Write down the reason L17 gave, then check it against Part 2 today.</li>
+    <li>Write, from memory, Java code that reads the first line of a file with try-with-resources, then the Kotlin version with <code>use</code>. (L10)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="0">
+  <p class="q">Two threads run in the same JVM. What do they share? (L4)</p>
+  <div class="opts"><button>The heap, not stacks</button><button>Their stacks, not heap</button><button>Both stacks and heap</button><button>Neither stacks nor heap</button></div>
+  <p class="why">Each thread gets its own stack of frames, while objects live on the one shared heap (L4). Part 1 shows the OS view: one address space, many stacks.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="1">
+  <p class="q">A <code>for (i in 0 until n)</code> loop calls <code>linkedList.get(i)</code> on every pass. Total cost? (L17, L21)</p>
+  <div class="opts"><button><code>O(n)</code></button><button><code>O(n²)</code></button><button><code>O(log n)</code></button><button><code>O(1)</code></button></div>
+  <p class="why">Each <code>get(i)</code> walks from an end of the list, which is O(n), and you do it n times. L21 listed it as an AI-code smell.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="0">
+  <p class="q">In <code>file.bufferedReader().use { it.readLine() }</code>, when is the reader closed? (L10)</p>
+  <div class="opts"><button>When the block finishes</button><button>When the program exits</button><button>When garbage collects it</button><button>Never, you must close</button></div>
+  <p class="why"><code>use</code> closes the resource when the block ends, normally or by an exception, just like Java's try-with-resources. Part 3 shows what happens when you forget.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="1">
+  <p class="q">How many bytes does UTF-8 use to store <code>é</code>? (L2)</p>
+  <div class="opts"><button>Gives 1</button><button>Gives 2</button><button>Gives 3</button><button>Gives 4</button></div>
+  <p class="why">ASCII characters take 1 byte; <code>é</code> (U+00E9) takes 2. Part 3 dumps the real bytes of a file to prove it.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Processes, virtual memory, system calls</h2><span class="t">~30 min</span></div>
+
+<p>An operating system's main job, in the words of the free textbook <em>Operating Systems: Three Easy Pieces</em> (OSTEP), is <dfn>virtualization</dfn>: "the OS takes a physical resource (such as the processor, or memory, or a disk) and transforms it into a more general, powerful, and easy-to-use virtual form of itself". To let programs use that virtual machine, "a typical OS, in fact, exports a few hundred system calls that are available to applications" (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/intro.pdf">OSTEP ch. 2, Introduction</a>). This part looks at the three illusions your JVM lives inside: its own CPU, its own memory, and a safe door into the kernel.</p>
+
+<h3>Processes and threads</h3>
+<p>A <dfn>process</dfn> "is a running program". The program on disk "is a lifeless thing", and the OS turns it into something running (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-intro.pdf">OSTEP ch. 4, The Process</a>). There are only a few CPU cores, yet hundreds of processes seem to run at once. The OS creates that illusion by <dfn>time sharing</dfn>: "by running one process, then stopping it and running another", it makes it look as if "many virtual CPUs exist when in fact there is only one physical CPU (or a few)".</p>
+<p>A process can contain several <dfn>threads</dfn>. All threads of one process share its memory (the heap from L4), and each thread has its own stack. Java gives you the current process and lets you start new ones:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · ProcInfo.kt</figcaption>
+<!--CODE:l22/ProcInfo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · ProcInfo.java</figcaption>
+<!--CODE:l22/ProcInfo.java--></figure>
+</div>
+<pre class="out">my pid:     9817
+parent pid: 9787
+command:    /Users/tl/Library/Java/JavaVirtualMachines/openjdk-26.0.1/Contents/Home/bin/java
+6 threads: [Common-Cleaner, Finalizer, Notification Thread, Reference Handler, Signal Dispatcher, main]
+child 9818 said 'hello from a child', exit 0
+sh -c 'exit 3' gave exit 3</pre>
+<ul>
+  <li><b>Every process has a number</b>, its <dfn>pid</dfn>, and a parent: here, the shell that launched <code>java</code>. Both languages print the same thing, because Kotlin on the JVM calls the same <a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ProcessHandle.html"><code>ProcessHandle</code></a> API.</li>
+  <li><b>Even "hello world" is multi-threaded.</b> Before <code>main</code> runs, the JVM has already started helper threads. <code>Thread.getAllStackTraces()</code> returns stack traces "for all live platform threads" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Thread.html#getAllStackTraces()">Thread docs</a>), meaning the threads that exist as Java <code>Thread</code> objects. Below, the OS will count far more.</li>
+  <li><b><code>ProcessBuilder</code> starts a child process</b> (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ProcessBuilder.html">ProcessBuilder</a>). You read its output as a stream and wait for its <dfn>exit code</dfn>. By convention <code>0</code> means success and anything else means failure, which is how shell scripts and build tools know a step failed.</li>
+</ul>
+
+<h3>Each process gets its own address space</h3>
+<p>OSTEP calls the memory illusion the <dfn>address space</dfn>: "the running program's view of memory in the system". It holds the program's code, its stack ("to keep track of where it is in the function call chain") and its heap (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-intro.pdf">OSTEP ch. 13, Address Spaces</a>). For a JVM there's one stack <em>per thread</em>. The key fact sits in a box in that chapter, titled "Every Address You See Is Virtual": "any address you can see as a programmer of a user-level program is a virtual address".</p>
+<p>The hardware and the OS translate virtual addresses into physical ones a <dfn>page</dfn> at a time. Memory is cut into fixed-size pages, and a per-process <dfn>page table</dfn> maps each virtual page to a physical one. (On this Mac a page is 16 KB: <code>sysctl hw.pagesize</code> prints <code>16384</code>.) Looking up the page table on every memory access would be slow, so the CPU keeps a small cache of recent translations, the <dfn>TLB</dfn> or translation-lookaside buffer: "simply a hardware cache of popular virtual-to-physical address translations" (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf">OSTEP ch. 19, TLBs</a>).</p>
+<p>That's why two processes can use the <em>same</em> address without clashing. I started two copies of the <code>Hold</code> program below at the same time and asked each one where its heap lives:</p>
+<pre class="term"><span class="p">$ </span>jcmd 26961 GC.heap_info | grep heap
+garbage-first heap   total reserved 1048576K, committed 215040K, used 208060K [0x00000007c0000000, 0x0000000800000000)
+<span class="p">$ </span>jcmd 26963 GC.heap_info | grep heap
+garbage-first heap   total reserved 1048576K, committed 215040K, used 208060K [0x00000007c0000000, 0x0000000800000000)</pre>
+<p>Two live processes, identical heap addresses <code>0x7c0000000</code>–<code>0x800000000</code>, each holding its own 200 MB. Each page table maps those virtual pages to <em>different</em> physical RAM. One process can't even name another's memory, which is the protection that stops a crashing app from corrupting your editor.</p>
+
+<h3>Look at a running JVM</h3>
+<p>This program grabs 200 MB and then waits a minute so you can inspect it:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Hold.kt</figcaption>
+<!--CODE:l22/Hold.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Hold.java</figcaption>
+<!--CODE:l22/Hold.java--></figure>
+</div>
+<pre class="term"><span class="p">$ </span>javac Hold.java
+<span class="p">$ </span>java -Xmx1g Hold &gt; hold.log &amp;
+<span class="p">$ </span>cat hold.log
+pid 25910 holding 200 MB; inspect me now
+<span class="p">$ </span>jps -l | grep Hold
+25910 Hold
+<span class="p">$ </span>ps -o pid,rss,vsz,command -p 25910
+  PID    RSS      VSZ COMMAND
+25910 254928 438036272 /usr/bin/java -Xmx1g Hold
+<span class="p">$ </span>ps -M 25910 | tail -n +2 | wc -l
+      26
+<span class="p">$ </span>vmmap --summary 25910 | grep -E 'Physical footprint:|^Stack  '
+Physical footprint:         227.0M
+Stack                             53.8M     944K     944K       0K       0K       0K       0K       26
+<span class="p">$ </span>lsof -a -p 25910 -d 0-99 | awk '{print $4, $5, $NF}' | sed -E 's|/.*/|…/|'
+FD TYPE NAME
+0u unix -&gt;0xf99d44df897879a6
+1w REG …/hold.log
+2w REG …/hold.log
+3r REG …/modules
+<span class="p">$ </span>jcmd 25910 GC.heap_info
+25910:
+garbage-first heap   total reserved 1048576K, committed 215040K, used 208060K [0x00000007c0000000, 0x0000000800000000)
+ region size 1M, 1 eden (1M), 1 survivor (1M), 2 old (2M), 201 humongous (201M), 5 free (5M)</pre>
+<table class="cmds">
+  <tr><th>Command</th><th>What it told us</th></tr>
+  <tr><td><code>jps -l</code></td><td>Lists running JVMs and their main classes. It ships with the JDK.</td></tr>
+  <tr><td><code>ps -o rss,vsz</code></td><td><dfn>RSS</dfn>, the "resident set size", is RAM actually in use: 254,928 KB ≈ 249 MB. <dfn>VSZ</dfn>, "virtual size in Kbytes" (<code>man ps</code>), is about 418 GB, far more than this Mac's RAM. Most of it is address space that's reserved but has never been touched, so the OS has never had to back it with RAM.</td></tr>
+  <tr><td><code>ps -M</code></td><td>The OS sees <b>26 threads</b>, where Java listed 6. The others are JVM-internal threads, such as the garbage collector's and the JIT compiler's (L23, L24), which aren't Java <code>Thread</code> objects.</td></tr>
+  <tr><td><code>vmmap --summary</code></td><td>macOS's map of the address space. Its <code>Stack</code> row shows 26 regions, one per thread, which matches <code>ps -M</code>. <dfn>Physical footprint</dfn> is macOS's own measure of the memory charged to the process.</td></tr>
+  <tr><td><code>lsof</code></td><td>Lists open files ("list open files"). Descriptors 0, 1 and 2 are stdin, stdout and stderr: here stdout and stderr go to <code>hold.log</code>, and stdin is a socket from the tool I ran it with (in your terminal it will be a <code>/dev/ttys…</code> device). Descriptor 3 is the JDK's <code>modules</code> file, which is where classes like <code>String</code> are loaded from.</td></tr>
+  <tr><td><code>jcmd … GC.heap_info</code></td><td><code>-Xmx1g</code> <em>reserved</em> 1 GB of address space for the heap, but only about 210 MB is <em>committed</em>, meaning backed by memory. The 200 MB array sits in 201 1 MB regions marked "humongous". The G1 collector treats objects "larger or equal the size of half a region" specially (<a href="https://docs.oracle.com/en/java/javase/25/gctuning/garbage-first-g1-garbage-collector1.html">HotSpot GC guide: G1</a>; more in L24).</td></tr>
+</table>
+<p><b><code>-Xmx</code> vs RSS.</b> <code>-Xmx</code> caps only the Java heap. RSS also counts thread stacks, the JVM's own code and data, the JIT's compiled code and the classes it has loaded. That's why a JVM with a 64 MB heap can still use well over 100 MB of RAM, and why Android and container platforms measure the whole process, not just your objects.</p>
+
+<h3>System calls: the door into the kernel</h3>
+<p>Your code can't touch the disk, the network or another process directly. OSTEP explains the hardware rule: code in <dfn>user mode</dfn> "is restricted in what it can do", while the OS runs in <dfn>kernel mode</dfn>, where code "can do what it likes, including privileged operations such as issuing I/O requests" (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-mechanisms.pdf">OSTEP ch. 6, Limited Direct Execution</a>). To cross the line, a program makes a <dfn>system call</dfn>. It looks like a normal function call, "but hidden inside that procedure call is the famous trap instruction", which jumps into the kernel and raises the privilege level, then returns when the work is done. Every file read, network send and new thread goes through one.</p>
+<p>Tools can show you each system call a process makes. On Linux that's <a href="https://man7.org/linux/man-pages/man1/strace.1.html"><code>strace</code></a>. macOS has <code>dtruss</code>, but its man page says "since this uses DTrace, only users with root privileges can run this", and recent macOS versions add further restrictions. I didn't run either one here. Instead, here's a safe, real measurement of what one system call costs:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · SyscallCost.kt</figcaption>
+<!--CODE:l22/SyscallCost.kt--></figure>
+  <figure class="java"><figcaption>JAVA · SyscallCost.java</figcaption>
+<!--CODE:l22/SyscallCost.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">array:                  0.22 ns per byte
+RandomAccessFile.read(): 305 ns per byte
+ratio: about 1391x  (checksum 126979520)</pre>
+<pre class="out">array:                  0.22 ns per byte
+RandomAccessFile.read(): 309 ns per byte
+ratio: about 1409x  (checksum 126979520)</pre>
+</div>
+<p>The file is tiny and already in the OS's memory, so no disk is involved at all. The difference is pure overhead: entering the kernel, finding the file, copying one byte back. Why is each <code>read()</code> a system call? In OpenJDK, <code>RandomAccessFile.read()</code> is a native method that ends up in <code>readSingle</code>, which calls <code>IO_Read(fd, &amp;ret, 1)</code>: one OS read of one byte (<a href="https://github.com/openjdk/jdk/blob/master/src/java.base/share/native/libjava/io_util.c">io_util.c</a>; an implementation detail, not a guarantee). <b>About 1,400× slower per byte</b> is why Part 3 is all about buffering. (The checksum is printed so the JIT can't throw away a loop whose result is never used.)</p>
+<p class="note">Bridge: an Android app is a Linux process too. "When an application component starts and the application doesn't have any other components running, the Android system starts a new Linux process for the application with a single thread of execution", the main thread (<a href="https://developer.android.com/guide/components/processes-and-threads">Android: Processes and threads</a>). Android may kill that process to reclaim memory, which is why the platform cares so much about your app's RSS.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li>Kotlin uses the very same JDK classes (<code>ProcessHandle</code>, <code>ProcessBuilder</code>, <code>RandomAccessFile</code>) with no wrappers needed.</li>
+    <li><code>stream.bufferedReader().use { it.readText() }</code> reads a child's whole output and closes the reader in one line. Java needs a try-with-resources block, and before <code>Process.inputReader()</code> (JDK 17) it needed an <code>InputStreamReader</code> wrapper too.</li>
+    <li>No <code>throws IOException, InterruptedException</code> on <code>main</code>. Kotlin has no checked exceptions (L10), so <code>waitFor()</code> and <code>start()</code> just work, and you decide where to catch.</li>
+    <li><code>me.parent().map { it.pid() }.orElse(-1)</code> works on Java's <code>Optional</code> with a lambda, and string templates replace the <code>+</code> chains.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: watch your own memory</div>
+  <ol>
+    <li>From a blank file, write <code>rssMb()</code>, which starts <code>ps -o rss= -p &lt;your pid&gt;</code> and returns the result in MB. The <code>=</code> after <code>rss</code> removes the header line.</li>
+    <li>Print your pid and thread count, then RSS before and after allocating a 100 MB <code>ByteArray</code>, then again after writing one byte every 4 KB of it.</li>
+    <li><b>Predict first:</b> which of the three RSS numbers will be different? Then run it with <code>-Xmx256m</code>, and again with <code>-Xmx64m</code>.</li>
+  </ol>
+  <details class="solution"><summary>Reference solution and real output</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Rss.kt</figcaption>
+<!--CODE:l22/Rss.kt--></figure>
+      <figure class="java"><figcaption>JAVA · Rss.java</figcaption>
+<!--CODE:l22/Rss.java--></figure>
+    </div>
+<div class="pair">
+<pre class="out">$ java -Xmx256m -jar rss.jar
+pid 25737, Java threads: 6
+RSS before: 46 MB
+RSS after allocating 100 MB: 151 MB
+RSS after touching it:       151 MB
+$ java -Xmx64m -jar rss.jar
+pid 25766, Java threads: 6
+RSS before: 46 MB
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+	at RssKt.main(Rss.kt:12)
+	at RssKt.main(Rss.kt)</pre>
+<pre class="out">$ java -Xmx256m Rss.java
+pid 25743, Java threads: 6
+RSS before: 102 MB
+RSS after allocating 100 MB: 197 MB
+RSS after touching it:       197 MB
+$ java -Xmx64m Rss.java
+pid 25770, Java threads: 6
+RSS before: 99 MB
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+	at Rss.main(Rss.java:16)
+	… (4 more lines from the source launcher)</pre>
+</div>
+    <ul>
+      <li><b>The jump happens at allocation, not when you touch the array.</b> Java promises every new array is filled with zeros (default values, L2), and on this JVM the memory was committed and written as soon as the array was created. That's why touching it added nothing. It surprised me too, which is exactly why you measure instead of guessing.</li>
+      <li><b>Java starts about 55 MB bigger.</b> <code>java Rss.java</code> runs in source-file mode, where "the source file is compiled into memory" first (<a href="https://openjdk.org/jeps/330">JEP 330</a>), so the compiler is loaded into the same process. Running a precompiled <code>.class</code> or <code>.jar</code> avoids that.</li>
+      <li><b><code>-Xmx64m</code> fails</b> with L4's <code>OutOfMemoryError</code>, because the heap cap is smaller than the array. The process still used about 46–99 MB of RSS before that. The heap is only part of a process's memory.</li>
+    </ul>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Processes and memory" data-answer="0">
+  <p class="q">What does a process's RSS measure?</p>
+  <div class="opts"><button>RAM the process actually uses</button><button>Address space it has reserved</button><button>Heap limit set by Xmx</button><button>Disk space its files use</button></div>
+  <p class="why">Resident set size is memory actually held in RAM: 249 MB for <code>Hold</code>, against a VSZ of about 418 GB of mostly untouched address space.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Processes and memory" data-answer="0">
+  <p class="q">Two running JVMs both report their heap at <code>0x7c0000000</code>. What follows?</p>
+  <div class="opts"><button>Nothing: each address is virtual</button><button>They share the same memory</button><button>One of them will crash</button><button>The OS merged their heaps</button></div>
+  <p class="why">"Any address you can see as a programmer of a user-level program is a virtual address" (OSTEP). Each process's page table maps it to different physical RAM.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Processes and memory" data-answer="1">
+  <p class="q">Which of these needs a system call every time it runs?</p>
+  <div class="opts"><button><code>arr[i]++</code></button><button><code>raf.read()</code></button><button><code>x * 2</code></button><button><code>list.size</code></button></div>
+  <p class="why">Reading a file means asking the kernel. In OpenJDK each single-byte <code>RandomAccessFile.read()</code> is one OS read, and it measured about 1,400× slower than reading an array.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Processes and memory" data-answer="0">
+  <p class="q"><code>ps -M</code> counted 26 threads, but <code>Thread.getAllStackTraces()</code> listed 6. Why?</p>
+  <div class="opts"><button>JVM internals use non-Java threads</button><button>ps counts every thread twice</button><button>Six threads had already finished</button><button>Java hides threads from macOS</button></div>
+  <p class="why">The garbage collector, the JIT compiler and other JVM internals run on native OS threads that have no Java <code>Thread</code> object. The OS counts them all.</p>
+</div>
+<div class="quiz" data-id="p1-5" data-group="Part 1 · Processes and memory" data-answer="1">
+  <p class="q"><code>ProcessBuilder("sh", "-c", "exit 3").start().waitFor()</code></p>
+  <div class="opts"><button>Gives 0</button><button>Gives 3</button><button>Gives -1</button><button>Throws exception</button></div>
+  <p class="why"><code>waitFor()</code> returns the child's exit code. A non-zero code is a normal result, not an exception, so check it yourself.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>CPU caches and the memory hierarchy</h2><span class="t">~30 min</span></div>
+
+<p>Big O counts steps as if every memory access cost the same. It doesn't. A CPU can do arithmetic far faster than main memory can deliver data, so chips put small, fast <dfn>caches</dfn> between the cores and RAM. The result is a <dfn>memory hierarchy</dfn>: registers, then the L1, L2 (and on many chips L3) caches, then RAM, then storage. Each level is bigger and slower than the one before. Peter Norvig's widely quoted table gives "approximate timing for various operations on a typical PC" (<a href="https://norvig.com/21-days.html#answers">Norvig, <em>Teach Yourself Programming in Ten Years</em></a>). It's old (the disk rows are spinning disks, not SSDs) and every number is approximate, but the <em>shape</em> still holds. The purple rows are things I measured in this lesson.</p>
+<div class="cacheviz" data-mode="ladder" data-src="cv-ladder"></div>
+<script type="application/json" id="cv-ladder">{
+ "anchor": 1,
+ "anchorText": "an L1 cache fetch",
+ "rows": [
+  {"label": "read a byte from an array, in order (SyscallCost)", "ns": 0.22, "kind": "mine"},
+  {"label": "fetch from L1 cache", "ns": 0.5, "kind": "book"},
+  {"label": "branch misprediction", "ns": 5, "kind": "book"},
+  {"label": "array access on a new cache line (Stride)", "ns": 6, "kind": "mine"},
+  {"label": "fetch from L2 cache", "ns": 7, "kind": "book"},
+  {"label": "mutex lock/unlock", "ns": 25, "kind": "book"},
+  {"label": "fetch from main memory", "ns": 100, "kind": "book"},
+  {"label": "one read() system call (SyscallCost)", "ns": 305, "kind": "mine"},
+  {"label": "send 2 KB over a 1 Gbps network", "ns": 20000, "kind": "book"},
+  {"label": "read 1 MB sequentially from memory", "ns": 250000, "kind": "book"},
+  {"label": "read 1 MB of a cached file, readAllBytes (Buffering)", "ns": 350000, "kind": "mine"},
+  {"label": "disk seek (spinning disk)", "ns": 8000000, "kind": "book"},
+  {"label": "read 1 MB sequentially from disk", "ns": 20000000, "kind": "book"},
+  {"label": "packet US → Europe → US", "ns": 150000000, "kind": "book"},
+  {"label": "read 1 MB with unbuffered read() (final)", "ns": 321000000, "kind": "mine"}
+ ]
+}</script>
+<p>Switch to the second tab. If an L1 cache hit took one second, a trip to main memory would take over three minutes, and reading a megabyte one system call at a time would take about 20 years. That last row isn't from a book. It's the unbuffered reader in today's final exercise.</p>
+
+<h3>This machine's caches</h3>
+<pre class="term"><span class="p">$ </span>sysctl hw.pagesize hw.cachelinesize hw.perflevel0.name hw.perflevel0.l1dcachesize hw.perflevel0.l2cachesize hw.perflevel1.name hw.perflevel1.l1dcachesize hw.perflevel1.l2cachesize
+hw.pagesize: 16384
+hw.cachelinesize: 128
+hw.perflevel0.name: Super
+hw.perflevel0.l1dcachesize: 131072
+hw.perflevel0.l2cachesize: 16777216
+hw.perflevel1.name: Performance
+hw.perflevel1.l1dcachesize: 65536
+hw.perflevel1.l2cachesize: 8388608</pre>
+<p>This chip has two kinds of cores, each with its own caches: 128 KB of L1 data cache per core on the fastest ones, and a shared 16 MB L2. No L3 key exists here. (On Linux, try <code>lscpu</code>; on Windows, Task Manager's CPU page. I didn't run those.) The number that matters most today is <code>hw.cachelinesize: 128</code>. Memory doesn't move between RAM and the caches one byte at a time. It moves in <dfn>cache lines</dfn>, here 128 bytes, which is 32 <code>int</code>s. Read one <code>int</code> and its 31 neighbours come along for free.</p>
+<p>Caches pay off because programs have <dfn>locality</dfn>. OSTEP: "with temporal locality, the idea is that an instruction or data item that has been recently accessed will likely be re-accessed soon", and "with spatial locality, the idea is that if a program accesses memory at address x, it will likely soon access memory near x. Imagine here streaming through an array" (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf">OSTEP ch. 19</a>). Code that walks memory in order gets most of its data for free. Code that jumps around pays for a miss on almost every access.</p>
+
+<h3>Row-major vs column-major</h3>
+<p>Here's a toy cache: 4 <code>int</code>s per line, room for 4 lines. Step through both orders and count the misses:</p>
+<div class="cacheviz" data-mode="grid" data-rows="8" data-cols="8" data-line="4" data-lines="4"></div>
+<p>Row-major gets 16 misses out of 64 reads: one per line, and the next 3 reads are hits. Column-major touches 8 different lines per column, but the cache holds only 4, so every line is evicted before it's reused: 64 misses out of 64. Real caches are far bigger, but so are real arrays. Now on real hardware:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Grid.kt</figcaption>
+<!--CODE:l22/Grid.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Grid.java</figcaption>
+<!--CODE:l22/Grid.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">row-major:       3.7 ms  (sum 50331645)
+column-major:   27.4 ms  (sum 50331645)
+column-major is 7.4x slower</pre>
+<pre class="out">row-major:       3.8 ms  (sum 50331645)
+column-major:   29.3 ms  (sum 50331645)
+column-major is 7.7x slower</pre>
+</div>
+<p>It's the same 16.7 million additions with the same result, and both are O(n²) in the grid side n. Yet one order is <b>7–8× slower</b>. Each row is an <code>IntArray</code> of 4,096 ints (16 KB), so column-major lands on a different row, a different cache line and usually a different 16 KB page on every single step.</p>
+
+<h3>Arrays vs boxes vs linked lists</h3>
+<p>Now the experiment behind L17's timing. Same 5 million numbers, four containers:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Lists.kt</figcaption>
+<!--CODE:l22/Lists.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Lists.java</figcaption>
+<!--CODE:l22/Lists.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">IntArray                 1.1 ms    1.0x  (sum 12499997500000)
+ArrayList&lt;Int&gt;           1.8 ms    1.6x  (sum 12499997500000)
+ArrayList, shuffled     14.2 ms   12.4x  (sum 12499997500000)
+LinkedList&lt;Int&gt;          8.0 ms    7.0x  (sum 12499997500000)</pre>
+<pre class="out">int[]                    1.1 ms    1.0x  (sum 12499997500000)
+ArrayList&lt;Integer&gt;       2.1 ms    1.9x  (sum 12499997500000)
+ArrayList, shuffled     10.6 ms    9.6x  (sum 12499997500000)
+LinkedList&lt;Integer&gt;      7.3 ms    6.6x  (sum 12499997500000)</pre>
+</div>
+<ul>
+  <li><b><code>IntArray</code> / <code>int[]</code></b> stores the numbers themselves, side by side: 32 per cache line.</li>
+  <li><b><code>ArrayList&lt;Int&gt;</code></b> stores <em>references</em> to boxed <code>Integer</code> objects (L5, L13). Every element costs an extra hop. It's only about 2× slower here because the objects were allocated in order, so they happen to sit next to each other in the heap.</li>
+  <li><b>Shuffled</b> holds the same objects and the same values, and gives the same sum and the same Big O. Only the <em>visiting order</em> changed, so each hop now lands somewhere unpredictable, and it's <b>10–12× slower</b>. That is locality, isolated.</li>
+  <li><b><code>LinkedList</code></b> hops twice per element, node then <code>Integer</code>, and each node carries extra pointers (L17). It's 7× slower than the array.</li>
+</ul>
+<p>So "an array beats a linked list in practice" isn't folklore. Big O deliberately drops constant factors (L16), and memory access is where the hardware hides big ones. The JDK's everyday collections are array-based (<code>ArrayList</code>, <code>ArrayDeque</code>, <code>HashMap</code>'s bucket table), and you should measure before you trust a Big O argument about speed.</p>
+
+<h3>Seeing the cache line</h3>
+<p>One more experiment: touch every <code>step</code>-th element of a 256 MB array, far too big for any cache, and time each access.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Stride.kt</figcaption>
+<!--CODE:l22/Stride.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Stride.java</figcaption>
+<!--CODE:l22/Stride.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">step  accesses    total ms   ns/access
+   1    67108864      21.4      0.32
+   2    33554432      11.0      0.33
+   4    16777216       6.9      0.41
+   8     8388608       4.1      0.49
+  16     4194304       3.5      0.83
+  32     2097152      12.9      6.17
+  64     1048576       5.7      5.41
+ 128      524288       2.7      5.20</pre>
+<pre class="out">step  accesses    total ms   ns/access
+   1    67108864      20.4      0.30
+   2    33554432      10.8      0.32
+   4    16777216       5.5      0.33
+   8     8388608       3.8      0.46
+  16     4194304       3.3      0.79
+  32     2097152      12.9      6.15
+  64     1048576       6.1      5.86
+ 128      524288       2.7      5.19</pre>
+</div>
+<p>Look at the last column. Up to step 16, an access costs under a nanosecond. At <b>step 32 it jumps about 7×</b>, to around 6 ns, and stays there. 32 ints × 4 bytes = 128 bytes, exactly <code>hw.cachelinesize</code>. From that step on, every access lands on a new cache line, so every access is a miss. Below it, several accesses share each line.</p>
+<p>Be honest about what this table doesn't show. The total times don't follow a neat formula: step 16 is faster overall than step 32, even though both touch every cache line. Real CPUs <em>prefetch</em> lines they predict you'll need, and the JIT compiler can unroll simple loops and turn them into vector instructions (L23). I won't pretend to explain every number. The clear, repeatable signal is the jump at the cache-line size. Real hardware is messy, which is the best argument for measuring.</p>
+<p class="note">Coming in Phase 8: when two threads write to different variables that happen to share one cache line, the cores keep stealing the line from each other. That's called <dfn>false sharing</dfn>, and it can make correct concurrent code mysteriously slow.</p>
+<p class="note">Bridge: Android ships <code>SparseArray</code> for maps keyed by <code>int</code>. Its docs say it's "intended to be more memory-efficient than a HashMap, because it avoids auto-boxing keys and its data structure doesn't rely on an extra entry object for each mapping" (<a href="https://developer.android.com/reference/android/util/SparseArray">SparseArray</a>). That's today's lesson baked into a platform API.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you</strong> (and what it hides).
+  <ul>
+    <li><code>IntArray(N) { it }</code> creates and fills a primitive array in one expression. Java needs a separate loop.</li>
+    <li>Kotlin hides boxing, which is convenient and also a trap here. <code>Array&lt;Int&gt;</code>, <code>List&lt;Int&gt;</code> and <code>ArrayList&lt;Int&gt;</code> all store boxed <code>Integer</code>s. Only <code>IntArray</code> stores raw ints. The docs: "If you use the Array class with primitive values, the compiler boxes these values into objects. To avoid boxing overhead, you can use dedicated primitive-type arrays" (<a href="https://kotlinlang.org/docs/arrays.html#primitive-type-arrays">Kotlin: Arrays</a>). Java makes the difference visible in the type: <code>int[]</code> vs <code>Integer</code>.</li>
+    <li><code>for (x in boxed)</code> unboxes automatically, as does Java's <code>for (int x : boxed)</code>. Neither shows you the pointer hop.</li>
+    <li>Destructuring <code>val (row, s1) = bestMs { … }</code> returns two values via <code>Pair</code>, where the Java version packs them into a <code>double[]</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: does a flat array help?</div>
+  <p>Some people store a grid in one flat array, with cell <code>(r, c)</code> at index <code>r * N + c</code>, so the whole grid is one contiguous block instead of N separate row objects.</p>
+  <ol>
+    <li>Predict: for row-major order, will flat beat nested? For column-major, will flat rescue it?</li>
+    <li>From a blank file, time all four combinations with the <code>bestMs</code> helper from <code>Grid</code>: nested or flat, times row-major or column-major. Use N = 4096 and <code>-Xmx1g</code>.</li>
+  </ol>
+  <details class="solution"><summary>Reference solution and real output</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Flat.kt</figcaption>
+<!--CODE:l22/Flat.kt--></figure>
+      <figure class="java"><figcaption>JAVA · Flat.java</figcaption>
+<!--CODE:l22/Flat.java--></figure>
+    </div>
+<div class="pair">
+<pre class="out">nested, row-major        4.0 ms  (sum 50331645)
+flat, row-major          3.7 ms  (sum 50331645)
+nested, column-major    29.6 ms  (sum 50331645)
+flat, column-major      51.6 ms  (sum 50331645)</pre>
+<pre class="out">nested, row-major        4.0 ms  (sum 50331645)
+flat, row-major          3.9 ms  (sum 50331645)
+nested, column-major    35.6 ms  (sum 50331645)
+flat, column-major      48.0 ms  (sum 50331645)</pre>
+</div>
+    <p><b>Order matters far more than layout.</b> Row-major is fast either way, because each 16 KB row is contiguous, so the flat array has nothing to fix. Column-major is slow either way, and the flat version was even <em>slower</em>. My best guess, which I didn't measure directly: in the flat array, consecutive column accesses are exactly 16,384 bytes apart, a power of two, and such strides tend to compete for the same few slots in the cache. Each nested row is a separate object with a small header, so its rows sit slightly more than 16 KB apart. Either way, the fix for slow column access is to change the loop order, or to transpose the data, not to change containers.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Caches" data-answer="1">
+  <p class="q">This Mac's cache line is 128 bytes. How many <code>int</code>s fit in one line?</p>
+  <div class="opts"><button>Gives 16</button><button>Gives 32</button><button>Gives 64</button><button>Gives 128</button></div>
+  <p class="why">An <code>int</code> is 4 bytes, and 128 / 4 = 32. That's why <code>Stride</code>'s cost per access jumped at step 32.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Caches" data-answer="0">
+  <p class="q">Same <code>ArrayList</code>, same values, just shuffled. Why was summing it about 10× slower?</p>
+  <div class="opts"><button>Reads jump around in memory</button><button>Shuffling boxes the values again</button><button>Iterators slow down after shuffling</button><button>The list became a LinkedList</button></div>
+  <p class="why">The <code>Integer</code> objects stayed where they were in the heap; only the order of references changed. Following them now jumps around memory, so spatial locality is lost.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Caches" data-answer="1">
+  <p class="q">Which Kotlin type stores its numbers side by side, with no boxes?</p>
+  <div class="opts"><button><code>Array&lt;Int&gt;</code></button><button><code>IntArray</code></button><button><code>List&lt;Int&gt;</code></button><button><code>ArrayList&lt;Int&gt;</code></button></div>
+  <p class="why"><code>IntArray</code> compiles to Java's <code>int[]</code>. The other three hold references to boxed <code>Integer</code> objects.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Caches" data-answer="0">
+  <p class="q">In Big O terms, how do row-major and column-major summing of an n × n grid compare?</p>
+  <div class="opts"><button>Identical, both visit every cell</button><button>Column-major is a worse class</button><button>Row-major is linear in n</button><button>Column-major is cubic in n</button></div>
+  <p class="why">Both are O(n²): the same cells, the same additions. The 7× gap is a constant factor that Big O drops, but the cache doesn't.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Files and I/O</h2><span class="t">~30 min</span></div>
+
+<p>A file is a sequence of <em>bytes</em>. Text only appears once you decode those bytes with a <dfn>character encoding</dfn>. Java's classic I/O library keeps the two worlds apart:</p>
+<table class="cmds">
+  <tr><th></th><th>Bytes</th><th>Characters (text)</th></tr>
+  <tr><td>Read</td><td><code>InputStream</code> (<code>FileInputStream</code>, <code>BufferedInputStream</code>)</td><td><code>Reader</code> (<code>BufferedReader</code>, <code>InputStreamReader</code>)</td></tr>
+  <tr><td>Write</td><td><code>OutputStream</code></td><td><code>Writer</code> (<code>BufferedWriter</code>)</td></tr>
+  <tr><td>Bridge</td><td colspan="2"><code>InputStreamReader(stream, charset)</code> decodes bytes into chars; <code>OutputStreamWriter</code> encodes</td></tr>
+</table>
+<p>The classes are designed to wrap each other: a <code>BufferedInputStream</code> wraps a <code>FileInputStream</code> and adds a buffer. That's L8's decorator pattern, and dev.java's tutorial calls it exactly that (<a href="https://dev.java/learn/api/io/java-io/reading-writing/decorating/">dev.java: Decorating I/O Streams</a>).</p>
+
+<h3>Encodings: bytes are not characters</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Encoding.kt</figcaption>
+<!--CODE:l22/Encoding.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Encoding.java</figcaption>
+<!--CODE:l22/Encoding.java--></figure>
+</div>
+<pre class="out">length: 7 chars, 6 code points, 10 bytes
+63 61 66 c3 a9 20 f0 9f 98 80
+decoded as UTF-8:        café 😀
+decoded as windows-1252: cafÃ© ðŸ˜€
+default charset: UTF-8</pre>
+<pre class="term"><span class="p">$ </span>printf 'café 😀' | xxd
+00000000: 6361 66c3 a920 f09f 9880                 caf.. ....</pre>
+<ul>
+  <li><b>Three different sizes for one string.</b> 6 code points (L2): <code>c a f é</code>, a space and 😀. 7 Java <code>char</code>s, because 😀 needs two UTF-16 units. 10 bytes in UTF-8: <code>c a f</code> take 1 byte each, <code>é</code> takes 2 (<code>c3 a9</code>), and 😀 takes 4 (<code>f0 9f 98 80</code>). <code>xxd</code>, the standard hex-dump tool, shows the same bytes the program printed.</li>
+  <li><b>Decode with the wrong charset and you get <dfn>mojibake</dfn>.</b> windows-1252 maps each byte to one character, so <code>c3 a9</code> becomes <code>Ã©</code>. If you've ever seen <code>Ã©</code> on a web page, someone decoded UTF-8 as a one-byte charset. ISO-8859-1 does the same to <code>é</code>, and turns the emoji's bytes into invisible control characters.</li>
+  <li><b>UTF-8 is the default since JDK 18.</b> <a href="https://openjdk.org/jeps/400">JEP 400</a>: "Specify UTF-8 as the default charset of the standard Java APIs. With this change, APIs that depend upon the default charset will behave consistently across all implementations, operating systems, locales, and configurations." Before that, the same program could write different bytes on Windows. <code>java -XshowSettings:properties -version</code> prints <code>file.encoding = UTF-8</code> on this machine. Still, pass a charset explicitly whenever the bytes come from somewhere else.</li>
+</ul>
+
+<h3>Buffering: the 1,400× tax, and how to avoid it</h3>
+<p>Part 1 measured about 300 ns per <code>read()</code> system call. Here's what that does to an 8 MB file:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Buffering.kt</figcaption>
+<!--CODE:l22/Buffering.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Buffering.java</figcaption>
+<!--CODE:l22/Buffering.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">FileInputStream.read()               2583.4 ms        3 MB/s  (sum 1048570078)
+BufferedInputStream.read()             41.2 ms      194 MB/s  (sum 1048570078)
+Files.readAllBytes                      2.9 ms     2724 MB/s  (sum 1048570078)</pre>
+<pre class="out">FileInputStream.read()               2555.7 ms        3 MB/s  (sum 1048570078)
+BufferedInputStream.read()             40.3 ms      198 MB/s  (sum 1048570078)
+Files.readAllBytes                      2.7 ms     2991 MB/s  (sum 1048570078)</pre>
+</div>
+<ul>
+  <li><b>Unbuffered:</b> 8,388,608 bytes means 8,388,608 system calls, about 2.6 seconds.</li>
+  <li><b>Buffered: 60× faster with the same loop.</b> "As bytes from the stream are read or skipped, the internal buffer is refilled as necessary from the contained input stream, many bytes at a time" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/io/BufferedInputStream.html">BufferedInputStream</a>). OpenJDK's default buffer is 8,192 bytes (<a href="https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/io/BufferedInputStream.java"><code>DEFAULT_BUFFER_SIZE</code></a>, an implementation detail), so the kernel is called about 1,024 times instead of 8 million. Each <code>read()</code> is now just a method call that takes the next byte from an array.</li>
+  <li><b><code>readAllBytes</code>:</b> a few large reads straight into one array, close to memory speed. That's fine for files that fit comfortably in memory.</li>
+</ul>
+
+<h3>The modern file APIs</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Files.kt</figcaption>
+<!--CODE:l22/Files.kt--></figure>
+  <figure class="java"><figcaption>JAVA · FilesDemo.java</figcaption>
+<!--CODE:l22/FilesDemo.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">readText: milk|eggs|bread|
+useLines: longest is bread
+first line: milk
+  java.io.File line: milk
+  java.io.File line: eggs
+  java.io.File line: bread
+walk: notes.txt (16 bytes)
+walk: sub/todo.txt (9 bytes)
+relative: data/../report.csv  absolute? false  normalized: report.csv
+working dir: .../l22  absolute(): .../l22/report.csv</pre>
+<pre class="out">readString: milk|eggs|bread|
+lines: longest is bread
+first line: milk
+  readAllLines: milk
+  readAllLines: eggs
+  readAllLines: bread
+walk: notes.txt (16 bytes)
+walk: sub/todo.txt (9 bytes)
+relative: data/../report.csv  absolute? false  normalized: report.csv
+working dir: .../l22  toAbsolutePath(): .../l22/report.csv</pre>
+</div>
+<table class="cmds">
+  <tr><th>Job</th><th>Kotlin</th><th>Java</th></tr>
+  <tr><td>Small file, all at once</td><td><code>path.readText()</code> / <code>writeText</code> / <code>appendText</code></td><td><code>Files.readString</code> / <code>writeString</code> (+ <code>APPEND</code>)</td></tr>
+  <tr><td>Lines, lazily</td><td><code>path.useLines { seq -&gt; … }</code> closes for you</td><td><code>try (Stream&lt;String&gt; s = Files.lines(p))</code></td></tr>
+  <tr><td>Line by line, by hand</td><td><code>path.bufferedReader().use { }</code></td><td><code>Files.newBufferedReader(p)</code> in try</td></tr>
+  <tr><td>All lines into a list</td><td><code>path.readLines()</code></td><td><code>Files.readAllLines(p)</code></td></tr>
+  <tr><td>A directory tree</td><td colspan="2"><code>Files.walk(dir)</code>: a lazy stream that must be closed</td></tr>
+</table>
+<ul>
+  <li><b><code>Files.lines</code> holds the file open.</b> Its docs: "The returned stream contains a reference to an open file. The file is closed by closing the stream" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/file/Files.html#lines(java.nio.file.Path)">Files.lines</a>). It's lazy like L15's streams, so close it with try-with-resources. Kotlin's <code>useLines</code> "closes the reader once the processing is complete" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io.path/use-lines.html">Path.useLines</a>). The lazy sequence is only valid <em>inside</em> the block.</li>
+  <li><b><code>kotlin.io.path</code></b> adds extensions like <code>readText</code>, <code>useLines</code> and the <code>/</code> operator to Java's <code>Path</code>. They're stable "since Kotlin 1.5" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io.path/">kotlin.io.path</a>). The older <code>java.io.File</code> extensions (<code>forEachLine</code>, <code>readText</code>) still work. Every text function here defaults to UTF-8.</li>
+  <li><b>Relative paths resolve against the working directory</b>, the folder you ran <code>java</code> from, not the folder your source file is in. <code>normalize()</code> removes <code>..</code> and <code>.</code>. This is the classic "works in IntelliJ, file not found in the terminal" bug, because IntelliJ runs your program from the project root.</li>
+  <li><b>Temporary files</b> from <code>Files.createTempFile</code> go to the OS temp directory, and all the demos delete them at the end, so nothing pollutes <code>~/katas</code>.</li>
+</ul>
+
+<h3>Close what you open</h3>
+<p>Every open file uses one entry in the process's table of <dfn>file descriptors</dfn>, the small numbers you saw from <code>lsof</code>. The table is limited. This program opens 300 streams and "forgets" to close them. On macOS and Linux, <code>/dev/fd</code> lists the current process's open descriptors:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Leak.kt</figcaption>
+<!--CODE:l22/Leak.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Leak.java</figcaption>
+<!--CODE:l22/Leak.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">open descriptors at start: 8
+after opening 300 streams:   308
+after closing them:         8</pre>
+<pre class="out">open descriptors at start: 7
+after opening 300 streams:   307
+after closing them:         7</pre>
+</div>
+<p>Each unclosed stream really does hold a descriptor until something closes it. What's the limit? I ran these commands on my machine:</p>
+<pre class="term"><span class="p">$ </span>ulimit -n
+1048576
+<span class="p">$ </span>launchctl limit maxfiles
+	maxfiles    256            unlimited</pre>
+<p>My shell has a very high limit, but <code>launchctl</code> reports a default soft limit of 256 on this Mac, so check yours. To watch the failure safely, lower the limit for one child shell only. This changes nothing system-wide:</p>
+<pre class="term"><span class="p">$ </span>javac Leak.java
+<span class="p">$ </span>sh -c 'ulimit -n 64; java Leak 300'
+open descriptors at start: 7
+failed after 58 streams: java.io.FileNotFoundException: /var/folders/3_/g5dwb35x4xl1lpd8717mpprw0000gn/T/l221986292625605674103.txt (Too many open files)
+after closing them:         7
+<span class="p">$ </span>sh -c 'ulimit -n 64; java -jar leak.jar 300'
+open descriptors at start: 8
+failed after 57 streams: java.io.FileNotFoundException: /var/folders/3_/g5dwb35x4xl1lpd8717mpprw0000gn/T/l2211138595580625087776.txt (Too many open files)
+after closing them:         8</pre>
+<p>"Too many open files" is a classic production outage: a server leaks one descriptor per request and dies after a few thousand requests. It's also why L10 drilled <code>use</code> and try-with-resources.</p>
+
+<h3><code>IOException</code>: checked in Java, not in Kotlin</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · ReadConfig.kt</figcaption>
+<!--CODE:l22/err/ReadConfig.kt--></figure>
+  <figure class="java"><figcaption>JAVA · ReadConfig.java</figcaption>
+<!--CODE:l22/err/ReadConfig.java--></figure>
+</div>
+<pre class="err">ReadConfig.java:5: error: unreported exception IOException; must be caught or declared to be thrown
+        String text = Files.readString(Path.of("config.txt"));
+                                      ^
+1 error</pre>
+<pre class="out">Exception in thread "main" java.nio.file.NoSuchFileException: config.txt
+	at java.base/sun.nio.fs.UnixException.translateToIOException(UnixException.java:92)
+	…
+	at java.base/java.nio.file.Files.readString(Files.java:3010)
+	at ReadConfigKt.main(ReadConfig.kt:5)
+	at ReadConfigKt.main(ReadConfig.kt)</pre>
+<p>Java refuses to compile it, which is L10's checked-exception rule in its most common setting: almost every file method declares <code>throws IOException</code>. Kotlin compiles it, and the missing file becomes a runtime <code>NoSuchFileException</code>, a subclass of <code>IOException</code>. Neither is wrong. Kotlin just trusts you to decide where to handle it, so do decide.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>path.readText()</code>, <code>writeText</code>, <code>useLines</code>, <code>readLines</code> and <code>dir / "notes.txt"</code> read like English. Java spells each one as a static <code>Files.xxx(path)</code> call.</li>
+    <li><code>useLines</code> and <code>use</code> close the file for you, even when an exception is thrown. With Java's <code>Files.lines</code>, forgetting the try block compiles fine and leaks a descriptor.</li>
+    <li>No <code>throws IOException</code> on every method, but the exceptions are still thrown. Handle them where it makes sense (L10).</li>
+    <li><code>file.deleteRecursively()</code> deletes a whole tree in one call. Java walks the tree in reverse order and deletes the children first.</li>
+    <li><code>InputStream.copyTo(out)</code> and <code>Path.copyTo(target)</code> already exist, so use them in real code instead of the exercise below.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: copy a file three ways</div>
+  <ol>
+    <li>From a blank file, write <code>copyByteByByte(src, dst)</code> using <code>read()</code>/<code>write(int)</code>, and <code>copyWithBuffer(src, dst, size)</code> using <code>read(buffer)</code>/<code>write(buffer, 0, n)</code>. Use <code>use</code> or try-with-resources for <em>both</em> streams.</li>
+    <li>Copy a 4 MB file of random bytes four ways: byte by byte, with a 16-byte buffer, with an 8 KB buffer, and with <code>Files.copy</code>. Time each one, and check the copy with <code>Files.mismatch(src, dst) == -1L</code>.</li>
+    <li>Why must you write <code>out.write(buffer, 0, n)</code> and not <code>out.write(buffer)</code>?</li>
+  </ol>
+  <details class="solution"><summary>Reference solution and real output</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Copy.kt</figcaption>
+<!--CODE:l22/Copy.kt--></figure>
+      <figure class="java"><figcaption>JAVA · Copy.java</figcaption>
+<!--CODE:l22/Copy.java--></figure>
+    </div>
+<div class="pair">
+<pre class="out">byte by byte               6015.2 ms  identical: true
+16-byte buffer              415.4 ms  identical: true
+8 KB buffer                   1.8 ms  identical: true
+Files.copy                    2.8 ms  identical: true</pre>
+<pre class="out">byte by byte               6009.1 ms  identical: true
+16-byte buffer              426.0 ms  identical: true
+8 KB buffer                   1.5 ms  identical: true
+Files.copy                    1.1 ms  identical: true</pre>
+</div>
+    <p>Byte by byte makes two system calls per byte, a read and a write, so 4 MB takes 6 seconds. A 16-byte buffer divides the number of calls by 16 and is about 15× faster. An 8 KB buffer is about 3,000× faster. Past a few KB, the buffer size stops mattering much. The last read usually returns fewer bytes than the buffer holds, and <code>read</code> returns that count as <code>n</code>. Writing the whole buffer would append stale bytes from the previous read, and <code>mismatch</code> would catch it.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · Files and I/O" data-answer="1">
+  <p class="q">How many bytes does <code>"café"</code> take in UTF-8?</p>
+  <div class="opts"><button>Gives 4</button><button>Gives 5</button><button>Gives 6</button><button>Gives 8</button></div>
+  <p class="why"><code>c</code>, <code>a</code> and <code>f</code> take 1 byte each, and <code>é</code> takes 2 (<code>c3 a9</code>).</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · Files and I/O" data-answer="0">
+  <p class="q">Why was <code>BufferedInputStream.read()</code> about 60× faster than <code>FileInputStream.read()</code>?</p>
+  <div class="opts"><button>Far fewer system calls</button><button>It compresses the file</button><button>It reads in parallel</button><button>It skips the kernel</button></div>
+  <p class="why">It still asks the kernel, but for 8,192 bytes at a time, so there are about 1,024 calls instead of 8 million.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · Files and I/O" data-answer="0">
+  <p class="q">Java: you use <code>Files.lines(path)</code> without try-with-resources. What's the risk?</p>
+  <div class="opts"><button>The file stays open longer</button><button>Every line is read twice</button><button>The stream returns no lines</button><button>The JVM crashes on exit</button></div>
+  <p class="why">"The returned stream contains a reference to an open file. The file is closed by closing the stream." Leak enough of them and you get "Too many open files".</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · Files and I/O" data-answer="2">
+  <p class="q">Java: <code>main</code> calls <code>Files.readString(path)</code> with no try/catch and no <code>throws</code> clause.</p>
+  <div class="opts"><button>Prints text</button><button>Throws exception</button><button>Compile error</button><button>Prints nothing</button></div>
+  <p class="why"><code>unreported exception IOException; must be caught or declared to be thrown</code>. It's a checked exception.</p>
+</div>
+<div class="quiz" data-id="p3-5" data-group="Part 3 · Files and I/O" data-answer="1">
+  <p class="q">Kotlin: the same call, and <code>config.txt</code> doesn't exist.</p>
+  <div class="opts"><button>Prints text</button><button>Throws exception</button><button>Compile error</button><button>Prints nothing</button></div>
+  <p class="why">It compiles, then throws <code>NoSuchFileException</code> at runtime. Kotlin has no checked exceptions.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>A log analyser</h2><span class="t">~25 min</span></div>
+
+<p>Servers write access logs, one line per request, and you'll often need to answer questions like "which endpoints are busiest, and how slow are they at the 95th percentile?" Build the whole thing from a blank file, Kotlin first and then Java. Run it with <code>-Xmx1g</code>.</p>
+<div class="task">
+  <ol>
+    <li><b>Generate</b> a log of 1,200,000 lines (about 50 MB) in a temp file, using <code>java.util.Random(22)</code> so the data is the same in both languages. Each line looks like <code>2026-10-20T00:00:01 GET /api/users 200 12ms</code>. Use 8 paths; <code>/health</code> gets 3 picks in 10. Latency is a per-path base plus a random 0–29 ms, plus a random spike of up to 900 ms on 1 request in 12.</li>
+    <li><b>Read it three ways and time each:</b>
+      <ul>
+        <li>unbuffered <code>FileInputStream.read()</code>, but only the first 1 MB (count the newlines, then estimate how long the whole file would take)</li>
+        <li>a buffered <code>readLine</code> loop that builds a <code>Map&lt;String, MutableList&lt;Int&gt;&gt;</code> of latencies per path</li>
+        <li>a lazy pipeline, <code>useLines</code> / <code>Files.lines</code> + <code>groupBy</code> / <code>groupingBy</code> (L15), and check that it gives the same map</li>
+      </ul></li>
+    <li><b>Report</b> the top 5 paths by request count (ties alphabetical) with their p95 latency. p95 by the <em>nearest-rank</em> method: sort the latencies, then take index <code>ceil(0.95 × n) − 1</code> (L18).</li>
+    <li><b>Print RSS</b> at the start and the end, using <code>ps -o rss= -p &lt;pid&gt;</code> from Part 1. Delete the temp file at the end.</li>
+  </ol>
+<pre class="out">RSS at start: 50 MB
+log: 1200000 lines, 50 MB
+unbuffered, first 1 MB           321 ms
+  (23801 lines; at that speed the whole file would take ~16 s)
+buffered readLine loop           138 ms
+useLines pipeline                136 ms
+top 5 paths:
+  /health         359737 requests  p95  371 ms
+  /api/orders     120504 requests  p95  380 ms
+  /api/login      120335 requests  p95  390 ms
+  /api/users      120225 requests  p95  374 ms
+  /api/products   119970 requests  p95  382 ms
+RSS at end: 357 MB</pre>
+  <p>The request counts and p95 values must match exactly in both languages, because both use the same seeded <code>java.util.Random</code>. Times and RSS will differ.</p>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: log analyser (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: log analyser (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-measure" data-label="Final: ran it and explained the timings"><span class="who">MEASURE</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+  <details class="solution"><summary>Reference solutions and real Java output</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · LogAnalyzer.kt</figcaption>
+<!--CODE:l22/LogAnalyzer.kt--></figure>
+      <figure class="java"><figcaption>JAVA · LogAnalyzer.java</figcaption>
+<!--CODE:l22/LogAnalyzer.java--></figure>
+    </div>
+<pre class="out">$ java -Xmx1g LogAnalyzer.java
+RSS at start: 118 MB
+log: 1200000 lines, 50 MB
+unbuffered, first 1 MB           320 ms
+  (23801 lines; at that speed the whole file would take ~16 s)
+buffered readLine loop           203 ms
+Files.lines pipeline             150 ms
+top 5 paths:
+  /health         359737 requests  p95  371 ms
+  /api/orders     120504 requests  p95  380 ms
+  /api/login      120335 requests  p95  390 ms
+  /api/users      120225 requests  p95  374 ms
+  /api/products   119970 requests  p95  382 ms
+RSS at end: 355 MB</pre>
+    <p><b>Explain the numbers (the MEASURE row):</b></p>
+    <ul>
+      <li><b>Unbuffered:</b> 1 MB took about 320 ms, which is about 300 ns per byte, Part 1's system-call cost again. The whole 50 MB would take about 16 s, more than 100× slower than the buffered readers.</li>
+      <li><b>Buffered vs pipeline:</b> both are in the 130–200 ms range, because both read through an 8 KB buffer. Most of the remaining time goes on <code>split</code> and <code>toInt</code>, not on I/O. Whichever runs first also pays for the JIT warming up (L23), so don't read much into the gap between them.</li>
+      <li><b>p95 around 370–390 ms</b>, while a typical request takes 10–60 ms. With spikes on 1 request in 12 (about 8%), more than 5% of requests are spikes, so the 95th percentile lands inside the spike range. That's why teams track p95 and p99 rather than averages: tail latency is what users notice.</li>
+      <li><b>RSS grew by about 300 MB</b> for a 50 MB file. Not much of that is the results. Most latencies are below 128, so L5's <code>Integer</code> cache shares those boxes, and 1.2 million references are only a few MB. The rest is the heap growing to hold the temporary garbage both readers create: a <code>String</code> per line, plus a list of five pieces from <code>split</code>. In a variant run, with <code>Runtime.getRuntime()</code> prints added at the end, the heap had grown to 306 MB <em>committed</em> but only 75 MB <em>used</em>. After <code>System.gc()</code>, the committed heap shrank to 97 MB, yet RSS stayed at 362 MB. RSS tracks memory the process holds from the OS, not your live objects (L24 digs in). A real tool would stream the data with a fixed amount of memory per path, for example an <code>IntArray</code> histogram.</li>
+      <li><b>Java started at 118 MB</b>, against 50 MB for Kotlin, because <code>java LogAnalyzer.java</code> compiles the source in-process first (JEP 330, as in the Part 1 exercise).</li>
+    </ul>
+  </details>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="2">
+  <p class="q">Summing 5 million numbers: <code>IntArray</code> vs <code>LinkedList&lt;Int&gt;</code>. Both are O(n). The measured gap? (L16 + L22)</p>
+  <div class="opts"><button>About 1×</button><button>About 2×</button><button>About 7×</button><button>About 50×</button></div>
+  <p class="why">About 7×: same Big O, very different constants. Pointer chasing defeats spatial locality.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="0">
+  <p class="q">A Kotlin function calls <code>Files.readString</code>. Java callers want to <code>catch (IOException e)</code>. What should the Kotlin function have? (L9)</p>
+  <div class="opts"><button><code>@Throws(IOException::class)</code></button><button><code>@JvmStatic</code></button><button><code>@JvmOverloads</code></button><button><code>@JvmField</code></button></div>
+  <p class="why">Without <code>@Throws</code> the bytecode declares no checked exception, and javac rejects a <code>catch</code> for an exception the method can't throw (L9).</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">Deep recursion hits <code>StackOverflowError</code>. Which part of the address space ran out? (L18)</p>
+  <div class="opts"><button>That thread's own stack</button><button>The shared heap space</button><button>The code segment size</button><button>The page table size</button></div>
+  <p class="why">Every thread gets its own fixed-size stack (<code>-Xss</code>, L4). <code>vmmap</code> showed one stack region per thread.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="0">
+  <p class="q">How should you test the analyser's <code>p95</code> function? (L11)</p>
+  <div class="opts"><button>Unit-test it with small lists</button><button>Run main and read output</button><button>Only test with real logs</button><button>Measure it with a timer</button></div>
+  <p class="why">Pure functions like <code>p95(sorted)</code> are easy to test with hand-made inputs, e.g. 20 values where you know the answer. Keep the I/O at the edges.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Define process, thread, address space and system call, one sentence each. Then explain how two processes can use the same address.</li>
+    <li>RSS vs VSZ vs <code>-Xmx</code>: which is biggest for a JVM, and why?</li>
+    <li>From memory, draw the latency ladder: L1, L2, RAM, one system call, a network round trip. Get the orders of magnitude right, not the digits.</li>
+    <li>Explain, with the words "cache line" and "locality", why column-major and shuffled-list traversals are slow.</li>
+    <li>Write a buffered copy loop in Java with try-with-resources and in Kotlin with <code>use</code>, including the <code>write(buffer, 0, n)</code> detail.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/"><em>Operating Systems: Three Easy Pieces</em></a> by Remzi and Andrea Arpaci-Dusseau, free online. Read <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/intro.pdf">ch. 2</a> (Introduction), <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-intro.pdf">ch. 4</a> (The Process), <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-mechanisms.pdf">ch. 6</a> (Limited Direct Execution: user mode, kernel mode, system calls), <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-intro.pdf">ch. 13</a> (Address Spaces) and <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf">ch. 19</a> (TLBs and locality). They're short and funny. For Java I/O, dev.java's <a href="https://dev.java/learn/api/io/java-io/">The Java I/O API</a> tutorial, especially <a href="https://dev.java/learn/api/io/java-io/reading-writing/buffered-text/">Reading and Writing Text Files</a> and <a href="https://dev.java/learn/api/io/java-io/file-system/path/">Working with Paths</a>, plus Kotlin's <a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io.path/"><code>kotlin.io.path</code></a> reference.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/runtime-and-os.html">Runtime &amp; OS</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "why is my RSS so much bigger than my heap?", "would an SSD change these numbers?" or "how do I read a 10 GB file?" are exactly the right kind. Paste in your analyser's timings and I'll help you interpret them.</p>
+
+<div class="lesson-nav">
+  <a href="0021-graphs-and-dynamic-programming.html">← L21 · Graphs &amp; Dynamic Programming</a>
+  <a href="0023-inside-the-jvm.html">L23 · Inside the JVM →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/cacheviz.js"></script>
+</body>
+</html>

@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L27 · The Memory Model &amp; Deadlock</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l27">
+<main>
+
+<div class="kicker">Lesson 27 · Phase 8 Concurrency · <a href="../reference/roadmap.html#p8">roadmap</a></div>
+<h1>The Memory Model &amp; Deadlock</h1>
+<p class="subtitle">L26 fixed lost updates. This lesson covers the two other ways shared state goes wrong: a thread that never <em>sees</em> another thread's write, and threads that wait for each other for ever. Then it covers the tools that avoid both: <code>volatile</code>, lock ordering, concurrent collections and immutable values.</p>
+
+<div class="lesson-meta">
+  <span><b>~100–115 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll watch a four-thread bank simulator deadlock, read the proof from the JVM itself, and then fix it two different ways while the total balance stays exactly right.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Visibility, volatile, happens-before</a><span class="t">30 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Deadlock: cause one, then prevent it</a><span class="t">30 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Thread-safe collections and immutability</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: the bank that deadlocks</a><span class="t">20 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l27/</code>. Every output on this page is from a real run: JDK 26.0.1 and Kotlin 2.4.20 on an Apple M5 Max (<code>arm64</code>, 18 cores, from <code>sysctl -n hw.ncpu</code>). Concurrency results depend on timing, core count and CPU architecture, so <b>your numbers will differ</b>. Where I ran something several times, every run is shown.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L5, L15, L22 and L26</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Write the three bytecode-level steps hidden inside <code>count++</code>, and say where two threads can interleave them. (L23, L26)</li>
+    <li>Name the three fixes for a lost-update counter from L26, and one cost of each.</li>
+    <li>What is a cache line, and how big is one on this machine? (L22)</li>
+    <li>What's the difference between a read-only <em>view</em> of a list and a <em>copy</em>? (L5)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="1">
+  <p class="q">Two threads each run <code>count++</code> one million times on a shared plain <code>Int</code>. The final value? (L26)</p>
+  <div class="opts"><button>Always exactly 2,000,000</button><button>Often below 2,000,000</button><button>Always above 2,000,000</button><button>Always exactly 1,000,000</button></div>
+  <p class="why">Lost updates: both threads read the same old value, both add one, both write back, and one increment vanishes. In L26 some runs lost hundreds of thousands of increments, and a few later runs printed exactly 2,000,000 once the JIT had compiled the loop. A correct-looking run doesn't make the code correct.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="3">
+  <p class="q">Why can <code>count++</code> lose updates even though it is one line of code? (L23, L26)</p>
+  <div class="opts"><button>The JIT deletes the increment</button><button>Ints overflow at one million</button><button>Threads share no memory whatsoever</button><button>It is three separate steps</button></div>
+  <p class="why"><code>javap</code> shows a read (<code>getstatic</code>), an add (<code>iadd</code>) and a write (<code>putstatic</code>). Another thread can run between any two of them.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="0">
+  <p class="q">A CPU core reads a variable. Besides RAM, where can the value come from? (L22)</p>
+  <div class="opts"><button>Its own cache</button><button>The disk drive</button><button>The GPU memory</button><button>The network card</button></div>
+  <p class="why">Each core has private L1/L2 caches. Today you'll see how that, plus the JIT, lets one thread keep using a stale value of a variable another thread changed.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="2">
+  <p class="q">With no argument, which <code>LazyThreadSafetyMode</code> does <code>by lazy { }</code> use? (L15)</p>
+  <div class="opts"><button><code>PUBLICATION</code></button><button><code>NONE</code></button><button><code>SYNCHRONIZED</code></button><button><code>UNSAFE</code></button></div>
+  <p class="why">"By default, the evaluation of lazy properties is synchronized" (<a href="https://kotlinlang.org/docs/delegated-properties.html#lazy-properties">Kotlin docs</a>). Part 1 opens up what that lock is doing for you.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Visibility, <code>volatile</code>, happens-before</h2><span class="t">~30 min</span></div>
+
+<p>L26 was about <b>atomicity</b>: two threads interleaving the steps of one update. This part is about <b>visibility</b>, a separate problem that surprises nearly everyone. Without synchronization, there is no guarantee that a thread <em>ever</em> sees a value another thread wrote, however long you wait. The program below has no <code>count++</code> and only one writer. A worker spins until <code>main</code> sets a flag.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · StopFlag.kt</figcaption>
+<!--CODE:l27/StopFlag.kt--></figure>
+  <figure class="java"><figcaption>JAVA · StopFlag.java</figcaption>
+<!--CODE:l27/StopFlag.java--></figure>
+</div>
+<p>The worker is a daemon thread, so a stuck worker can't stop the JVM from exiting, and <code>join(3000)</code> gives up after three seconds. Never write a concurrency demo that can hang. Here are every run I did, each identical:</p>
+<pre class="out">$ java StopFlag               <span class="c"># Java, 5 runs: all 5 printed this</span>
+main set stop = true
+still running after 3 s: the worker never saw the write
+$ java -jar StopFlag.jar      <span class="c"># Kotlin, 3 runs: all 3 printed this</span>
+main set stop = true
+still running after 3 s: the worker never saw the write</pre>
+<p><code>main</code> wrote <code>true</code>, and three seconds later the worker was still looping. Now switch off the JIT compiler with <code>-Xint</code> (interpreter only, L23) and run the same class:</p>
+<pre class="out">$ java -Xint StopFlag
+main set stop = true
+worker saw stop after 381262217 spins</pre>
+<p><b>What happened.</b> After a second of spinning, the loop is hot, and the JIT compiles it (L23). Nothing in the loop tells the compiler that another thread might change <code>stop</code>, so it's allowed to read the field once and keep using that value. In effect it turns <code>while (!stop) spins++</code> into <code>if (!stop) while (true) spins++</code>. The interpreter happens to re-read memory every time, so the bug "disappears" under <code>-Xint</code>. That is the worst kind of bug: it depends on the JIT, the machine and the timing.</p>
+<p>The hardware is allowed to do similar things. Cores keep values in private caches and buffer their writes (L22), and Apple's documentation says it directly: "A weak memory ordering model, like the one in Apple silicon, gives the processor more flexibility to reorder memory instructions and improve performance, but doesn't add implicit memory barriers" (<a href="https://developer.apple.com/documentation/apple-silicon/addressing-architectural-differences-in-your-macos-code">Apple: Addressing architectural differences</a>). The Java Memory Model exists so that you don't have to reason about any of this. You reason about one rule instead.</p>
+
+<h3>The fix: one keyword</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · StopFlagFixed.kt</figcaption>
+<!--CODE:l27/StopFlagFixed.kt--></figure>
+  <figure class="java"><figcaption>JAVA · StopFlagFixed.java</figcaption>
+<!--CODE:l27/StopFlagFixed.java--></figure>
+</div>
+<pre class="out">main set stop = true
+worker saw stop after 4111260979 spins</pre>
+<p>Every run stopped, in both languages. The two lines can print in either order, since the worker may report first. Kotlin has no <code>volatile</code> keyword. The <code>@Volatile</code> annotation "marks the backing field of the annotated <code>var</code> property as <code>volatile</code>, meaning that reads and writes to this field are atomic and writes are always made visible to other threads" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.concurrent/-volatile/">Kotlin API: Volatile</a>). <code>javap -v</code> on the compiled Kotlin shows the same flag Java sets: <code>flags: (0x004a) ACC_PRIVATE, ACC_STATIC, ACC_VOLATILE</code>.</p>
+
+<h3>The rule: happens-before</h3>
+<p>The Java Language Specification defines when one thread's write is guaranteed to be visible to another thread's read. It calls the relation <dfn>happens-before</dfn>. The <code>java.util.concurrent</code> docs put it in one sentence: "The results of a write by one thread are guaranteed to be visible to a read by another thread only if the write operation <em>happens-before</em> the read operation" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/package-summary.html#MemoryVisibility">Memory Consistency Properties</a>). The JLS lists the basic edges (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.4.5">JLS §17.4.5</a>):</p>
+<ul>
+  <li><b>Program order:</b> "If <em>x</em> and <em>y</em> are actions of the same thread and <em>x</em> comes before <em>y</em> in program order, then <em>hb(x, y)</em>."</li>
+  <li><b>Locks:</b> "An unlock on a monitor <em>happens-before</em> every subsequent lock on that monitor."</li>
+  <li><b>Volatile:</b> "A write to a <code>volatile</code> field <em>happens-before</em> every subsequent read of that field."</li>
+  <li><b>Starting:</b> "A call to <code>start()</code> on a thread <em>happens-before</em> any actions in the started thread."</li>
+  <li><b>Joining:</b> "All actions in a thread <em>happen-before</em> any other thread successfully returns from a <code>join()</code> on that thread."</li>
+  <li><b>Transitivity:</b> "If <em>hb(x, y)</em> and <em>hb(y, z)</em>, then <em>hb(x, z)</em>."</li>
+</ul>
+<p>Transitivity is the useful part. Everything a thread did <em>before</em> a volatile write, or before releasing a lock, becomes visible to the thread that later reads that variable or takes that lock. That's why <code>volatile</code> works as a "ready" flag that publishes other, non-volatile data written before it. And it's why L26's <code>join()</code> calls were enough to read the final count safely. <code>java.util.concurrent</code> adds more edges: "Actions in a thread prior to placing an object into any concurrent collection <em>happen-before</em> actions subsequent to the access or removal of that element from the collection in another thread", and similar rules for executors, futures and locks. Part 3 relies on these.</p>
+<p>The JLS names the bug: "When a program contains two conflicting accesses that are not ordered by a happens-before relationship, it is said to contain a <em>data race</em>." <code>StopFlag</code> has a data race on <code>stop</code>, so the JVM never promised the worker would see the write.</p>
+
+<h3><code>volatile</code> is not a lock</h3>
+<p><code>volatile</code> gives <b>visibility and ordering</b>. It does <em>not</em> make a read-modify-write atomic. The package docs warn that volatile reads and writes "do <em>not</em> entail mutual exclusion locking". Four threads, one million <code>count++</code> each, on a volatile field:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · VolatileCount.kt</figcaption>
+<!--CODE:l27/VolatileCount.kt--></figure>
+  <figure class="java"><figcaption>JAVA · VolatileCount.java</figcaption>
+<!--CODE:l27/VolatileCount.java--></figure>
+</div>
+<div class="pair">
+  <figure><figcaption>KOTLIN OUTPUT</figcaption>
+<pre class="out">run 1: 1291017 (expected 4000000)
+run 2: 1161712 (expected 4000000)
+run 3: 1028198 (expected 4000000)
+run 4: 1034570 (expected 4000000)
+run 5: 1017106 (expected 4000000)</pre></figure>
+  <figure><figcaption>JAVA OUTPUT</figcaption>
+<pre class="out">run 1: 1142168 (expected 4000000)
+run 2: 1203195 (expected 4000000)
+run 3: 1267357 (expected 4000000)
+run 4: 1193341 (expected 4000000)
+run 5: 1065710 (expected 4000000)</pre></figure>
+</div>
+<p>About three quarters of the increments are lost. Every thread <em>sees</em> the latest value, but two threads still read it, add one, and write the same number back. For counters, use L26's tools (<code>AtomicInteger</code>, <code>LongAdder</code>, a lock). Use <code>volatile</code> for a value that one thread writes and others read: a stop flag, a "ready" flag, a reference to a fresh immutable config.</p>
+
+<h3>Safe publication and <code>final</code> fields</h3>
+<p>Handing an object to another thread is called <dfn>publishing</dfn> it. Publish through a field with no happens-before edge and the reader may see the reference before it sees the fields the constructor wrote (<em>Java Concurrency in Practice</em> §3.5, "Safe publication"). There is one big exception. "A thread that can only see a reference to an object after that object has been completely initialized is guaranteed to see the correctly initialized values for that object's <code>final</code> fields" (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.5">JLS §17.5</a>). An object whose fields are all <code>final</code>, and which doesn't leak <code>this</code> from its constructor, is safe however it's shared. That's the foundation of Part 3's best defence. Kotlin's <code>val</code> compiles to exactly such a field: <code>javap</code> shows <code>private final java.util.List&lt;java.lang.String&gt; hosts;</code>.</p>
+
+<h3>Lazy initialisation: double-checked locking</h3>
+<p>"Create it on first use" looks simple until eight threads ask at once. This program races four strategies. The 20 ms sleep inside the constructor deliberately widens the window so the race shows up every time. That's a standard trick for making a timing bug reproducible.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LazyInit.kt</figcaption>
+<!--CODE:l27/LazyInit.kt--></figure>
+  <figure class="java"><figcaption>JAVA · LazyInit.java</figcaption>
+<!--CODE:l27/LazyInit.java--></figure>
+</div>
+<div class="pair">
+  <figure><figcaption>KOTLIN OUTPUT</figcaption>
+<pre class="out">racy            : created 8 time(s), callers saw 8 instance(s)
+by lazy         : created 1 time(s), callers saw 1 instance(s)
+lazy PUBLICATION: created 8 time(s), callers saw 1 instance(s)
+object          : created 1 time(s), callers saw 1 instance(s)</pre></figure>
+  <figure><figcaption>JAVA OUTPUT</figcaption>
+<pre class="out">racy        : created 8 time(s), callers saw 8 instance(s)
+double-check: created 1 time(s), callers saw 1 instance(s)
+holder class: created 1 time(s), callers saw 1 instance(s)</pre></figure>
+</div>
+<ul>
+  <li><b>Racy</b> check-then-act built eight "singletons", and each caller got its own.</li>
+  <li><b>Double-checked locking</b> (DCL) skips the lock once the field is set. It is correct <em>only</em> because the field is <code>volatile</code>. Without it, "the writes that initialize the Helper object and the write to the helper field can be done or perceived out of order", so another thread can see a non-null reference to a half-built object. Under the Java 5 memory model, "the Double-Checked Locking idiom can be made to work by declaring the helper field to be volatile" (<a href="https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html">The "Double-Checked Locking is Broken" Declaration</a>, signed by Bloch, Lea and others; <em>JCiP</em> §16.2). The broken version usually <em>works</em> in testing, which is exactly why it was so widespread.</li>
+  <li><b>The holder class</b> is simpler. The JVM initialises <code>Holder</code> exactly once, on first use, under its own lock (L23's class initialisation). No <code>volatile</code>, no <code>synchronized</code>.</li>
+  <li><b><code>by lazy</code></b> is DCL written for you. In the Kotlin standard library's source, <code>SynchronizedLazyImpl</code> has a <code>@Volatile private var _value</code> that it reads once without a lock and again inside <code>synchronized(lock)</code>, the exact shape of the Java version (<a href="https://github.com/JetBrains/kotlin/blob/master/libraries/stdlib/jvm/src/kotlin/util/LazyJVM.kt">LazyJVM.kt</a>; an implementation detail, not a guarantee).</li>
+  <li><b><code>lazy(PUBLICATION)</code></b> ran the initializer eight times but handed everyone the same instance. That matches its documentation: the "initializer function can be called several times on concurrent access", "but only one computed value will be used" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin/-lazy-thread-safety-mode/">LazyThreadSafetyMode</a>). Use it when the initializer is cheap and has no side effects.</li>
+  <li><b><code>object</code></b>: "The initialization of an object declaration is thread-safe and done on first access" (<a href="https://kotlinlang.org/docs/object-declarations.html">Kotlin docs</a>). Under the hood it's the holder-class idiom: a static <code>INSTANCE</code> set in the class initializer.</li>
+</ul>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>by lazy { }</code> writes correct double-checked locking for you, <code>volatile</code> field included. In Java you type every line yourself and must remember the keyword.</li>
+    <li><code>object</code> gives you a lazily created, thread-safe singleton in one word. Java needs the holder class or an enum.</li>
+    <li><code>val</code> compiles to a <code>final</code> field, so a class of <code>val</code>s gets the JLS §17.5 publication guarantee automatically.</li>
+    <li>What Kotlin <em>doesn't</em> do: there's no <code>volatile</code> keyword, so you write <code>@Volatile</code>. And a plain <code>var</code> shared between threads has exactly the same visibility bug as Java.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: two more cures for the stop flag</div>
+  <p>From a blank file, write a stop-flag program that runs the worker twice: once with an <code>AtomicBoolean</code>, and once with a plain field read and written only through two <code>synchronized</code> methods (<code>@Synchronized</code> in Kotlin). Both must stop. Then predict which version spins more times per second, and why.</p>
+  <details class="solution"><summary>Reference solutions and real output</summary>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · StopFlagOther.kt</figcaption>
+<!--CODE:l27/StopFlagOther.kt--></figure>
+    <figure class="java"><figcaption>JAVA · StopFlagOther.java</figcaption>
+<!--CODE:l27/StopFlagOther.java--></figure>
+  </div>
+<pre class="out">AtomicBoolean: worker stopped after 4067456923 spins     <span class="c"># Kotlin run</span>
+synchronized : worker stopped after 200540222 spins
+AtomicBoolean: worker stopped after 2777088150 spins     <span class="c"># Java run</span>
+synchronized : worker stopped after 212297106 spins</pre>
+  <p>Both stop. <code>AtomicBoolean.get()</code> has volatile-read semantics, and the two synchronized methods share one lock, so unlock→lock gives the happens-before edge. Note that the reader must <em>also</em> lock: a synchronized setter with an unsynchronized getter is still a data race. The lock version spun about 15–20 times fewer times in its second, because taking a lock costs more than a volatile read.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Visibility" data-answer="1">
+  <p class="q">On my machine, what did <code>StopFlag</code> (no <code>volatile</code>) do with the JIT switched on?</p>
+  <div class="opts"><button>Worker stopped immediately</button><button>Worker never stopped</button><button>Program threw exception</button><button>Main thread hung</button></div>
+  <p class="why">Every JIT run kept spinning after <code>stop = true</code>. The compiled loop never re-read the field. Under <code>-Xint</code> it stopped, which proves the program is broken, not "fine on some machines".</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Visibility" data-answer="2">
+  <p class="q">Thread A sets a plain field <code>x = 1</code>, then calls <code>b.start()</code>. Thread <code>b</code> reads <code>x</code>. What is it guaranteed to read?</p>
+  <div class="opts"><button>Gives 0</button><button>Throws exception</button><button>Gives 1</button><button>Compile error</button></div>
+  <p class="why">"A call to <code>start()</code> on a thread <em>happens-before</em> any actions in the started thread", and program order puts the write before <code>start()</code>. By transitivity the write is visible.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Visibility" data-answer="1">
+  <p class="q"><code>@Volatile var count = 0</code>, and 4 threads each run <code>count++</code> a million times. The result?</p>
+  <div class="opts"><button>Always exactly four million</button><button>Usually well below that</button><button>Always exactly one million</button><button>It throws an exception</button></div>
+  <p class="why">Volatile makes each read and write visible, but <code>count++</code> is still read, add, write. The real runs lost about three quarters of the increments.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Visibility" data-answer="3">
+  <p class="q">Why does double-checked locking need the field to be <code>volatile</code>?</p>
+  <div class="opts"><button>The lock would never be released</button><button>Synchronized blocks cannot contain if statements</button><button>Volatile makes the constructor run faster</button><button>Readers could see a half-initialised object</button></div>
+  <p class="why">The fast path reads the field <em>without</em> the lock, so it needs its own happens-before edge. Without <code>volatile</code>, a reader can see the reference before the constructor's writes.</p>
+</div>
+<div class="quiz" data-id="p1-5" data-group="Part 1 · Visibility" data-answer="0">
+  <p class="q">Eight threads first read a default <code>by lazy { }</code> property at the same moment. How often does the initializer run?</p>
+  <div class="opts"><button>Exactly one time</button><button>Up to eight</button><button>Never at all</button><button>Once per thread</button></div>
+  <p class="why">The default mode is <code>SYNCHRONIZED</code>: "only a single thread can initialize" it. <code>PUBLICATION</code> is the mode that may run it several times.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Deadlock: cause one, then prevent it</h2><span class="t">~30 min</span></div>
+
+<p>Locks fix races. Take more than one lock, and you can build a program that stops for ever. Two transfers run at the same time, alice→bob and bob→alice. Each locks its "from" account, pauses, then locks its "to" account. The 50 ms pause again widens the window so the bug shows up every run.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Deadlock.kt</figcaption>
+<!--CODE:l27/Deadlock.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Deadlock.java</figcaption>
+<!--CODE:l27/Deadlock.java--></figure>
+</div>
+<div class="pair">
+  <figure><figcaption>KOTLIN OUTPUT</figcaption>
+<pre class="out">DEADLOCK between 2 threads:
+  t1 alice-&gt;bob is BLOCKED, waiting for Account@4f023edb held by t2 bob-&gt;alice
+  t2 bob-&gt;alice is BLOCKED, waiting for Account@85ede7b held by t1 alice-&gt;bob</pre></figure>
+  <figure><figcaption>JAVA OUTPUT</figcaption>
+<pre class="out">DEADLOCK between 2 threads:
+  t1 alice-&gt;bob is BLOCKED, waiting for Deadlock$Account@15ff3e9e held by t2 bob-&gt;alice
+  t2 bob-&gt;alice is BLOCKED, waiting for Deadlock$Account@5e0826e7 held by t1 alice-&gt;bob</pre></figure>
+</div>
+<p>Each thread holds one lock and waits for the other's. Neither can continue, so neither will ever let go. Nothing crashes and nothing is logged: the threads just stop. The program above ends cleanly only because of the watchdog. After two seconds, <code>ThreadMXBean.findDeadlockedThreads()</code> asks the JVM to look for cycles of threads waiting on each other's locks. The <code>@4f023edb</code> part is the lock object's identity hash. Step through how the cycle forms, then switch tabs to see why ordering prevents it:</p>
+<div class="deadlockviz" data-src="dl-bank"></div>
+<script type="application/json" id="dl-bank">{"height":230,"nodes":{"t1":{"x":20,"y":40,"label":"t1 alice→bob","kind":"thread"},"alice":{"x":370,"y":40,"label":"lock alice","kind":"lock"},"t2":{"x":370,"y":165,"label":"t2 bob→alice","kind":"thread"},"bob":{"x":20,"y":165,"label":"lock bob","kind":"lock"}},"modes":[{"name":"Opposite order (deadlock)","steps":[{"note":"Two threads start at the same moment. <code>t1</code> runs <code>transfer(alice, bob)</code> and <code>t2</code> runs <code>transfer(bob, alice)</code>. Nobody holds anything yet.","state":{"t1":"run","t2":"run"},"edges":[]},{"note":"<code>t1</code> enters <code>synchronized(alice)</code> and takes alice's lock, then sleeps for 50 ms while still holding it.","state":{"t1":"run","t2":"run"},"tags":{"t1":"holds alice, sleeping"},"edges":[["alice","t1","holds"]]},{"note":"Meanwhile <code>t2</code> enters <code>synchronized(bob)</code> and takes bob's lock. So far, so normal: two threads, two different locks.","state":{"t1":"run","t2":"run"},"tags":{"t1":"holds alice, sleeping","t2":"holds bob, sleeping"},"edges":[["alice","t1","holds"],["bob","t2","holds"]]},{"note":"<code>t1</code> wakes and reaches <code>synchronized(bob)</code>. Bob is held by <code>t2</code>, so <code>t1</code> becomes <b>BLOCKED</b>. It keeps holding alice while it waits: that's <em>hold-and-wait</em>.","state":{"t1":"blocked","t2":"run"},"tags":{"t1":"BLOCKED on bob","t2":"holds bob, sleeping"},"edges":[["alice","t1","holds"],["t1","bob","waits"],["bob","t2","holds"]]},{"note":"<code>t2</code> wakes and reaches <code>synchronized(alice)</code>. Alice is held by <code>t1</code>. Follow the arrows: t1 → bob → t2 → alice → t1. A <b>cycle</b>. Neither thread can ever continue, and Java locks can't be taken away (<em>no preemption</em>).","state":{"t1":"blocked","t2":"blocked"},"tags":{"t1":"BLOCKED on bob","t2":"BLOCKED on alice"},"edges":[["alice","t1","holds"],["t1","bob","waits"],["bob","t2","holds"],["t2","alice","waits"]],"cycle":true},{"note":"This graph is exactly what <code>findDeadlockedThreads()</code> searches for, and what <code>jcmd Thread.print</code> reports as \"Found one Java-level deadlock\". Without a watchdog, the program would sit here for ever using 0% CPU.","state":{"t1":"blocked","t2":"blocked"},"tags":{"t1":"BLOCKED for ever","t2":"BLOCKED for ever"},"edges":[["alice","t1","holds"],["t1","bob","waits"],["bob","t2","holds"],["t2","alice","waits"]],"cycle":true}]},{"name":"Ordered by id (fixed)","steps":[{"note":"Same two transfers, but every transfer locks the account with the <b>lower id first</b>: alice (id 1), then bob (id 2). <code>t2</code> wants bob→alice, but it still locks alice first.","state":{"t1":"run","t2":"run"},"edges":[]},{"note":"<code>t1</code> takes alice.","state":{"t1":"run","t2":"run"},"tags":{"t1":"holds alice"},"edges":[["alice","t1","holds"]]},{"note":"<code>t2</code> also needs alice first, so it waits for alice <b>while holding nothing</b>. A thread that holds nothing can't be part of a cycle.","state":{"t1":"run","t2":"blocked"},"tags":{"t1":"holds alice","t2":"waits, holds nothing"},"edges":[["alice","t1","holds"],["t2","alice","waits"]]},{"note":"<code>t1</code> takes bob too. Nobody else can be holding bob without already holding alice, so <code>t1</code> is guaranteed to get it. It moves the money.","state":{"t1":"run","t2":"blocked"},"tags":{"t1":"holds alice + bob","t2":"waits, holds nothing"},"edges":[["alice","t1","holds"],["bob","t1","holds"],["t2","alice","waits"]]},{"note":"<code>t1</code> leaves both blocks and releases both locks. <code>t2</code> gets alice, then bob, and does its transfer.","state":{"t1":"done","t2":"run"},"tags":{"t1":"done","t2":"holds alice + bob"},"edges":[["alice","t2","holds"],["bob","t2","holds"]]},{"note":"Both transfers finished. With one global order, every waiting arrow points \"up\" the order, so the arrows can never close into a loop. That is OSTEP's <em>total ordering on lock acquisition</em>.","state":{"t1":"done","t2":"done"},"tags":{"t1":"done","t2":"done"},"edges":[]}]}]}</script>
+
+<h3>The proof from the JVM: a thread dump</h3>
+<p>In production you'd have no watchdog. You'd notice a request that never returned. The tool for that moment is a <dfn>thread dump</dfn>. I ran <code>Deadlock</code> and, during its two-second wait, asked the running JVM for one with <code>jcmd</code> (L22):</p>
+<pre class="term"><span class="p">$ </span>jcmd 62492 Thread.print
+…
+"t1 alice-&gt;bob" #35 [33027] daemon prio=5 os_prio=31 cpu=0.11ms elapsed=0.99s … waiting for monitor entry
+   java.lang.Thread.State: BLOCKED (on object monitor)
+…
+Found one Java-level deadlock:
+=============================
+"t1 alice-&gt;bob":
+  waiting to lock monitor 0x000000097308a680 (object 0x0000007001018310, a Deadlock$Account),
+  which is held by "t2 bob-&gt;alice"
+
+"t2 bob-&gt;alice":
+  waiting to lock monitor 0x000000097308a5a0 (object 0x00000070010182c8, a Deadlock$Account),
+  which is held by "t1 alice-&gt;bob"
+
+Java stack information for the threads listed above:
+===================================================
+"t1 alice-&gt;bob":
+	at Deadlock.transfer(Deadlock.java:17)
+	- waiting to lock &lt;0x0000007001018310&gt; (a Deadlock$Account)
+	- locked &lt;0x00000070010182c8&gt; (a Deadlock$Account)
+	at Deadlock.lambda$main$0(Deadlock.java:25)
+…
+Found 1 deadlock.</pre>
+<p>Read it bottom-up for each thread: <code>t1</code> <b>locked</b> <code>…182c8</code> and is <b>waiting to lock</b> <code>…18310</code>; <code>t2</code> holds and wants the reverse. Line 17 of <code>Deadlock.java</code> is the inner <code>synchronized (to)</code>. This is also why every thread in this lesson has a name: <code>"t1 alice-&gt;bob"</code> is much more useful in a dump than <code>"Thread-0"</code>. In IntelliJ you get the same dump from a paused debug session: "on the Debug tool window's toolbar, click More, then select Get Thread Dump". For a program started without the debugger, use <b>Dump Threads</b> on the Run tool window's toolbar (<a href="https://www.jetbrains.com/help/idea/thread-dumps.html">IntelliJ: Thread dumps</a>; I haven't verified the menus in the GUI). <em>JCiP</em> §10.2 covers deadlock analysis with thread dumps.</p>
+
+<h3>The four conditions</h3>
+<p>OSTEP lists the four conditions that must <em>all</em> hold for a deadlock (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf">OSTEP ch. 32, "Common Concurrency Problems"</a>):</p>
+<ul>
+  <li><b>Mutual exclusion:</b> "Threads claim exclusive control of resources that they require (e.g., a thread grabs a lock)."</li>
+  <li><b>Hold-and-wait:</b> "Threads hold resources allocated to them (e.g., locks that they have already acquired) while waiting for additional resources."</li>
+  <li><b>No preemption:</b> "Resources (e.g., locks) cannot be forcibly removed from threads that are holding them."</li>
+  <li><b>Circular wait:</b> "There exists a circular chain of threads such that each thread holds one or more resources (e.g., locks) that are being requested by the next thread in the chain."</li>
+</ul>
+<p>"If any of these four conditions are not met, deadlock cannot occur." Every prevention technique breaks one of them.</p>
+
+<h3>Fix 1: a global lock order (breaks circular wait)</h3>
+<p>"The most straightforward way to do that is to provide a total ordering on lock acquisition" (OSTEP). Accounts have ids, so always lock the lower id first, whichever direction the money moves (<em>JCiP</em> §10.1 calls the original bug a <em>dynamic lock-order deadlock</em>, because the order depends on the arguments).</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Ordered.kt</figcaption>
+<!--CODE:l27/Ordered.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Ordered.java</figcaption>
+<!--CODE:l27/Ordered.java--></figure>
+</div>
+<pre class="out">2,000,000 opposite transfers in 30 ms
+alice=1000000 bob=1000000 total=2000000</pre>
+<p>Two million transfers in opposite directions, no deadlock, and the money adds up. Both languages printed these lines. Java's first run also took 30 ms, its second 52 ms. When objects have no natural id, <em>JCiP</em> §10.1 suggests ordering by <code>System.identityHashCode</code>, with a tie-breaking lock for the rare equal hashes.</p>
+
+<h3>Fix 2: give up and retry (breaks hold-and-wait)</h3>
+<p><code>ReentrantLock.tryLock(timeout)</code> waits only a limited time. If the second lock doesn't come, release the first one too, back off for a random moment, and start again:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · TryLock.kt</figcaption>
+<!--CODE:l27/TryLock.kt--></figure>
+  <figure class="java"><figcaption>JAVA · TryLock.java</figcaption>
+<!--CODE:l27/TryLock.java--></figure>
+</div>
+<pre class="out">total=2000 after 20,000 transfers, 18 retries      <span class="c"># Kotlin</span>
+total=2000 after 20,000 transfers, 25 retries      <span class="c"># Java, run 1</span>
+total=2000 after 20,000 transfers, 21 retries      <span class="c"># Java, run 2</span></pre>
+<p>A handful of attempts failed, let go and retried, and every transfer completed. The random back-off matters. Without it, two threads can fail, retry and collide again in lock-step for ever. OSTEP calls that <dfn>livelock</dfn>: "both systems are running through this code sequence over and over again (and thus it is not a deadlock), but progress is not being made". Its suggested fix is the one used above: "add a random delay before looping back". <code>tryLock</code> is more code than ordering, so prefer ordering when you can define one.</p>
+
+<h3>Fix 3: fewer locks</h3>
+<p>One lock can't form a cycle. A single lock around the whole bank is deadlock-free by construction. The cost is that unrelated transfers now wait for each other. The final exercise measures whether that cost matters here. Lock-free designs (L26's atomics) go further and hold no lock at all.</p>
+
+<h3>Two more liveness failures</h3>
+<ul>
+  <li><b>Livelock:</b> threads keep running and keep retrying, but none makes progress. You met it above.</li>
+  <li><b>Starvation:</b> one thread rarely or never gets the lock (or the CPU) because others keep winning. L26's <code>ReentrantLock(true)</code> fairness option trades throughput to prevent this. <em>JCiP</em> §10.3 covers both.</li>
+</ul>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>synchronized(lock) { … }</code> is a standard-library <code>inline</code> function, not a keyword. It compiles to the same <code>monitorenter</code>/<code>monitorexit</code> pair as Java's block (L23), so the thread dump looks identical.</li>
+    <li><code>thread(isDaemon = true, name = "t1 alice-&gt;bob") { }</code> creates, names, configures and starts a thread in one call. Java needs <code>new Thread(…, name)</code>, <code>setDaemon(true)</code> and <code>start()</code>.</li>
+    <li><code>lock.withLock { }</code> wraps <code>lock()</code> … <code>finally { unlock() }</code> for you (used in the final). <code>tryLock</code> still needs the explicit <code>try</code>/<code>finally</code> in both languages.</li>
+    <li>Destructuring <code>val (first, second) = if (…) from to to else to to from</code> makes the ordering rule a single readable line.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: dining philosophers</div>
+  <p>Five philosophers sit at a round table with one fork between each pair. To eat, philosopher <code>i</code> needs fork <code>i</code> (left) and fork <code>(i + 1) % 5</code> (right). From a blank file, start five threads that each eat 100,000 meals by taking left then right with <code>synchronized</code>. Add a two-second watchdog using <code>findDeadlockedThreads()</code>. Run it a few times. Then add an <code>ordered</code> mode that fixes it with the lock-ordering rule, without changing who needs which forks.</p>
+  <details class="solution"><summary>Reference solutions and real output</summary>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · Philosophers.kt</figcaption>
+<!--CODE:l27/Philosophers.kt--></figure>
+    <figure class="java"><figcaption>JAVA · Philosophers.java</figcaption>
+<!--CODE:l27/Philosophers.java--></figure>
+  </div>
+<pre class="out">$ java Philosophers            <span class="c"># 3 runs per language: all 6 deadlocked</span>
+DEADLOCK: 5 philosophers each hold one fork
+$ java Philosophers ordered    <span class="c"># both languages</span>
+everyone ate 100000 meals</pre>
+  <p>Everyone grabs their left fork, so all five are held and every philosopher waits for a right fork that their neighbour holds: a five-thread cycle. With ordering, philosophers 0–3 still take left then right, but philosopher 4 needs forks 4 and 0 and now takes fork 0 first. That one change means the arrows can no longer close into a loop.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Deadlock" data-answer="3">
+  <p class="q">Always locking the account with the smaller id first prevents deadlock by breaking which condition?</p>
+  <div class="opts"><button>Exclusive lock ownership</button><button>Holding while waiting</button><button>No forced release</button><button>A circular wait</button></div>
+  <p class="why">Threads still hold one lock while waiting for another, but every wait points "up" the order, so no cycle can form.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Deadlock" data-answer="0">
+  <p class="q">What does <code>lock.tryLock(1, TimeUnit.MILLISECONDS)</code> do if the lock stays busy?</p>
+  <div class="opts"><button>Returns false after waiting</button><button>Waits forever for it</button><button>Throws an exception immediately</button><button>Steals the lock anyway</button></div>
+  <p class="why">It waits up to the timeout and returns <code>false</code> if the lock never became free. Your code decides what to do next: release what you hold and retry.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Deadlock" data-answer="1">
+  <p class="q">Two threads deadlock in a server with no watchdog. What happens to them?</p>
+  <div class="opts"><button>The JVM kills one</button><button>Both block forever, silently</button><button>Both throw DeadlockException eventually</button><button>The OS restarts both</button></div>
+  <p class="why">Java monitors can't be preempted, and the JVM doesn't break deadlocks. The threads sit <code>BLOCKED</code> using no CPU until the process dies. A thread dump is how you find them.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Deadlock" data-answer="2">
+  <p class="q">Two threads keep failing <code>tryLock</code>, releasing, and retrying in perfect lock-step. That's called…</p>
+  <div class="opts"><button>Deadlock</button><button>Starvation</button><button>Livelock</button><button>Preemption</button></div>
+  <p class="why">They're busy, not blocked, but nobody makes progress. A random back-off breaks the lock-step.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Thread-safe collections and immutability as a defence</h2><span class="t">~25 min</span></div>
+
+<p>You rarely write <code>synchronized</code> around your own fields in real code. You reach for a collection that's already thread-safe, or you share data that can't change. Both have traps. "Thread-safe" describes each <em>method</em>, not the sequence of calls you make.</p>
+
+<h3>Synchronized wrappers: each call is atomic, your sequence isn't</h3>
+<p><code>Collections.synchronizedList</code> wraps every method in a lock (<em>JCiP</em> §5.1). Eight threads each try to add 0…9,999 "if absent":</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · SyncList.kt</figcaption>
+<!--CODE:l27/SyncList.kt--></figure>
+  <figure class="java"><figcaption>JAVA · SyncList.java</figcaption>
+<!--CODE:l27/SyncList.java--></figure>
+</div>
+<pre class="out">no client lock:   size 10143 (expected 10000)     <span class="c"># Kotlin</span>
+with client lock: size 10000 (expected 10000)
+no client lock:   size 10225 (expected 10000)     <span class="c"># Java, 3 runs: 10225, 11031, 10250</span>
+with client lock: size 10000 (expected 10000)</pre>
+<p><code>contains</code> is atomic and <code>add</code> is atomic, but two threads can both find "absent" before either adds: L26's check-then-act, again. The fix is <dfn>client-side locking</dfn>: hold the wrapper's own lock (the list object) around the whole sequence. The same applies to iteration, and the API docs say so in bold: "It is imperative that the user manually synchronize on the returned list when traversing it via <code>Iterator</code>, <code>Spliterator</code> or <code>Stream</code> … Failure to follow this advice may result in non-deterministic behavior" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/Collections.html#synchronizedList(java.util.List)"><code>Collections.synchronizedList</code></a>).</p>
+
+<h3><code>ConcurrentHashMap</code>: use the atomic methods</h3>
+<p>Four threads count the same words into one <code>ConcurrentHashMap</code>, first with "get, add one, put", then with <code>merge</code>:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · ConcurrentCount.kt</figcaption>
+<!--CODE:l27/ConcurrentCount.kt--></figure>
+  <figure class="java"><figcaption>JAVA · ConcurrentCount.java</figcaption>
+<!--CODE:l27/ConcurrentCount.java--></figure>
+</div>
+<pre class="out">get + put: {cat=940077, end=960540, mat=979162, on=994027, sat=925004, the=1290824}     <span class="c"># Kotlin</span>
+merge:     {cat=1000000, end=1000000, mat=1000000, on=1000000, sat=1000000, the=3000000}
+get + put: {cat=958101, end=973288, mat=974895, on=988549, sat=958071, the=1549119}     <span class="c"># Java</span>
+merge:     {cat=1000000, end=1000000, mat=1000000, on=1000000, sat=1000000, the=3000000}</pre>
+<p>The map never corrupted itself and never threw: it's genuinely thread-safe. The <em>program</em> still lost more than half of the "the" counts, because <code>get</code> then <code>put</code> is two operations. <code>merge</code> is one: "The entire method invocation is performed atomically" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html#merge(K,V,java.util.function.BiFunction)"><code>ConcurrentHashMap.merge</code></a>). So are <code>compute</code>, <code>computeIfAbsent</code> and <code>putIfAbsent</code>. For hot counters, the class docs suggest <code>LongAdder</code> values: "<code>freqs.computeIfAbsent(key, k -&gt; new LongAdder()).increment();</code>". Keep the function you pass short, because "some attempted update operations on this map by other threads may be blocked while computation is in progress".</p>
+
+<h3>A Kotlin trap: <code>getOrPut</code> on a concurrent map</h3>
+<p>Kotlin's <code>getOrPut</code> reads naturally, so it's tempting on a <code>ConcurrentHashMap</code>. Here eight threads ask for the same missing key at once:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · GetOrPut.kt</figcaption>
+<!--CODE:l27/GetOrPut.kt--></figure>
+  <figure class="java"><figcaption>JAVA · GetOrPut.java</figcaption>
+<!--CODE:l27/GetOrPut.java--></figure>
+</div>
+<div class="pair">
+  <figure><figcaption>KOTLIN OUTPUT</figcaption>
+<pre class="out">getOrPut         built 8, map holds 1, callers saw 1
+computeIfAbsent  built 1, map holds 1, callers saw 1</pre></figure>
+  <figure><figcaption>JAVA OUTPUT</figcaption>
+<pre class="out">get + putIfAbsent built 8, map holds 1, callers saw 1
+computeIfAbsent   built 1, map holds 1, callers saw 1</pre></figure>
+</div>
+<p><code>getOrPut</code> never overwrote an entry, and everyone got the same connection, but it <em>opened eight</em> and threw seven away. That's documented behaviour: on a <code>ConcurrentMap</code> it "guarantees not to put the value into the map if the key is already there, but the defaultValue function may be invoked even if the key is already in the map" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.collections/get-or-put.html">Kotlin API: getOrPut</a>). The Java column shows the equivalent hand-written logic. <code>computeIfAbsent</code> invokes the function "exactly once per invocation of this method if the key is absent, else not at all", and other callers wait. Use <code>computeIfAbsent</code> when building the value is expensive or has side effects. (L21 showed the other edge: never modify the map from <em>inside</em> that function.)</p>
+
+<h3>Iterating while someone modifies</h3>
+<p>Concurrent collections use <dfn>weakly consistent</dfn> iterators: "they will never throw <code>ConcurrentModificationException</code>" and "are guaranteed to traverse elements as they existed upon construction exactly once, and may (but are not guaranteed to) reflect any modifications subsequent to construction" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/package-summary.html#Weakly">package docs</a>). For listener lists, which are read constantly and changed rarely, the classic choice is <code>CopyOnWriteArrayList</code>. Every write copies the array, and its "snapshot" iterator "is guaranteed not to throw <code>ConcurrentModificationException</code>" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/CopyOnWriteArrayList.html">CopyOnWriteArrayList</a>). Here a one-shot listener unregisters itself in the middle of notification, which happens all the time in event buses (L24's listener leak was the opposite mistake):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Listeners.kt</figcaption>
+<!--CODE:l27/Listeners.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Listeners.java</figcaption>
+<!--CODE:l27/Listeners.java--></figure>
+</div>
+<pre class="out">CopyOnWriteArrayList:
+  one-shot got saved, unregistering
+  logger got saved
+  listeners left: 1
+ArrayList:
+  one-shot got saved, unregistering
+  listeners left: 1</pre>
+<p>Both languages printed exactly this. I expected the <code>ArrayList</code> to throw, and it didn't. It silently <b>skipped the logger</b>. Removing element 0 shrank the list to one element while the iterator's cursor was already at 1, so <code>hasNext()</code> said "done". Add a third listener (<code>Listeners3.java</code>) and the same code throws instead:</p>
+<pre class="err">Exception in thread "main" java.util.ConcurrentModificationException
+	at java.base/java.util.ArrayList$Itr.checkForComodification(ArrayList.java:1104)
+	at java.base/java.util.ArrayList$Itr.next(ArrayList.java:1058)
+	at Listeners3.fire(Listeners3.java:18)</pre>
+<p>The <code>ArrayList</code> docs warn about this: "Fail-fast iterators throw <code>ConcurrentModificationException</code> on a best-effort basis. Therefore, it would be wrong to write a program that depended on this exception for its correctness" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/ArrayList.html">ArrayList</a>). No exception doesn't mean no bug.</p>
+
+<h3>Handing work between threads: <code>BlockingQueue</code></h3>
+<p>The <dfn>producer-consumer</dfn> pattern lets threads communicate without sharing mutable objects: one side <code>put</code>s jobs into a queue, the other <code>take</code>s them out (<em>JCiP</em> §5.3). An <code>ArrayBlockingQueue</code> is bounded. <code>put</code> blocks when it's full, which slows a fast producer down automatically, and <code>take</code> blocks when it's empty. To shut down, the producer sends a <dfn>poison pill</dfn>, a special value meaning "no more work", one per consumer:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Pipeline.kt</figcaption>
+<!--CODE:l27/Pipeline.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Pipeline.java</figcaption>
+<!--CODE:l27/Pipeline.java--></figure>
+</div>
+<pre class="out">consumer-1 took 960 jobs        <span class="c"># Kotlin</span>
+consumer-2 took 40 jobs
+total 500500 (expected 500500)
+consumer-2 took 463 jobs        <span class="c"># Java, run 1</span>
+consumer-1 took 537 jobs
+total 500500 (expected 500500)
+consumer-2 took 134 jobs        <span class="c"># Java, run 2</span>
+consumer-1 took 866 jobs
+total 500500 (expected 500500)</pre>
+<p>The split between consumers is different every run, and that's fine. The total is always exact, and no job is processed twice. The happens-before rule for concurrent collections means each consumer sees a job exactly as the producer built it, with no extra locking.</p>
+
+<h3>The best defence: immutability</h3>
+<p>Every bug in this lesson and in L26 needs <b>shared, mutable</b> state. Remove either word and the bug can't exist. <em>JCiP</em> §3.4 makes immutable objects its strongest recommendation: an object whose state can't change after construction is thread-safe with no locking at all, and §17.5's <code>final</code>-field guarantee means it's even safe to publish carelessly. But "immutable" has to go all the way down (L5):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Shared.kt</figcaption>
+<!--CODE:l27/Shared.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Shared.java</figcaption>
+<!--CODE:l27/Shared.java--></figure>
+</div>
+<div class="pair">
+  <figure><figcaption>KOTLIN OUTPUT</figcaption>
+<pre class="out">Config(name=prod, hosts=[a.example, b.example, evil.example])
+Config(name=prod, hosts=[a.example, b.example])</pre></figure>
+  <figure><figcaption>JAVA OUTPUT</figcaption>
+<pre class="out">Config[name=prod, hosts=[a.example, b.example, evil.example]]
+SafeConfig[name=prod, hosts=[a.example, b.example]]
+safe.hosts().add -&gt; UnsupportedOperationException</pre></figure>
+</div>
+<p>The first config's <code>hosts</code> is a <code>val</code> / record component, yet it changed, because it's a read-only <em>view</em> of a list someone else can still mutate (L5). If another thread were iterating it, you'd have a data race inside a "constant". The fix is a private copy at construction: <code>List.copyOf</code> in a Java compact constructor, which is also unmodifiable, or <code>toList()</code> in Kotlin, whose result is typed as read-only. Persistent collection libraries go further, but a copy is usually enough.</p>
+<p><b>Thread confinement</b> is the other way out: don't share at all. A local variable used by one thread needs no locking (L4: every thread has its own stack). <code>ThreadLocal</code> gives each thread its own copy of a field, but in thread pools the values outlive the task, which is L24's leak again (<em>JCiP</em> §3.3).</p>
+
+<div class="callout">
+  <b>Bridge.</b> Spring creates most beans once and shares them across every request thread. Its docs say: "Only one shared instance of a singleton bean is managed", and "as a rule, you should use the prototype scope for all stateful beans and the singleton scope for stateless beans" (<a href="https://docs.spring.io/spring-framework/reference/core/beans/factory-scopes.html">Spring: Bean Scopes</a>). A mutable field in a singleton service is this lesson's bug, running on hundreds of threads. On Android, UI state usually lives in a <code>StateFlow</code> holding an immutable data class, and <code>MutableStateFlow.update { it.copy(…) }</code> "updates the <code>MutableStateFlow.value</code> atomically" (<a href="https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/-mutable-state-flow/">kotlinx.coroutines API</a>). It swaps one immutable value for another, never mutating in place. You'll use flows in L29.
+</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>data class</code> with <code>val</code> properties gives you <code>final</code> fields, <code>equals</code>/<code>hashCode</code> and <code>copy()</code>, the raw material for immutable values. Java records do the same.</li>
+    <li>Kotlin's <code>List</code> type has no <code>add</code>, so <code>safe.hosts.add(…)</code> doesn't even compile. Java's <code>List</code> has <code>add</code>, so Java needs <code>List.copyOf</code> to make the call fail at runtime.</li>
+    <li>But a Kotlin <code>List</code> is only a read-only <em>view</em>. The compiler won't stop someone holding the <code>MutableList</code>. Copy at the boundary.</li>
+    <li>Kotlin uses Java's concurrent collections directly. The Kotlin-specific risk is <code>getOrPut</code>, which looks atomic and isn't. Prefer <code>computeIfAbsent</code>/<code>merge</code> on shared maps.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a parallel word index</div>
+  <p>Take L3's text (<code>"The cat sat on the mat. The mat was flat,\nand the cat was fat! A cat, a mat, a hat."</code>). Four threads each count every word of 25,000 copies of it into <b>one shared map</b>: 100,000 copies in all. Write three versions and print the total and the counts for <code>the</code> and <code>cat</code>: a plain <code>HashMap</code> with <code>merge</code>, a <code>ConcurrentHashMap</code> with <code>merge</code>, and a <code>ConcurrentHashMap&lt;String, LongAdder&gt;</code>. Work out the right answer before you run it.</p>
+  <details class="solution"><summary>Reference solutions and real output</summary>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · WordIndex.kt</figcaption>
+<!--CODE:l27/WordIndex.kt--></figure>
+    <figure class="java"><figcaption>JAVA · WordIndex.java</figcaption>
+<!--CODE:l27/WordIndex.java--></figure>
+  </div>
+<pre class="out">HashMap       total=1160199 the=179331 cat=135625     <span class="c"># Kotlin</span>
+CHM merge     total=2100000 the=400000 cat=300000
+CHM LongAdder total=2100000 the=400000 cat=300000</pre>
+<pre class="err">Exception in thread "Thread-1" java.util.ConcurrentModificationException      <span class="c"># Java, run 1</span>
+	at java.base/java.util.HashMap.merge(HashMap.java:1394)
+	at WordIndex$1.add(WordIndex.java:35)
+	at WordIndex.lambda$run$0(WordIndex.java:19)
+	at java.base/java.lang.Thread.run(Thread.java:1516)</pre>
+<pre class="out">HashMap       total=798056 the=130190 cat=98509        <span class="c"># Java, run 1 (one thread had died)</span>
+CHM merge     total=2100000 the=400000 cat=300000
+CHM LongAdder total=2100000 the=400000 cat=300000
+HashMap       total=976051 the=137759 cat=112371       <span class="c"># Java, run 2</span></pre>
+  <p>L3's text has 21 words, including 4 × "the" and 3 × "cat", so the answer is 2,100,000, 400,000 and 300,000. Both concurrent versions are exact every time. The <code>HashMap</code> lost over half the counts, and in one Java run its <code>merge</code> noticed the interference and threw <code>ConcurrentModificationException</code> inside a worker thread. That killed the thread, while <code>main</code> carried on printing a wrong total. A plain <code>HashMap</code> shared by writers is simply broken, sometimes loudly and usually quietly.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · Collections" data-answer="0">
+  <p class="q">Eight threads run <code>if (!list.contains(x)) list.add(x)</code> on a <code>Collections.synchronizedList</code>. Can duplicates appear?</p>
+  <div class="opts"><button>Yes, two separate calls</button><button>No, every call locks</button><button>No, lists reject duplicates</button><button>Only with LinkedList backing</button></div>
+  <p class="why">Each call is atomic on its own, but another thread can add between <code>contains</code> and <code>add</code>. Hold the list's lock around both.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · Collections" data-answer="1">
+  <p class="q">Which line counts a word atomically in a shared <code>ConcurrentHashMap&lt;String, Int&gt;</code> named <code>m</code>?</p>
+  <div class="opts"><button><code>m[w] = (m[w] ?: 0) + 1</code></button><button><code>m.merge(w, 1, Int::plus)</code></button><button><code>m.put(w, m.getOrDefault(w, 0) + 1)</code></button><button><code>m[w] = m.getValue(w) + 1</code></button></div>
+  <p class="why"><code>merge</code> is one atomic read-modify-write. The others read and then write in two separate calls.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · Collections" data-answer="2">
+  <p class="q">Eight threads call <code>chm.getOrPut("db") { open() }</code> on a missing key at once. <code>open()</code> runs…</p>
+  <div class="opts"><button>Exactly once guaranteed</button><button>Never at all</button><button>Possibly several times</button><button>Only on errors</button></div>
+  <p class="why">The real run opened 8. Only one value is kept, but "the defaultValue function may be invoked even if the key is already in the map". <code>computeIfAbsent</code> runs it once.</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · Collections" data-answer="3">
+  <p class="q">A listener removes itself while a plain two-element <code>ArrayList</code> of listeners is being iterated. What happened in my run?</p>
+  <div class="opts"><button>An exception was thrown</button><button>Both listeners got it</button><button>The program deadlocked forever</button><button>The second was skipped</button></div>
+  <p class="why">The iterator's cursor passed the new size, so the loop ended early without throwing. Fail-fast is "best-effort", so silence isn't proof of correctness.</p>
+</div>
+<div class="quiz" data-id="p3-5" data-group="Part 3 · Collections" data-answer="0">
+  <p class="q">Why can an immutable object be shared between threads without any locking?</p>
+  <div class="opts"><button>Its state never changes afterwards</button><button>The JVM locks it automatically</button><button>It lives on every stack</button><button>Final fields are never shared</button></div>
+  <p class="why">Races need a write. With no writes after construction, and <code>final</code> fields guaranteeing the constructor's values are visible, there's nothing to race on.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>The bank that deadlocks</h2><span class="t">~20 min</span></div>
+
+<p>Build a bank simulator from a blank file, Kotlin first and then Java. Write it in the order below so that you see each failure before you fix it.</p>
+<div class="task">
+  <ol>
+    <li><b>Setup.</b> 10 accounts with ids 0–9 and €1,000 each. 4 worker threads share 100,000 random transfers (25,000 each). Each thread has its own <code>Random(42 + threadIndex)</code>. A transfer picks two accounts and an amount from 1 to 100, skips a transfer to itself, and refuses overdrafts.</li>
+    <li><b>Monitor.</b> A daemon thread prints <code>monitor: N transfers done</code> every 500 ms while a <code>volatile</code> / <code>@Volatile</code> <code>running</code> flag is true. Count transfers with a <code>LongAdder</code>.</li>
+    <li><b>v1:</b> lock <code>from</code>, then <code>to</code>, with nested <code>synchronized</code>. Give the workers 2 seconds. If they're not done, print the deadlocked threads from <code>findDeadlockedThreads()</code> and exit.</li>
+    <li><b>v2:</b> lock the lower id first. Print the time and the total balance, which must be exactly 10,000.</li>
+    <li><b>v3:</b> one <code>ReentrantLock</code> for the whole bank. Print the time and total. Is it slower than v2?</li>
+    <li>Explain in two sentences why the monitor's flag needs <code>volatile</code> but the account balances don't.</li>
+  </ol>
+</div>
+<div class="rating-group">
+  <div class="rating" data-id="final-kt" data-label="Final: bank simulator (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-jv" data-label="Final: bank simulator (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-rs" data-label="Final: could explain each failure and each fix"><span class="who">REASONING</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+</div>
+<details class="solution"><summary>Reference solutions and real output</summary>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · Bank.kt</figcaption>
+<!--CODE:l27/final/Bank.kt--></figure>
+    <figure class="java"><figcaption>JAVA · Bank.java</figcaption>
+<!--CODE:l27/final/Bank.java--></figure>
+  </div>
+  <div class="pair">
+    <figure><figcaption>KOTLIN OUTPUT</figcaption>
+<pre class="out">$ java -jar bank.jar v1
+  monitor: 140 transfers done
+  monitor: 140 transfers done
+  monitor: 140 transfers done
+v1: DEADLOCK after 140 transfers
+  worker-0 waits for Account@31befd9f held by worker-1
+  worker-1 waits for Account@548c4f57 held by worker-0
+$ java -jar bank.jar v1
+  …
+v1: DEADLOCK after 454 transfers
+  worker-0 waits for Account@31befd9f held by worker-3
+  worker-3 waits for Account@548c4f57 held by worker-0
+$ java -jar bank.jar v2
+v2: 100000 transfers in 21 ms, total 10000 (expected 10000)
+$ java -jar bank.jar v3
+v3: 100000 transfers in 21 ms, total 10000 (expected 10000)</pre></figure>
+    <figure><figcaption>JAVA OUTPUT</figcaption>
+<pre class="out">$ java Bank v1
+  monitor: 1577 transfers done
+  monitor: 1577 transfers done
+  monitor: 1577 transfers done
+v1: DEADLOCK after 1577 transfers
+  worker-0 waits for Bank$Account@247d8ae held by worker-1
+  worker-1 waits for Bank$Account@6c130c45 held by worker-2
+  worker-2 waits for Bank$Account@247d8ae held by worker-1
+$ java Bank v1
+  …
+v1: DEADLOCK after 300 transfers
+$ java Bank v2
+v2: 100000 transfers in 16 ms, total 10000 (expected 10000)
+$ java Bank v3
+v3: 100000 transfers in 18 ms, total 10000 (expected 10000)</pre></figure>
+  </div>
+  <p><b>v1 deadlocked on every one of my runs</b>, in both languages, after anywhere from 140 to 1,577 transfers. The frozen monitor count is a symptom worth recognising: a program that's still running but has stopped making progress. Look at the first Java run. The cycle is worker-1 ↔ worker-2, and worker-0 is reported too, because it's stuck waiting for a lock that worker-1 holds. A deadlock can freeze threads that aren't part of the cycle.</p>
+  <p><b>v2 and v3 always finished</b> with the total at exactly 10,000. The first Java runs took 16 ms (v2) and 18 ms (v3), and repeats took 21–23 ms and 21–22 ms. The single global lock is just as fast here, because each transfer holds a lock for a few nanoseconds and there are only 4 threads. Fine-grained locking pays off when the work inside the lock is long or the thread count is high. Measure before you take on the extra deadlock risk.</p>
+  <p><b>Why only the flag needs <code>volatile</code>:</b> the balances are only ever read and written while holding locks, and unlock→lock gives the happens-before edge. The <code>running</code> flag is read by the monitor <em>without</em> any lock, exactly like <code>StopFlag</code>, so it needs <code>volatile</code> to be guaranteed to see <code>running = false</code>. The final balances are read after <code>join</code> returns, which is its own happens-before edge. In the deadlock case the reader never gets that far.</p>
+</details>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="2">
+  <p class="q">L10 + L27: why does every <code>lock()</code> call get its <code>unlock()</code> in a <code>finally</code> block?</p>
+  <div class="opts"><button>Finally blocks run much faster</button><button>The compiler requires it there</button><button>Exceptions would leave it locked</button><button>It releases memory sooner too</button></div>
+  <p class="why">If the guarded code throws, a lock with no <code>finally</code> stays held for ever. Every later caller blocks, which looks just like a deadlock. <code>synchronized</code> and <code>withLock</code> release automatically.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="0">
+  <p class="q">L19 + L27: a key's <code>hashCode</code> changes after it's put in a <code>ConcurrentHashMap</code>. Does the map's thread safety help?</p>
+  <div class="opts"><button>No, the entry is stranded</button><button>Yes, locks fix hash codes</button><button>Yes, it rehashes on change</button><button>Only with merge and compute</button></div>
+  <p class="why">Thread safety protects the map's own structure, not your keys' contract. A mutated key sits in the wrong bucket in any hash map. Immutable keys avoid it.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="3">
+  <p class="q">L23 + L27: in bytecode, a <code>synchronized (lock) { … }</code> block or Kotlin's <code>synchronized(lock) { }</code> compiles to…</p>
+  <div class="opts"><button><code>invokedynamic</code></button><button><code>tableswitch</code></button><button><code>checkcast</code></button><button><code>monitorenter</code> … <code>monitorexit</code></button></div>
+  <p class="why">Both take the object's monitor, which is why <code>jcmd Thread.print</code> shows "waiting to lock monitor" for either language.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="1">
+  <p class="q">L24 + L27: a <code>static</code> <code>ConcurrentHashMap</code> cache is perfectly thread-safe but only ever grows. The remaining problem?</p>
+  <div class="opts"><button>A deadlock risk</button><button>A memory leak</button><button>A visibility bug</button><button>A race condition</button></div>
+  <p class="why">Thread safety isn't boundedness. A static root holding ever more entries is L24's leak. Bound it, for example with an LRU.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Write <code>StopFlag</code> from memory, say why it may never stop, and fix it.</li>
+    <li>List five happens-before edges from JLS §17.4.5, and say which one makes <code>join()</code> safe.</li>
+    <li>Write correct double-checked locking in Java, then the one-line Kotlin equivalent.</li>
+    <li>Name the four deadlock conditions and the fix that breaks each of two of them.</li>
+    <li>Explain why <code>getOrPut</code> on a <code>ConcurrentHashMap</code> can run its lambda several times, and what to use instead.</li>
+    <li>Give two reasons immutable objects are the best defence, and one way a <code>val</code> list can still change.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  <a href="https://jcip.net/"><em>Java Concurrency in Practice</em></a> by Goetz, Peierls, Bloch, Bowbeer, Holmes and Lea. Chapter 3 ("Sharing Objects": visibility, publication, confinement, immutability), §5.1–5.3 (synchronized and concurrent collections, blocking queues), chapter 10 ("Avoiding Liveness Hazards") and §16.2 (publication and double-checked locking) are this lesson in depth. It predates virtual threads and Kotlin, but none of these rules have changed. For the exact rules, read <a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.4.5">JLS §17.4.5</a> and the <a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/package-summary.html#MemoryVisibility"><code>java.util.concurrent</code> Memory Consistency Properties</a>, both short. For deadlock, read <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf">OSTEP ch. 32</a>, which is free.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/concurrency.html">Concurrency</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "does this field need <code>volatile</code>?", "can these two locks deadlock?" or "is this map access atomic?" are exactly the right kind. Paste a thread dump or a suspicious class in for a second opinion.</p>
+
+<div class="lesson-nav">
+  <a href="0026-threads-and-race-conditions.html">← L26 · Threads &amp; Race Conditions</a>
+  <a href="0028-executors-and-virtual-threads.html">L28 · Executors &amp; Virtual Threads →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/deadlockviz.js"></script>
+</body>
+</html>

@@ -1,0 +1,1588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L24 · Garbage Collection &amp; Profiling</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l24">
+<main>
+
+<div class="kicker">Lesson 24 · Phase 7 How the Machine Runs Your Code · <a href="../reference/roadmap.html#p7">roadmap</a></div>
+<h1>Garbage Collection &amp; Profiling</h1>
+<p class="subtitle">The JVM frees memory for you, so how can a Java or Kotlin program still run out of it? This lesson covers what the garbage collector actually does, how leaks happen anyway, and how to find where the time and memory really go, using only tools that ship with the JDK.</p>
+
+<div class="lesson-meta">
+  <span><b>~100–115 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll take a running service that crashes with <code>OutOfMemoryError</code> and is also slow. You'll find the leak with a heap histogram and the hotspot with Flight Recorder, fix both, and prove it with before-and-after numbers.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Reachability, GC roots, generations</a><span class="t">30 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Memory leaks in a garbage-collected language</a><span class="t">30 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Profiling: where do the time and memory go?</a><span class="t">30 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: find the leak and the hotspot</a><span class="t">20 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l24/</code>. Every output on this page comes from a real run: JDK 26.0.1 and Kotlin 2.4 on an Apple M5 Max (18 cores, 128 GB of RAM). Timings and pause lengths are <b>from my machine</b>, so yours will differ. The shapes and the ratios are what to compare.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L4, L19, L22 and L23</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Name the JVM's runtime memory areas from L23. Which one holds objects, and which hold the local variables of running methods? (L4, L23)</li>
+    <li>Two variables <code>a</code> and <code>b</code> refer to the same object. You set <code>a = null</code>. Is the object garbage now? Why or why not? (L4, L5: aliasing)</li>
+    <li>Write, from memory, the three lines that turn a <code>LinkedHashMap</code> into an LRU cache. (L19)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="0">
+  <p class="q">Objects made with <code>new</code>, and the local variables of a running method: where does each live? (L4, L23)</p>
+  <div class="opts"><button>Heap and stack respectively</button><button>Stack and heap respectively</button><button>Both in the metaspace</button><button>Both in the heap</button></div>
+  <p class="why">Objects live on the heap. Each running method gets a stack frame holding its locals, and a local that refers to an object holds a reference into the heap (L4). Those locals are where the garbage collector starts looking, as Part 1 shows.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="2">
+  <p class="q">A method's first few thousand calls are slower than later ones. The main reason? (L23)</p>
+  <div class="opts"><button>The garbage collector runs during startup</button><button>The heap starts out completely full</button><button>It is interpreted before JIT compilation</button><button>Class files are re-read every call</button></div>
+  <p class="why">HotSpot interprets bytecode first and compiles hot methods later (L23). Any timing you take must allow for that warm-up, which is a big part of why Part 3 uses JMH.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="1">
+  <p class="q">A JVM started with <code>-Xmx64m</code> shows more than 64 MB of resident memory in <code>ps</code>. Why? (L22)</p>
+  <div class="opts"><button>The heap leaked past its limit</button><button>JVM memory extends beyond the heap</button><button>ps reports memory in different units</button><button>The flag only applies to Kotlin</button></div>
+  <p class="why"><code>-Xmx</code> caps the <em>heap</em> only. The process also needs memory for metaspace, thread stacks, compiled code and the JVM itself. Today we stay inside the heap.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="3">
+  <p class="q">Which call creates a <code>LinkedHashMap</code> in <em>access order</em>, the basis of L19's LRU cache?</p>
+  <div class="opts"><button><code>new LinkedHashMap&lt;&gt;(16)</code></button><button><code>new LinkedHashMap&lt;&gt;(16, 0.75f, false)</code></button><button><code>new HashMap&lt;&gt;(16, 0.75f)</code></button><button><code>new LinkedHashMap&lt;&gt;(16, 0.75f, true)</code></button></div>
+  <p class="why">The third argument, <code>accessOrder = true</code>, moves an entry to the end on every access. Override <code>removeEldestEntry</code> and the map evicts the least recently used entry. You'll use that to fix a leak in the final.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Reachability, GC roots, generations</h2><span class="t">~30 min</span></div>
+
+<p>You never call <code>free</code> on the JVM. So how does the garbage collector decide which objects to throw away? It never asks "is this object still <em>needed</em>?", because it can't know that. It asks a question it <em>can</em> answer: <b>can the program still reach it?</b> The Java API puts it like this: "A reachable object is any object that can be accessed in any potential continuing computation from any live thread" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ref/package-summary.html#reachability"><code>java.lang.ref</code>: Reachability</a>, quoting <a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-12.html#jls-12.6.1">JLS §12.6.1</a>). Everything else is garbage, and "its memory can be reused by the VM when it can no longer be reached from any reference of any other live object in the running program" (<a href="https://docs.oracle.com/en/java/javase/25/gctuning/garbage-collector-implementation.html">HotSpot GC Tuning Guide, ch. 3</a>).</p>
+
+<p>Reaching has to start somewhere. Collectors start from <dfn>GC roots</dfn>: references the program can use without going through any other object. The ones you'll meet every day are:</p>
+<ul>
+  <li><b>Local variables and parameters</b> in every active stack frame, on every thread (L4).</li>
+  <li><b>Static fields</b> of loaded classes. In Kotlin, that includes every <code>object</code> declaration and top-level property.</li>
+  <li>Live <code>Thread</code> objects themselves, plus references held by native code (JNI), which you won't see in this course.</li>
+</ul>
+
+<h3>Mark, then sweep</h3>
+<p>The simplest tracing collector works in two phases. <b>Mark</b> starts at the roots and follows every reference, marking each object it reaches. <b>Sweep</b> then reclaims everything left unmarked. Step through it, because two of the results surprise most people:</p>
+<div class="gcviz" data-src="gc-mark"></div>
+<script type="application/json" id="gc-mark">{"height":230,"modes":[{"name":"Mark & sweep","steps":[{"note":"Three <b>GC roots</b> (orange): two local variables in <code>main</code>'s stack frame (L4) and a <code>static</code> field, <code>CONFIG</code>. Every arrow is a reference. Before a collection, the GC knows nothing about which objects are still needed.","nodes":{"rOrder":{"x":8,"y":20,"label":"local order","cls":"root"},"rLine":{"x":8,"y":75,"label":"local line","cls":"root"},"rCfg":{"x":8,"y":185,"label":"CONFIG","cls":"root"},"order":{"x":150,"y":20,"label":"Order #2"},"cust":{"x":280,"y":20,"label":"Customer"},"items":{"x":280,"y":75,"label":"List<Item>"},"line":{"x":150,"y":75,"label":"\"line 7\""},"old":{"x":410,"y":75,"label":"Order #1"},"a":{"x":150,"y":130,"label":"Node A"},"b":{"x":280,"y":130,"label":"Node B"},"cfg":{"x":150,"y":185,"label":"Config"},"set":{"x":280,"y":185,"label":"Settings"}},"edges":[["rOrder","order"],["order","cust"],["order","items"],["rLine","line"],["old","cust"],["a","b"],["b","a"],["rCfg","cfg"],["cfg","set"]]},{"note":"The loop moves on and <code>line</code> now refers to something else (here: nothing). Nobody is pointing at <code>\"line 7\"</code> any more, but the object is still sitting in the heap.","nodes":{"rOrder":{"x":8,"y":20,"label":"local order","cls":"root"},"rLine":{"x":8,"y":75,"label":"local line","cls":"root"},"rCfg":{"x":8,"y":185,"label":"CONFIG","cls":"root"},"order":{"x":150,"y":20,"label":"Order #2"},"cust":{"x":280,"y":20,"label":"Customer"},"items":{"x":280,"y":75,"label":"List<Item>"},"line":{"x":150,"y":75,"label":"\"line 7\""},"old":{"x":410,"y":75,"label":"Order #1"},"a":{"x":150,"y":130,"label":"Node A"},"b":{"x":280,"y":130,"label":"Node B"},"cfg":{"x":150,"y":185,"label":"Config"},"set":{"x":280,"y":185,"label":"Settings"}},"edges":[["rOrder","order"],["order","cust"],["order","items"],["old","cust"],["a","b"],["b","a"],["rCfg","cfg"],["cfg","set"]]},{"note":"<b>Mark, part 1.</b> The GC starts at every root and marks what each one refers to directly: <code>Order #2</code> and <code>Config</code>.","nodes":{"rOrder":{"x":8,"y":20,"label":"local order","cls":"root"},"rLine":{"x":8,"y":75,"label":"local line","cls":"root"},"rCfg":{"x":8,"y":185,"label":"CONFIG","cls":"root"},"order":{"x":150,"y":20,"label":"Order #2","cls":"marked"},"cust":{"x":280,"y":20,"label":"Customer"},"items":{"x":280,"y":75,"label":"List<Item>"},"line":{"x":150,"y":75,"label":"\"line 7\""},"old":{"x":410,"y":75,"label":"Order #1"},"a":{"x":150,"y":130,"label":"Node A"},"b":{"x":280,"y":130,"label":"Node B"},"cfg":{"x":150,"y":185,"label":"Config","cls":"marked"},"set":{"x":280,"y":185,"label":"Settings"}},"edges":[["rOrder","order"],["order","cust"],["order","items"],["old","cust"],["a","b"],["b","a"],["rCfg","cfg"],["cfg","set"]]},{"note":"<b>Mark, part 2.</b> It follows every arrow out of a marked object, and so on, until nothing new is found. <code>Customer</code>, <code>List&lt;Item&gt;</code> and <code>Settings</code> are reachable, so they are <b>live</b>.","nodes":{"rOrder":{"x":8,"y":20,"label":"local order","cls":"root"},"rLine":{"x":8,"y":75,"label":"local line","cls":"root"},"rCfg":{"x":8,"y":185,"label":"CONFIG","cls":"root"},"order":{"x":150,"y":20,"label":"Order #2","cls":"marked"},"cust":{"x":280,"y":20,"label":"Customer","cls":"marked"},"items":{"x":280,"y":75,"label":"List<Item>","cls":"marked"},"line":{"x":150,"y":75,"label":"\"line 7\""},"old":{"x":410,"y":75,"label":"Order #1"},"a":{"x":150,"y":130,"label":"Node A"},"b":{"x":280,"y":130,"label":"Node B"},"cfg":{"x":150,"y":185,"label":"Config","cls":"marked"},"set":{"x":280,"y":185,"label":"Settings","cls":"marked"}},"edges":[["rOrder","order"],["order","cust"],["order","items"],["old","cust"],["a","b"],["b","a"],["rCfg","cfg"],["cfg","set"]]},{"note":"Everything left unmarked is <b>unreachable</b>, so it is garbage. Two surprises: <code>Order #1</code> points <em>at</em> a live object, but that doesn't help it, because only references <em>into</em> an object count. And <code>Node A</code> ↔ <code>Node B</code> refer to each other, yet nothing reachable refers to either, so the whole cycle goes.","nodes":{"rOrder":{"x":8,"y":20,"label":"local order","cls":"root"},"rLine":{"x":8,"y":75,"label":"local line","cls":"root"},"rCfg":{"x":8,"y":185,"label":"CONFIG","cls":"root"},"order":{"x":150,"y":20,"label":"Order #2","cls":"marked"},"cust":{"x":280,"y":20,"label":"Customer","cls":"marked"},"items":{"x":280,"y":75,"label":"List<Item>","cls":"marked"},"line":{"x":150,"y":75,"label":"\"line 7\"","cls":"dead"},"old":{"x":410,"y":75,"label":"Order #1","cls":"dead"},"a":{"x":150,"y":130,"label":"Node A","cls":"dead"},"b":{"x":280,"y":130,"label":"Node B","cls":"dead"},"cfg":{"x":150,"y":185,"label":"Config","cls":"marked"},"set":{"x":280,"y":185,"label":"Settings","cls":"marked"}},"edges":[["rOrder","order"],["order","cust"],["order","items"],["old","cust"],["a","b"],["b","a"],["rCfg","cfg"],["cfg","set"]]},{"note":"<b>Sweep.</b> The unmarked objects' memory is reclaimed. A real collector then usually <b>compacts</b>: it slides the survivors together so the free space is one big block, which keeps allocation a cheap pointer bump.","nodes":{"rOrder":{"x":8,"y":20,"label":"local order","cls":"root"},"rLine":{"x":8,"y":75,"label":"local line","cls":"root"},"rCfg":{"x":8,"y":185,"label":"CONFIG","cls":"root"},"order":{"x":150,"y":20,"label":"Order #2","cls":"marked"},"cust":{"x":280,"y":20,"label":"Customer","cls":"marked"},"items":{"x":280,"y":75,"label":"List<Item>","cls":"marked"},"cfg":{"x":150,"y":185,"label":"Config","cls":"marked"},"set":{"x":280,"y":185,"label":"Settings","cls":"marked"}},"edges":[["rOrder","order"],["order","cust"],["order","items"],["rCfg","cfg"],["cfg","set"]]}]}]}</script>
+<p>Two takeaways:</p>
+<ul>
+  <li><b>Cycles don't keep anything alive.</b> Unreachable objects that point at each other are still unreachable. Reachability is decided by tracing from the roots, never by counting references.</li>
+  <li><b>Only incoming references from live objects count.</b> A dead object can point at a live one. That doesn't help the dead object.</li>
+</ul>
+<p>Sweeping leaves holes between the survivors. Real collectors therefore also <dfn>compact</dfn>, sliding the survivors together, or they <dfn>copy</dfn> the survivors into a fresh area and treat the whole old area as free. Copying does mark-sweep-compact in one pass, and its cost depends on how many objects <em>survive</em>, not on how much garbage there is. That fact drives the next idea.</p>
+
+<h3>Generations: most objects die young</h3>
+<p>Tracing the entire heap on every collection would be slow for a big application. The tuning guide says "the time this approach takes is proportional to the number of live objects, which is prohibitive for large applications". HotSpot relies on an observation called the <dfn>weak generational hypothesis</dfn>, "which states that most objects survive for only a short period of time" (<a href="https://docs.oracle.com/en/java/javase/25/gctuning/garbage-collector-implementation.html">GC Tuning Guide, ch. 3</a>). Think of every iterator, every temporary <code>String</code> and every <code>StringBuilder</code> you've written. So the heap is split up:</p>
+<ul>
+  <li>"The vast majority of objects are allocated in a pool dedicated to young objects (the <b>young generation</b>), and most objects die there. When the young generation fills up, it causes a <b>minor collection</b> in which only the young generation is collected."</li>
+  <li>"The young generation consists of <b>eden</b> and two <b>survivor spaces</b>. Most objects are initially allocated in eden." Live objects are copied between the survivor spaces until "they've been copied a certain number of times", and then they move to the <b>old generation</b>. "This process is also called aging."</li>
+  <li>"Eventually, the old generation fills up and must be collected, resulting in a <b>major collection</b>, in which the entire heap is collected."</li>
+</ul>
+<div class="gcviz" data-src="gc-gen"></div>
+<script type="application/json" id="gc-gen">{"height":262,"modes":[{"name":"Generations","lanes":[{"label":"young · eden","x":112,"y":0,"h":96},{"label":"young · survivor","x":112,"y":102,"h":70},{"label":"old","x":112,"y":178,"h":82}],"steps":[{"note":"Every new object is allocated in <b>eden</b>, part of the young generation. Most of these are temporaries: a <code>String</code> built for a log line, an <code>Iterator</code> for one loop, a <code>StringBuilder</code>.","nodes":{"rCart":{"x":4,"y":22,"label":"local cart","cls":"root"},"rCache":{"x":4,"y":204,"label":"static cache","cls":"root"},"cart":{"x":128,"y":22,"label":"Cart","cls":"new"},"item":{"x":258,"y":22,"label":"Item","cls":"new"},"s1":{"x":388,"y":22,"label":"String","cls":"new"},"cat":{"x":128,"y":60,"label":"Catalog","cls":"new"},"it1":{"x":258,"y":60,"label":"Iterator","cls":"new"},"tmp":{"x":388,"y":60,"label":"StringBuilder","cls":"new"}},"edges":[["rCart","cart"],["cart","item"],["rCache","cat"]]},{"note":"Eden is full, so a <b>minor collection</b> runs. It marks from the roots but only cares about young objects, which is why it's fast: its cost is proportional to the <em>live</em> objects, and most young objects are already dead.","nodes":{"rCart":{"x":4,"y":22,"label":"local cart","cls":"root"},"rCache":{"x":4,"y":204,"label":"static cache","cls":"root"},"cart":{"x":128,"y":22,"label":"Cart","cls":"marked"},"item":{"x":258,"y":22,"label":"Item","cls":"marked"},"s1":{"x":388,"y":22,"label":"String","cls":"dead"},"cat":{"x":128,"y":60,"label":"Catalog","cls":"marked"},"it1":{"x":258,"y":60,"label":"Iterator","cls":"dead"},"tmp":{"x":388,"y":60,"label":"StringBuilder","cls":"dead"}},"edges":[["rCart","cart"],["cart","item"],["rCache","cat"]]},{"note":"The survivors are <b>copied</b> into a survivor space and get age 1. Eden is now completely empty, with no sweeping needed: copying the few live objects out <em>is</em> the collection, and they end up packed together.","nodes":{"rCart":{"x":4,"y":22,"label":"local cart","cls":"root"},"rCache":{"x":4,"y":204,"label":"static cache","cls":"root"},"cart":{"x":128,"y":124,"label":"Cart","cls":"live","tag":"age 1"},"item":{"x":258,"y":124,"label":"Item","cls":"live","tag":"age 1"},"cat":{"x":388,"y":124,"label":"Catalog","cls":"live","tag":"age 1"}},"edges":[["rCart","cart"],["cart","item"],["rCache","cat"]]},{"note":"The program keeps allocating into the empty eden. The cart now refers to a new <code>Order</code>.","nodes":{"rCart":{"x":4,"y":22,"label":"local cart","cls":"root"},"rCache":{"x":4,"y":204,"label":"static cache","cls":"root"},"cart":{"x":128,"y":124,"label":"Cart","cls":"live","tag":"age 1"},"item":{"x":258,"y":124,"label":"Item","cls":"live","tag":"age 1"},"cat":{"x":388,"y":124,"label":"Catalog","cls":"live","tag":"age 1"},"ord":{"x":128,"y":22,"label":"Order","cls":"new"},"s2":{"x":258,"y":22,"label":"String","cls":"new"},"it2":{"x":388,"y":22,"label":"Iterator","cls":"new"}},"edges":[["rCart","cart"],["cart","item"],["rCache","cat"],["cart","ord"]]},{"note":"A second minor collection. <code>Cart</code>, <code>Item</code> and <code>Catalog</code> survive again, and so does the new <code>Order</code>.","nodes":{"rCart":{"x":4,"y":22,"label":"local cart","cls":"root"},"rCache":{"x":4,"y":204,"label":"static cache","cls":"root"},"cart":{"x":128,"y":124,"label":"Cart","cls":"marked","tag":"age 1"},"item":{"x":258,"y":124,"label":"Item","cls":"marked","tag":"age 1"},"cat":{"x":388,"y":124,"label":"Catalog","cls":"marked","tag":"age 1"},"ord":{"x":128,"y":22,"label":"Order","cls":"marked"},"s2":{"x":258,"y":22,"label":"String","cls":"dead"},"it2":{"x":388,"y":22,"label":"Iterator","cls":"dead"}},"edges":[["rCart","cart"],["cart","item"],["rCache","cat"],["cart","ord"]]},{"note":"Objects that keep surviving are <b>promoted</b> to the old generation. In this toy the threshold is 2. HotSpot adapts it at run time, up to the <code>-XX:MaxTenuringThreshold</code> cap (15 by default). Long-lived things like caches end up here.","nodes":{"rCart":{"x":4,"y":22,"label":"local cart","cls":"root"},"rCache":{"x":4,"y":204,"label":"static cache","cls":"root"},"cart":{"x":128,"y":204,"label":"Cart","cls":"live","tag":"promoted"},"item":{"x":258,"y":204,"label":"Item","cls":"live","tag":"promoted"},"cat":{"x":388,"y":204,"label":"Catalog","cls":"live","tag":"promoted"},"ord":{"x":128,"y":124,"label":"Order","cls":"live","tag":"age 1"}},"edges":[["rCart","cart"],["cart","item"],["rCache","cat"],["cart","ord"]]},{"note":"The user empties the cart: <code>cart = null</code>. <code>Cart</code> and <code>Item</code> are garbage now, but they're in the old generation, which minor collections skip. They stay until an old-generation collection: in G1's log, that's the <code>Concurrent Mark Cycle</code> followed by <code>Mixed</code> pauses. (<code>Order</code> is unreachable too; the next minor collection reclaims it.)","nodes":{"rCart":{"x":4,"y":22,"label":"local cart","cls":"root"},"rCache":{"x":4,"y":204,"label":"static cache","cls":"root"},"cart":{"x":128,"y":204,"label":"Cart","cls":"dead","tag":"waits for old GC"},"item":{"x":258,"y":204,"label":"Item","cls":"dead","tag":"waits for old GC"},"cat":{"x":388,"y":204,"label":"Catalog","cls":"live","tag":"promoted"},"ord":{"x":128,"y":124,"label":"Order","cls":"dead","tag":"next minor GC"}},"edges":[["cart","item"],["rCache","cat"],["cart","ord"]]}]}]}</script>
+
+<h3>Which collector is yours using?</h3>
+<p>Ask the JVM. <code>-XX:+PrintCommandLineFlags</code> prints the choices it made for you (<a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html">the <code>java</code> command</a>). Here's the real output with the less interesting flags cut out:</p>
+<pre class="term"><span class="p">$ </span>java -XX:+PrintCommandLineFlags -version
+… -XX:InitialHeapSize=6815736 … -XX:MaxHeapSize=32178700288 -XX:MaxRAM=137438953472 … -XX:+UseG1GC
+openjdk version "26.0.1" 2026-04-21
+<span class="p">$ </span>java -Xlog:gc -version
+[0.002s][info][gc] Using G1</pre>
+<p>That's <b>G1</b>, with a maximum heap of about 30 GB on a 128 GB machine. Both match the documented defaults: "Garbage-First (G1) Collector on server-class machines, Serial Collector otherwise", "Maximum heap size of 1/4 of physical memory", and "the VM considers machines as server-class if the VM detects two or more processors and physical memory larger than or equal to 1792 MB" (<a href="https://docs.oracle.com/en/java/javase/25/gctuning/ergonomics.html">GC Tuning Guide: Ergonomics</a>). The heap is a little under an exact quarter because other ergonomic rules round the figure.</p>
+
+<table class="cmds">
+  <tr><th>Collector</th><th>Flag</th><th>What the guide says it's for</th></tr>
+  <tr><td>Serial</td><td><code>-XX:+UseSerialGC</code></td><td>"a single thread to perform all garbage collection work"; small heaps "(up to approximately 100 MB)"</td></tr>
+  <tr><td>Parallel</td><td><code>-XX:+UseParallelGC</code></td><td>"also known as throughput collector"; many threads, pauses the app while it works</td></tr>
+  <tr><td>G1 (default)</td><td><code>-XX:+UseG1GC</code></td><td>"a mostly concurrent collector"; aims to "meet a pause-time goal with high probability, while achieving high throughput"</td></tr>
+  <tr><td>ZGC</td><td><code>-XX:+UseZGC</code></td><td>"max pause times under a millisecond, but at the cost of some throughput"</td></tr>
+</table>
+<p class="note">Quotes are from <a href="https://docs.oracle.com/en/java/javase/25/gctuning/available-collectors.html">GC Tuning Guide: Available Collectors</a>. ZGC became generational in JDK 21 (<a href="https://openjdk.org/jeps/439">JEP 439</a>), that mode became the default in JDK 23 (<a href="https://openjdk.org/jeps/474">JEP 474</a>), and the old non-generational mode was removed in JDK 24 (<a href="https://openjdk.org/jeps/490">JEP 490</a>). On JDK 26 the old switch is gone completely: <code>-XX:-ZGenerational</code> fails with <code>Unrecognized VM option 'ZGenerational'</code>. You may also read about Shenandoah, another low-pause collector. It isn't included in every JDK build, and this one prints <code>Option -XX:+UseShenandoahGC not supported</code>.</p>
+
+<h3>Reading a real GC log</h3>
+<p>Theory is cheap, so watch it happen. This program allocates about 20 million small orders but only ever keeps the most recent 100,000 alive: a lot of short-lived garbage plus a steady live set.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Churn.kt</figcaption>
+<pre><code class="language-kotlin">// Allocates ~4 GB of short-lived objects while keeping a small window alive.
+data class Order(val id: Long, val customer: String, val items: IntArray)
+
+fun main() {
+    val recent = arrayOfNulls&lt;Order&gt;(100_000)     // the "live" window: 100k orders
+    var checksum = 0L
+    val start = System.nanoTime()
+    for (i in 0L until 20_000_000L) {
+        val o = Order(i, "customer-${i % 1000}", IntArray(16))
+        recent[(i % recent.size).toInt()] = o    // older orders become garbage
+        checksum += o.items.size
+    }
+    val ms = (System.nanoTime() - start) / 1_000_000
+    println("checksum $checksum in $ms ms")
+    System.gc()                                  // only a request (see below)
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Churn.java</figcaption>
+<pre><code class="language-java">// Allocates ~4 GB of short-lived objects while keeping a small window alive.
+public class Churn {
+    record Order(long id, String customer, int[] items) {}
+
+    public static void main(String[] args) {
+        Order[] recent = new Order[100_000];       // the "live" window: 100k orders
+        long checksum = 0;
+        long start = System.nanoTime();
+        for (long i = 0; i &lt; 20_000_000; i++) {
+            Order o = new Order(i, "customer-" + (i % 1000), new int[16]);
+            recent[(int) (i % recent.length)] = o; // older orders become garbage
+            checksum += o.items().length;
+        }
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("checksum " + checksum + " in " + ms + " ms");
+        System.gc();                                // only a request (see below)
+    }
+}</code></pre></figure>
+</div>
+<p>Run it with a 256 MB heap and logging switched on. <code>-Xlog:gc</code> prints one line per collection (<code>-verbose:gc</code> is an alias). Here are lines from the Java run, with "…" where I cut repetitive lines. The Kotlin run has the same shape.</p>
+<pre class="term"><span class="p">$ </span>java -Xmx256m -Xlog:gc Churn
+[0.003s][info][gc] Using G1
+[0.017s][info][gc] GC(0) Pause Young (Normal) (G1 Evacuation Pause) 5M-&gt;5M(10M) 0.978ms
+…                                                          <span class="c"># heap grows from 10M to 238M while the JVM sizes it</span>
+[0.069s][info][gc] GC(16) Pause Young (Normal) (G1 Evacuation Pause) 124M-&gt;64M(168M) 1.269ms
+[0.085s][info][gc] GC(18) Pause Young (Normal) (G1 Evacuation Pause) 162M-&gt;79M(204M) 1.304ms
+[0.106s][info][gc] GC(21) Pause Young (Normal) (G1 Evacuation Pause) 165M-&gt;90M(225M) 1.417ms
+[0.137s][info][gc] GC(25) Pause Young (Normal) (G1 Evacuation Pause) 187M-&gt;102M(238M) 1.147ms
+[0.154s][info][gc] GC(27) Pause Young (Concurrent Start) (G1 Evacuation Pause) 201M-&gt;108M(238M) 1.153ms
+[0.154s][info][gc] GC(28) Concurrent Mark Cycle
+[0.155s][info][gc] GC(28) Pause Remark 123M-&gt;35M(238M) 0.155ms
+[0.155s][info][gc] GC(28) Pause Cleanup 38M-&gt;38M(238M) 0.018ms
+[0.155s][info][gc] GC(28) Concurrent Mark Cycle 1.754ms
+[0.162s][info][gc] GC(29) Pause Young (Prepare Mixed) (G1 Evacuation Pause) 113M-&gt;22M(238M) 1.122ms
+[0.171s][info][gc] GC(30) Pause Young (Mixed) (G1 Evacuation Pause) 150M-&gt;25M(246M) 1.132ms
+[0.182s][info][gc] GC(31) Pause Young (Normal) (G1 Evacuation Pause) 154M-&gt;25M(246M) 1.103ms
+[0.192s][info][gc] GC(32) Pause Young (Normal) (G1 Evacuation Pause) 154M-&gt;24M(246M) 1.155ms
+…                                                          <span class="c"># GC(33)–GC(42) look exactly like GC(32)</span>
+[0.303s][info][gc] GC(43) Pause Young (Normal) (G1 Evacuation Pause) 160M-&gt;25M(255M) 0.992ms
+checksum 320000000 in 296 ms
+[0.309s][info][gc] GC(44) Pause Full (System.gc()) 79M-&gt;1M(17M) 0.846ms</pre>
+<p><b>How to read a line.</b> The guide spells out the format: after the timestamp, the GC number, and the type and cause, comes "used before GC" -&gt; "used after GC" ("heap size"), then the pause length (<a href="https://docs.oracle.com/en/java/javase/25/gctuning/garbage-collector-implementation.html#GUID-A24775AB-16A3-4B86-9963-76E5AC398A3E">ch. 3</a>). So <code>154M-&gt;25M(246M) 1.103ms</code> means 154 MB in use, 25 MB left after the collection, a 246 MB heap, and the program stopped for about a millisecond.</p>
+<p><b>The story the log tells:</b></p>
+<ol>
+  <li><b>GC(16)–GC(27), young collections.</b> Each one frees most of eden. But the "after" figure creeps up from 64M to 108M. Some orders survived long enough to be promoted, and died later, <em>in the old generation</em>, where young collections never look. This is the last step of the generations diagram.</li>
+  <li><b>GC(28), a concurrent mark cycle.</b> G1 traces the whole heap <em>while the program keeps running</em>, then stops it briefly for <code>Remark</code>. Usage drops from 123M to 35M, because completely empty old regions are reclaimed right away.</li>
+  <li><b>GC(29)–GC(30), mixed collections.</b> These are young collections that also clean up some old regions G1 now knows are mostly garbage.</li>
+  <li><b>From GC(31) on, steady state.</b> Every collection takes about 154M down to 25M in about 1.1 ms. The 25 MB that survives is the live window of 100,000 orders.</li>
+  <li><b>The last line</b> is the <code>System.gc()</code> call, a <em>full</em> collection. Only 1M survived because <code>recent</code> is no longer used after the loop, so the compiled code doesn't keep it alive. The JLS allows exactly that: "a Java compiler or code generator may choose to set a variable or parameter that will no longer be used to null" (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-12.html#jls-12.6.1">JLS §12.6.1</a>).</li>
+</ol>
+
+<h3>Same program, four collectors</h3>
+<p>Swap the collector with one flag and measure two things: how long the program took, and how long it was <em>stopped</em>. <code>-Xlog:safepoint</code> logs every stop-the-world pause the same way for all collectors, and a 6-line script adds them up:</p>
+<pre><code class="language-python"># Summarise -Xlog:safepoint output: number of stop-the-world pauses, their total and the longest.
+import re, sys
+
+totals = [int(m.group(1)) / 1e6 for line in sys.stdin
+          if (m := re.search(r"Total: (\d+) ns", line))]
+print(f"pauses={len(totals)} total={sum(totals):.1f}ms max={max(totals):.2f}ms")</code></pre>
+<pre class="term"><span class="p">$ </span>java -XX:+UseSerialGC -Xmx256m -Xlog:safepoint Churn | python3 pauses.py
+pauses=65 total=257.4ms max=23.52ms</pre>
+<table class="cmds">
+  <tr><th>Collector (Java run)</th><th>Program time</th><th>Pauses</th><th>Total paused</th><th>Longest pause</th></tr>
+  <tr><td>Serial</td><td>496 ms</td><td>65</td><td>257.4 ms</td><td>23.52 ms</td></tr>
+  <tr><td>Parallel</td><td>391 ms</td><td>74</td><td>152.9 ms</td><td>2.63 ms</td></tr>
+  <tr><td>G1 (default)</td><td>303 ms</td><td>49</td><td>53.2 ms</td><td>2.71 ms</td></tr>
+  <tr><td>ZGC</td><td>305 ms</td><td>126</td><td>2.9 ms</td><td>0.04 ms</td></tr>
+</table>
+<p>These are the middle of three runs each, on my machine; repeats agreed within a few percent. The Kotlin version ranked the same way, with Serial longest at 19.44 ms, G1 at 2.66 ms and ZGC at 0.04 ms. Serial stops the program for half its run time on one thread. ZGC pauses more <em>often</em> than any other, but every pause is tens of <em>micro</em>seconds, because it does almost all its work concurrently. <b>This is one toy program</b>, though. A real service's best choice depends on its heap size, its live data and whether it cares more about throughput or latency. The guide's own advice is to "first run your application and allow the VM to select a collector" and to change it only when you have a measured reason (<a href="https://docs.oracle.com/en/java/javase/25/gctuning/available-collectors.html">Selecting a Collector</a>).</p>
+
+<h3><code>System.gc()</code> is a request</h3>
+<p>The API docs: calling it "suggests that the Java Virtual Machine expend effort toward recycling unused objects", and "there is no guarantee that this effort will recycle any particular number of unused objects, reclaim any particular amount of space, or complete at any particular time, if at all" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/System.html#gc()"><code>System.gc</code></a>). Operators can switch it off entirely with <code>-XX:+DisableExplicitGC</code>. I ran <code>Churn</code> with that flag, and the final <code>Pause Full (System.gc())</code> line simply wasn't there. Don't sprinkle it into code to "help". G1 already decides when to collect better than you can.</p>
+<p><b>And not <code>finalize()</code> either.</b> Finalizers, which run "some time" before an object is reclaimed, were deprecated for removal in JDK 18 (<a href="https://openjdk.org/jeps/421">JEP 421</a>). The replacement for releasing files and sockets is try-with-resources / <code>use</code> (L10). For long-lived resources, use the <code>java.lang.ref.Cleaner</code> API, which "allows a program to register a cleaning action for an object that is run some time after the object becomes unreachable". Garbage collection manages <em>memory</em>. It isn't a resource-closing mechanism.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li>Nothing different at runtime: Kotlin on the JVM runs on exactly the same heap and collectors, so everything in this part applies to both languages unchanged.</li>
+    <li>But Kotlin <em>hides</em> some roots. An <code>object</code> declaration and a top-level <code>val</code> both compile to <b>static fields</b>. In Part 2, <code>javap</code> shows <code>object Sessions</code> becoming <code>public static final Sessions INSTANCE</code>. A static field is a GC root for as long as its class is loaded, so anything it refers to lives that long.</li>
+    <li>Kotlin's <code>use { }</code>, like Java's try-with-resources, closes files and sockets deterministically. Neither relies on the GC.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: predict, then read the log</div>
+  <ol>
+    <li>Type <code>Churn</code> from a blank file in one language, then change the live window from <code>100_000</code> to <code>400_000</code> orders. Before running it, write down your prediction: will the "after" figure in the steady state go up? Will a new <em>kind</em> of collection appear? Will the program get faster or slower?</li>
+    <li>Run it with <code>java -Xmx256m -Xlog:gc …</code> and check your predictions.</li>
+    <li>Run it again with <code>-XX:+UseZGC -Xlog:safepoint</code> piped through <code>pauses.py</code>. Does ZGC's longest pause change?</li>
+  </ol>
+  <details class="solution"><summary>What actually happened</summary>
+<pre class="out">[0.106s][info][gc] GC(33) Pause Full (G1 Compaction Pause) 256M-&gt;67M(241M) 5.598ms
+[0.154s][info][gc] GC(47) Pause Full (G1 Compaction Pause) 255M-&gt;67M(234M) 5.958ms
+…
+checksum 320000000 in 609 ms</pre>
+    <p>With 400,000 live orders, about 67 MB survives each collection, and that plus a busy eden doesn't fit in 256 MB comfortably. G1 fell back to <b>full collections</b> (12 of them in the Java run, 11 in Kotlin). A full collection compacts the whole heap and costs about 5–6 ms here, versus about 1 ms for a young one. The program took about twice as long: 609 ms instead of 296 ms in Java, and 641 ms in Kotlin. ZGC stayed at a 0.05 ms longest pause and finished in 516 ms. That's the trade-off in miniature. Full GCs in a log are a warning that the heap is too small for the live data, or that something is holding on to far more than it should, which is Part 2's subject.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Reachability" data-answer="0">
+  <p class="q"><code>Node A</code> and <code>Node B</code> refer only to each other, and no root can reach either. After a full collection…</p>
+  <div class="opts"><button>Both are collected</button><button>Both stay alive</button><button>Only one survives</button><button>Program throws exception</button></div>
+  <p class="why">Tracing collectors decide by reachability from the roots, so an unreachable cycle is garbage like anything else.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Reachability" data-answer="1">
+  <p class="q">In <code>GC(36) Pause Young (Normal) (G1 Evacuation Pause) 157M-&gt;25M(250M) 1.080ms</code>, what is <code>25M</code>?</p>
+  <div class="opts"><button>Heap used before the GC</button><button>Heap used after the GC</button><button>Total size of the heap</button><button>Memory freed by the GC</button></div>
+  <p class="why">The format is "used before" -&gt; "used after" ("heap size"). About 132 MB were freed, and 250 MB is the current heap size.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Reachability" data-answer="2">
+  <p class="q">Why is a young-generation collection usually so quick?</p>
+  <div class="opts"><button>Young objects are always much smaller</button><button>It runs on a separate CPU</button><button>Most young objects are already dead</button><button>It skips marking and only sweeps</button></div>
+  <p class="why">Its cost is proportional to the <em>live</em> objects it copies, and the weak generational hypothesis says most young objects have already died.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Reachability" data-answer="3">
+  <p class="q">With no GC flags, which collector does JDK 26 pick on a laptop with 8 cores and 16 GB?</p>
+  <div class="opts"><button><code>-XX:+UseSerialGC</code></button><button><code>-XX:+UseParallelGC</code></button><button><code>-XX:+UseZGC</code></button><button><code>-XX:+UseG1GC</code></button></div>
+  <p class="why">Two or more processors and at least 1792 MB makes it "server-class", and the default there is G1.</p>
+</div>
+<div class="quiz" data-id="p1-5" data-group="Part 1 · Reachability" data-answer="0">
+  <p class="q">What exactly does a call to <code>System.gc()</code> promise?</p>
+  <div class="opts"><button>Only a best effort attempt</button><button>A full collection right now</button><button>Every unreachable object gets freed</button><button>No pauses for ten seconds</button></div>
+  <p class="why">"There is no guarantee …", and with <code>-XX:+DisableExplicitGC</code> it does nothing at all.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Memory leaks in a garbage-collected language</h2><span class="t">~30 min</span></div>
+
+<p>If the GC frees everything unreachable, how can memory leak? Because the GC can only free what's <em>unreachable</em>, not what's <em>unneeded</em>. LeakCanary's documentation defines it well: "In a Java based runtime, a memory leak is a programming error that causes an application to keep a reference to an object that is no longer needed. As a result, the memory allocated for that object cannot be reclaimed" (<a href="https://square.github.io/leakcanary/fundamentals/">LeakCanary: Fundamentals</a>). <em>Effective Java</em> Item 7 makes the same point: eliminate obsolete object references. Every leak below is a reference somebody forgot about.</p>
+
+<h3>Leak 1: the collection that only grows</h3>
+<p>The classic case: a static map, used as a cache or a registry, that things are added to and never removed from. Every login adds about 100 KB, and nobody ever logs out:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · SessionLeak.kt</figcaption>
+<pre><code class="language-kotlin">// Every login is remembered forever: the map lives in an object, so it is a GC root.
+class Session(val user: String, val state: ByteArray)
+
+object Sessions {
+    val all = HashMap&lt;Int, Session&gt;()
+
+    fun login(id: Int) {
+        all[id] = Session("user$id", ByteArray(100_000))   // ~100 KB each
+    }
+}
+
+fun main() {
+    var id = 0
+    while (true) {
+        Sessions.login(id)  // ...and nobody ever calls Sessions.all.remove(id)
+        if (id % 100 == 0) println("sessions: ${Sessions.all.size}")
+        Thread.sleep(10)    // one login every 10 ms, like a server under load
+        id++
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · SessionLeak.java</figcaption>
+<pre><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+
+// Every login is remembered forever: the map is static, so it is a GC root.
+public class SessionLeak {
+    record Session(String user, byte[] state) {}
+
+    static final Map&lt;Integer, Session&gt; SESSIONS = new HashMap&lt;&gt;();
+
+    static void login(int id) {
+        SESSIONS.put(id, new Session("user" + id, new byte[100_000])); // ~100 KB each
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        for (int id = 0; ; id++) {
+            login(id);          // ...and nobody ever calls SESSIONS.remove(id)
+            if (id % 100 == 0) System.out.println("sessions: " + SESSIONS.size());
+            Thread.sleep(10);   // one login every 10 ms, like a server under load
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="term"><span class="p">$ </span>java -Xmx64m SessionLeak
+sessions: 1
+sessions: 101
+sessions: 201
+sessions: 301
+sessions: 401
+sessions: 501
+sessions: 601
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "main"</pre>
+<p>Both languages print exactly this. Look at the last line: the heap was so full that the JVM couldn't even allocate the memory to print the usual stack trace, so the error was thrown again <em>while handling the error</em>. Leaks often end this messily. The GC log shows what happened in the final moments, and it's the signature of a leak worth memorising:</p>
+<pre class="term"><span class="p">$ </span>java -Xmx64m -Xlog:gc SessionLeak
+…
+[7.412s][info][gc] GC(92) Pause Full (G1 Compaction Pause) 61M-&gt;61M(64M) 1.578ms
+[7.412s][info][gc] GC(93) Pause Young (Normal) (G1 Evacuation Pause) 61M-&gt;61M(64M) 0.308ms
+[7.414s][info][gc] GC(94) Pause Full (G1 Compaction Pause) 61M-&gt;61M(64M) 1.925ms
+[7.416s][info][gc] GC(95) Pause Full (G1 Compaction Pause) 61M-&gt;61M(64M) 1.877ms</pre>
+<p><b>Full collections back to back that free nothing</b> (<code>61M-&gt;61M</code>). Everything in the heap is reachable. The GC is doing its job perfectly, and the program is keeping everything.</p>
+
+<h3>Diagnosing it while it runs</h3>
+<p>The JDK comes with command-line tools that attach to a running JVM. <code>jps</code> lists the JVMs, <code>jcmd</code> sends one of them a diagnostic command, and <code>jstat</code> samples GC statistics (<a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/jcmd.html"><code>jcmd</code></a>, <a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/jstat.html"><code>jstat</code></a>). The 10 ms sleep keeps <code>SessionLeak</code> alive long enough to inspect. Start it in one terminal and run these in another:</p>
+<pre class="term"><span class="p">$ </span>jps -l
+10749 SessionLeak                           <span class="c"># (other JVMs, like IntelliJ and Gradle daemons, cut)</span>
+<span class="p">$ </span>jcmd 10749 GC.class_histogram | head -6
+10749:
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:          8912       13392600  [B (java.base@26.0.1)
+   2:           347         436200  [Ljdk.internal.vm.FillerElement; (java.base@26.0.1)
+   3:          1708         225928  java.lang.Class (java.base@26.0.1)
+<span class="p">$ </span>jcmd 10749 GC.class_histogram | grep -i session
+  30:           134           3216  SessionLeak$Session
+<span class="p">$ </span>sleep 2; jcmd 10749 GC.class_histogram | grep -i session
+  17:           283           6792  SessionLeak$Session</pre>
+<ul>
+  <li><b>The top of a histogram is usually <code>[B</code></b>, the JVM's name for <code>byte[]</code>. It's the payload, and it doesn't say who is holding it. Every program has lots of byte arrays, since every <code>String</code> keeps its characters in one.</li>
+  <li><b>So look for your own classes, and take two snapshots.</b> <code>Session</code> went from 134 to 283 instances in two seconds and never goes down. A count that only grows is a leak suspect. In the Kotlin run, the same commands showed <code>Session</code> going from 127 to 284, plus exactly <b>1</b> instance of <code>Sessions</code>: the <code>object</code> holding the map.</li>
+  <li><code>GC.class_histogram</code> is listed with "Impact: High --- depends on Java heap size and content" in the <a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/jcmd.html">jcmd docs</a>. It walks the whole heap, so on a production server, run it deliberately and not in a loop.</li>
+</ul>
+<p><code>jstat -gcutil &lt;pid&gt; 1000</code> prints one line per second. <code>O</code> is "old space utilization as a percentage of the space's current capacity", and <code>YGC</code>/<code>FGC</code> count young and full collections (<a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/jstat.html"><code>jstat</code></a>):</p>
+<pre class="term"><span class="p">$ </span>jstat -gcutil 10554 1000 5     <span class="c"># an earlier run of SessionLeak, hence a different pid</span>
+  S0     S1     E      O      M     CCS    YGC     YGCT     FGC    FGCT     CGC    CGCT       GCT
+     -      -   0.00  65.38  47.11   6.35     17     0.012     1     0.001    16     0.002     0.015
+     - 100.00   0.00  80.69  50.50   6.35     19     0.014     1     0.001    18     0.002     0.017
+     -  95.78   0.00  95.64  50.50   6.35     26     0.019     1     0.001    24     0.003     0.023
+     -  95.78   0.00  96.41  50.50   6.35     34     0.024     1     0.001    32     0.004     0.029
+     -  95.78   0.00  96.89  50.50   6.35     41     0.027     1     0.001    40     0.005     0.034</pre>
+<p>The old generation climbed from 65% to 97% in four seconds, and young collections keep coming, at 41 by the end, but none of them helps. That's the shape of a leak in numbers.</p>
+
+<h3>The heap dump: a photo of every object</h3>
+<p>A histogram counts objects. A <dfn>heap dump</dfn> records every object and every reference, so a tool can show you the path from a GC root to the thing that's leaking. You can ask for one on demand with <code>jcmd &lt;pid&gt; GC.heap_dump file.hprof</code>, or have the JVM write one automatically at the moment it dies (<a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html"><code>-XX:+HeapDumpOnOutOfMemoryError</code></a>):</p>
+<pre class="term"><span class="p">$ </span>java -Xmx64m -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=sessions.hprof SessionLeak
+…
+java.lang.OutOfMemoryError: Java heap space
+Dumping heap to sessions.hprof ...
+Heap dump file created [66675663 bytes in 0.045 secs]
+<span class="p">$ </span>ls -lh sessions.hprof
+-rw-------@ 1 tl  wheel    64M Oct 20 10:13 sessions.hprof
+<span class="p">$ </span>rm sessions.hprof                        <span class="c"># dumps are as big as the heap, so clean up</span></pre>
+<p>Note that this time the JVM got to print <code>Java heap space</code>, the classic message, because it reported the error before the handler ran out of room. To read a dump, open it in IntelliJ. JetBrains' docs say "IntelliJ IDEA allows you to analyze <code>.hprof</code> snapshots": in the <b>Profiler</b> tool window (<b>View | Tool Windows | Profiler</b>), click <b>Open Snapshot</b> on the Recent Snapshots tab (<a href="https://www.jetbrains.com/help/idea/create-a-memory-snapshot.html">IntelliJ: memory snapshots</a>). The free <a href="https://eclipse.dev/mat/">Eclipse Memory Analyzer (MAT)</a> does the same job. I didn't run either GUI for this lesson, so treat the menu names as the docs' wording. A heap dump contains everything in memory, passwords and personal data included. Treat a production dump as sensitive.</p>
+
+<h3>Leak 2: listeners nobody removes</h3>
+<p>An object registers a callback with something long-lived, an event bus, a timer, a system service, and never unregisters. The long-lived object holds the callback, and the callback holds the object that created it.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Listeners.kt</figcaption>
+<pre><code class="language-kotlin">// A long-lived event bus keeps every subscriber reachable until it unsubscribes.
+object EventBus {                                    // lives as long as the app
+    private val listeners = mutableListOf&lt;(String) -&gt; Unit&gt;()
+    fun subscribe(l: (String) -&gt; Unit) { listeners += l }
+    fun unsubscribe(l: (String) -&gt; Unit) { listeners -= l }
+    val size get() = listeners.size
+}
+
+var fixed = false
+
+class Screen {
+    private val bitmap = ByteArray(1_000_000)               // 1 MB of pixels
+    private val listener: (String) -&gt; Unit = { e -&gt; onEvent(e) } // captures this
+    init { EventBus.subscribe(listener) }
+    fun onEvent(e: String) = println("$e ${bitmap.size}")
+    fun close() {
+        if (fixed) EventBus.unsubscribe(listener)    // the line people forget
+    }
+}
+
+fun main(args: Array&lt;String&gt;) {
+    fixed = args.isNotEmpty()
+    for (i in 1..500) {
+        val s = Screen()
+        s.close()                                    // the user left the screen
+        if (i % 20 == 0) println("opened $i, listeners ${EventBus.size}")
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Listeners.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+
+// A long-lived event bus keeps every subscriber reachable until it unsubscribes.
+public class Listeners {
+    static class EventBus {
+        private final List&lt;Consumer&lt;String&gt;&gt; listeners = new ArrayList&lt;&gt;();
+        void subscribe(Consumer&lt;String&gt; l)   { listeners.add(l); }
+        void unsubscribe(Consumer&lt;String&gt; l) { listeners.remove(l); }
+        int size() { return listeners.size(); }
+    }
+
+    static final EventBus BUS = new EventBus();      // lives as long as the app
+    static boolean fixed;
+
+    static class Screen {
+        private final byte[] bitmap = new byte[1_000_000];      // 1 MB of pixels
+        private final Consumer&lt;String&gt; listener = this::onEvent; // captures this
+        Screen() { BUS.subscribe(listener); }
+        void onEvent(String e) { System.out.println(e + " " + bitmap.length); }
+        void close() {
+            if (fixed) BUS.unsubscribe(listener);    // the line people forget
+        }
+    }
+
+    public static void main(String[] args) {
+        fixed = args.length &gt; 0;
+        for (int i = 1; i &lt;= 500; i++) {
+            Screen s = new Screen();
+            s.close();                               // the user left the screen
+            if (i % 20 == 0) System.out.println("opened " + i + ", listeners " + BUS.size());
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">$ java -Xmx64m Listeners
+opened 20, listeners 20
+opened 40, listeners 40
+opened 60, listeners 60
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+	at java.base/jdk.internal.misc.Unsafe.allocateInstance(Native Method)
+	…
+	at Listeners$Screen.&lt;init&gt;(Listeners.java:19)
+	at Listeners.main(Listeners.java:30)</pre>
+<pre class="out">$ java -Xmx64m Listeners fix
+opened 20, listeners 0
+opened 40, listeners 0
+…
+opened 480, listeners 0
+opened 500, listeners 0</pre>
+</div>
+<p>Every screen was "closed", but each one stayed reachable through the bus's listener list, holding its 1 MB bitmap: <code>BUS</code> (static, a root) → <code>listeners</code> → the lambda → its <code>Screen</code> → <code>bitmap</code>. The Kotlin version fails at the same point, with <code>Screen.&lt;init&gt;(Listeners.kt:13)</code> in the trace. One forgotten line, <code>unsubscribe</code>, is the whole difference.</p>
+<p class="note">Bridge: this is <em>the</em> classic Android leak. LeakCanary's docs: "an Android <code>Activity</code> instance is no longer needed after its <code>onDestroy()</code> method is called, and storing a reference to that instance in a static field prevents it from being garbage collected" (<a href="https://square.github.io/leakcanary/fundamentals/">LeakCanary</a>). An Activity holds its whole screen of views and bitmaps, so leaking one leaks megabytes, and rotating the phone creates a new Activity every time. <a href="https://square.github.io/leakcanary/">LeakCanary</a> is a library that detects exactly this and shows the reference path.</p>
+
+<h3>Leak 3: a key you can never find again</h3>
+<p>From L19: if a key's <code>hashCode</code> changes while it's in a <code>HashMap</code> or <code>HashSet</code>, lookups go to the wrong bucket. That makes it a leak too, because something you can't find, you can't <em>remove</em>:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LostKey.kt</figcaption>
+<pre><code class="language-kotlin">// A key mutated after insertion can never be found again, so it can never be removed.
+data class Cell(var row: Int)                     // equals/hashCode use a MUTABLE field
+
+fun main() {
+    val active = HashSet&lt;Cell&gt;()
+    for (i in 0 until 3) {
+        val c = Cell(i)
+        active.add(c)
+        c.row += 100                              // mutate the key while it's inside
+        println("removed? ${active.remove(c)}, size ${active.size}")
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LostKey.java</figcaption>
+<pre><code class="language-java">import java.util.HashSet;
+import java.util.Set;
+
+// A key mutated after insertion can never be found again, so it can never be removed.
+public class LostKey {
+    static class Cell {                           // equals/hashCode use a MUTABLE field
+        int row;
+        Cell(int row) { this.row = row; }
+        @Override public boolean equals(Object o) { return o instanceof Cell c &amp;&amp; c.row == row; }
+        @Override public int hashCode() { return Integer.hashCode(row); }
+    }
+
+    public static void main(String[] args) {
+        Set&lt;Cell&gt; active = new HashSet&lt;&gt;();
+        for (int i = 0; i &lt; 3; i++) {
+            Cell c = new Cell(i);
+            active.add(c);
+            c.row += 100;                         // mutate the key while it's inside
+            System.out.println("removed? " + active.remove(c) + ", size " + active.size());
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">removed? false, size 1
+removed? false, size 2
+removed? false, size 3</pre>
+<p>Every <code>remove</code> fails and the set only grows. In Kotlin, one keyword causes this: <code>data class Cell(var row: Int)</code> generates <code>equals</code>/<code>hashCode</code> from a <em>mutable</em> property. Use <code>val</code> for anything that goes into a hash key.</p>
+
+<h3>Leak 4: callbacks that capture their creator</h3>
+<p>L17 said to make nested node classes <code>static</code> in Java, because a non-static inner class holds a hidden reference to its outer instance. Does a callback keep its creator alive? Test it instead of guessing. Each check keeps <em>only</em> the callback, drops the screen, requests a GC and looks through a <code>WeakReference</code> (more on those below):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Capture.kt</figcaption>
+<pre><code class="language-kotlin">import java.lang.ref.WeakReference
+
+// Which callbacks keep their Screen (and its 1 MB bitmap) alive?
+class Screen {
+    val bitmap = ByteArray(1_000_000)
+
+    fun objectIgnoringScreen() = object : Runnable { override fun run() = println("tick") }
+    fun objectUsingScreen() = object : Runnable { override fun run() = println(bitmap.size) }
+    fun lambdaIgnoringScreen() = Runnable { println("tick") }
+    fun lambdaUsingScreen() = Runnable { println(bitmap.size) }
+}
+
+// Keep only the callback, drop the Screen, request a GC: is the Screen gone?
+fun check(name: String, make: (Screen) -&gt; Runnable) {
+    var screen: Screen? = Screen()
+    val ref = WeakReference(screen)
+    val callback = make(screen!!)
+    screen = null
+    System.gc()
+    println(name + if (ref.get() == null) "collected" else "STILL ALIVE")
+    callback.hashCode()                        // keeps callback reachable until here
+}
+
+fun main() {
+    check("object, ignores screen: ", Screen::objectIgnoringScreen)
+    check("object, uses bitmap:    ", Screen::objectUsingScreen)
+    check("lambda, ignores screen: ", Screen::lambdaIgnoringScreen)
+    check("lambda, uses bitmap:    ", Screen::lambdaUsingScreen)
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Capture.java</figcaption>
+<pre><code class="language-java">import java.lang.ref.WeakReference;
+import java.util.function.Function;
+
+// Which callbacks keep their Screen (and its 1 MB bitmap) alive?
+public class Capture {
+    static class Screen {
+        final byte[] bitmap = new byte[1_000_000];
+
+        Runnable anonymousIgnoringScreen() {
+            return new Runnable() { public void run() { System.out.println("tick"); } };
+        }
+        Runnable anonymousUsingScreen() {
+            return new Runnable() { public void run() { System.out.println(bitmap.length); } };
+        }
+        Runnable lambdaIgnoringScreen() { return () -&gt; System.out.println("tick"); }
+        Runnable lambdaUsingScreen()    { return () -&gt; System.out.println(bitmap.length); }
+    }
+
+    // Keep only the callback, drop the Screen, request a GC: is the Screen gone?
+    static void check(String name, Function&lt;Screen, Runnable&gt; make) {
+        Screen screen = new Screen();
+        WeakReference&lt;Screen&gt; ref = new WeakReference&lt;&gt;(screen);
+        Runnable callback = make.apply(screen);
+        screen = null;
+        System.gc();
+        System.out.println(name + (ref.get() == null ? "collected" : "STILL ALIVE"));
+        callback.hashCode();                   // keeps callback reachable until here
+    }
+
+    public static void main(String[] args) {
+        check("anonymous, ignores screen: ", Screen::anonymousIgnoringScreen);
+        check("anonymous, uses bitmap:    ", Screen::anonymousUsingScreen);
+        check("lambda, ignores screen:    ", Screen::lambdaIgnoringScreen);
+        check("lambda, uses bitmap:       ", Screen::lambdaUsingScreen);
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">object, ignores screen: collected
+object, uses bitmap:    STILL ALIVE
+lambda, ignores screen: collected
+lambda, uses bitmap:    STILL ALIVE</pre>
+<pre class="out">anonymous, ignores screen: collected
+anonymous, uses bitmap:    STILL ALIVE
+lambda, ignores screen:    collected
+lambda, uses bitmap:       STILL ALIVE</pre>
+</div>
+<p><code>javap</code> shows why. Only the class that <em>uses</em> the screen gets a field pointing to it:</p>
+<pre class="term"><span class="p">$ </span>javap -p 'Capture$Screen$1.class' 'Capture$Screen$2.class'
+class Capture$Screen$1 implements java.lang.Runnable {
+  Capture$Screen$1(Capture$Screen);
+  public void run();
+}
+class Capture$Screen$2 implements java.lang.Runnable {
+  final Capture$Screen this$0;
+  Capture$Screen$2(Capture$Screen);
+  public void run();
+}
+<span class="p">$ </span>javap -p 'Screen$objectIgnoringScreen$1.class' 'Screen$objectUsingScreen$1.class'
+public final class Screen$objectIgnoringScreen$1 implements java.lang.Runnable {
+  Screen$objectIgnoringScreen$1();
+  public void run();
+}
+public final class Screen$objectUsingScreen$1 implements java.lang.Runnable {
+  final Screen this$0;
+  Screen$objectUsingScreen$1(Screen);
+  public void run();
+}</pre>
+<p>Older Java tutorials say every anonymous or inner class captures its outer instance. That <em>was</em> true until JDK 17. The JDK 18 release notes: "Prior to JDK 18, when javac compiles an inner class it always generates a private synthetic field with a name starting with <code>this$</code> … Starting in JDK 18, unused <code>this$</code> fields are omitted", which "avoids a source of potential memory leaks" (<a href="https://www.oracle.com/java/technologies/javase/18-relnote-issues.html#JDK-8271623">JDK 18 release notes: Enclosing Instance Fields Omitted</a>). Serializable classes are not affected. The rule that matters today is the same in both languages: <b>a callback that touches anything of its creator's, even one field, keeps the whole creator alive.</b> If it needs only one value, copy it into a local first. I checked that <code>val size = bitmap.size; Runnable { println(size) }</code> lets the screen be collected, in both languages.</p>
+
+<h3>Leak 5, briefly: <code>ThreadLocal</code> in a thread pool</h3>
+<p>"Each thread holds an implicit reference to its copy of a thread-local variable as long as the thread is alive" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ThreadLocal.html"><code>ThreadLocal</code></a>). In a thread pool, threads live as long as the application, so anything you put in a <code>ThreadLocal</code> and forget to <code>remove()</code> lives that long too. It's a common leak in servers. Thread pools come in Phase 8.</p>
+
+<h3>The fixes</h3>
+<ol>
+  <li><b>Bound what grows.</b> Caches get a maximum size and an eviction policy, like L19's LRU. The final exercise does exactly this.</li>
+  <li><b>Pair every register with an unregister.</b> Tie the unregister to the end of the object's life: <code>close()</code>, <code>onDestroy()</code>, a <code>use { }</code> block.</li>
+  <li><b>Hold references weakly when the holder shouldn't keep things alive.</b> A <code>WeakReference</code> is a reference the GC ignores when deciding reachability. Weak references "do not prevent their referents from being made finalizable, finalized, and then reclaimed" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ref/WeakReference.html"><code>WeakReference</code></a>). A <code>WeakHashMap</code> holds its <em>keys</em> weakly:</li>
+</ol>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Weak.kt</figcaption>
+<pre><code class="language-kotlin">import java.lang.ref.WeakReference
+import java.util.WeakHashMap
+
+// Weak references don't keep their target alive; the GC may clear them.
+class Screen(val name: String)
+
+fun main() {
+    val home = Screen("home")
+    var settings: Screen? = Screen("settings")
+
+    val lastScroll = WeakHashMap&lt;Screen, String&gt;()        // keys held weakly
+    lastScroll[home] = "row 12"
+    lastScroll[settings!!] = "row 3"
+    val ref = WeakReference(settings)
+
+    println("before: entries=${lastScroll.size} ref=${ref.get()?.name}")
+    settings = null                  // the only strong reference is gone
+    System.gc()                      // a request, not a guarantee
+    println("after:  entries=${lastScroll.size} ref=${ref.get()?.name}")
+    Thread.sleep(100)                // give the JVM time to queue the cleared entry
+    println("later:  entries=${lastScroll.size}")
+    println("home still there: ${lastScroll[home]}")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Weak.java</figcaption>
+<pre><code class="language-java">import java.lang.ref.WeakReference;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+// Weak references don't keep their target alive; the GC may clear them.
+public class Weak {
+    static class Screen {
+        final String name;
+        Screen(String name) { this.name = name; }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Screen home = new Screen("home");
+        Screen settings = new Screen("settings");
+
+        Map&lt;Screen, String&gt; lastScroll = new WeakHashMap&lt;&gt;(); // keys held weakly
+        lastScroll.put(home, "row 12");
+        lastScroll.put(settings, "row 3");
+        WeakReference&lt;Screen&gt; ref = new WeakReference&lt;&gt;(settings);
+
+        System.out.println("before: entries=" + lastScroll.size() + " ref=" + ref.get().name);
+        settings = null;                 // the only strong reference is gone
+        System.gc();                     // a request, not a guarantee
+        System.out.println("after:  entries=" + lastScroll.size() + " ref=" + ref.get());
+        Thread.sleep(100);               // give the JVM time to queue the cleared entry
+        System.out.println("later:  entries=" + lastScroll.size());
+        System.out.println("home still there: " + lastScroll.get(home));
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">before: entries=2 ref=settings
+after:  entries=2 ref=null
+later:  entries=1
+home still there: row 12</pre>
+<p>Both languages print this, every time I ran it. Look closely at the <code>after</code> line. The GC had already <em>cleared</em> the weak reference (<code>ref=null</code>), but the map still reported 2 entries. A <code>WeakHashMap</code> removes stale entries only after the JVM has queued the cleared references for it, and that happens on another thread shortly afterwards. The docs warn that a <code>WeakHashMap</code> "may behave as though an unknown thread is silently removing entries" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/WeakHashMap.html"><code>WeakHashMap</code></a>). Two more cautions from the same page: it's "intended primarily for use with key objects whose <code>equals</code> methods test for object identity", and the values are held strongly, so "care should be taken to ensure that value objects do not strongly refer to their own keys". Weak references are a precise tool. They aren't a general fix for forgetting to clean up.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you, and what it doesn't.</strong>
+  <ul>
+    <li>Kotlin makes Leak 1 easy to write without noticing: <code>object Sessions { val all = HashMap… }</code> looks harmless, but <code>javap</code> shows <code>private static final java.util.HashMap&lt;…&gt; all</code> and <code>public static final Sessions INSTANCE</code>. That's a GC root forever.</li>
+    <li>It nudges you away from Leak 3: prefer <code>val</code> in data classes, because <code>var</code> properties feed straight into the generated <code>hashCode</code>.</li>
+    <li>On Leak 4 the two languages now agree: Kotlin lambdas and <code>object</code> expressions, like Java 18+ lambdas and anonymous classes, capture their creator only if they use it.</li>
+    <li><code>WeakReference</code>, <code>WeakHashMap</code> and <code>ThreadLocal</code> are the same <code>java.*</code> classes in both languages. Kotlin adds no wrappers on the JVM.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a bus that can't leak screens</div>
+  <p>Fix <code>Listeners</code> a second way, <b>without</b> calling <code>unsubscribe</code>. From a blank file, write an <code>EventBus</code> whose list holds <code>WeakReference</code>s to listeners. <code>publish(event)</code> first drops cleared references, then calls the rest and returns how many it called. Open 500 screens under <code>-Xmx64m</code> without unsubscribing, keep one "visible" screen in a local variable, then call <code>System.gc()</code> and publish once more.</p>
+  <p>Then answer: why must each <code>Screen</code> keep its listener in a field? What would happen to the visible screen's subscription if it didn't?</p>
+  <details class="solution"><summary>Reference solutions and real output</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · WeakBus.kt</figcaption>
+<pre><code class="language-kotlin">import java.lang.ref.WeakReference
+
+// The bus holds listeners weakly, so a forgotten unsubscribe no longer leaks.
+object EventBus {
+    private val listeners = mutableListOf&lt;WeakReference&lt;(String) -&gt; Unit&gt;&gt;()
+    fun subscribe(l: (String) -&gt; Unit) { listeners += WeakReference(l) }
+    fun publish(event: String): Int {                  // returns how many listeners got it
+        listeners.removeAll { it.get() == null }       // drop cleared entries
+        for (ref in listeners) ref.get()?.invoke(event)
+        return listeners.size
+    }
+}
+
+class Screen {
+    val bitmap = ByteArray(1_000_000)
+    private val listener: (String) -&gt; Unit = { e -&gt; onEvent(e) } // the Screen keeps its listener alive
+    init { EventBus.subscribe(listener) }
+    fun onEvent(e: String) { if (bitmap.isEmpty()) println(e) }
+}
+
+fun main() {
+    val visible = Screen()                             // one screen the user is looking at
+    for (i in 1..500) {
+        Screen()                                       // opened and left: never unsubscribed
+        if (i % 100 == 0) println("opened $i, delivered to ${EventBus.publish("tick")}")
+    }
+    System.gc()
+    println("after GC, delivered to ${EventBus.publish("tick")}")
+    println("visible screen still open: ${visible.bitmap.isNotEmpty()}")
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · WeakBus.java</figcaption>
+<pre><code class="language-java">import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+
+// The bus holds listeners weakly, so a forgotten unsubscribe no longer leaks.
+public class WeakBus {
+    static class EventBus {
+        private final List&lt;WeakReference&lt;Consumer&lt;String&gt;&gt;&gt; listeners = new ArrayList&lt;&gt;();
+        void subscribe(Consumer&lt;String&gt; l) { listeners.add(new WeakReference&lt;&gt;(l)); }
+        int publish(String event) {                    // returns how many listeners got it
+            listeners.removeIf(ref -&gt; ref.get() == null);  // drop cleared entries
+            for (WeakReference&lt;Consumer&lt;String&gt;&gt; ref : listeners) {
+                Consumer&lt;String&gt; l = ref.get();
+                if (l != null) l.accept(event);
+            }
+            return listeners.size();
+        }
+    }
+
+    static final EventBus BUS = new EventBus();
+
+    static class Screen {
+        private final byte[] bitmap = new byte[1_000_000];
+        private final Consumer&lt;String&gt; listener = this::onEvent; // the Screen keeps its listener alive
+        Screen() { BUS.subscribe(listener); }
+        void onEvent(String e) { if (bitmap.length == 0) System.out.println(e); }
+    }
+
+    public static void main(String[] args) {
+        Screen visible = new Screen();                 // one screen the user is looking at
+        for (int i = 1; i &lt;= 500; i++) {
+            new Screen();                              // opened and left: never unsubscribed
+            if (i % 100 == 0) System.out.println("opened " + i + ", delivered to " + BUS.publish("tick"));
+        }
+        System.gc();
+        System.out.println("after GC, delivered to " + BUS.publish("tick"));
+        System.out.println("visible screen still open: " + (visible.bitmap.length &gt; 0));
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">opened 100, delivered to 6
+opened 200, delivered to 13
+opened 300, delivered to 19
+opened 400, delivered to 16
+opened 500, delivered to 7
+after GC, delivered to 1
+visible screen still open: true</pre>
+    <p>No <code>OutOfMemoryError</code>. The "delivered to" numbers in the middle <b>change from run to run</b>, because they depend on when the GC happened to run. That's the nature of weak references. After an explicit GC, only the visible screen remains.</p>
+    <p>The field matters. The bus holds the listener only weakly, so <em>something</em> must hold it strongly, or it could be cleared at the next GC while the screen is still on display. Here the screen holds it, so the listener lives exactly as long as the screen. That's the lifetime you want.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Leaks" data-answer="2">
+  <p class="q">A GC log ends with several <code>Pause Full … 61M-&gt;61M(64M)</code> lines in a row. The most likely cause?</p>
+  <div class="opts"><button>The collector has a bug</button><button>The heap is fragmented badly</button><button>Everything is still reachable somehow</button><button>Too many threads are running</button></div>
+  <p class="why">A full collection that frees nothing means every object is reachable. Either the heap is too small for genuinely live data, or something is holding references it no longer needs.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Leaks" data-answer="0">
+  <p class="q">The top line of a <code>GC.class_histogram</code> is <code>[B</code>. What's your next step?</p>
+  <div class="opts"><button>Find your classes and compare snapshots</button><button>Stop creating Strings in the program</button><button>Raise the heap limit and rerun</button><button>Call System.gc before every single request</button></div>
+  <p class="why"><code>byte[]</code> is the payload in almost every program. Look for the count of your own classes that only grows, then find what holds them, which is where a heap dump helps.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Leaks" data-answer="3">
+  <p class="q">JDK 26: an anonymous <code>Runnable</code> inside a method of <code>Screen</code> prints only <code>"tick"</code>. Does it keep the screen alive?</p>
+  <div class="opts"><button>Yes, inner classes always do</button><button>Yes, until it finishes running</button><button>Only when it's declared static</button><button>No, nothing captures the screen</button></div>
+  <p class="why">Since JDK 18, javac omits the unused <code>this$0</code> field, and <code>Capture.java</code> showed the screen collected. Touch one field and it's captured.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Leaks" data-answer="1">
+  <p class="q">Right after <code>System.gc()</code>, a <code>WeakReference</code> returns <code>null</code> but its <code>WeakHashMap</code> still reports the entry. Why?</p>
+  <div class="opts"><button>The map holds a strong copy</button><button>Stale entries are removed slightly later</button><button>The garbage collector made a mistake</button><button>WeakHashMap entries are never removed automatically</button></div>
+  <p class="why">The cleared references are queued on another thread, and the map drops stale entries when it next looks at that queue. 100 ms later, <code>entries=1</code>.</p>
+</div>
+<div class="quiz" data-id="p2-5" data-group="Part 2 · Leaks" data-answer="0">
+  <p class="q">Kotlin: <code>object Registry { val items = mutableListOf&lt;Item&gt;() }</code>. When can the list's items be collected?</p>
+  <div class="opts"><button>Only when they're removed</button><button>When main finally returns</button><button>After every young collection</button><button>When Registry leaves scope</button></div>
+  <p class="why">An <code>object</code> compiles to a static field, which is a GC root for the life of the class, effectively the whole program. Its contents live until you remove them.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Profiling: where do the time and memory go?</h2><span class="t">~30 min</span></div>
+
+<p>When a program is slow, everyone has a theory. Theories about performance are usually wrong. In L16 and L21 the culprits were things nobody suspects by reading the code: a <code>contains</code> inside a loop, a list that grew by +10. A <dfn>profiler</dfn> replaces the theory with a measurement. It samples what the program is actually doing and tells you where the time goes. The JDK has one built in.</p>
+
+<h3>JDK Flight Recorder</h3>
+<p>JDK Flight Recorder (JFR) is "a low-overhead data collection framework for troubleshooting Java applications and the HotSpot JVM" (<a href="https://openjdk.org/jeps/328">JEP 328</a>). You switch it on with one JVM flag, and read the recording with the <code>jfr</code> tool (<a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/jfr.html">the <code>jfr</code> command</a>).</p>
+<p class="note"><b>macOS gotcha I hit:</b> <code>jcmd</code>, <code>jps</code> and <code>jstat</code> worked straight from the terminal, but <code>jfr</code> gave <code>command not found</code>. macOS puts launchers for many JDK tools in <code>/usr/bin</code>, and <code>jfr</code> isn't one of them. Put the JDK's own <code>bin</code> folder first on your <code>PATH</code>:</p>
+<pre class="term"><span class="p">$ </span>export PATH="$(/usr/libexec/java_home)/bin:$PATH"
+<span class="p">$ </span>which jfr
+/Users/tl/Library/Java/JavaVirtualMachines/openjdk-26.0.1/Contents/Home/bin/jfr</pre>
+
+<p>Here's a program with a hidden hotspot. Try to spot it before you profile:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Emails.kt</figcaption>
+<pre><code class="language-kotlin">// Counts valid e-mail addresses. Something in here is slow: let JFR find it.
+const val EMAIL = "[a-z0-9.]+@[a-z0-9]+\\.[a-z]{2,}"
+
+fun isValid(s: String): Boolean = Regex(EMAIL).matches(s)
+
+fun main() {
+    val inbox = List(2_000_000) { i -&gt;
+        if (i % 7 == 0) "not an email $i" else "user$i@example.com"
+    }
+    val start = System.nanoTime()
+    var valid = 0
+    repeat(3) {
+        for (s in inbox) if (isValid(s)) valid++
+    }
+    println("$valid valid in ${(System.nanoTime() - start) / 1_000_000} ms")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Emails.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+// Counts valid e-mail addresses. Something in here is slow: let JFR find it.
+public class Emails {
+    static final String EMAIL = "[a-z0-9.]+@[a-z0-9]+\\.[a-z]{2,}";
+
+    static boolean isValid(String s) {
+        return s.matches(EMAIL);
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; inbox = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 2_000_000; i++) {
+            inbox.add(i % 7 == 0 ? "not an email " + i : "user" + i + "@example.com");
+        }
+        long start = System.nanoTime();
+        int valid = 0;
+        for (int round = 0; round &lt; 3; round++) {
+            for (String s : inbox) if (isValid(s)) valid++;
+        }
+        System.out.println(valid + " valid in " + (System.nanoTime() - start) / 1_000_000 + " ms");
+    }
+}</code></pre></figure>
+</div>
+<pre class="term"><span class="p">$ </span>java -XX:StartFlightRecording=filename=slow.jfr,settings=profile Emails
+[0.125s][info][jfr,startup] Started recording 1. No limit specified, using maxsize=250MB as default.
+[0.125s][info][jfr,startup]
+[0.125s][info][jfr,startup] Use jcmd 24699 JFR.dump name=1 to copy recording data to file.
+5142855 valid in 1369 ms
+<span class="p">$ </span>jfr summary slow.jfr
+
+ Version: 2.1
+ Chunks: 1
+ Start: 2026-10-20 10:05:03 (UTC)
+ Duration: 1 s
+
+ Event Type                              Count  Size (bytes)
+=============================================================
+ jdk.GCPhaseParallel                      6123        148928
+ jdk.PromoteObjectInNewPLAB               1161         19082
+ …
+ jdk.ExecutionSample                       100          1095</pre>
+<p><code>settings=profile</code> picks JFR's more detailed preset. A recording is full of event types: GC phases, class loading, flags, and more. The one that answers "where does the time go?" is <code>jdk.ExecutionSample</code>, a snapshot of a thread's stack taken at regular intervals. The <code>jfr view</code> subcommand will "aggregate and display event data", and <code>hot-methods</code> is the view you want:</p>
+<pre class="term"><span class="p">$ </span>jfr view hot-methods slow.jfr
+                                    Java Methods that Execute the Most
+
+Method                                                                                    Samples Percent
+----------------------------------------------------------------------------------------- ------- -------
+java.util.regex.Pattern.lambda$union$0(Pattern$CharPredicate, Pattern$CharPredicate, int)      27  27.00%
+java.util.regex.Pattern.clazz(boolean)                                                         19  19.00%
+java.util.regex.Pattern.union(Pattern$CharPredicate, Pattern$CharPredicate, boolean)           10  10.00%
+java.util.regex.Matcher.reset()                                                                10  10.00%
+java.util.regex.Pattern.closure(Pattern$Node)                                                   5   5.00%
+java.util.regex.Pattern.compile()                                                               5   5.00%
+…</pre>
+<p>Almost every sample is inside <code>java.util.regex.Pattern</code>, and methods like <code>clazz</code>, <code>union</code>, <code>closure</code> and <code>compile</code> belong to the regex <em>parser</em>. The program is spending its time <em>compiling</em> the regular expression, not matching with it. To see who calls the parser, print a few raw samples with a deeper stack:</p>
+<pre class="term"><span class="p">$ </span>jfr print --stack-depth 10 --events jdk.ExecutionSample slow.jfr | head -16
+jdk.ExecutionSample {
+  startTime = 05:05:03.218 (2026-10-20)
+  sampledThread = "main" (javaThreadId = 3)
+  state = "STATE_RUNNABLE"
+  stackTrace = [
+    java.util.regex.Pattern.clazz(boolean) line: 2898
+    java.util.regex.Pattern.sequence(Pattern$Node) line: 2317
+    java.util.regex.Pattern.expr(Pattern$Node) line: 2247
+    java.util.regex.Pattern.compile() line: 1947
+    java.util.regex.Pattern.&lt;init&gt;(String, int) line: 1578
+    java.util.regex.Pattern.compile(String) line: 1103
+    java.util.regex.Pattern.matches(String, CharSequence) line: 1222
+    java.lang.String.matches(String) line: 3321
+    Emails.isValid(String) line: 9
+    Emails.main(String[]) line: 20
+    ...</pre>
+<p>Read it bottom-up: <code>main</code> → <code>isValid</code> (line 9) → <code>String.matches</code> → <code>Pattern.compile</code>. The docs confirm that <code>str.matches(regex)</code> "yields exactly the same result as the expression <code>Pattern.matches(regex, str)</code>" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/String.html#matches(java.lang.String)"><code>String.matches</code></a>), and <code>Pattern.matches</code> warns: "If a pattern is to be used multiple times, compiling it once and reusing it will be more efficient than invoking this method each time" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/regex/Pattern.html#matches(java.lang.String,java.lang.CharSequence)"><code>Pattern.matches</code></a>). So the code compiled the same pattern 6 million times. Kotlin's version hides it just as well. Its recording shows <code>kotlin.text.Regex.&lt;init&gt;(String) line: 90</code> → <code>Pattern.compile</code>, because <code>Regex</code> "represents a compiled regular expression" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.text/-regex/">Kotlin <code>Regex</code></a>), and every <code>Regex(EMAIL)</code> compiles a new one.</p>
+<p><b>The fix: compile once.</b> <code>Pattern</code> "instances of this class are immutable and are safe for use by multiple concurrent threads", so one shared instance is fine:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · EmailsFixed.kt</figcaption>
+<pre><code class="language-kotlin">// Same program, with the pattern compiled once and reused.
+private val EMAIL = Regex("[a-z0-9.]+@[a-z0-9]+\\.[a-z]{2,}")   // compiled once
+
+fun isValid(s: String): Boolean = EMAIL.matches(s)
+
+fun main() {
+    val inbox = List(2_000_000) { i -&gt;
+        if (i % 7 == 0) "not an email $i" else "user$i@example.com"
+    }
+    val start = System.nanoTime()
+    var valid = 0
+    repeat(3) {
+        for (s in inbox) if (isValid(s)) valid++
+    }
+    println("$valid valid in ${(System.nanoTime() - start) / 1_000_000} ms")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · EmailsFixed.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Pattern;
+
+// Same program, with the pattern compiled once and reused.
+public class EmailsFixed {
+    static final Pattern EMAIL = Pattern.compile("[a-z0-9.]+@[a-z0-9]+\\.[a-z]{2,}"); // once
+
+    static boolean isValid(String s) {
+        return EMAIL.matcher(s).matches();
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; inbox = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 2_000_000; i++) {
+            inbox.add(i % 7 == 0 ? "not an email " + i : "user" + i + "@example.com");
+        }
+        long start = System.nanoTime();
+        int valid = 0;
+        for (int round = 0; round &lt; 3; round++) {
+            for (String s : inbox) if (isValid(s)) valid++;
+        }
+        System.out.println(valid + " valid in " + (System.nanoTime() - start) / 1_000_000 + " ms");
+    }
+}</code></pre></figure>
+</div>
+<table class="cmds">
+  <tr><th>Run (plain, no JFR)</th><th>Java slow</th><th>Java fixed</th><th>Kotlin slow</th><th>Kotlin fixed</th></tr>
+  <tr><td>1</td><td>1101 ms</td><td>381 ms</td><td>1130 ms</td><td>363 ms</td></tr>
+  <tr><td>2</td><td>1111 ms</td><td>361 ms</td><td>1123 ms</td><td>361 ms</td></tr>
+  <tr><td>3</td><td>1110 ms</td><td>356 ms</td><td>1111 ms</td><td>367 ms</td></tr>
+</table>
+<p>That's about 3× faster from moving one line. Recording again proves the cause is gone, not just hidden:</p>
+<pre class="term"><span class="p">$ </span>jfr view hot-methods fast.jfr
+                                    Java Methods that Execute the Most
+
+Method                                                                                    Samples Percent
+----------------------------------------------------------------------------------------- ------- -------
+java.util.regex.Pattern.lambda$union$0(Pattern$CharPredicate, Pattern$CharPredicate, int)      17  68.00%
+java.util.regex.Pattern$BmpCharProperty.match(Matcher, int, CharSequence)                       3  12.00%
+java.util.regex.Matcher.reset()                                                                 2   8.00%
+java.util.regex.Pattern.matcher(CharSequence)                                                   2   8.00%
+java.util.Arrays.copyOf(Object[], int)                                                          1   4.00%</pre>
+<p>There were 25 samples instead of 100, and no <code>compile</code>, <code>clazz</code> or <code>closure</code> left. What remains is the actual <em>matching</em>, which is the work the program exists to do.</p>
+
+<h3>Allocation profiling</h3>
+<p>Time isn't the only thing to measure. Allocating lots of short-lived objects costs CPU twice: once to create them, and again in young collections. JFR samples allocations too, and <code>jfr view allocation-by-class</code> summarises them. Before and after the fix:</p>
+<div class="pair">
+<pre class="out">slow.jfr: Allocation by Class
+Object Type                                Allocation Pressure
+------------------------------------------ -------------------
+boolean[]                                               50.68%
+java.util.regex.Pattern$BmpCharProperty                 32.39%
+java.util.regex.Pattern$$Lambda.0x80000002e              9.61%
+int[]                                                    6.97%</pre>
+<pre class="out">fast.jfr: Allocation by Class
+Object Type                                Allocation Pressure
+------------------------------------------ -------------------
+int[]                                                   77.87%
+java.util.regex.Matcher                                 16.58%
+java.util.regex.IntHashSet[]                             5.50%
+java.util.concurrent.ConcurrentHashMap$Node[]            0.03%</pre>
+</div>
+<p>Before the fix, most allocation was parser internals, a fresh pattern tree every call. After, it's mostly the <code>Matcher</code> and its working arrays: one small object per check, which is expected. (I narrowed the columns to fit; the numbers are as printed.)</p>
+
+<h3>The GUI profilers</h3>
+<p>The same data is easier to explore visually, but these GUI tools can't run in my headless setup, so everything here is from the official docs:</p>
+<ul>
+  <li><b>IntelliJ Profiler.</b> "Click the Run icon in the gutter. From the menu, select <b>Profile with IntelliJ Profiler</b>." When you're done, click <b>Stop Profiling and Show Results</b>. The snapshot opens in the <b>Profiler</b> tool window (<b>View | Tool Windows | Profiler</b>) with a <b>flame graph</b>, "a graphic representation of the code paths … representing stack frames as visual elements" (<a href="https://www.jetbrains.com/help/idea/create-a-profiling-report.html">IntelliJ: create snapshots</a>, <a href="https://www.jetbrains.com/help/idea/read-the-profiling-report.html">read the snapshot</a>). Under the hood it uses "Java Flight Recorder" and "Async Profiler", and on "Windows and macOS, the profiler works out of the box" (<a href="https://www.jetbrains.com/help/idea/custom-profiler-configurations.html">IntelliJ: profiler configurations</a>). It samples, like JFR: "instead of capturing all method entries and exits … IntelliJ Profiler will only get the stack traces at a regular interval" (<a href="https://www.jetbrains.com/help/idea/cpu-and-allocation-profiling-basic-concepts.html">IntelliJ: CPU and allocation profiling</a>).</li>
+  <li><b>JDK Mission Control</b> (JMC), a free OpenJDK desktop app for opening <code>.jfr</code> files (<a href="https://openjdk.org/projects/jmc/">OpenJDK: JMC</a>).</li>
+</ul>
+<p>Either way, the <code>.jfr</code> file is the same one you just made on the command line.</p>
+
+<h3>Microbenchmarks: JMH</h3>
+<p>A profiler finds the slow <em>part</em> of a whole program. Sometimes you want to compare two small pieces of code in isolation, like <code>+</code> versus <code>StringBuilder</code>, or <code>ArrayList</code> versus <code>LinkedList</code>. In L16 you timed things with <code>nanoTime</code> and warm-up loops, and you saw how noisy that was. The professional tool is <a href="https://github.com/openjdk/jmh">JMH</a>, "a Java harness for building, running, and analysing nano/micro/milli/macro benchmarks", written by the JDK's own performance engineers. It handles warm-up, forking a fresh JVM, statistics, and the problem that silently ruins hand-written benchmarks: the JIT <b>deleting the code you're timing</b>.</p>
+<p>JMH's README recommends a Maven archetype. Most Gradle users use the community plugin <code>me.champeau.jmh</code>, and I checked that its current version, 0.7.3, works with Gradle 9.7.1 (<a href="https://plugins.gradle.org/plugin/me.champeau.jmh">Gradle plugin portal</a>, <a href="https://github.com/melix/jmh-gradle-plugin">plugin README</a>). Create a project as in L1 (<code>gradle init --type java-application</code>), delete <code>src/main</code> and <code>src/test</code>, and put benchmarks in <code>app/src/jmh/java/</code>:</p>
+<figure class="java"><figcaption>JAVA PROJECT · app/build.gradle.kts</figcaption>
+<pre><code class="language-kotlin">plugins {
+    java
+    id("me.champeau.jmh") version "0.7.3"
+}
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+jmh {
+    warmupIterations = 3   // let the JIT compile the code first...
+    warmup = "1s"          // ...for three 1-second rounds
+    iterations = 5         // then measure five rounds
+    timeOnIteration = "1s" // of 1 second each
+    fork = 1               // in one fresh JVM
+}</code></pre></figure>
+<p>Leave out <code>warmup</code> and <code>timeOnIteration</code> and JMH uses 10-second iterations. My first run with the defaults took 5 minutes and 20 seconds for four benchmarks.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · app/src/jmh/kotlin/bench/ConcatBench.kt</figcaption>
+<pre><code class="language-kotlin">package bench
+
+import org.openjdk.jmh.annotations.*
+import java.util.concurrent.TimeUnit
+
+@State(Scope.Thread)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
+open class ConcatBench {
+    @Param("100", "1000")
+    var n = 0
+
+    @Benchmark
+    fun plusInLoop(): String {
+        var s = ""
+        for (i in 0 until n) s += i
+        return s
+    }
+
+    @Benchmark
+    fun stringBuilder(): String {
+        val sb = StringBuilder()
+        for (i in 0 until n) sb.append(i)
+        return sb.toString()
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · app/src/jmh/java/bench/ConcatBench.java</figcaption>
+<pre><code class="language-java">package bench;
+
+import org.openjdk.jmh.annotations.*;
+import java.util.concurrent.TimeUnit;
+
+@State(Scope.Thread)                       // one instance per benchmark thread
+@BenchmarkMode(Mode.AverageTime)           // report time per call...
+@OutputTimeUnit(TimeUnit.MICROSECONDS)     // ...in microseconds
+public class ConcatBench {
+    @Param({"100", "1000"})                // run every benchmark at both sizes
+    int n;
+
+    @Benchmark
+    public String plusInLoop() {
+        String s = "";
+        for (int i = 0; i &lt; n; i++) s += i;  // builds a new String every time
+        return s;                            // returning it keeps the work alive
+    }
+
+    @Benchmark
+    public String stringBuilder() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i &lt; n; i++) sb.append(i);
+        return sb.toString();
+    }
+}</code></pre></figure>
+</div>
+<ul>
+  <li><b><code>@Benchmark</code></b> marks a method to measure. <b><code>@State</code></b> marks a class whose fields hold the benchmark's data. <b><code>@Param</code></b> runs everything once per value. <b><code>@BenchmarkMode(Mode.AverageTime)</code></b> reports time per call (<a href="https://github.com/openjdk/jmh/blob/master/jmh-samples/src/main/java/org/openjdk/jmh/samples/JMHSample_01_HelloWorld.java">JMH samples</a>).</li>
+  <li><b>Return the result.</b> More on why below.</li>
+</ul>
+<pre class="term"><span class="p">$ </span>./gradlew jmh
+…
+Benchmark                         (n)  Mode  Cnt    Score    Error  Units
+ConcatBench.plusInLoop            100  avgt    5    0.689 ±  0.006  us/op
+ConcatBench.plusInLoop           1000  avgt    5   26.516 ±  0.721  us/op
+ConcatBench.stringBuilder         100  avgt    5    0.158 ±  0.006  us/op
+ConcatBench.stringBuilder        1000  avgt    5    2.277 ±  0.044  us/op</pre>
+<p>Read the scaling, not just the speed. Ten times more items made <code>+</code> about <b>38×</b> slower, because each <code>s += i</code> copies the whole string so far, which is O(n²) overall (L16). <code>StringBuilder</code> got about 14× slower, close to linear. The ± column is JMH's 99.9% confidence interval, a proper error bar, which <code>nanoTime</code> never gave you. The Kotlin project measured 0.737 / 26.976 / 0.148 / 2.302 µs: the same code, so the same costs.</p>
+
+<p><b>The Kotlin catch.</b> My first Kotlin run failed before measuring anything:</p>
+<pre class="err">Benchmark classes should not be final.
+   [bench.ConcatBench]</pre>
+<p>JMH generates subclasses of your benchmark class, and Kotlin classes are final by default (L8). Either write <code>open class ConcatBench</code>, as above, or let the <a href="https://kotlinlang.org/docs/all-open-plugin.html">all-open compiler plugin</a> open every <code>@State</code> class for you. I tested both. The plugin version adds this to <code>build.gradle.kts</code>:</p>
+<pre><code class="language-kotlin">plugins {
+    alias(libs.plugins.kotlin.jvm)
+    id("me.champeau.jmh") version "0.7.3"
+    id("org.jetbrains.kotlin.plugin.allopen") version "2.4.0"
+}
+
+allOpen {
+    annotation("org.openjdk.jmh.annotations.State")   // classes with @State become open
+}</code></pre>
+
+<h3>Why JMH: the JIT deletes unused work</h3>
+<p>The JIT compiler (L23) removes code whose result is never used. That's great for your program and fatal for a benchmark. JMH's own sample says "the downfall of many benchmarks is Dead-Code Elimination (DCE)" (<a href="https://github.com/openjdk/jmh/blob/master/jmh-samples/src/main/java/org/openjdk/jmh/samples/JMHSample_08_DeadCode.java">JMHSample_08_DeadCode</a>). Watch it happen:</p>
+<figure class="java"><figcaption>JAVA · DeadCodeBench.java (same project)</figcaption>
+<pre><code class="language-java">package bench;
+
+import org.openjdk.jmh.annotations.*;
+import org.openjdk.jmh.infra.Blackhole;
+import java.util.concurrent.TimeUnit;
+
+@State(Scope.Thread)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
+public class DeadCodeBench {
+    double x = Math.PI;                    // fields, so the JIT can't treat them as constants
+    int n = 1000;
+
+    @Benchmark
+    public void baseline() { }             // an empty method: the harness's own cost
+
+    @Benchmark
+    public void resultIgnored() {
+        double sum = 0;
+        for (int i = 0; i &lt; n; i++) sum += i * x;
+        // sum is never used, so the JIT is allowed to delete the whole loop
+    }
+
+    @Benchmark
+    public double resultReturned() {
+        double sum = 0;
+        for (int i = 0; i &lt; n; i++) sum += i * x;
+        return sum;                        // JMH consumes the return value
+    }
+
+    @Benchmark
+    public void resultToBlackhole(Blackhole bh) {
+        double sum = 0;
+        for (int i = 0; i &lt; n; i++) sum += i * x;
+        bh.consume(sum);                   // or hand it to a Blackhole explicitly
+    }
+}</code></pre></figure>
+<pre class="term">Benchmark                         (n)  Mode  Cnt    Score    Error  Units
+DeadCodeBench.baseline            N/A  avgt    5    0.241 ±  0.001  ns/op
+DeadCodeBench.resultIgnored       N/A  avgt    5    0.241 ±  0.001  ns/op
+DeadCodeBench.resultReturned      N/A  avgt    5  430.442 ±  0.873  ns/op
+DeadCodeBench.resultToBlackhole   N/A  avgt    5  426.886 ±  0.583  ns/op</pre>
+<p>A 1,000-step loop "taking" 0.241 ns, exactly as long as an <em>empty</em> method, didn't run at all. The JIT proved <code>sum</code> was unused and deleted the loop. Return the value, or pass it to a <code>Blackhole</code>, and the real cost appears: about 430 ns. Returned results "are implicitly consumed by Blackholes" (<a href="https://github.com/openjdk/jmh/blob/master/jmh-samples/src/main/java/org/openjdk/jmh/samples/JMHSample_09_Blackholes.java">JMHSample_09</a>). A hand-rolled <code>nanoTime</code> loop has the same problem, and nothing warns you. The other traps JMH handles are constant folding (<a href="https://github.com/openjdk/jmh/blob/master/jmh-samples/src/main/java/org/openjdk/jmh/samples/JMHSample_10_ConstantFold.java">sample 10</a>), which is why <code>x</code> and <code>n</code> are fields and not constants, and JIT warm-up.</p>
+<p class="note">A detail that shows how slippery this is: my first version of <code>resultIgnored</code> computed <code>Math.log(x)</code> and threw the result away. On the JDK 21 that Gradle used, it took 3.1 ns (not deleted). Running the same benchmark jar directly on JDK 26, it took 0.26 ns (deleted). What the JIT removes changes between JDK versions, which is exactly why you let JMH guard against it rather than reasoning it out yourself.</p>
+
+<h3>A profiling checklist</h3>
+<ol>
+  <li><b>Reproduce the problem with realistic data</b>, and measure the baseline: total time, or memory over time.</li>
+  <li><b>Record, don't guess.</b> JFR (<code>-XX:StartFlightRecording</code>) for time and allocation, a GC log and <code>jstat</code> for memory, <code>GC.class_histogram</code> and heap dumps for leaks.</li>
+  <li><b>Find the biggest single cost</b> in <code>hot-methods</code> or a flame graph, and follow its stack down to <em>your</em> code.</li>
+  <li><b>Fix that one thing</b>, then measure again with the same data. A fix you didn't measure is a guess.</li>
+  <li><b>Use JMH</b> only to compare small alternatives in isolation, never to judge a whole program.</li>
+</ol>
+
+<div class="auto">
+  <strong>What Kotlin does for you, and what it costs.</strong>
+  <ul>
+    <li>Kotlin's <code>String.matches</code> on the JVM takes a <code>Regex</code>, not a <code>String</code>. Passing a string fails with <code>argument type mismatch: actual type is 'String', but 'Regex' was expected</code>. That nudges you toward building a <code>Regex</code> object. Keeping it in a <code>val</code> outside the function, so it's compiled once, is still on you.</li>
+    <li>JFR, <code>jcmd</code> and the IntelliJ Profiler work on Kotlin unchanged. Stacks show Kotlin's generated names, like <code>EmailsKt.isValid</code> for a top-level function in <code>Emails.kt</code>.</li>
+    <li>JMH needs <code>open</code> (or all-open) in Kotlin, the price of final-by-default classes. In Java nothing is final unless you say so.</li>
+    <li>For quick, rough timings Kotlin has <code>measureTime { }</code> (L16). For anything you'll make decisions on, use JMH.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: settle the L17 argument with JMH</div>
+  <p>In L17 you timed <code>ArrayList</code> against <code>LinkedList</code> iteration with <code>nanoTime</code>. Now do it properly. Add a benchmark class to the Java JMH project that fills both lists with 100,000 <code>Integer</code>s in a <code>@Setup</code> method (it runs before measurement and isn't timed), then has one <code>@Benchmark</code> per list that sums every element with a for-each loop. Predict the ratio first. To run only your class, add <code>includes = listOf("ListBench")</code> to the <code>jmh { }</code> block.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+    <figure class="java"><figcaption>JAVA · ListBench.java</figcaption>
+<pre><code class="language-java">package bench;
+
+import org.openjdk.jmh.annotations.*;
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+@State(Scope.Thread)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
+public class ListBench {
+    List&lt;Integer&gt; array = new ArrayList&lt;&gt;();
+    List&lt;Integer&gt; linked = new LinkedList&lt;&gt;();
+
+    @Setup                                   // runs before measuring, not timed
+    public void fill() {
+        for (int i = 0; i &lt; 100_000; i++) {
+            array.add(i);
+            linked.add(i);
+        }
+    }
+
+    @Benchmark
+    public long sumArrayList() {
+        long sum = 0;
+        for (int x : array) sum += x;
+        return sum;
+    }
+
+    @Benchmark
+    public long sumLinkedList() {
+        long sum = 0;
+        for (int x : linked) sum += x;
+        return sum;
+    }
+}</code></pre></figure>
+<pre class="out">ListBench.sumArrayList            N/A  avgt    5   49.542 ±  0.179  us/op
+ListBench.sumLinkedList           N/A  avgt    5  158.755 ±  0.400  us/op</pre>
+    <p>Both loops do exactly the same O(n) work, yet <code>LinkedList</code> is about 3.2× slower. Its nodes are separate objects scattered around the heap, and every <code>next</code> is a pointer to chase. <code>ArrayList</code>'s backing array lets the CPU stream through memory, as L22's cache section showed. A Kotlin version needs <code>open class</code> and the same annotations, as <code>ConcatBench.kt</code> showed.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · Profiling" data-answer="1">
+  <p class="q">Which <code>jfr</code> command lists the methods that appeared most often in CPU samples?</p>
+  <div class="opts"><button><code>jfr summary rec.jfr</code></button><button><code>jfr view hot-methods rec.jfr</code></button><button><code>jfr view gc rec.jfr</code></button><button><code>jcmd rec.jfr Thread.print</code></button></div>
+  <p class="why"><code>summary</code> counts event types. <code>hot-methods</code> aggregates <code>jdk.ExecutionSample</code> events by top frame.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · Profiling" data-answer="3">
+  <p class="q">JMH reports a benchmark at the same 0.24 ns as an empty method. The most likely explanation?</p>
+  <div class="opts"><button>The CPU is unusually fast here</button><button>JMH subtracted the harness baseline time</button><button>The method was cached by JMH</button><button>The JIT deleted the unused work</button></div>
+  <p class="why">Dead-code elimination: the result was never used, so the loop vanished. Return it or consume it with a <code>Blackhole</code>.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · Profiling" data-answer="0">
+  <p class="q">A Kotlin JMH run fails with <code>Benchmark classes should not be final.</code> The fix?</p>
+  <div class="opts"><button><code>open class ConcatBench</code></button><button><code>data class ConcatBench</code></button><button><code>object ConcatBench</code></button><button><code>abstract class ConcatBench</code></button></div>
+  <p class="why">JMH generates subclasses. Kotlin classes are final unless marked <code>open</code>, or opened by the all-open plugin. An <code>abstract</code> class can't be instantiated by JMH.</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · Profiling" data-answer="2">
+  <p class="q">Why did <code>Emails</code> spend most of its time in <code>Pattern.clazz</code> and <code>Pattern.union</code>?</p>
+  <div class="opts"><button>The addresses were very long strings</button><button>Matching regexes is always that slow</button><button>It compiled the pattern every call</button><button>The garbage collector ran too often</button></div>
+  <p class="why"><code>String.matches(regex)</code> compiles a new <code>Pattern</code> each time, and those methods belong to the parser.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>Find the leak and the hotspot</h2><span class="t">~20 min</span></div>
+
+<p>Below is a small thumbnail service. Requests arrive in batches, each thumbnail is cached, and a report counts the distinct images in each batch. It has one memory leak and one CPU hotspot. <b>Don't fix anything by reading the code.</b> Prove each problem with a tool first, then fix it, then prove the fix. Type it in one language first, then the other.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Thumbnails.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.Random
+
+// A thumbnail service: requests arrive in batches, thumbnails are cached, and a
+// report counts the distinct images per batch. It has a leak and a hotspot.
+object Thumbnails {
+    val cache = HashMap&lt;String, ByteArray&gt;()                   // shared by all requests
+
+    fun render(id: String): ByteArray {                        // pretend to resize an image
+        val pixels = ByteArray(1_000)
+        pixels[0] = id.hashCode().toByte()
+        return pixels
+    }
+
+    fun thumbnail(id: String): ByteArray = cache.getOrPut(id) { render(id) }
+
+    fun distinct(ids: List&lt;String&gt;): List&lt;String&gt; {            // keeps first-seen order
+        val out = ArrayList&lt;String&gt;()
+        for (id in ids) {
+            if (id !in out) out.add(id)
+        }
+        return out
+    }
+}
+
+fun main() {
+    val random = Random(42)
+    val start = System.nanoTime()
+    var checksum = 0L
+    for (batch in 1..1_000) {
+        val requests = List(4_000) {                           // new images keep arriving
+            "img${batch * 1_000 + random.nextInt(3_000)}"
+        }
+        for (id in requests) checksum += Thumbnails.thumbnail(id)[0]
+        val unique = Thumbnails.distinct(requests).size
+        if (batch % 100 == 0) {
+            println("batch $batch: $unique distinct, cache ${Thumbnails.cache.size}")
+        }
+    }
+    println("checksum $checksum, ${(System.nanoTime() - start) / 1_000_000} ms")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Thumbnails.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+// A thumbnail service: requests arrive in batches, thumbnails are cached, and a
+// report counts the distinct images per batch. It has a leak and a hotspot.
+public class Thumbnails {
+    static final Map&lt;String, byte[]&gt; CACHE = new HashMap&lt;&gt;();   // shared by all requests
+
+    static byte[] render(String id) {                          // pretend to resize an image
+        byte[] pixels = new byte[1_000];
+        pixels[0] = (byte) id.hashCode();
+        return pixels;
+    }
+
+    static byte[] thumbnail(String id) {
+        return CACHE.computeIfAbsent(id, Thumbnails::render);
+    }
+
+    static List&lt;String&gt; distinct(List&lt;String&gt; ids) {          // keeps first-seen order
+        List&lt;String&gt; out = new ArrayList&lt;&gt;();
+        for (String id : ids) {
+            if (!out.contains(id)) out.add(id);
+        }
+        return out;
+    }
+
+    public static void main(String[] args) {
+        Random random = new Random(42);
+        long start = System.nanoTime();
+        long checksum = 0;
+        for (int batch = 1; batch &lt;= 1_000; batch++) {
+            List&lt;String&gt; requests = new ArrayList&lt;&gt;();
+            for (int i = 0; i &lt; 4_000; i++) {                  // new images keep arriving
+                requests.add("img" + (batch * 1_000 + random.nextInt(3_000)));
+            }
+            for (String id : requests) checksum += thumbnail(id)[0];
+            int unique = distinct(requests).size();
+            if (batch % 100 == 0) {
+                System.out.println("batch " + batch + ": " + unique + " distinct, cache " + CACHE.size());
+            }
+        }
+        System.out.println("checksum " + checksum + ", " + (System.nanoTime() - start) / 1_000_000 + " ms");
+    }
+}</code></pre></figure>
+</div>
+<div class="task">
+  <ol>
+    <li><b>Reproduce the crash.</b> Run with <code>-Xmx64m</code>, then again with <code>-Xlog:gc</code>. What does the end of the log look like?</li>
+    <li><b>Find the leak.</b> Run with a big heap (<code>-Xmx2g</code>) so it lives about four seconds. Take two <code>jcmd &lt;pid&gt; GC.class_histogram</code> snapshots about a second apart. Which counts grow? Compare them with the "distinct" figure the program prints.</li>
+    <li><b>Fix the leak</b> with a bounded LRU cache of 2,000 entries (L19). Rerun step 1: it must finish.</li>
+    <li><b>Find the hotspot.</b> Record the fixed-leak version with JFR. Which method dominates <code>hot-methods</code>, and which line of <em>your</em> code leads to it? Fix it with a hash-based structure (L19), keeping first-seen order.</li>
+    <li><b>Prove it.</b> Write down the run time before and after each fix. The checksum must not change.</li>
+  </ol>
+</div>
+<div class="rating-group">
+  <div class="rating" data-id="final-kt" data-label="Final: leak and hotspot (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-jv" data-label="Final: leak and hotspot (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-dx" data-label="Final: proved each problem with a tool before fixing"><span class="who">DIAGNOSE</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+</div>
+<details class="solution"><summary>Step by step, with real output</summary>
+  <p><b>Step 1.</b> Both languages crash before printing the first progress line (batch 100):</p>
+<pre class="out">$ java -Xmx64m Thumbnails
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "main"
+$ java -Xmx64m -Xlog:gc Thumbnails | grep 'Pause Full' | tail -3
+[0.335s][info][gc] GC(47) Pause Full (G1 Compaction Pause) 63M-&gt;63M(64M) 5.492ms
+[0.339s][info][gc] GC(49) Pause Full (G1 Compaction Pause) 63M-&gt;63M(64M) 3.844ms
+[0.345s][info][gc] GC(50) Pause Full (G1 Compaction Pause) 63M-&gt;63M(64M) 5.085ms</pre>
+  <p>Full collections that free nothing: everything is reachable.</p>
+  <p><b>Step 2.</b> Two snapshots, 1.2 s apart (Java run):</p>
+<pre class="out">   1:        628949      323141352  [B (java.base@26.0.1)
+   2:        309625        9908000  java.util.HashMap$Node (java.base@26.0.1)
+   3:        320254        7686096  java.lang.String (java.base@26.0.1)
+
+   1:       1312458      681285800  [B (java.base@26.0.1)
+   2:        651365       20843680  java.util.HashMap$Node (java.base@26.0.1)
+   3:        662023       15888552  java.lang.String (java.base@26.0.1)</pre>
+  <p><code>HashMap$Node</code> doubled from about 310k to 651k in a second, while every batch has only about 2,200 distinct images. Each cache entry is a node, a <code>String</code> key, the key's own <code>byte[]</code> and the thumbnail's <code>byte[]</code>, which is why there are about twice as many <code>[B</code> as nodes. The only <code>HashMap</code> that lives that long is the static <code>CACHE</code>, and nothing ever removes from it. The program's own output with <code>-Xmx2g</code> agrees by the end: <code>batch 1000: 2218 distinct, cache 983063</code>. The Kotlin run showed the same pattern: 276k → 584k nodes.</p>
+  <p><b>Step 3.</b> Replace the map with an access-order <code>LinkedHashMap</code> that evicts beyond 2,000 entries. That's the cache in the file below.</p>
+  <p><b>Step 4.</b> Recording the fixed-leak version:</p>
+<pre class="out">$ jfr view hot-methods step3.jfr
+Method                                                                    Samples Percent
+------------------------------------------------------------------------- ------- -------
+java.util.ArrayList.indexOfRange(Object, int, int)                            274  93.52%
+java.util.HashMap.computeIfAbsent(Object, Function)                            12   4.10%
+…
+$ jfr print --stack-depth 8 --events jdk.ExecutionSample step3.jfr
+    java.util.ArrayList.indexOfRange(Object, int, int) line: 299
+    java.util.ArrayList.indexOf(Object) line: 287
+    java.util.ArrayList.contains(Object) line: 276
+    ThumbnailsStep3.distinct(List) line: 31
+    ThumbnailsStep3.main(String[]) line: 46</pre>
+  <p>93.5% of samples are in <code>ArrayList.indexOfRange</code>, reached from <code>contains</code> inside <code>distinct</code>. That's a linear search inside a loop: O(n²), the smell from L16 and L21. Kotlin's <code>id !in out</code> compiles to the same <code>ArrayList.contains</code>, and its stack shows <code>Thumbnails.distinct(List) line: 22</code> at 94.5%.</p>
+  <p><b>Both fixes:</b></p>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · ThumbnailsFixed.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.Random
+
+// Fixed: a bounded LRU cache (no leak) and a hash-based distinct (no hotspot).
+object Thumbnails {
+    const val MAX_ENTRIES = 2_000                              // enough for one batch's images
+    val cache = object : LinkedHashMap&lt;String, ByteArray&gt;(16, 0.75f, true) { // LRU (L19)
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry&lt;String, ByteArray&gt;) =
+            size &gt; MAX_ENTRIES
+    }
+
+    fun render(id: String): ByteArray {                        // pretend to resize an image
+        val pixels = ByteArray(1_000)
+        pixels[0] = id.hashCode().toByte()
+        return pixels
+    }
+
+    fun thumbnail(id: String): ByteArray = cache.getOrPut(id) { render(id) }
+
+    fun distinct(ids: List&lt;String&gt;): List&lt;String&gt; = ids.distinct() // hash-based, keeps order
+}
+
+fun main() {
+    val random = Random(42)
+    val start = System.nanoTime()
+    var checksum = 0L
+    for (batch in 1..1_000) {
+        val requests = List(4_000) {                           // new images keep arriving
+            "img${batch * 1_000 + random.nextInt(3_000)}"
+        }
+        for (id in requests) checksum += Thumbnails.thumbnail(id)[0]
+        val unique = Thumbnails.distinct(requests).size
+        if (batch % 100 == 0) {
+            println("batch $batch: $unique distinct, cache ${Thumbnails.cache.size}")
+        }
+    }
+    println("checksum $checksum, ${(System.nanoTime() - start) / 1_000_000} ms")
+}</code></pre></figure>
+    <figure class="java"><figcaption>JAVA · ThumbnailsFixed.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+// Fixed: a bounded LRU cache (no leak) and a hash-based distinct (no hotspot).
+public class ThumbnailsFixed {
+    static final int MAX_ENTRIES = 2_000;                       // enough for one batch's images
+    static final Map&lt;String, byte[]&gt; CACHE =
+        new LinkedHashMap&lt;&gt;(16, 0.75f, true) {                  // access order = LRU (L19)
+            @Override
+            protected boolean removeEldestEntry(Map.Entry&lt;String, byte[]&gt; eldest) {
+                return size() &gt; MAX_ENTRIES;
+            }
+        };
+
+    static byte[] render(String id) {                          // pretend to resize an image
+        byte[] pixels = new byte[1_000];
+        pixels[0] = (byte) id.hashCode();
+        return pixels;
+    }
+
+    static byte[] thumbnail(String id) {
+        return CACHE.computeIfAbsent(id, ThumbnailsFixed::render);
+    }
+
+    static List&lt;String&gt; distinct(List&lt;String&gt; ids) {          // keeps first-seen order
+        return new ArrayList&lt;&gt;(new LinkedHashSet&lt;&gt;(ids));      // O(1) contains per id (L19)
+    }
+
+    public static void main(String[] args) {
+        Random random = new Random(42);
+        long start = System.nanoTime();
+        long checksum = 0;
+        for (int batch = 1; batch &lt;= 1_000; batch++) {
+            List&lt;String&gt; requests = new ArrayList&lt;&gt;();
+            for (int i = 0; i &lt; 4_000; i++) {                  // new images keep arriving
+                requests.add("img" + (batch * 1_000 + random.nextInt(3_000)));
+            }
+            for (String id : requests) checksum += thumbnail(id)[0];
+            int unique = distinct(requests).size();
+            if (batch % 100 == 0) {
+                System.out.println("batch " + batch + ": " + unique + " distinct, cache " + CACHE.size());
+            }
+        }
+        System.out.println("checksum " + checksum + ", " + (System.nanoTime() - start) / 1_000_000 + " ms");
+    }
+}</code></pre></figure>
+  </div>
+  <p><b>Step 5. The numbers</b> (all with <code>-Xmx64m</code>, on my machine):</p>
+  <table class="cmds">
+    <tr><th>Version</th><th>Java</th><th>Kotlin</th><th>Last lines</th></tr>
+    <tr><td>Original</td><td>OutOfMemoryError</td><td>OutOfMemoryError</td><td>crashes before batch 100</td></tr>
+    <tr><td>LRU cache (step 3)</td><td>3655 ms</td><td>3985 ms</td><td><code>batch 1000: 2218 distinct, cache 2000</code></td></tr>
+    <tr><td>LRU + hash-based distinct</td><td>316 ms</td><td>318 ms</td><td><code>checksum -9536632</code>, unchanged</td></tr>
+  </table>
+  <p>The first fix turned a crash into a working program with a fixed 2,000-entry cache, about 2 MB of thumbnails. The second made it about 11× faster. Neither fix came from staring at the code: a GC log, a histogram and a flight recording each pointed at exactly one line. Kotlin's <code>ids.distinct()</code> is already hash-based and keeps first-seen order, the hidden loop you met in L16. Java's equivalent is <code>new ArrayList&lt;&gt;(new LinkedHashSet&lt;&gt;(ids))</code>.</p>
+</details>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">L10: a <code>FileInputStream</code> is never closed, but the stream object becomes unreachable. Is the file descriptor released at once?</p>
+  <div class="opts"><button>Yes, the GC closes it immediately</button><button>No, close it explicitly with use</button><button>Yes, when the method returns normally</button><button>No, files can never be closed</button></div>
+  <p class="why">The GC manages memory, not files, and it runs whenever it likes. Close resources deterministically with try-with-resources / <code>use</code>. Finalizers are deprecated for removal.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="2">
+  <p class="q">L16 + L24: a JMH benchmark shows a method taking about 4× longer every time <code>n</code> doubles. Its complexity?</p>
+  <div class="opts"><button><code>O(log n)</code></button><button><code>O(n)</code></button><button><code>O(n²)</code></button><button><code>O(2ⁿ)</code></button></div>
+  <p class="why">The L16 doubling rule: a ratio of 4 means quadratic. <code>plusInLoop</code> behaved similarly, about 38× for 10× more input.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">L19 + L24: why is a <code>data class Key(var id: Int)</code> risky as a <code>HashMap</code> key?</p>
+  <div class="opts"><button>Mutating id strands the entry forever</button><button>Data classes never generate hashCode methods</button><button>Var properties are never copied in</button><button>HashMap rejects all Kotlin data classes</button></div>
+  <p class="why">The generated <code>hashCode</code> uses <code>id</code>. Change it and the entry sits in the wrong bucket. You can't find it and can't remove it, which is a leak (<code>LostKey</code>).</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="3">
+  <p class="q">L23 + L24: why does JMH run warm-up iterations before measuring?</p>
+  <div class="opts"><button>To fill the heap with objects</button><button>To let the GC finish starting</button><button>To load the benchmark's source files</button><button>To let hot code get compiled</button></div>
+  <p class="why">Early calls run in the interpreter or lower JIT tiers (L23). Measuring them would mix up warm-up cost with steady-state speed.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Draw three roots and six objects, including one unreachable cycle and one dead object pointing at a live one. Mark, then sweep, from memory.</li>
+    <li>Explain eden, survivor and old in three sentences, and why a minor collection is cheap.</li>
+    <li>Read <code>Pause Young (Normal) (G1 Evacuation Pause) 154M-&gt;25M(246M) 1.103ms</code> aloud: what is each number?</li>
+    <li>Name four ways a garbage-collected program leaks, and the fix for each.</li>
+    <li>Write the three commands that find a leak (<code>jcmd</code> histogram, twice) and a hotspot (<code>-XX:StartFlightRecording</code>, then <code>jfr view hot-methods</code>).</li>
+    <li>Write a JMH benchmark skeleton from memory, and say why the result must be returned.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  Oracle's <a href="https://docs.oracle.com/en/java/javase/25/gctuning/introduction-garbage-collection-tuning.html">HotSpot Virtual Machine Garbage Collection Tuning Guide</a>. Chapters 2 (Ergonomics), 3 (Garbage Collector Implementation) and 5 (Available Collectors) are short and are where every GC claim on this page comes from. For tools, read the <a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/jfr.html"><code>jfr</code></a>, <a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/jcmd.html"><code>jcmd</code></a> and <a href="https://docs.oracle.com/en/java/javase/25/docs/specs/man/jstat.html"><code>jstat</code></a> pages. For benchmarking, work through the first ten <a href="https://github.com/openjdk/jmh/tree/master/jmh-samples/src/main/java/org/openjdk/jmh/samples">JMH samples</a>, which are short, heavily commented classes. Then read <em>Effective Java</em> Item 7, "Eliminate obsolete object references", in <a href="https://www.informit.com/store/effective-java-9780134685991">Bloch's <em>Effective Java</em></a>.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/runtime-and-os.html">Runtime &amp; OS</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "is this a leak or just a big heap?", "how do I read this GC log line?" or "is my benchmark measuring what I think?" are exactly the right kind. Paste a histogram, a GC log or JMH output in for a second opinion.</p>
+
+<div class="lesson-nav">
+  <a href="0023-inside-the-jvm.html">← L23 · Inside the JVM</a>
+  <a href="0025-annotations-reflection-and-builds.html">L25 · Annotations, Reflection &amp; Builds →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/gcviz.js"></script>
+</body>
+</html>

@@ -43,6 +43,10 @@
   Covers the weak generational hypothesis, young and old generations, eden and survivor spaces, minor vs major collections, and how objects age. Use for: understanding how garbage collection actually reclaims your objects.
 - [Reference: _The javap Command_ by Oracle (JDK 25)](https://docs.oracle.com/en/java/javase/25/docs/specs/man/javap.html)
   The class-file disassembler. `javap -c` prints the bytecode and `-v` prints the constant pool and everything else. Use for: compiling a tiny Kotlin or Java file and seeing what it really became, e.g. what a `data class` or a `when` generates.
+- [Tool: _JDK Flight Recorder_ (`jfr` command reference) by Oracle](https://docs.oracle.com/en/java/javase/25/docs/specs/man/jfr.html)
+  The built-in, low-overhead profiler: record with `-XX:StartFlightRecording`, then `jfr summary`, `jfr print` and `jfr view hot-methods`. On macOS `jfr` may not be on PATH; use `$(/usr/libexec/java_home)/bin/jfr`. Use for: finding where time and allocations really go, without installing anything (L24).
+- [Tool: _JMH (Java Microbenchmark Harness)_ by OpenJDK](https://github.com/openjdk/jmh)
+  The standard microbenchmark harness. It handles warm-up, forking, dead-code elimination and constant folding, which naive `nanoTime` loops get wrong. The `samples` folder is the best tutorial. Use for: any "is A faster than B?" question at the method level (L24).
 - [Docs: _Android Runtime (ART) and Dalvik_ by Google (AOSP)](https://source.android.com/docs/core/runtime)
   Android does not run JVM bytecode. Your `.class` files are converted to DEX, and ART runs them with ahead-of-time compilation (dex2oat) plus a mostly concurrent, compacting garbage collector. Use for: knowing which JVM facts carry over to Android and which don't.
 
@@ -58,6 +62,10 @@
   The canonical book on thread safety, visibility, publication, and the `java.util.concurrent` toolkit (Addison-Wesley, 2006). Paid. It predates lambdas and virtual threads, but its principles haven't changed. Use for: learning to reason about whether code is thread-safe.
 - [Spec: _JLS Ch. 17: Threads and Locks (§17.4 Memory Model)_ by Oracle](https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html)
   The official Java Memory Model: happens-before, volatile, monitors, data races, and final-field semantics. Use for: the final word once JCIP Ch. 16 has given you the intuition.
+- [Spec: _JLS Chapter 17: Threads and Locks_ by Oracle](https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html)
+  The official memory model: §17.4.5 happens-before, §17.5 `final` field semantics, and the definition of a data race. Pair it with the `java.util.concurrent` package summary's "Memory Consistency Properties". Use for: the authoritative answer to "will the other thread see this write?" (L27).
+- [JEP: _JEP 444: Virtual Threads_ by OpenJDK](https://openjdk.org/jeps/444)
+  Why virtual threads exist, how they mount and unmount on carrier threads, and the guidance (don't pool them; limit with semaphores). Read it alongside [JEP 491](https://openjdk.org/jeps/491), which stopped `synchronized` from pinning in JDK 24. Use for: deciding between pools, virtual threads and coroutines (L28).
 - [Guide: _Coroutines Guide_ by JetBrains](https://kotlinlang.org/docs/coroutines-guide.html)
   The official kotlinx.coroutines guide: basics, cancellation and timeouts, composing suspend functions, dispatchers, Flow, channels, exception handling, and shared mutable state. Use for: Kotlin's structured concurrency, which is how Android does async work.
 

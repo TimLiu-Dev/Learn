@@ -1,0 +1,2157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L26 · Threads &amp; Race Conditions</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l26">
+<main>
+
+<div class="kicker">Lesson 26 · Phase 8 Concurrency · <a href="../reference/roadmap.html#p8">roadmap</a></div>
+<h1>Threads &amp; Race Conditions</h1>
+<p class="subtitle">You'll start threads and watch the OS interleave them, then break a counter on purpose and see exactly which bytecode instructions collide. Finally you'll fix it three ways and measure what each fix costs.</p>
+
+<div class="lesson-meta">
+  <span><b>~100–115 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll write a test that proves a counter is broken: eight threads, a start gate, and a red bar that shows up every single time. Then you'll make it green three different ways, with <code>synchronized</code>, a <code>ReentrantLock</code> and an <code>AtomicInteger</code>, and you'll know why a test that passed once proves almost nothing about thread safety.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Starting threads; how the OS schedules them</a><span class="t">25 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Cause a race condition on purpose</a><span class="t">25 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · <code>synchronized</code>, locks, atomics</a><span class="t">30 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: prove it's broken, fix it three ways</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l26/</code>. Every output on this page was captured from real runs on an Apple M5 Max with 18 cores, JDK 26.0.1, Kotlin 2.4.20 (<code>kotlinc</code>) and Gradle 9.7.1. Concurrency results depend on the machine and on timing: <b>your numbers will differ</b>, and some runs of the same program will differ from each other. That's the point of this lesson.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L4, L22, L23 and L25</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Draw one process with two threads. Which parts of memory does each thread get for itself, and which part do they share? (L4, L22)</li>
+    <li>Write the bytecode <code>javap -c</code> shows for <code>count++</code> on a field, as best you remember. How many instructions? (L23)</li>
+    <li>An annotation does nothing until some tool reads it. Name the three kinds of reader. (L25)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="1">
+  <p class="q">Two threads in one JVM both use a local variable <code>i</code> in the same method. Where does each <code>i</code> live? (L4)</p>
+  <div class="opts"><button>In one shared heap slot</button><button>Separately, on each thread's stack</button><button>In a static class field</button><button>Inside the method's bytecode itself</button></div>
+  <p class="why">Each thread has its own stack, and local variables live in that thread's frames. That's why locals are never shared between threads, and why the trouble in this lesson always comes from <em>fields</em> on the heap.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="3">
+  <p class="q">What do two threads of the same process share that two separate processes don't? (L22)</p>
+  <div class="opts"><button>A program counter</button><button>A call stack</button><button>Its CPU registers</button><button>An address space</button></div>
+  <p class="why">Threads of one process live in one virtual address space, so they see the same heap. Each still has its own program counter, registers and stack. Separate processes get separate address spaces.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="0">
+  <p class="q">In <code>javap -c</code> output, which instruction stores a value back into an object's field? (L23)</p>
+  <div class="opts"><button><code>putfield</code></button><button><code>getfield</code></button><button><code>iadd</code></button><button><code>istore_1</code></button></div>
+  <p class="why"><code>getfield</code> pushes a field's value onto the operand stack, and <code>putfield</code> pops a value and writes it into the field. <code>istore_1</code> writes a <em>local</em> variable. Keep <code>getfield</code>/<code>putfield</code> in mind for Part 2.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="2">
+  <p class="q">Kotlin's <code>@Synchronized</code> is an annotation. Who acts on it? (L25)</p>
+  <div class="opts"><button>Reflection at runtime</button><button>An annotation processor</button><button>The Kotlin compiler</button><button>The garbage collector</button></div>
+  <p class="why">kotlinc reads it and sets the JVM's <code>ACC_SYNCHRONIZED</code> flag on the generated method. You'll see that flag with <code>javap</code> in Part 3.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Starting threads; how the OS schedules them</h2><span class="t">~25 min</span></div>
+
+<p>A thread is a separate path of execution inside one process. OSTEP puts it like this: each thread "is very much like a separate process, except for one difference: they share the same address space and thus can access the same data" (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-intro.pdf"><em>OSTEP</em> ch. 26</a>). Every Java or Kotlin program already has one: <code>main</code> runs on a thread called <code>main</code>. You add more by giving a <code>Thread</code> a piece of work and calling <code>start()</code>.</p>
+
+<h3><code>start()</code> vs <code>run()</code></h3>
+<p>The work is a <code>Runnable</code>, an interface with one method, <code>run()</code> (L14's functional interfaces). The classic beginner bug is calling <code>run()</code> yourself. That's an ordinary method call on the current thread. Only <code>start()</code> asks the JVM for a new thread: "Starting a thread schedules it to execute its run method. The newly started thread executes concurrently with the thread that caused it to start" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Thread.html"><code>Thread</code> API docs</a>). <code>join()</code> makes the caller wait until that thread has finished.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · StartRun.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+fun main() {
+    val task = Runnable { println("task runs on: ${Thread.currentThread().name}") }
+
+    Thread(task, "worker").run()     // just a method call: runs on main
+    val t = Thread(task, "worker")
+    t.start()                        // the JVM starts a new thread, which calls run()
+    t.join()                         // main waits here until worker finishes
+
+    val k = thread(name = "kotlin-worker") {     // created AND started
+        println("block runs on: ${Thread.currentThread().name}")
+    }
+    k.join()
+    println("main done on: ${Thread.currentThread().name}")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · StartRun.java</figcaption>
+<pre><code class="language-java">public class StartRun {
+    public static void main(String[] args) throws InterruptedException {
+        Runnable task = () -&gt; System.out.println("task runs on: " + Thread.currentThread().getName());
+
+        new Thread(task, "worker").run();    // just a method call: runs on main
+        Thread t = new Thread(task, "worker");
+        t.start();                           // the JVM starts a new thread, which calls run()
+        t.join();                            // main waits here until worker finishes
+
+        Thread b = Thread.ofPlatform().name("builder-worker").start(() -&gt;   // JDK 21+ builder
+            System.out.println("builder runs on: " + Thread.currentThread().getName()));
+        b.join();
+        System.out.println("main done on: " + Thread.currentThread().getName());
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">task runs on: main
+task runs on: worker
+block runs on: kotlin-worker
+main done on: main</pre>
+<pre class="out">task runs on: main
+task runs on: worker
+builder runs on: builder-worker
+main done on: main</pre>
+</div>
+<p>The first line says <code>main</code>, even though the thread object is called <code>worker</code>: <code>run()</code> never started anything. Kotlin's <code>thread { }</code> from <code>kotlin.concurrent</code> creates <em>and</em> starts a thread in one call. Its full signature is <code>thread(start = true, isDaemon = false, contextClassLoader = null, name = null, priority = -1, block)</code> (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.concurrent/thread.html">Kotlin API: <code>thread</code></a>). Those are named parameters with defaults (L3), so you only write the ones you change. Java's closest equivalent is the <code>Thread.ofPlatform()</code> builder added in JDK 21.</p>
+
+<h3>The scheduler decides the order</h3>
+<p>Start two threads that each print a letter 40 times, and run the program five times:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Interleave.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+fun main() {
+    val a = thread { repeat(40) { print("A") } }
+    val b = thread { repeat(40) { print("B") } }
+    a.join(); b.join()
+    println()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Interleave.java</figcaption>
+<pre><code class="language-java">public class Interleave {
+    public static void main(String[] args) throws InterruptedException {
+        Thread a = new Thread(() -&gt; { for (int i = 0; i &lt; 40; i++) System.out.print("A"); });
+        Thread b = new Thread(() -&gt; { for (int i = 0; i &lt; 40; i++) System.out.print("B"); });
+        a.start(); b.start();
+        a.join(); b.join();
+        System.out.println();
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">AAAAAAAAAAAAAAAABBBAABBAABBAABBBBBBBBAABBBBBBBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBAAAAABBBBBBBBBBBAABBAABBABBBBBBBBBBBBBBBBBBBBB
+AAAAAAAAAAAABBBBBBAAAAABBAABBAAAAABBBBBAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBBBBBB
+AAAAAAAAAAAAAAAAAAAAAAAAAAABBBAAAABBAABBAABBAABBAABBABBBBBBBBBBBBBBBBBBBBBBBBBBB
+AAAAAAAAAAAAAAABBBBBBBBBBAAABBBBBBBAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBBBB</pre>
+<pre class="out">AAABBBAABBAABBAABBBBAABBAABBAABBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAAAAAABBBBBB
+AAAABBBAABBBBAABBAABBBBBAABBAABBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBB
+AAABBBBAABBAABBAABBBBBBAABBAABBBBBBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAABBBBAABBAABBBBBBAAAABBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBB
+AAAAABBBBBAABBAABBBBBBBBBBBBBAABBAABBBBBBBBBBBBBBBAAAAAAAAABBBAAAAAAAAAAAAAAAAAA</pre>
+</div>
+<p>Same code, five different orders, in both languages. You didn't choose the order, and neither did the JVM. On this machine a Java thread is a <dfn>platform thread</dfn>, which is "typically mapped 1:1 to kernel threads scheduled by the operating system" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Thread.html"><code>Thread</code> API docs</a>). You saw those kernel threads in L22, when <code>ps -M</code> listed 26 of them for one JVM. The OS scheduler decides which thread runs on which core, for how long, and when to <dfn>preempt</dfn> it. Switching threads on a core is a <dfn>context switch</dfn>: "the register state of T1 must be saved and the register state of T2 restored before running T2" (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-intro.pdf"><em>OSTEP</em> ch. 26</a>). With several cores, two threads also run at literally the same time. Here's what this machine has:</p>
+<pre class="term"><span class="p">$ </span>sysctl hw.ncpu hw.perflevel0.name hw.perflevel0.physicalcpu hw.perflevel1.name hw.perflevel1.physicalcpu
+hw.ncpu: 18
+hw.perflevel0.name: Super
+hw.perflevel0.physicalcpu: 6
+hw.perflevel1.name: Performance
+hw.perflevel1.physicalcpu: 12</pre>
+<p>That's 18 cores in two tiers: Apple names the faster six "Super" and the other twelve "Performance". <code>Runtime.getRuntime().availableProcessors()</code> reports 18 to the JVM. Even with 18 cores, the order of the two threads' output isn't fixed, because each <code>print</code> is a separate call, and the threads race each other for <code>System.out</code> between calls. Never write code that depends on one thread "probably" running first.</p>
+
+<h3>Thread states</h3>
+<p>A thread is always in one of six states, the <code>Thread.State</code> enum: <code>NEW</code> ("has not yet started"), <code>RUNNABLE</code> ("executing in the Java virtual machine"), <code>BLOCKED</code> ("blocked waiting for a monitor lock"), <code>WAITING</code> ("waiting indefinitely for another thread"), <code>TIMED_WAITING</code> (waiting "for up to a specified waiting time") and <code>TERMINATED</code> ("has exited") (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Thread.State.html"><code>Thread.State</code> API docs</a>). This program catches a thread in each one:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · States.kt</figcaption>
+<pre><code class="language-kotlin">fun main() {
+    val lock = Any()
+    val sleeper = Thread { Thread.sleep(500) }
+    println("before start: ${sleeper.state}")
+    sleeper.start()
+    Thread.sleep(50)                     // demo only: give the thread time to get there
+    println("sleeping:     ${sleeper.state}")
+
+    val joiner = Thread { sleeper.join() }
+    joiner.start(); Thread.sleep(50)
+    println("joining:      ${joiner.state}")
+
+    val blocked = Thread { synchronized(lock) { } }
+    synchronized(lock) {                 // main holds the lock...
+        blocked.start(); Thread.sleep(50)
+        println("needs lock:   ${blocked.state}")
+    }                                    // ...and releases it here
+
+    val spinner = Thread { var x = 0L; while (!Thread.currentThread().isInterrupted) x++ }
+    spinner.start(); Thread.sleep(50)
+    println("computing:    ${spinner.state}")
+    spinner.interrupt()
+
+    for (t in listOf(sleeper, joiner, blocked, spinner)) t.join()
+    println("all finished: ${sleeper.state}")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · States.java</figcaption>
+<pre><code class="language-java">public class States {
+    public static void main(String[] args) throws InterruptedException {
+        Object lock = new Object();
+        Thread sleeper = new Thread(() -&gt; {
+            try { Thread.sleep(500); } catch (InterruptedException e) { }
+        });
+        System.out.println("before start: " + sleeper.getState());
+        sleeper.start();
+        Thread.sleep(50);                    // demo only: give the thread time to get there
+        System.out.println("sleeping:     " + sleeper.getState());
+
+        Thread joiner = new Thread(() -&gt; {
+            try { sleeper.join(); } catch (InterruptedException e) { }
+        });
+        joiner.start(); Thread.sleep(50);
+        System.out.println("joining:      " + joiner.getState());
+
+        Thread blocked = new Thread(() -&gt; { synchronized (lock) { } });
+        synchronized (lock) {                // main holds the lock...
+            blocked.start(); Thread.sleep(50);
+            System.out.println("needs lock:   " + blocked.getState());
+        }                                    // ...and releases it here
+
+        Thread spinner = new Thread(() -&gt; {
+            long x = 0;
+            while (!Thread.currentThread().isInterrupted()) x++;
+        });
+        spinner.start(); Thread.sleep(50);
+        System.out.println("computing:    " + spinner.getState());
+        spinner.interrupt();
+
+        for (Thread t : new Thread[] { sleeper, joiner, blocked, spinner }) t.join();
+        System.out.println("all finished: " + sleeper.getState());
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">before start: NEW
+sleeping:     TIMED_WAITING
+joining:      WAITING
+needs lock:   BLOCKED
+computing:    RUNNABLE
+all finished: TERMINATED</pre>
+<pre class="out">before start: NEW
+sleeping:     TIMED_WAITING
+joining:      WAITING
+needs lock:   BLOCKED
+computing:    RUNNABLE
+all finished: TERMINATED</pre>
+</div>
+<p>The <code>Thread.sleep(50)</code> calls in <code>main</code> are only there so the other thread has time to reach the state being printed. Using <code>sleep</code> to coordinate threads is a bug in real code; you'll use proper tools like <code>join</code> and latches instead. Notice the Java version is longer: every lambda that calls <code>sleep</code> or <code>join</code> needs a <code>try</code>/<code>catch</code>. More on that below. The docs add that these "are virtual machine states which do not reflect any operating system thread states". <code>RUNNABLE</code> means "ready to run", not necessarily "on a core right now".</p>
+
+<h3>Daemon threads</h3>
+<p>When does the JVM exit? "The shutdown sequence begins when all started non-daemon threads have terminated" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Thread.html"><code>Thread</code> API docs</a>). A <dfn>daemon</dfn> thread is a background helper that doesn't keep the JVM alive:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Daemon.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+fun main() {
+    thread(isDaemon = true, name = "heartbeat") {
+        while (true) {                   // never ends on its own
+            println("  heartbeat")
+            Thread.sleep(100)
+        }
+    }
+    Thread.sleep(350)
+    println("main ends; only a daemon thread is left, so the JVM exits")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Daemon.java</figcaption>
+<pre><code class="language-java">public class Daemon {
+    public static void main(String[] args) throws InterruptedException {
+        Thread hb = new Thread(() -&gt; {
+            while (true) {                   // never ends on its own
+                System.out.println("  heartbeat");
+                try { Thread.sleep(100); } catch (InterruptedException e) { return; }
+            }
+        }, "heartbeat");
+        hb.setDaemon(true);                  // must be set before start()
+        hb.start();
+        Thread.sleep(350);
+        System.out.println("main ends; only a daemon thread is left, so the JVM exits");
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">  heartbeat
+  heartbeat
+  heartbeat
+  heartbeat
+main ends; only a daemon thread is left, so the JVM exits</pre>
+<pre class="out">  heartbeat
+  heartbeat
+  heartbeat
+  heartbeat
+main ends; only a daemon thread is left, so the JVM exits</pre>
+</div>
+<p>The heartbeat loop never ends, yet the program does. Drop <code>isDaemon = true</code> (or <code>setDaemon(true)</code>) and it would print heartbeats forever, because a live non-daemon thread holds the JVM open. That's also the classic reason a "finished" program doesn't exit: some thread you forgot about is still running.</p>
+
+<h3>Threads aren't free</h3>
+<p>A platform thread is an OS thread with its own stack. The docs warn they "will usually have a large stack and other resources that are maintained by the operating system" and "may be a limited resource". Time how long it takes to start and join 10,000 threads that do nothing:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · ThreadCost.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+fun main() {
+    val n = 10_000
+    repeat(3) { round -&gt;
+        val start = System.nanoTime()
+        val threads = List(n) { thread { } }     // start 10,000 threads that do nothing
+        threads.forEach { it.join() }
+        val ms = (System.nanoTime() - start) / 1_000_000
+        println("round ${round + 1}: $n threads started and joined in $ms ms (${ms * 1000 / n} µs each)")
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · ThreadCost.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class ThreadCost {
+    public static void main(String[] args) throws InterruptedException {
+        int n = 10_000;
+        for (int round = 1; round &lt;= 3; round++) {
+            long start = System.nanoTime();
+            List&lt;Thread&gt; threads = new ArrayList&lt;&gt;();
+            for (int i = 0; i &lt; n; i++) {
+                Thread t = new Thread(() -&gt; { });    // start 10,000 threads that do nothing
+                t.start();
+                threads.add(t);
+            }
+            for (Thread t : threads) t.join();
+            long ms = (System.nanoTime() - start) / 1_000_000;
+            System.out.println("round " + round + ": " + n + " threads started and joined in " + ms + " ms (" + (ms * 1000 / n) + " µs each)");
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">round 1: 10000 threads started and joined in 232 ms (23 µs each)
+round 2: 10000 threads started and joined in 221 ms (22 µs each)
+round 3: 10000 threads started and joined in 217 ms (21 µs each)</pre>
+<pre class="out">round 1: 10000 threads started and joined in 228 ms (22 µs each)
+round 2: 10000 threads started and joined in 218 ms (21 µs each)
+round 3: 10000 threads started and joined in 221 ms (22 µs each)</pre>
+</div>
+<p>About 22 µs per thread on my machine, the same in both languages because it's the same OS call underneath. That's thousands of times the cost of a method call, which is why real servers reuse threads in a <dfn>pool</dfn> (L28) and why Java added much cheaper <dfn>virtual threads</dfn> (also L28).</p>
+
+<h3>Sleeping, interrupting, and crashing</h3>
+<p>You can't safely kill a thread from outside. Instead you <dfn>interrupt</dfn> it: a polite request that the thread checks for. If the thread is blocked in <code>sleep</code>, <code>join</code> or <code>wait</code>, the request arrives as an <code>InterruptedException</code>. And if a thread throws an exception nobody catches, only that thread dies:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Interrupts.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+fun main() {
+    val sleeper = thread(name = "sleeper") {
+        try {
+            Thread.sleep(10_000)
+            println("woke up normally")
+        } catch (e: InterruptedException) {
+            println("sleeper: interrupted (${e.message}), cleaning up and stopping")
+        }
+    }
+    Thread.sleep(100)
+    sleeper.interrupt()                  // a polite request, not a kill
+    sleeper.join()
+
+    val crasher = thread(name = "crasher") { error("boom") }
+    crasher.join()
+    println("main is still alive; crasher.isAlive = ${crasher.isAlive}")
+
+    val handled = Thread { throw IllegalStateException("bang") }
+    handled.setUncaughtExceptionHandler { t, e -&gt; println("handler: ${t.name} died with ${e.message}") }
+    handled.start()
+    handled.join()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Interrupts.java</figcaption>
+<pre><code class="language-java">public class Interrupts {
+    public static void main(String[] args) throws InterruptedException {
+        Thread sleeper = new Thread(() -&gt; {
+            try {
+                Thread.sleep(10_000);
+                System.out.println("woke up normally");
+            } catch (InterruptedException e) {   // checked: the compiler insists on this catch
+                System.out.println("sleeper: interrupted (" + e.getMessage() + "), cleaning up and stopping");
+            }
+        }, "sleeper");
+        sleeper.start();
+        Thread.sleep(100);
+        sleeper.interrupt();                     // a polite request, not a kill
+        sleeper.join();
+
+        Thread crasher = new Thread(() -&gt; { throw new IllegalStateException("boom"); }, "crasher");
+        crasher.start();
+        crasher.join();
+        System.out.println("main is still alive; crasher.isAlive = " + crasher.isAlive());
+
+        Thread handled = new Thread(() -&gt; { throw new IllegalStateException("bang"); });
+        handled.setUncaughtExceptionHandler((t, e) -&gt; System.out.println("handler: " + t.getName() + " died with " + e.getMessage()));
+        handled.start();
+        handled.join();
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="err">sleeper: interrupted (sleep interrupted), cleaning up and stopping
+Exception in thread "crasher" java.lang.IllegalStateException: boom
+	at InterruptsKt.main$lambda$1(Interrupts.kt:16)
+	at kotlin.concurrent.ThreadsKt$thread$thread$1.run(Thread.kt:30)
+main is still alive; crasher.isAlive = false
+handler: Thread-2 died with bang</pre>
+<pre class="err">sleeper: interrupted (sleep interrupted), cleaning up and stopping
+Exception in thread "crasher" java.lang.IllegalStateException: boom
+	at Interrupts.lambda$main$1(Interrupts.java:16)
+	at java.base/java.lang.Thread.run(Thread.java:1516)
+main is still alive; crasher.isAlive = false
+handler: Thread-0 died with bang</pre>
+</div>
+<p>The default behaviour for an uncaught exception is to print the stack trace with the thread's name (<code>Exception in thread "crasher"</code>) and end that thread. <code>main</code> carries on. That's dangerous in a server, where a worker can die silently while the rest looks healthy, so set an <code>UncaughtExceptionHandler</code> to log it. The unnamed threads got default names, <code>Thread-0</code> and <code>Thread-2</code>.</p>
+<p>In Java, <code>InterruptedException</code> is a checked exception (L10), and <code>Runnable.run()</code> declares no exceptions. So a lambda that sleeps without a <code>try</code> doesn't compile:</p>
+<figure class="java"><figcaption>JAVA · err/SleepNoCatch.java</figcaption>
+<pre><code class="language-java">public class SleepNoCatch {
+    public static void main(String[] args) {
+        Thread t = new Thread(() -&gt; {
+            Thread.sleep(100);          // Runnable.run() declares no exceptions
+            System.out.println("done");
+        });
+        t.start();
+    }
+}</code></pre></figure>
+<pre class="err">SleepNoCatch.java:4: error: unreported exception InterruptedException; must be caught or declared to be thrown
+            Thread.sleep(100);          // Runnable.run() declares no exceptions
+                        ^
+1 error</pre>
+<p>Kotlin "treats all exceptions as unchecked" (<a href="https://kotlinlang.org/docs/exceptions.html">Kotlin docs: Exceptions</a>), so <code>thread { Thread.sleep(100) }</code> just compiles. That's convenient, but it means nothing reminds you to handle the interruption. A good habit in both languages: catch it, clean up, and stop, as <code>sleeper</code> does above. If you can't stop right there, restore the flag with <code>Thread.currentThread().interrupt()</code> so code further up can see it.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>thread(name = "w", isDaemon = true) { … }</code> creates, configures and starts a thread in one call, using named parameters with defaults. Java needs <code>new Thread(…)</code>, <code>setDaemon</code> and <code>start()</code>, or the JDK 21 builder.</li>
+    <li>No checked exceptions, so lambdas that call <code>sleep</code> or <code>join</code> need no <code>try</code>/<code>catch</code>. Compare the lengths of <code>States.kt</code> and <code>States.java</code>.</li>
+    <li>Trailing-lambda syntax (L14) makes <code>thread { … }</code> read like a built-in block.</li>
+    <li>What it <em>doesn't</em> do: anything about thread safety. Kotlin threads are the same JVM platform threads as Java's, with the same scheduler and the same costs.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a parallel sum with nothing shared</div>
+  <ol>
+    <li>From a blank file, fill an <code>IntArray</code>/<code>int[]</code> of 40,000,000 elements with <code>i % 7</code>.</li>
+    <li>Start 4 threads named <code>summer-0</code> to <code>summer-3</code>. Each sums one quarter of the array into a <em>local</em> variable, then writes the result into its own slot of a 4-element <code>LongArray</code>/<code>long[]</code>.</li>
+    <li><code>join</code> all four, add up the slots, and compare the answer and the time with a single-threaded loop. Print each worker's name and state at the end.</li>
+    <li>Predict: will 4 threads be 4× faster? Then run it.</li>
+  </ol>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex1.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+fun main() {
+    val data = IntArray(40_000_000) { it % 7 }
+    val parts = 4
+    val partial = LongArray(parts)                  // one slot per thread: nothing shared
+    val chunk = data.size / parts
+
+    val start = System.nanoTime()
+    val workers = List(parts) { p -&gt;
+        thread(name = "summer-$p") {
+            var sum = 0L                            // a local: lives on this thread's own stack
+            for (i in p * chunk until (p + 1) * chunk) sum += data[i]
+            partial[p] = sum                        // each thread writes only its own slot
+        }
+    }
+    workers.forEach { it.join() }                   // join also makes the slots visible to main
+    val total = partial.sum()
+    val ms = (System.nanoTime() - start) / 1_000_000
+
+    val s2 = System.nanoTime()
+    val check = data.fold(0L) { acc, x -&gt; acc + x }
+    val ms2 = (System.nanoTime() - s2) / 1_000_000
+
+    println("4 threads: $total in $ms ms; 1 thread: $check in $ms2 ms")
+    println(workers.joinToString { "${it.name}=${it.state}" })
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex1.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class Ex1 {
+    public static void main(String[] args) throws InterruptedException {
+        int[] data = new int[40_000_000];
+        for (int i = 0; i &lt; data.length; i++) data[i] = i % 7;
+        int parts = 4;
+        long[] partial = new long[parts];               // one slot per thread: nothing shared
+        int chunk = data.length / parts;
+
+        long start = System.nanoTime();
+        List&lt;Thread&gt; workers = new ArrayList&lt;&gt;();
+        for (int p = 0; p &lt; parts; p++) {
+            int from = p * chunk, to = (p + 1) * chunk, slot = p;
+            Thread t = new Thread(() -&gt; {
+                long sum = 0;                           // a local: lives on this thread's own stack
+                for (int i = from; i &lt; to; i++) sum += data[i];
+                partial[slot] = sum;                    // each thread writes only its own slot
+            }, "summer-" + p);
+            t.start();
+            workers.add(t);
+        }
+        for (Thread t : workers) t.join();              // join also makes the slots visible to main
+        long total = 0;
+        for (long s : partial) total += s;
+        long ms = (System.nanoTime() - start) / 1_000_000;
+
+        long s2 = System.nanoTime();
+        long check = 0;
+        for (int x : data) check += x;
+        long ms2 = (System.nanoTime() - s2) / 1_000_000;
+
+        System.out.println("4 threads: " + total + " in " + ms + " ms; 1 thread: " + check + " in " + ms2 + " ms");
+        StringBuilder sb = new StringBuilder();
+        for (Thread t : workers) sb.append(sb.isEmpty() ? "" : ", ").append(t.getName()).append("=").append(t.getState());
+        System.out.println(sb);
+    }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+<pre class="out">4 threads: 119999995 in 12 ms; 1 thread: 119999995 in 10 ms
+summer-0=TERMINATED, summer-1=TERMINATED, summer-2=TERMINATED, summer-3=TERMINATED</pre>
+<pre class="out">4 threads: 119999995 in 5 ms; 1 thread: 119999995 in 10 ms
+summer-0=TERMINATED, summer-1=TERMINATED, summer-2=TERMINATED, summer-3=TERMINATED</pre>
+    </div>
+    <p>The answers are always right, because no two threads ever write the same memory. This is <dfn>thread confinement</dfn>, the simplest kind of thread safety. Each sum is a local on its own thread's stack, and each slot has exactly one writer. <code>join</code> also guarantees that <code>main</code> sees the slot values the workers wrote (L27 explains why that guarantee matters).</p>
+    <p>The speed-up is not 4×. Java went from 10 ms to 5 ms; Kotlin was <em>slower</em> with threads in this run. Starting threads costs time, the loop code is still cold (not yet JIT-compiled, L23) when the workers start, and summing an array is limited by memory bandwidth, not by the CPU. Measure before you assume threads make something faster.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Threads" data-answer="2">
+  <p class="q"><code>val t = Thread { println(Thread.currentThread().name) }</code>, then <code>t.run()</code> called from <code>main</code>. What's printed?</p>
+  <div class="opts"><button>Thread-0</button><button>Nothing</button><button>main</button><button>worker</button></div>
+  <p class="why"><code>run()</code> is an ordinary method call, so the lambda runs on the calling thread, <code>main</code>. Only <code>start()</code> creates a new thread. <code>StartRun</code>'s first line showed exactly this.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Threads" data-answer="0">
+  <p class="q">A thread is waiting to enter a <code>synchronized</code> block that another thread holds. Its state?</p>
+  <div class="opts"><button><code>BLOCKED</code></button><button><code>WAITING</code></button><button><code>TIMED_WAITING</code></button><button><code>RUNNABLE</code></button></div>
+  <p class="why">"A thread that is blocked waiting for a monitor lock is in this state." <code>WAITING</code> is for <code>join()</code>-style waits with no timeout, and <code>TIMED_WAITING</code> is for <code>sleep</code> or waits with one.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Threads" data-answer="3">
+  <p class="q"><code>main</code> returns while a non-daemon thread is still looping forever. What happens?</p>
+  <div class="opts"><button>The JVM exits right away</button><button>The loop thread is interrupted</button><button>The JVM throws an exception</button><button>The JVM keeps on running</button></div>
+  <p class="why">Shutdown begins only "when all started non-daemon threads have terminated". A forgotten non-daemon thread keeps the program alive. Daemon threads don't.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Threads" data-answer="1">
+  <p class="q">A worker thread throws an exception that nobody catches. What happens to the rest of the program?</p>
+  <div class="opts"><button>Every thread in the JVM stops</button><button>Only that thread dies; others continue</button><button>The JVM restarts the dead thread</button><button>The exception is rethrown in main</button></div>
+  <p class="why">The default handler prints <code>Exception in thread "…"</code> and the trace, then that thread terminates. <code>main</code> kept going in <code>Interrupts</code>. In a server, add an <code>UncaughtExceptionHandler</code> so the failure isn't silent.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Cause a race condition on purpose</h2><span class="t">~25 min</span></div>
+
+<p>The exercise above was safe because nothing was shared. Now share one thing: a counter. Two threads each add 1 to it a million times, so the answer should be 2,000,000. Run it five times:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LostUpdate.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+var count = 0     // a top-level var compiles to a static field of LostUpdateKt
+
+fun main() {
+    repeat(5) { run -&gt;
+        count = 0
+        val workers = List(2) { thread { repeat(1_000_000) { count++ } } }
+        workers.forEach { it.join() }
+        println("run ${run + 1}: count = $count (expected 2000000)")
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LostUpdate.java</figcaption>
+<pre><code class="language-java">public class LostUpdate {
+    static int count = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        for (int run = 1; run &lt;= 5; run++) {
+            count = 0;
+            Thread a = new Thread(LostUpdate::work);
+            Thread b = new Thread(LostUpdate::work);
+            a.start(); b.start();
+            a.join(); b.join();
+            System.out.println("run " + run + ": count = " + count + " (expected 2000000)");
+        }
+    }
+
+    static void work() {
+        for (int i = 0; i &lt; 1_000_000; i++) count++;
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="err">run 1: count = 1809603 (expected 2000000)
+run 2: count = 1992832 (expected 2000000)
+run 3: count = 1000000 (expected 2000000)
+run 4: count = 2000000 (expected 2000000)
+run 5: count = 2000000 (expected 2000000)</pre>
+<pre class="err">run 1: count = 1007267 (expected 2000000)
+run 2: count = 1822618 (expected 2000000)
+run 3: count = 2000000 (expected 2000000)
+run 4: count = 2000000 (expected 2000000)
+run 5: count = 2000000 (expected 2000000)</pre>
+</div>
+<p>The early runs lose hundreds of thousands of increments. Each lost increment is a <dfn>lost update</dfn>: one thread's write overwrote another's. Then something odd happens. Later runs print exactly 2,000,000, or exactly 1,000,000. Did the bug fix itself?</p>
+<p>No. Here is the same Java program run with <code>-Xint</code>, which turns the JIT compiler off (L23):</p>
+<pre class="term"><span class="p">$ </span>javac LostUpdate.java
+<span class="p">$ </span>java -Xint LostUpdate
+run 1: count = 1039715 (expected 2000000)
+run 2: count = 1025407 (expected 2000000)
+run 3: count = 1043679 (expected 2000000)
+run 4: count = 1255031 (expected 2000000)
+run 5: count = 1020188 (expected 2000000)</pre>
+<p>Interpreted, every run loses about half the updates; the Kotlin version under <code>-Xint</code> behaved the same, at 1,014,152–1,020,747. With <code>-XX:+PrintCompilation</code>, the clean numbers start right after C2 compiles <code>work</code> at tier 4:</p>
+<pre class="term"><span class="p">$ </span>java -XX:+PrintCompilation LostUpdate 2&gt;&amp;1 | grep -E 'work|run [0-9]'
+     <span class="c">…</span>
+run 1: count = 1071272 (expected 2000000)
+19   65 %     4       LostUpdate::work @ 2 (23 bytes)
+19   66       4       LostUpdate::work (23 bytes)
+run 2: count = 1014612 (expected 2000000)
+run 3: count = 1043841 (expected 2000000)
+run 4: count = 2000000 (expected 2000000)
+run 5: count = 2000000 (expected 2000000)</pre>
+<p>Because <code>count</code> has no synchronization, the JIT is allowed to keep it in a CPU register for the whole loop: read it once, add 1,000,000, and write it once at the end. The JLS says exactly this about a similar loop: "The compiler is free to read the field this.done just once, and reuse the cached value in each execution of the loop" (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.3">JLS §17.3</a>). Now each thread does one big read and one big write. If the threads don't overlap, you get 2,000,000. If they overlap, one big write erases the other, and you get exactly 1,000,000. The race is still there; it just got coarser. That is my reading of the evidence above (I can't show you the machine code without extra tools), but the conclusion doesn't depend on it: <b>a racy program can print the right answer, and that proves nothing</b>.</p>
+
+<h3>Why <code>count++</code> isn't one step</h3>
+<p>To see the collision, look at what <code>count++</code> compiles to. Here is a tiny <code>Counter</code> class with an <code>increment()</code> method, through <code>javap -c</code> (L23):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Counter.kt</figcaption>
+<pre><code class="language-kotlin">class Counter {
+    var count = 0
+    fun increment() { count++ }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Counter.java</figcaption>
+<pre><code class="language-java">class Counter {
+    int count;
+    void increment() { count++; }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">public final void increment();
+  Code:
+     0: aload_0
+     1: getfield      #16   // Field count:I
+     4: istore_1
+     5: aload_0
+     6: iload_1
+     7: iconst_1
+     8: iadd
+     9: putfield      #16   // Field count:I
+    12: return</pre>
+<pre class="out">void increment();
+  Code:
+     0: aload_0
+     1: dup
+     2: getfield      #7    // Field count:I
+     5: iconst_1
+     6: iadd
+     7: putfield      #7    // Field count:I
+    10: return</pre>
+</div>
+<p>Both are <b>read</b> (<code>getfield</code>), <b>add</b> (<code>iconst_1</code>, <code>iadd</code>), <b>write</b> (<code>putfield</code>). kotlinc even parks the old value in local variable 1 on the way. The scheduler can switch threads between any two instructions, and on a multicore machine the two threads run these steps at the same time. The Java tutorial calls this <dfn>thread interference</dfn>: it "happens when two operations, running in different threads, but acting on the same data, interleave. This means that the two operations consist of multiple steps, and the sequences of steps overlap" (<a href="https://docs.oracle.com/javase/tutorial/essential/concurrency/interfere.html">Java Tutorials: Thread Interference</a>).</p>
+<p>Play the scheduler yourself. Each thread runs <code>count++</code> once, starting from 41, so the answer should be 43. Use the <b>No lock</b> tab: click "Scripted step" six times for the classic lost update, or click the lane buttons to try your own orders. Can you find an order that gives 43? Which orders give 42? Then switch to the <b>synchronized</b> tab, which you'll understand properly in Part 3.</p>
+
+<div class="threadviz" data-src="tv-count"></div>
+<script type="application/json" id="tv-count">{
+  "start": 41,
+  "ops": ["getfield count", "iconst_1; iadd", "putfield count"],
+  "modes": [
+    { "name": "No lock", "lock": false, "script": ["A","B","A","A","B","B"] },
+    { "name": "synchronized", "lock": true, "script": ["A","B","A","A","A","A","B","B","B","B","B"] }
+  ]
+}</script>
+
+<h3>Check-then-act</h3>
+<p>Lost updates come from <dfn>read-modify-write</dfn>: read a value, compute from it, write it back. The other classic shape is <dfn>check-then-act</dfn>: check a condition, then act on it, while another thread changes the world in between. Lazy initialisation is the textbook case. Eight threads call <code>getConfig()</code> at the same moment, held at a start line by a <code>CountDownLatch</code>, "a synchronization aid that allows one or more threads to wait until a set of operations being performed in other threads completes" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/CountDownLatch.html"><code>CountDownLatch</code> API docs</a>):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · CheckThenAct.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+
+val created = AtomicInteger()               // counts constructor calls safely
+
+class Config {
+    init {
+        created.incrementAndGet()
+        Thread.sleep(5)                      // "expensive" setup widens the race window
+    }
+}
+
+var instance: Config? = null
+fun getConfig(): Config {
+    if (instance == null) {                  // check...
+        instance = Config()                  // ...then act: another thread may be here too
+    }
+    return instance!!
+}
+
+val lazyConfig by lazy { Config() }          // L15: synchronized by default
+
+fun main() {
+    repeat(5) { run -&gt;
+        created.set(0); instance = null
+        hammer { getConfig() }
+        println("run ${run + 1}: Config created ${created.get()} times by getConfig()")
+    }
+    created.set(0)
+    hammer { lazyConfig }
+    println("by lazy: Config created ${created.get()} time")
+}
+
+fun hammer(task: () -&gt; Unit) {
+    val gate = CountDownLatch(1)             // hold all 8 threads at the start line
+    val threads = List(8) { thread { gate.await(); task() } }
+    gate.countDown()                         // ...then release them together
+    threads.forEach { it.join() }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · CheckThenAct.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class CheckThenAct {
+    static final AtomicInteger created = new AtomicInteger();   // counts constructor calls safely
+
+    static class Config {
+        Config() {
+            created.incrementAndGet();
+            sleep(5);                                  // "expensive" setup widens the race window
+        }
+    }
+
+    static Config instance;
+    static Config getConfig() {
+        if (instance == null) {                        // check...
+            instance = new Config();                   // ...then act: another thread may be here too
+        }
+        return instance;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        for (int run = 1; run &lt;= 5; run++) {
+            created.set(0); instance = null;
+            hammer(CheckThenAct::getConfig);
+            System.out.println("run " + run + ": Config created " + created.get() + " times by getConfig()");
+        }
+    }
+
+    static void hammer(Runnable task) throws InterruptedException {
+        CountDownLatch gate = new CountDownLatch(1);   // hold all 8 threads at the start line
+        List&lt;Thread&gt; threads = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 8; i++) {
+            Thread t = new Thread(() -&gt; {
+                try { gate.await(); } catch (InterruptedException e) { return; }
+                task.run();
+            });
+            t.start();
+            threads.add(t);
+        }
+        gate.countDown();                              // ...then release them together
+        for (Thread t : threads) t.join();
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="err">run 1: Config created 8 times by getConfig()
+run 2: Config created 8 times by getConfig()
+run 3: Config created 8 times by getConfig()
+run 4: Config created 8 times by getConfig()
+run 5: Config created 8 times by getConfig()
+by lazy: Config created 1 time</pre>
+<pre class="err">run 1: Config created 8 times by getConfig()
+run 2: Config created 8 times by getConfig()
+run 3: Config created 8 times by getConfig()
+run 4: Config created 8 times by getConfig()
+run 5: Config created 8 times by getConfig()</pre>
+</div>
+<p>All eight threads saw <code>null</code>, all eight built a <code>Config</code>, and each overwrote the last one. The 5 ms "expensive setup" widens the window between check and act, which is realistic: real initialisation reads files or opens connections. Kotlin's <code>by lazy</code> (L15) created exactly one, because "by default, the evaluation of lazy properties is synchronized: the value is computed only in one thread, but all threads will see the same value" (<a href="https://kotlinlang.org/docs/delegated-properties.html">Kotlin docs: Delegated properties</a>). The <code>created</code> counter is an <code>AtomicInteger</code>, Part 3's tool, so the <em>measuring</em> code isn't racy itself.</p>
+
+<h3>Collections aren't thread-safe either</h3>
+<p><code>HashMap</code> is the collection you use most (L19), and its API docs say plainly that it is "not synchronized". Two threads update one map, both counting words (read-modify-write) and inserting distinct keys (structural changes that trigger resizes):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · MapRace.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+fun main() {
+    repeat(5) { run -&gt;
+        val counts = HashMap&lt;String, Int&gt;()
+        val keys = HashMap&lt;Int, Int&gt;()
+        val workers = List(2) { w -&gt;
+            thread {
+                repeat(100_000) { i -&gt;
+                    val word = "w${i % 10}"
+                    counts[word] = (counts[word] ?: 0) + 1     // read-modify-write
+                    keys[w * 100_000 + i] = i                  // structural change: inserts, resizes
+                }
+            }
+        }
+        workers.forEach { it.join() }
+        println("run ${run + 1}: total count = ${counts.values.sum()} (expected 200000), " +
+                "keys.size = ${keys.size} (expected 200000)")
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · MapRace.java</figcaption>
+<pre><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+
+public class MapRace {
+    public static void main(String[] args) throws InterruptedException {
+        for (int run = 1; run &lt;= 5; run++) {
+            Map&lt;String, Integer&gt; counts = new HashMap&lt;&gt;();
+            Map&lt;Integer, Integer&gt; keys = new HashMap&lt;&gt;();
+            Thread[] workers = new Thread[2];
+            for (int w = 0; w &lt; 2; w++) {
+                int base = w * 100_000;
+                workers[w] = new Thread(() -&gt; {
+                    for (int i = 0; i &lt; 100_000; i++) {
+                        String word = "w" + (i % 10);
+                        counts.put(word, counts.getOrDefault(word, 0) + 1);   // read-modify-write
+                        keys.put(base + i, i);                                // structural change: inserts, resizes
+                    }
+                });
+                workers[w].start();
+            }
+            for (Thread t : workers) t.join();
+            int total = counts.values().stream().mapToInt(Integer::intValue).sum();
+            System.out.println("run " + run + ": total count = " + total + " (expected 200000), keys.size = " + keys.size() + " (expected 200000)");
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="err">run 1: total count = 192396 (expected 200000), keys.size = 129263 (expected 200000)
+run 2: total count = 179037 (expected 200000), keys.size = 151982 (expected 200000)
+run 3: total count = 181540 (expected 200000), keys.size = 147012 (expected 200000)
+run 4: total count = 180831 (expected 200000), keys.size = 149802 (expected 200000)
+run 5: total count = 188626 (expected 200000), keys.size = 129394 (expected 200000)</pre>
+<pre class="err">run 1: total count = 186916 (expected 200000), keys.size = 126716 (expected 200000)
+run 2: total count = 185029 (expected 200000), keys.size = 129116 (expected 200000)
+run 3: total count = 180112 (expected 200000), keys.size = 150668 (expected 200000)
+run 4: total count = 187909 (expected 200000), keys.size = 129837 (expected 200000)
+run 5: total count = 187938 (expected 200000), keys.size = 135491 (expected 200000)</pre>
+</div>
+<p>The counts are short, and tens of thousands of keys went missing. It's worse than the size suggests. A follow-up probe (<code>MapProbe.java</code> in the course sources) looked up every key afterwards: in one run <code>size()</code> said 128,764 while 183,513 keys could actually be found. The map's internal bookkeeping no longer agreed with its own contents. No exception was thrown in any run, so nothing warned me. The program just carried on with a corrupt map. L27 covers <code>ConcurrentHashMap</code>, the thread-safe replacement.</p>
+
+<h3>Why races are so hard to find</h3>
+<ul>
+  <li><b>They depend on timing.</b> The same program printed 1,809,603, then 2,000,000. On a different machine, JDK or load, the odds change.</li>
+  <li><b>They hide when you look.</b> A breakpoint (L12) or a <code>println</code> changes the timing, and the bug may vanish while you watch. People call this a <dfn>Heisenbug</dfn>.</li>
+  <li><b>The code looks right.</b> <code>count++</code> and <code>if (instance == null)</code> are correct in single-threaded code. Nothing in the source says "shared".</li>
+  <li><b>The failure shows up far away,</b> as a wrong balance or a missing map entry, long after the racing lines ran.</li>
+</ul>
+
+<h3>Data race vs race condition</h3>
+<p>The two terms are related but different. A <dfn>data race</dfn> is defined by the JLS: two accesses to the same variable are "conflicting if at least one of the accesses is a write", and "when a program contains two conflicting accesses that are not ordered by a happens-before relationship, it is said to contain a data race" (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.4.5">JLS §17.4.5</a>). A <dfn>race condition</dfn> is any bug where the result depends on the timing between threads. You can have one without the other. The JLS itself warns that "freedom from data races still allows errors arising from groups of operations that need to be perceived atomically and are not" (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.4.3">§17.4.3</a>). Part 3's exercise shows exactly that: an <code>AtomicInteger</code> account has no data race, but it still overdraws. L27 explains "happens-before".</p>
+
+<p><b>Kotlin note.</b> <code>LostUpdate.kt</code> used a top-level <code>var count</code>. There's no magic there: it compiles to a <code>static</code> field of the <code>LostUpdateKt</code> class (L9), shared by every thread exactly like Java's <code>static int count</code>. The same goes for properties of an <code>object</code> and of a <code>companion object</code>. "Global" in Kotlin means "shared between all threads".</p>
+
+<p class="note">Bridge: Spring creates one instance of a singleton bean, and "all requests for beans with an ID or IDs that match that bean definition result in that one specific bean instance being returned". Its advice is "use the prototype scope for all stateful beans and the singleton scope for stateless beans" (<a href="https://docs.spring.io/spring-framework/reference/core/beans/factory-scopes.html">Spring: Bean Scopes</a>). A web server handles requests on many threads at once, so a mutable field in a singleton controller is this lesson's shared counter. Android takes the opposite approach: "the Android UI toolkit is not thread-safe", so its rule is "Don't access the Android UI toolkit from outside the UI thread" (<a href="https://developer.android.com/guide/components/processes-and-threads">Android: Processes and threads</a>). Confining all UI work to one thread removes the races by design.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>by lazy { }</code> is synchronized by default, so the check-then-act race in <code>getConfig()</code> can't happen. In Java you write the locking yourself (L27 shows the correct way).</li>
+    <li><code>object</code> declarations are initialised safely: "The initialization of an object declaration is thread-safe and done on first access" (<a href="https://kotlinlang.org/docs/object-declarations.html">Kotlin docs</a>).</li>
+    <li>What it doesn't do: protect any <code>var</code>. A Kotlin property is a field plus getter and setter, and <code>count++</code> on it is the same read, add, write as Java's, as <code>javap</code> showed. Read-only <code>List</code> types don't help either: <code>HashMap</code> under a <code>MutableMap</code> races exactly as in Java.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: overdraw a bank account</div>
+  <ol>
+    <li>From a blank file, write an <code>Account</code> with a <code>balance</code> and <code>withdraw(amount): Boolean</code>. If the balance covers the amount, sleep 1 ms (a pretend fraud check), subtract, and return <code>true</code>; otherwise return <code>false</code>.</li>
+    <li>Start the account at 100. Release 10 threads at once with a <code>CountDownLatch</code> start gate, each trying to withdraw 20. Count approvals with an <code>AtomicInteger</code>.</li>
+    <li>Run it three times. How many approvals <em>should</em> there be, and what's the right final balance? Name the race shape (or shapes) you see.</li>
+  </ol>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex2.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+
+class Account(var balance: Int) {
+    fun withdraw(amount: Int): Boolean {
+        if (balance &gt;= amount) {                 // check...
+            Thread.sleep(1)                      // (a slow fraud check widens the window)
+            balance -= amount                    // ...then act
+            return true
+        }
+        return false
+    }
+}
+
+fun main() {
+    repeat(3) { run -&gt;
+        val acct = Account(100)
+        val approved = AtomicInteger()
+        val gate = CountDownLatch(1)
+        val customers = List(10) {
+            thread { gate.await(); if (acct.withdraw(20)) approved.incrementAndGet() }
+        }
+        gate.countDown()
+        customers.forEach { it.join() }
+        println("run ${run + 1}: approved ${approved.get()} withdrawals of 20, balance = ${acct.balance}")
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex2.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Ex2 {
+    static class Account {
+        int balance;
+        Account(int balance) { this.balance = balance; }
+
+        boolean withdraw(int amount) throws InterruptedException {
+            if (balance &gt;= amount) {             // check...
+                Thread.sleep(1);                 // (a slow fraud check widens the window)
+                balance -= amount;               // ...then act
+                return true;
+            }
+            return false;
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        for (int run = 1; run &lt;= 3; run++) {
+            Account acct = new Account(100);
+            AtomicInteger approved = new AtomicInteger();
+            CountDownLatch gate = new CountDownLatch(1);
+            List&lt;Thread&gt; customers = new ArrayList&lt;&gt;();
+            for (int i = 0; i &lt; 10; i++) {
+                Thread t = new Thread(() -&gt; {
+                    try {
+                        gate.await();
+                        if (acct.withdraw(20)) approved.incrementAndGet();
+                    } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                });
+                t.start(); customers.add(t);
+            }
+            gate.countDown();
+            for (Thread t : customers) t.join();
+            System.out.println("run " + run + ": approved " + approved.get() + " withdrawals of 20, balance = " + acct.balance);
+        }
+    }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+<pre class="err">run 1: approved 10 withdrawals of 20, balance = -40
+run 2: approved 10 withdrawals of 20, balance = -100
+run 3: approved 10 withdrawals of 20, balance = -100</pre>
+<pre class="err">run 1: approved 10 withdrawals of 20, balance = -100
+run 2: approved 10 withdrawals of 20, balance = -60
+run 3: approved 10 withdrawals of 20, balance = -100</pre>
+    </div>
+    <p>There should be 5 approvals and a final balance of 0. Instead all 10 were approved, because all 10 threads did the <b>check</b> before any of them did the <b>act</b>: check-then-act. The runs ending at −40 and −60 show a <em>second</em> race on top. Ten subtractions of 20 from 100 should reach −100, so some <code>balance -= amount</code> writes were lost: read-modify-write. Part 3's exercise fixes this.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Races" data-answer="1">
+  <p class="q">Two threads each run <code>count++</code> once on a shared <code>count</code> that starts at 5. Which final values are possible?</p>
+  <div class="opts"><button>Always exactly seven</button><button>Six or seven</button><button>Five to seven</button><button>Always exactly six</button></div>
+  <p class="why">If the read-add-write sequences don't overlap, you get 7. If both threads read 5 before either writes, both write 6. Both threads always write <em>something</em> at least 6, so 5 is impossible. Try both orders in the widget.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Races" data-answer="3">
+  <p class="q">A racy counter printed the right total on runs 4 and 5. What does that prove?</p>
+  <div class="opts"><button>The JIT fixed the race</button><button>Only cold code has bugs</button><button>Two threads are always safe</button><button>Nothing about its thread safety</button></div>
+  <p class="why">Run 3 of the same program printed exactly 1,000,000. Compiled code made the race coarser (one read, one write per thread), not safe. A correct-looking result from a racy program is luck.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Races" data-answer="0">
+  <p class="q"><code>if (cache[key] == null) cache[key] = load(key)</code> on a shared map is an example of which race shape?</p>
+  <div class="opts"><button>Check-then-act race</button><button>Lost wakeup</button><button>A deadlock</button><button>Stack overflow</button></div>
+  <p class="why">The check (<code>== null</code>) and the act (the put) are separate steps, and another thread can pass the same check in between, so <code>load</code> runs twice. It's the same shape as <code>getConfig()</code>.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Races" data-answer="2">
+  <p class="q">In Kotlin, a top-level <code>var hits = 0</code> is updated from many threads. How is it shared?</p>
+  <div class="opts"><button>Each thread gets a copy</button><button>Kotlin makes it atomic automatically</button><button>Like a static Java field</button><button>Only main can change it</button></div>
+  <p class="why">Top-level properties compile to static fields of the file's <code>…Kt</code> class (L9). Every thread sees the same field, with no protection, exactly like <code>LostUpdate.kt</code>'s <code>count</code>.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2><code>synchronized</code>, locks, atomics</h2><span class="t">~30 min</span></div>
+
+<p>Every fix in this part does the same job: it makes the read-modify-write behave as one indivisible step, an <dfn>atomic action</dfn>, one that "effectively happens all at once. An atomic action cannot stop in the middle: it either happens completely, or it doesn't happen at all" (<a href="https://docs.oracle.com/javase/tutorial/essential/concurrency/atomic.html">Java Tutorials: Atomic Access</a>). There are three tools, and you'll measure all three.</p>
+
+<h3>Tool 1: the built-in lock</h3>
+<p>"Each object in Java is associated with a monitor, which a thread can lock or unlock. Only one thread at a time may hold a lock on a monitor. Any other threads attempting to lock that monitor are blocked until they can obtain a lock on that monitor" (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.1">JLS §17.1</a>). Java uses it through the <code>synchronized</code> keyword, on a whole method (the lock is <code>this</code>) or on a block (you choose the lock object). Kotlin has no such keyword. It has the <code>@Synchronized</code> annotation, which "marks the JVM method generated from the annotated function as synchronized" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.jvm/-synchronized/">Kotlin API</a>), and a stdlib function <code>synchronized(lock) { }</code> that "executes the given function block while holding the monitor of the given object lock" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin/synchronized.html">Kotlin API</a>).</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · SyncCounters.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+class SyncCounter {
+    private var count = 0
+    @Synchronized fun increment() { count++ }          // lock = this object
+    @Synchronized fun addTwice() { increment(); increment() }   // re-enters the lock it holds
+    @Synchronized fun get() = count
+}
+
+class BlockCounter {
+    private val lock = Any()                           // a private lock nobody else can grab
+    private var count = 0
+    fun increment() { synchronized(lock) { count++ } }
+    fun get() = synchronized(lock) { count }
+}
+
+fun main() {
+    repeat(3) { run -&gt;
+        val s = SyncCounter(); val b = BlockCounter()
+        val workers = List(2) { thread { repeat(1_000_000) { s.increment(); b.increment() } } }
+        workers.forEach { it.join() }
+        println("run ${run + 1}: @Synchronized = ${s.get()}, synchronized(lock) = ${b.get()}")
+    }
+    val s = SyncCounter()
+    s.addTwice()
+    println("reentrant: addTwice() -&gt; ${s.get()}")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · SyncCounters.java</figcaption>
+<pre><code class="language-java">public class SyncCounters {
+    static class SyncCounter {
+        private int count;
+        synchronized void increment() { count++; }                  // lock = this object
+        synchronized void addTwice() { increment(); increment(); }  // re-enters the lock it holds
+        synchronized int get() { return count; }
+    }
+
+    static class BlockCounter {
+        private final Object lock = new Object();                   // a private lock nobody else can grab
+        private int count;
+        void increment() { synchronized (lock) { count++; } }
+        int get() { synchronized (lock) { return count; } }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        for (int run = 1; run &lt;= 3; run++) {
+            SyncCounter s = new SyncCounter(); BlockCounter b = new BlockCounter();
+            Runnable work = () -&gt; { for (int i = 0; i &lt; 1_000_000; i++) { s.increment(); b.increment(); } };
+            Thread t1 = new Thread(work), t2 = new Thread(work);
+            t1.start(); t2.start(); t1.join(); t2.join();
+            System.out.println("run " + run + ": synchronized method = " + s.get() + ", synchronized (lock) = " + b.get());
+        }
+        SyncCounter s = new SyncCounter();
+        s.addTwice();
+        System.out.println("reentrant: addTwice() -&gt; " + s.get());
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">run 1: @Synchronized = 2000000, synchronized(lock) = 2000000
+run 2: @Synchronized = 2000000, synchronized(lock) = 2000000
+run 3: @Synchronized = 2000000, synchronized(lock) = 2000000
+reentrant: addTwice() -> 2</pre>
+<pre class="out">run 1: synchronized method = 2000000, synchronized (lock) = 2000000
+run 2: synchronized method = 2000000, synchronized (lock) = 2000000
+run 3: synchronized method = 2000000, synchronized (lock) = 2000000
+reentrant: addTwice() -> 2</pre>
+</div>
+<p>Correct every time. Notice that <code>get()</code> is synchronized too. Reading under the same lock is what guarantees you see the latest value; L27 explains why. <code>addTwice()</code> already holds the lock when it calls <code>increment()</code>, which needs the same lock, and that works because monitors are <dfn>reentrant</dfn>: "A thread t may lock a particular monitor multiple times; each unlock reverses the effect of one lock operation" (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.1">JLS §17.1</a>).</p>
+<p>What did each form compile to? A synchronized method is just a flag; a synchronized block is real instructions (L23):</p>
+<pre class="term"><span class="p">$ </span>javap -v -p SyncCounter        <span class="c"># Kotlin's @Synchronized fun increment()</span>
+  public final synchronized void increment();
+    flags: (0x0031) ACC_PUBLIC, ACC_FINAL, ACC_SYNCHRONIZED
+<span class="p">$ </span>javap -v -p 'SyncCounters$SyncCounter'      <span class="c"># Java's synchronized void increment()</span>
+  synchronized void increment();
+    flags: (0x0020) ACC_SYNCHRONIZED
+<span class="p">$ </span>javap -c -p 'SyncCounters$BlockCounter'     <span class="c"># Java's synchronized (lock) { count++; }</span>
+  void increment();
+    Code:
+       0: aload_0
+       1: getfield      #7     // Field lock:Ljava/lang/Object;
+       4: dup
+       5: astore_1
+       6: monitorenter
+       7: aload_0
+       8: dup
+       9: getfield      #13    // Field count:I
+      12: iconst_1
+      13: iadd
+      14: putfield      #13    // Field count:I
+      17: aload_1
+      18: monitorexit
+      19: goto          27
+      22: astore_2
+      23: aload_1
+      24: monitorexit
+      25: aload_2
+      26: athrow
+      27: return
+    Exception table:
+       from    to  target type
+           7    19    22   any
+          22    25    22   any</pre>
+<p>The same read-add-write sits between <code>monitorenter</code> and <code>monitorexit</code>. The compiler also adds a second <code>monitorexit</code> at offset 24 and an exception-table entry covering the body: if anything inside throws, the lock is still released before the exception continues (<code>athrow</code>). It's a <code>finally</code> you get for free. Kotlin's inline <code>synchronized(lock) { }</code> compiles to the same <code>monitorenter</code>/<code>monitorexit</code> pair. Try the <b>synchronized</b> tab of the widget again: thread B now shows <code>BLOCKED</code> until A's <code>monitorexit</code>.</p>
+
+<h3>The lock must be the same object</h3>
+<p>A lock only excludes threads that lock <em>the same object</em>. Two ways to get that wrong:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · WrongLock.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.thread
+
+var a = 0
+
+fun main() {
+    val workers = List(2) {
+        thread {
+            repeat(1_000_000) {
+                synchronized(Any()) { a++ }      // a brand-new lock object every time
+            }
+        }
+    }
+    workers.forEach { it.join() }
+    println("fresh lock each call: a = $a (expected 2000000)")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · WrongLock.java</figcaption>
+<pre><code class="language-java">public class WrongLock {
+    static int a = 0;
+    static Integer boxed = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable work = () -&gt; {
+            for (int i = 0; i &lt; 1_000_000; i++) {
+                synchronized (new Object()) { a++; }      // a brand-new lock object every time
+                synchronized (boxed) {                    // lock on the counter's own box...
+                    boxed++;                              // ...which this line replaces with a new box
+                }
+            }
+        };
+        Thread t1 = new Thread(work), t2 = new Thread(work);
+        t1.start(); t2.start(); t1.join(); t2.join();
+        System.out.println("fresh lock each call: a = " + a + " (expected 2000000)");
+        System.out.println("lock on boxed value:  boxed = " + boxed + " (expected 2000000)");
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="err">fresh lock each call: a = 1956713 (expected 2000000)
+fresh lock each call: a = 1955986 (expected 2000000)
+fresh lock each call: a = 1958290 (expected 2000000)</pre>
+<pre class="err">WrongLock.java:9: warning: [identity] attempt to synchronize on an instance of a value-based class
+                synchronized (boxed) {                    // lock on the counter's own box...
+                ^
+1 warning
+fresh lock each call: a = 1900946 (expected 2000000)
+lock on boxed value:  boxed = 1609968 (expected 2000000)
+fresh lock each call: a = 1905204 (expected 2000000)
+lock on boxed value:  boxed = 1588689 (expected 2000000)
+fresh lock each call: a = 1894164 (expected 2000000)
+lock on boxed value:  boxed = 1631258 (expected 2000000)</pre>
+</div>
+<p>A new <code>Any()</code>/<code>new Object()</code> per call means every thread holds its own private lock, so no thread ever waits. Locking on the boxed counter is sneakier. <code>boxed++</code> creates a <em>new</em> <code>Integer</code> (L5: wrappers are immutable), so the next thread locks a different object. For values from −128 to 127 it might even share a cached box with unrelated code that locks on the same number. javac warns about it: <code>Integer</code> is a value-based class, and the docs say "synchronization on instances of value-based classes is strongly discouraged, because the programmer cannot guarantee exclusive ownership of the associated monitor" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/doc-files/ValueBased.html">Value-based Classes</a>). Kotlin goes further and refuses to compile it:</p>
+<figure class="kotlin"><figcaption>KOTLIN · err/LockOnInt.kt</figcaption>
+<pre><code class="language-kotlin">var boxed: Int? = 0                     // a nullable Int is a boxed Integer object
+
+fun bump() {
+    synchronized(boxed!!) {             // lock on the counter's own box...
+        boxed = boxed!! + 1             // ...which this line replaces with a new box
+    }
+}</code></pre></figure>
+<pre class="err">LockOnInt.kt:4:18: error: synchronizing on 'Int' is forbidden.
+    synchronized(boxed!!) {             // lock on the counter's own box...
+                 ^^^^^^^</pre>
+<p>The safe pattern is the one in <code>BlockCounter</code>: a <code>private val lock = Any()</code> / <code>private final Object lock = new Object()</code> field, created once, used for every access to the data it guards, and invisible to outside code. Never lock on a <code>String</code> literal either: identical literals are the same interned object (L5), so unrelated code could end up sharing your lock.</p>
+
+<h3>Tool 2: <code>ReentrantLock</code></h3>
+<p><code>java.util.concurrent.locks.ReentrantLock</code> is "a reentrant mutual exclusion Lock with the same basic behavior and semantics as the implicit monitor lock accessed using synchronized methods and statements, but with extended capabilities" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/locks/ReentrantLock.html"><code>ReentrantLock</code> API docs</a>). Being explicit, it doesn't release itself. The docs: "It is recommended practice to always immediately follow a call to lock with a try block, and to always immediately call unlock as the first statement in the finally block" (L10's <code>finally</code>). Kotlin wraps that pattern in the <code>withLock</code> extension, which "executes the given action under this lock" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.concurrent/with-lock.html">Kotlin API</a>).</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Locks.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
+
+class LockCounter {
+    private val lock = ReentrantLock()
+    private var count = 0
+    fun increment() = lock.withLock { count++ }        // lock, run, unlock in finally
+    fun get() = lock.withLock { count }
+}
+
+fun main() {
+    val c = LockCounter()
+    List(2) { thread { repeat(1_000_000) { c.increment() } } }.forEach { it.join() }
+    println("ReentrantLock counter = ${c.get()}")
+
+    val lock = ReentrantLock()
+    val holder = thread {
+        lock.withLock { println("holder: got the lock, working for 300 ms"); Thread.sleep(300) }
+    }
+    Thread.sleep(50)
+    if (lock.tryLock(100, TimeUnit.MILLISECONDS)) {
+        try { println("main: got it") } finally { lock.unlock() }
+    } else {
+        println("main: gave up after 100 ms instead of waiting forever")
+    }
+    holder.join()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Locks.java</figcaption>
+<pre><code class="language-java">import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class Locks {
+    static class LockCounter {
+        private final ReentrantLock lock = new ReentrantLock();
+        private int count;
+        void increment() {
+            lock.lock();
+            try { count++; }
+            finally { lock.unlock(); }       // always unlock, even if the body throws
+        }
+        int get() {
+            lock.lock();
+            try { return count; } finally { lock.unlock(); }
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        LockCounter c = new LockCounter();
+        Runnable work = () -&gt; { for (int i = 0; i &lt; 1_000_000; i++) c.increment(); };
+        Thread t1 = new Thread(work), t2 = new Thread(work);
+        t1.start(); t2.start(); t1.join(); t2.join();
+        System.out.println("ReentrantLock counter = " + c.get());
+
+        ReentrantLock lock = new ReentrantLock();
+        Thread holder = new Thread(() -&gt; {
+            lock.lock();
+            try {
+                System.out.println("holder: got the lock, working for 300 ms");
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally { lock.unlock(); }
+        });
+        holder.start();
+        Thread.sleep(50);
+        if (lock.tryLock(100, TimeUnit.MILLISECONDS)) {
+            try { System.out.println("main: got it"); } finally { lock.unlock(); }
+        } else {
+            System.out.println("main: gave up after 100 ms instead of waiting forever");
+        }
+        holder.join();
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">ReentrantLock counter = 2000000
+holder: got the lock, working for 300 ms
+main: gave up after 100 ms instead of waiting forever</pre>
+<pre class="out">ReentrantLock counter = 2000000
+holder: got the lock, working for 300 ms
+main: gave up after 100 ms instead of waiting forever</pre>
+</div>
+<p>The extended capabilities are why you'd choose it over <code>synchronized</code>:</p>
+<ul>
+  <li><b><code>tryLock</code>, with or without a timeout.</b> As above, a thread can give up and do something else instead of waiting forever. That becomes a deadlock defence in L27.</li>
+  <li><b>Interruptible waiting</b> with <code>lockInterruptibly()</code>. A thread stuck entering a <code>synchronized</code> block can't be interrupted.</li>
+  <li><b>Fairness.</b> <code>ReentrantLock(true)</code> makes the lock "favor granting access to the longest-waiting thread", but the docs warn that fair locks "may display lower overall throughput (i.e., are slower; often much slower)".</li>
+  <li><b>Conditions</b> (<code>newCondition()</code>), for more than one wait queue. You'll meet them with blocking queues in L27.</li>
+</ul>
+<p>If you need none of these, <code>synchronized</code> is shorter and can't be left locked by mistake.</p>
+
+<h3>Tool 3: atomics and compare-and-set</h3>
+<p>The third option needs no lock at all. <code>AtomicInteger.incrementAndGet()</code> does the read-modify-write as one atomic hardware operation. Underneath is <dfn>compare-and-set</dfn> (CAS): <code>compareAndSet(expected, new)</code> "atomically sets the value to newValue if the current value == expectedValue" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/atomic/AtomicInteger.html"><code>AtomicInteger</code> API docs</a>), and returns <code>false</code> if another thread got there first. So you can build any atomic update yourself: read, compute, try to swap, and retry if you lost. The program below does exactly that and counts the retries:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Atomics.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.LongAdder
+import kotlin.concurrent.thread
+
+val retries = LongAdder()                     // counts failed compare-and-set attempts
+
+fun casIncrement(a: AtomicInteger) {
+    while (true) {
+        val old = a.get()                     // 1. read
+        if (a.compareAndSet(old, old + 1)) return   // 2. write only if nobody changed it
+        retries.increment()                   // 3. somebody did: loop and try again
+    }
+}
+
+fun main() {
+    val atomic = AtomicInteger()
+    val manual = AtomicInteger()
+    val adder = LongAdder()
+    val workers = List(4) {
+        thread {
+            repeat(1_000_000) {
+                atomic.incrementAndGet()
+                casIncrement(manual)
+                adder.increment()
+            }
+        }
+    }
+    workers.forEach { it.join() }
+    println("incrementAndGet: ${atomic.get()}")
+    println("my CAS loop:     ${manual.get()} after ${retries.sum()} retries")
+    println("LongAdder:       ${adder.sum()}")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Atomics.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
+
+public class Atomics {
+    static final LongAdder retries = new LongAdder();     // counts failed compare-and-set attempts
+
+    static void casIncrement(AtomicInteger a) {
+        while (true) {
+            int old = a.get();                              // 1. read
+            if (a.compareAndSet(old, old + 1)) return;      // 2. write only if nobody changed it
+            retries.increment();                            // 3. somebody did: loop and try again
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        AtomicInteger atomic = new AtomicInteger();
+        AtomicInteger manual = new AtomicInteger();
+        LongAdder adder = new LongAdder();
+        List&lt;Thread&gt; workers = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 4; i++) {
+            Thread t = new Thread(() -&gt; {
+                for (int j = 0; j &lt; 1_000_000; j++) {
+                    atomic.incrementAndGet();
+                    casIncrement(manual);
+                    adder.increment();
+                }
+            });
+            t.start();
+            workers.add(t);
+        }
+        for (Thread t : workers) t.join();
+        System.out.println("incrementAndGet: " + atomic.get());
+        System.out.println("my CAS loop:     " + manual.get() + " after " + retries.sum() + " retries");
+        System.out.println("LongAdder:       " + adder.sum());
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">incrementAndGet: 4000000
+my CAS loop:     4000000 after 8119671 retries
+LongAdder:       4000000</pre>
+<pre class="out">incrementAndGet: 4000000
+my CAS loop:     4000000 after 9067867 retries
+LongAdder:       4000000</pre>
+</div>
+<p>All correct, but look at the retries. With 4 threads hammering one value, my CAS loop failed about twice for every success, and each failure is wasted work. CAS is <dfn>optimistic</dfn>: it assumes no conflict and pays when there is one. <code>LongAdder</code> solves heavy contention differently. It spreads the count over several internal cells and only adds them up when you call <code>sum()</code>. The docs: "under high contention, expected throughput of this class is significantly higher, at the expense of higher space consumption" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/atomic/LongAdder.html"><code>LongAdder</code> API docs</a>). It's perfect for statistics, and wrong when you need the exact current value in the middle of updates.</p>
+<p>Kotlin 2.4 has its own atomics in <code>kotlin.concurrent.atomics</code>; on the JVM, <code>AtomicInt</code> "instances … are represented by <code>java.util.concurrent.atomic.AtomicInteger</code>" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.concurrent.atomics/-atomic-int/">Kotlin API</a>). They're still experimental, though:</p>
+<figure class="kotlin"><figcaption>KOTLIN · err/KotlinAtomic.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.concurrent.atomics.AtomicInt
+
+val hits = AtomicInt(0)          // Kotlin's own atomics, without opting in</code></pre></figure>
+<pre class="err">KotlinAtomic.kt:3:12: error: this declaration needs opt-in. Its usage must be marked with '@kotlin.concurrent.atomics.ExperimentalAtomicApi' or '@OptIn(kotlin.concurrent.atomics.ExperimentalAtomicApi::class)'
+val hits = AtomicInt(0)          // Kotlin's own atomics, without opting in
+           ^^^^^^^^^</pre>
+<p>They matter for Kotlin Multiplatform code. On the JVM, use <code>java.util.concurrent.atomic</code> directly, as this lesson does.</p>
+
+<h3>Measure them</h3>
+<p>Five counters behind one interface: unsafe, <code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicInteger</code> and <code>LongAdder</code>. Each gets 2, 4 and 8 threads doing 1,000,000 increments each, after one warm-up round:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Bench.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.LongAdder
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
+
+interface Counter { fun increment(); fun get(): Long }
+
+class Unsafe : Counter {
+    private var n = 0L
+    override fun increment() { n++ }
+    override fun get() = n
+}
+class Synced : Counter {
+    private var n = 0L
+    @Synchronized override fun increment() { n++ }
+    @Synchronized override fun get() = n
+}
+class Locked : Counter {
+    private val lock = ReentrantLock(); private var n = 0L
+    override fun increment() = lock.withLock { n++; Unit }
+    override fun get() = lock.withLock { n }
+}
+class Atomic : Counter {
+    private val n = AtomicInteger()
+    override fun increment() { n.incrementAndGet() }
+    override fun get() = n.get().toLong()
+}
+class Adder : Counter {
+    private val n = LongAdder()
+    override fun increment() = n.increment()
+    override fun get() = n.sum()
+}
+
+fun measure(make: () -&gt; Counter, threads: Int, perThread: Int): Pair&lt;Long, Long&gt; {
+    val c = make()
+    val start = System.nanoTime()
+    List(threads) { thread { repeat(perThread) { c.increment() } } }.forEach { it.join() }
+    return c.get() to (System.nanoTime() - start) / 1_000_000
+}
+
+fun main() {
+    val kinds = listOf("unsafe" to ::Unsafe, "synchronized" to ::Synced, "ReentrantLock" to ::Locked,
+                       "AtomicInteger" to ::Atomic, "LongAdder" to ::Adder)
+    val perThread = 1_000_000
+    for ((_, make) in kinds) measure(make, 4, perThread)          // warm-up round, not printed
+    println("cores: ${Runtime.getRuntime().availableProcessors()}, $perThread increments per thread")
+    for (threads in listOf(2, 4, 8)) {
+        println("--- $threads threads, expected ${threads.toLong() * perThread}")
+        for ((name, make) in kinds) {
+            val (total, ms) = measure(make, threads, perThread)
+            val ok = if (total == threads.toLong() * perThread) "correct" else "WRONG"
+            println("%-14s %10d  %-7s %5d ms".format(name, total, ok, ms))
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Bench.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
+
+public class Bench {
+    interface Counter { void increment(); long get(); }
+
+    static class Unsafe implements Counter {
+        private long n;
+        public void increment() { n++; }
+        public long get() { return n; }
+    }
+    static class Synced implements Counter {
+        private long n;
+        public synchronized void increment() { n++; }
+        public synchronized long get() { return n; }
+    }
+    static class Locked implements Counter {
+        private final ReentrantLock lock = new ReentrantLock(); private long n;
+        public void increment() { lock.lock(); try { n++; } finally { lock.unlock(); } }
+        public long get() { lock.lock(); try { return n; } finally { lock.unlock(); } }
+    }
+    static class Atomic implements Counter {
+        private final AtomicInteger n = new AtomicInteger();
+        public void increment() { n.incrementAndGet(); }
+        public long get() { return n.get(); }
+    }
+    static class Adder implements Counter {
+        private final LongAdder n = new LongAdder();
+        public void increment() { n.increment(); }
+        public long get() { return n.sum(); }
+    }
+
+    record Kind(String name, Supplier&lt;Counter&gt; make) {}
+
+    static long[] measure(Supplier&lt;Counter&gt; make, int threads, int perThread) throws InterruptedException {
+        Counter c = make.get();
+        long start = System.nanoTime();
+        List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; threads; i++) {
+            Thread t = new Thread(() -&gt; { for (int j = 0; j &lt; perThread; j++) c.increment(); });
+            t.start(); ts.add(t);
+        }
+        for (Thread t : ts) t.join();
+        return new long[] { c.get(), (System.nanoTime() - start) / 1_000_000 };
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        List&lt;Kind&gt; kinds = List.of(new Kind("unsafe", Unsafe::new), new Kind("synchronized", Synced::new),
+            new Kind("ReentrantLock", Locked::new), new Kind("AtomicInteger", Atomic::new), new Kind("LongAdder", Adder::new));
+        int perThread = 1_000_000;
+        for (Kind k : kinds) measure(k.make(), 4, perThread);        // warm-up round, not printed
+        System.out.println("cores: " + Runtime.getRuntime().availableProcessors() + ", " + perThread + " increments per thread");
+        for (int threads : new int[] { 2, 4, 8 }) {
+            System.out.println("--- " + threads + " threads, expected " + (long) threads * perThread);
+            for (Kind k : kinds) {
+                long[] r = measure(k.make(), threads, perThread);
+                String ok = r[0] == (long) threads * perThread ? "correct" : "WRONG";
+                System.out.println(String.format("%-14s %10d  %-7s %5d ms", k.name(), r[0], ok, r[1]));
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">cores: 18, 1000000 increments per thread
+--- 2 threads, expected 2000000
+unsafe            1067084  WRONG       2 ms
+synchronized      2000000  correct   324 ms
+ReentrantLock     2000000  correct   141 ms
+AtomicInteger     2000000  correct    31 ms
+LongAdder         2000000  correct     5 ms
+--- 4 threads, expected 4000000
+unsafe            1123488  WRONG       4 ms
+synchronized      4000000  correct   557 ms
+ReentrantLock     4000000  correct    62 ms
+AtomicInteger     4000000  correct    83 ms
+LongAdder         4000000  correct     4 ms
+--- 8 threads, expected 8000000
+unsafe            1326384  WRONG       2 ms
+synchronized      8000000  correct  1082 ms
+ReentrantLock     8000000  correct    61 ms
+AtomicInteger     8000000  correct    69 ms
+LongAdder         8000000  correct     4 ms</pre>
+<pre class="out">cores: 18, 1000000 increments per thread
+--- 2 threads, expected 2000000
+unsafe            1018884  WRONG       2 ms
+synchronized      2000000  correct   306 ms
+ReentrantLock     2000000  correct   104 ms
+AtomicInteger     2000000  correct    33 ms
+LongAdder         2000000  correct     4 ms
+--- 4 threads, expected 4000000
+unsafe            1052978  WRONG       4 ms
+synchronized      4000000  correct   532 ms
+ReentrantLock     4000000  correct    33 ms
+AtomicInteger     4000000  correct    84 ms
+LongAdder         4000000  correct     4 ms
+--- 8 threads, expected 8000000
+unsafe            1382568  WRONG       9 ms
+synchronized      8000000  correct   797 ms
+ReentrantLock     8000000  correct    55 ms
+AtomicInteger     8000000  correct    76 ms
+LongAdder         8000000  correct     4 ms</pre>
+</div>
+<p>On my machine, and only for this extreme case of threads doing nothing but fighting over one counter:</p>
+<ul>
+  <li><b>Unsafe is fastest and wrong.</b> Speed means nothing if the answer is wrong.</li>
+  <li><b><code>synchronized</code> was the slowest</b> under this heavy contention, and got slower as threads were added.</li>
+  <li><b><code>ReentrantLock</code> beat <code>synchronized</code> by 2–18×</b> here. A likely reason is the non-fair default: a thread that just released the lock can grab it again straight away, so one thread often does long runs of increments without a hand-off. That's an inference from the docs' description of non-fair locking, not something this program proves. The 2-thread row being slower than the 4-thread row shows how noisy single runs are.</li>
+  <li><b><code>AtomicInteger</code></b> sits in between, paying for the CAS retries you counted earlier.</li>
+  <li><b><code>LongAdder</code> barely notices</b> the contention, as its docs promise.</li>
+</ul>
+<p>Treat these numbers as a rough sketch: one run each, a crude timer, and a workload no real program has. For decisions that matter, use JMH (L24) on a workload that looks like yours. In real code a lock is usually held around a few microseconds of actual work, and uncontended locking is far cheaper than this table suggests.</p>
+
+<h3>Which one?</h3>
+<table class="vs">
+  <tr><th>Situation</th><th>Reach for</th></tr>
+  <tr><td>Several fields that must change together, or check-then-act</td><td><code>synchronized</code> / <code>@Synchronized</code> / <code>synchronized(lock) { }</code></td></tr>
+  <tr><td>The same, but you need <code>tryLock</code>, timeouts, interruptible waits or fairness</td><td><code>ReentrantLock</code> + <code>withLock</code> / <code>try</code>-<code>finally</code></td></tr>
+  <tr><td>A single number or reference updated on its own</td><td><code>AtomicInteger</code>, <code>AtomicLong</code>, <code>AtomicReference</code></td></tr>
+  <tr><td>A heavily contended counter you only read occasionally</td><td><code>LongAdder</code></td></tr>
+  <tr><td>Data that never changes after construction</td><td>nothing: share immutable objects freely (L5, L7)</td></tr>
+</table>
+<p><em>Java Concurrency in Practice</em> (ch. 2) sums the whole topic up in three options, paraphrased here: if several threads access the same mutable state without synchronization, the program is broken, and you can fix it by not sharing the state, by making it immutable, or by synchronizing every access to it. Confinement (Part 1's exercise), immutability, or locking. "Every access" includes reads.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>lock.withLock { … }</code> writes the <code>lock()</code>/<code>try</code>/<code>finally</code>/<code>unlock()</code> dance for you, so you can't forget the <code>unlock</code>. It's inline, so there's no lambda object (L14).</li>
+    <li><code>synchronized(lock) { … }</code> is an inline function that returns the block's value: <code>fun get() = synchronized(lock) { count }</code>.</li>
+    <li>It refuses to compile <code>synchronized</code> on an <code>Int</code>, where javac only warns.</li>
+    <li>The price: <code>synchronized</code> isn't a keyword. For a synchronized <em>method</em> you need the <code>@Synchronized</code> annotation, and for a synchronized getter <code>@Synchronized get</code>, which are easy to miss when you read Java examples.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: fix the bank account</div>
+  <ol>
+    <li>Take Part 2's <code>Account</code> and fix it with <code>synchronized</code>. Check and act must happen under one lock.</li>
+    <li>Write a second version with an <code>AtomicInteger</code> balance: <code>if (bal.get() &gt;= amount) { sleep; bal.addAndGet(-amount) }</code>. Predict the result before running it.</li>
+    <li>Write a third version that uses a <code>compareAndSet</code> loop, so a withdrawal only succeeds if the balance it checked is still the balance it replaces.</li>
+    <li>Run all three three times. Use an interface so one trial function can test any account.</li>
+  </ol>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex3.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+
+interface Account { fun withdraw(amount: Int): Boolean; val balance: Int }
+
+class SyncAccount(start: Int) : Account {
+    override var balance = start
+        @Synchronized get
+        private set
+    @Synchronized override fun withdraw(amount: Int): Boolean {   // check AND act under one lock
+        if (balance &lt; amount) return false
+        Thread.sleep(1)
+        balance -= amount
+        return true
+    }
+}
+
+class AtomicButWrong(start: Int) : Account {
+    private val bal = AtomicInteger(start)
+    override val balance get() = bal.get()
+    override fun withdraw(amount: Int): Boolean {
+        if (bal.get() &lt; amount) return false     // each call is atomic...
+        Thread.sleep(1)
+        bal.addAndGet(-amount)                    // ...but the pair is not
+        return true
+    }
+}
+
+class CasAccount(start: Int) : Account {
+    private val bal = AtomicInteger(start)
+    override val balance get() = bal.get()
+    override fun withdraw(amount: Int): Boolean {
+        while (true) {
+            val old = bal.get()
+            if (old &lt; amount) return false
+            Thread.sleep(1)
+            if (bal.compareAndSet(old, old - amount)) return true  // only if nobody got there first
+        }
+    }
+}
+
+fun trial(acct: Account): String {
+    val approved = AtomicInteger()
+    val gate = CountDownLatch(1)
+    val ts = List(10) { thread { gate.await(); if (acct.withdraw(20)) approved.incrementAndGet() } }
+    gate.countDown(); ts.forEach { it.join() }
+    return "approved ${approved.get()}, balance ${acct.balance}"
+}
+
+fun main() {
+    repeat(3) { run -&gt;
+        println("run ${run + 1}: synchronized: ${trial(SyncAccount(100))} | " +
+                "atomic get+add: ${trial(AtomicButWrong(100))} | CAS loop: ${trial(CasAccount(100))}")
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex3.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Ex3 {
+    interface Account { boolean withdraw(int amount); int balance(); }
+
+    static class SyncAccount implements Account {
+        private int balance;
+        SyncAccount(int start) { balance = start; }
+        public synchronized int balance() { return balance; }
+        public synchronized boolean withdraw(int amount) {     // check AND act under one lock
+            if (balance &lt; amount) return false;
+            sleep(1);
+            balance -= amount;
+            return true;
+        }
+    }
+
+    static class AtomicButWrong implements Account {
+        private final AtomicInteger bal;
+        AtomicButWrong(int start) { bal = new AtomicInteger(start); }
+        public int balance() { return bal.get(); }
+        public boolean withdraw(int amount) {
+            if (bal.get() &lt; amount) return false;     // each call is atomic...
+            sleep(1);
+            bal.addAndGet(-amount);                    // ...but the pair is not
+            return true;
+        }
+    }
+
+    static class CasAccount implements Account {
+        private final AtomicInteger bal;
+        CasAccount(int start) { bal = new AtomicInteger(start); }
+        public int balance() { return bal.get(); }
+        public boolean withdraw(int amount) {
+            while (true) {
+                int old = bal.get();
+                if (old &lt; amount) return false;
+                sleep(1);
+                if (bal.compareAndSet(old, old - amount)) return true;   // only if nobody got there first
+            }
+        }
+    }
+
+    static String trial(Account acct) throws InterruptedException {
+        AtomicInteger approved = new AtomicInteger();
+        CountDownLatch gate = new CountDownLatch(1);
+        List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 10; i++) {
+            Thread t = new Thread(() -&gt; {
+                try { gate.await(); } catch (InterruptedException e) { return; }
+                if (acct.withdraw(20)) approved.incrementAndGet();
+            });
+            t.start(); ts.add(t);
+        }
+        gate.countDown();
+        for (Thread t : ts) t.join();
+        return "approved " + approved.get() + ", balance " + acct.balance();
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        for (int run = 1; run &lt;= 3; run++) {
+            System.out.println("run " + run + ": synchronized: " + trial(new SyncAccount(100)) + " | atomic get+add: "
+                + trial(new AtomicButWrong(100)) + " | CAS loop: " + trial(new CasAccount(100)));
+        }
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+<pre class="out">run 1: synchronized: approved 5, balance 0 | atomic get+add: approved 10, balance -100 | CAS loop: approved 5, balance 0
+run 2: synchronized: approved 5, balance 0 | atomic get+add: approved 10, balance -100 | CAS loop: approved 5, balance 0
+run 3: synchronized: approved 5, balance 0 | atomic get+add: approved 10, balance -100 | CAS loop: approved 5, balance 0</pre>
+<pre class="out">run 1: synchronized: approved 5, balance 0 | atomic get+add: approved 10, balance -100 | CAS loop: approved 5, balance 0
+run 2: synchronized: approved 5, balance 0 | atomic get+add: approved 10, balance -100 | CAS loop: approved 5, balance 0
+run 3: synchronized: approved 5, balance 0 | atomic get+add: approved 10, balance -100 | CAS loop: approved 5, balance 0</pre>
+    </div>
+    <ul>
+      <li><b><code>synchronized</code></b> works because the check and the act are inside one critical section. The 1 ms sleep inside the lock means withdrawals now run one at a time. That's correct, but holding a lock during slow work is a performance smell. Keep critical sections short.</li>
+      <li><b>Atomic get + add is still wrong:</b> 10 approvals, −100. Each call is atomic, but the <em>pair</em> isn't, so the check-then-act race survives. The balance itself is exact this time (−100, never −40), because <code>addAndGet</code> loses no updates. This is the JLS warning from Part 2 in action: no data race, still a race condition.</li>
+      <li><b>The CAS loop</b> works because <code>compareAndSet(old, old - amount)</code> fails if any other withdrawal changed the balance after this thread checked it. Then it re-checks with the new value. The Kotlin version's <code>@Synchronized get</code> shows how to synchronize a property getter.</li>
+    </ul>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · Locks and atomics" data-answer="2">
+  <p class="q">Two threads call <code>increment()</code>, where each call runs <code>synchronized (new Object()) { count++; }</code>. Is <code>count</code> safe?</p>
+  <div class="opts"><button>Yes, every update is locked</button><button>Yes, but only in Kotlin</button><button>No, each lock is new</button><button>No, synchronized blocks never work</button></div>
+  <p class="why">A lock only excludes threads that lock the same object. A fresh object per call means nobody ever waits. <code>WrongLock</code> lost about 40,000–106,000 updates per run this way.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · Locks and atomics" data-answer="0">
+  <p class="q">Kotlin: <code>var n: Int? = 0</code> and then <code>synchronized(n!!) { n = n!! + 1 }</code>. What happens?</p>
+  <div class="opts"><button>Compile error</button><button>Compile warning</button><button>Throws exception</button><button>Runs normally</button></div>
+  <p class="why">Kotlin 2.4 reports <code>synchronizing on 'Int' is forbidden</code>. javac only issues an <code>[identity]</code> warning for the Java equivalent, which then lost updates at runtime.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · Locks and atomics" data-answer="3">
+  <p class="q">Why must <code>lock.unlock()</code> go in a <code>finally</code> block when you use <code>ReentrantLock</code> in Java?</p>
+  <div class="opts"><button>The compiler rejects code without it</button><button>Unlocking outside of finally is slower</button><button>Only finally can see the lock</button><button>An exception would leave it locked</button></div>
+  <p class="why">An explicit lock isn't released automatically. If the body throws and <code>unlock()</code> is skipped, every other thread waits forever. <code>synchronized</code> gets this for free (the extra <code>monitorexit</code> in <code>javap</code>), and Kotlin's <code>withLock</code> writes the <code>finally</code> for you.</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · Locks and atomics" data-answer="1">
+  <p class="q">What does <code>compareAndSet(5, 6)</code> do if another thread already changed the value to 7?</p>
+  <div class="opts"><button>Writes 6 over 7</button><button>Changes nothing, returns false</button><button>Waits until it's 5</button><button>Throws a concurrent exception</button></div>
+  <p class="why">CAS only writes when the current value equals the expected one. Otherwise it leaves the value alone and returns <code>false</code>, and your loop re-reads and tries again. Those were the millions of retries in <code>Atomics</code>.</p>
+</div>
+<div class="quiz" data-id="p3-5" data-group="Part 3 · Locks and atomics" data-answer="2">
+  <p class="q">A request counter is incremented by 200 threads and read once a minute by a dashboard. Best fit?</p>
+  <div class="opts"><button><code>Collections.synchronizedMap</code></button><button><code>@Volatile var</code></button><button><code>LongAdder</code></button><button><code>ReentrantLock(true)</code></button></div>
+  <p class="why">Heavy contention with rare reads is exactly <code>LongAdder</code>'s job: "significantly higher" throughput under contention. A fair lock would be the slowest choice. A plain <code>@Volatile var</code> would still lose updates, since <code>++</code> isn't atomic (L27).</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>Prove it's broken, then fix it three ways</h2><span class="t">~25 min</span></div>
+
+<p>From blank files, in both languages, in a fresh Gradle project (<code>gradle init --type kotlin-application</code> / <code>java-application</code>, as in L11). Turn AI completion off.</p>
+<div class="task">
+  <ol>
+    <li><b>Red.</b> Write a <code>Counter</code> interface (<code>increment()</code>, <code>value</code>) and an <code>UnsafeCounter</code> with a plain <code>count++</code>. Write a test that <b>proves it's broken</b>: 8 threads, 100,000 increments each, assert the total is 800,000. Make the test reliable. Use enough threads and work, and hold all threads at a <code>CountDownLatch</code> start gate so they really overlap. Run <code>./gradlew test</code> several times; it should be red <em>every</em> time.</li>
+    <li><b>The trap.</b> Write a second test with 2 threads × 1,000 increments and no start gate. Run it several times. What does it tell you?</li>
+    <li><b>Green, three ways.</b> Add <code>SyncCounter</code>, <code>LockCounter</code> and <code>AtomicCounter</code>, and test each one 5 times in a row.</li>
+    <li><b>Decide.</b> Write two sentences: which of the three would you use for a real hit counter, and why?</li>
+  </ol>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: broken counter test + three fixes (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: broken counter test + three fixes (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-tests" data-label="Final: my test was red every run before the fix"><span class="who">TESTS</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+  <details class="solution"><summary>Reference solutions</summary>
+    <p><b>Step 1: the broken counter and the test that proves it.</b></p>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Counter.kt (step 1)</figcaption>
+<pre><code class="language-kotlin">package demo
+
+interface Counter {
+    fun increment()
+    val value: Int
+}
+
+class UnsafeCounter : Counter {
+    private var count = 0
+    override fun increment() { count++ }
+    override val value get() = count
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Counter.java + UnsafeCounter.java (step 1)</figcaption>
+<pre><code class="language-java">package demo;
+
+public interface Counter {
+    void increment();
+    int value();
+}</code></pre>
+<pre><code class="language-java">package demo;
+
+public class UnsafeCounter implements Counter {
+    private int count;
+    @Override public void increment() { count++; }
+    @Override public int value() { return count; }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · CounterTest.kt (step 1)</figcaption>
+<pre><code class="language-kotlin">package demo
+
+import java.util.concurrent.CountDownLatch
+import kotlin.concurrent.thread
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class CounterTest {
+    private fun hammer(counter: Counter, threads: Int, perThread: Int): Int {
+        val ready = CountDownLatch(threads)     // every worker has started...
+        val go = CountDownLatch(1)              // ...then one start signal for all
+        val workers = List(threads) {
+            thread {
+                ready.countDown()
+                go.await()
+                repeat(perThread) { counter.increment() }
+            }
+        }
+        ready.await()
+        go.countDown()
+        workers.forEach { it.join() }
+        return counter.value
+    }
+
+    @Test
+    fun `8 threads x 100_000 increments give 800_000`() {
+        assertEquals(800_000, hammer(UnsafeCounter(), threads = 8, perThread = 100_000))
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · CounterTest.java (step 1)</figcaption>
+<pre><code class="language-java">package demo;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class CounterTest {
+    private static int hammer(Counter counter, int threads, int perThread) throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(threads);   // every worker has started...
+        CountDownLatch go = new CountDownLatch(1);            // ...then one start signal for all
+        List&lt;Thread&gt; workers = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; threads; i++) {
+            Thread t = new Thread(() -&gt; {
+                ready.countDown();
+                try { go.await(); } catch (InterruptedException e) { return; }
+                for (int j = 0; j &lt; perThread; j++) counter.increment();
+            });
+            t.start();
+            workers.add(t);
+        }
+        ready.await();
+        go.countDown();
+        for (Thread t : workers) t.join();
+        return counter.value();
+    }
+
+    @Test
+    void eightThreadsTimes100kIncrementsGive800k() throws InterruptedException {
+        assertEquals(800_000, hammer(new UnsafeCounter(), 8, 100_000));
+    }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+<pre class="err">CounterTest &gt; 8 threads x 100_000 increments give 800_000() FAILED
+    org.opentest4j.AssertionFailedError: expected: &lt;800000&gt; but was: &lt;129007&gt;
+        …
+        at app//demo.CounterTest.8 threads x 100_000 increments give 800_000(CounterTest.kt:27)</pre>
+<pre class="err">CounterTest &gt; eightThreadsTimes100kIncrementsGive800k() FAILED
+    org.opentest4j.AssertionFailedError: expected: &lt;800000&gt; but was: &lt;134056&gt;
+        …
+        at app//demo.CounterTest.eightThreadsTimes100kIncrementsGive800k(CounterTest.java:31)
+1 test completed, 1 failed</pre>
+    </div>
+    <p>I ran each test 8 more times with <code>--rerun-tasks</code>, and every run was red. Java got 121,974–143,826 and Kotlin 112,730–145,151, out of 800,000. The two latches are what make it reliable. <code>ready</code> waits until all 8 threads exist, and <code>go</code> releases them together, so they really do overlap. Without the gate, early threads can finish before late ones start.</p>
+    <p><b>Step 2: the trap.</b> A smaller test with no gate:</p>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · NaiveCounterTest.kt</figcaption>
+<pre><code class="language-kotlin">package demo
+
+import kotlin.concurrent.thread
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class NaiveCounterTest {
+    @Test
+    fun `2 threads x 1_000 increments give 2_000`() {     // too small, no start gate
+        val c = UnsafeCounter()
+        val a = thread { repeat(1_000) { c.increment() } }
+        val b = thread { repeat(1_000) { c.increment() } }
+        a.join(); b.join()
+        assertEquals(2_000, c.value)
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · NaiveCounterTest.java</figcaption>
+<pre><code class="language-java">package demo;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class NaiveCounterTest {
+    @Test
+    void twoThreadsTimes1000IncrementsGive2000() throws InterruptedException {   // too small, no start gate
+        Counter c = new UnsafeCounter();
+        Thread a = new Thread(() -&gt; { for (int i = 0; i &lt; 1_000; i++) c.increment(); });
+        Thread b = new Thread(() -&gt; { for (int i = 0; i &lt; 1_000; i++) c.increment(); });
+        a.start(); b.start();
+        a.join(); b.join();
+        assertEquals(2_000, c.value());
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">NaiveCounterTest &gt; 2 threads x 1_000 increments give 2_000() PASSED
+BUILD SUCCESSFUL in 970ms</pre>
+    <p>On my machine the Kotlin version passed 9 runs out of 10. The Java version failed all 10, at 1,398–1,866. Same bug, same idea, a tiny difference in how quickly the second thread got going, and opposite verdicts. A green run tells you the threads didn't collide <em>that time</em>. It can't tell you they never will. That's why a concurrency test should make collisions as likely as possible (many threads, a start gate, plenty of work), and why a fix should pass repeatedly. Even then, passing tests are evidence, not proof. The proof is in reasoning about which state is shared and how every access to it is guarded.</p>
+    <p><b>Step 3: three fixes.</b> Kotlin keeps them in one file; Java needs one public class per file.</p>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Counter.kt</figcaption>
+<pre><code class="language-kotlin">package demo
+
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+interface Counter {
+    fun increment()
+    val value: Int
+}
+
+class UnsafeCounter : Counter {                // step 1: the bug
+    private var count = 0
+    override fun increment() { count++ }
+    override val value get() = count
+}
+
+class SyncCounter : Counter {                  // fix 1: the object's own monitor
+    private var count = 0
+    @Synchronized override fun increment() { count++ }
+    override val value: Int @Synchronized get() = count
+}
+
+class LockCounter : Counter {                  // fix 2: an explicit lock
+    private val lock = ReentrantLock()
+    private var count = 0
+    override fun increment() = lock.withLock { count++; Unit }
+    override val value get() = lock.withLock { count }
+}
+
+class AtomicCounter : Counter {                // fix 3: lock-free compare-and-set
+    private val count = AtomicInteger()
+    override fun increment() { count.incrementAndGet() }
+    override val value get() = count.get()
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · SyncCounter.java, LockCounter.java, AtomicCounter.java</figcaption>
+<pre><code class="language-java">package demo;
+
+public class SyncCounter implements Counter {         // fix 1: the object's own monitor
+    private int count;
+    @Override public synchronized void increment() { count++; }
+    @Override public synchronized int value() { return count; }
+}</code></pre>
+<pre><code class="language-java">package demo;
+
+import java.util.concurrent.locks.ReentrantLock;
+
+public class LockCounter implements Counter {         // fix 2: an explicit lock
+    private final ReentrantLock lock = new ReentrantLock();
+    private int count;
+
+    @Override public void increment() {
+        lock.lock();
+        try { count++; } finally { lock.unlock(); }
+    }
+
+    @Override public int value() {
+        lock.lock();
+        try { return count; } finally { lock.unlock(); }
+    }
+}</code></pre>
+<pre><code class="language-java">package demo;
+
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class AtomicCounter implements Counter {       // fix 3: lock-free compare-and-set
+    private final AtomicInteger count = new AtomicInteger();
+    @Override public void increment() { count.incrementAndGet(); }
+    @Override public int value() { return count.get(); }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · CounterTest.kt</figcaption>
+<pre><code class="language-kotlin">package demo
+
+import java.util.concurrent.CountDownLatch
+import kotlin.concurrent.thread
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class CounterTest {
+    private fun hammer(counter: Counter, threads: Int = 8, perThread: Int = 100_000): Int {
+        val ready = CountDownLatch(threads)     // every worker has started...
+        val go = CountDownLatch(1)              // ...then one start signal for all
+        val workers = List(threads) {
+            thread {
+                ready.countDown()
+                go.await()
+                repeat(perThread) { counter.increment() }
+            }
+        }
+        ready.await()
+        go.countDown()
+        workers.forEach { it.join() }
+        return counter.value
+    }
+
+    // One green run proves little, so each fix is hammered five times.
+    private fun check(make: () -&gt; Counter) = repeat(5) { assertEquals(800_000, hammer(make())) }
+
+    @Test fun `synchronized counter never loses an update`() = check(::SyncCounter)
+    @Test fun `ReentrantLock counter never loses an update`() = check(::LockCounter)
+    @Test fun `AtomicInteger counter never loses an update`() = check(::AtomicCounter)
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · CounterTest.java</figcaption>
+<pre><code class="language-java">package demo;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.function.Supplier;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class CounterTest {
+    private static int hammer(Counter counter, int threads, int perThread) throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(threads);   // every worker has started...
+        CountDownLatch go = new CountDownLatch(1);            // ...then one start signal for all
+        List&lt;Thread&gt; workers = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; threads; i++) {
+            Thread t = new Thread(() -&gt; {
+                ready.countDown();
+                try { go.await(); } catch (InterruptedException e) { return; }
+                for (int j = 0; j &lt; perThread; j++) counter.increment();
+            });
+            t.start();
+            workers.add(t);
+        }
+        ready.await();
+        go.countDown();
+        for (Thread t : workers) t.join();
+        return counter.value();
+    }
+
+    // One green run proves little, so each fix is hammered five times.
+    private static void check(Supplier&lt;Counter&gt; make) throws InterruptedException {
+        for (int i = 0; i &lt; 5; i++) assertEquals(800_000, hammer(make.get(), 8, 100_000));
+    }
+
+    @Test void synchronizedCounterNeverLosesAnUpdate() throws InterruptedException { check(SyncCounter::new); }
+    @Test void reentrantLockCounterNeverLosesAnUpdate() throws InterruptedException { check(LockCounter::new); }
+    @Test void atomicIntegerCounterNeverLosesAnUpdate() throws InterruptedException { check(AtomicCounter::new); }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+<pre class="out">CounterTest &gt; AtomicInteger counter never loses an update() PASSED
+CounterTest &gt; synchronized counter never loses an update() PASSED
+CounterTest &gt; ReentrantLock counter never loses an update() PASSED
+BUILD SUCCESSFUL in 1s</pre>
+<pre class="out">CounterTest &gt; reentrantLockCounterNeverLosesAnUpdate() PASSED
+CounterTest &gt; atomicIntegerCounterNeverLosesAnUpdate() PASSED
+CounterTest &gt; synchronizedCounterNeverLosesAnUpdate() PASSED
+BUILD SUCCESSFUL in 820ms</pre>
+    </div>
+    <p>Notes on the design:</p>
+    <ul>
+      <li><b>The reads are guarded too:</b> <code>@Synchronized get</code>, <code>withLock { count }</code>, <code>synchronized int value()</code>. In this test <code>join()</code> would already make the final value visible, but a counter class can't know how callers will use it.</li>
+      <li><b>Kotlin's <code>withLock { count++; Unit }</code></b> needs the <code>Unit</code> because <code>count++</code> as the last expression would make the lambda return an <code>Int</code>, while <code>increment()</code> returns nothing.</li>
+      <li><b>One sensible decision note:</b> "For a hit counter I'd use <code>AtomicInteger</code>, or <code>LongAdder</code> if it's very hot. It's a single number with no invariant tying it to other fields, so a lock buys nothing. If the counter had to change together with another field, such as hits and last-hit time, I'd use <code>synchronized</code>."</li>
+    </ul>
+  </details>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">Two threads add words to one plain <code>HashMap</code> with no locking. What should you expect? (L19)</p>
+  <div class="opts"><button>A guaranteed runtime exception</button><button>Silently lost, corrupted entries</button><button>Correct results, just slower</button><button>A compile-time type error</button></div>
+  <p class="why"><code>HashMap</code> is "not synchronized". In <code>MapRace</code> entries vanished and <code>size()</code> stopped matching the real contents, with no exception at all. Silent corruption is the dangerous outcome.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">Which L10 construct guarantees that <code>unlock()</code> runs even when the locked code throws?</p>
+  <div class="opts"><button>A catch block</button><button>A return statement</button><button>An init block</button><button>A finally block</button></div>
+  <p class="why"><code>finally</code> runs whether the <code>try</code> body completes or throws. The <code>ReentrantLock</code> docs make <code>unlock()</code> "the first statement in the finally block"; <code>withLock</code> and <code>synchronized</code> do it for you.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">Why is locking on an <code>Integer</code> especially risky for small values like 42? (L5)</p>
+  <div class="opts"><button>Small boxes are cached, shared</button><button>Small integers cannot be locked</button><button>The JIT removes such locks</button><button>Integers are stored on stacks</button></div>
+  <p class="why"><code>Integer.valueOf</code> caches −128 to 127 (L5's Integer cache), so unrelated code using the same value can hold the very same object, and therefore the same monitor. Larger values get fresh boxes, so the lock changes on every <code>++</code>.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">Several threads read <code>val config by lazy { load() }</code> at the same time. How many times does <code>load()</code> run? (L15)</p>
+  <div class="opts"><button>Once per thread</button><button>Never, it's lazy</button><button>Exactly one time</button><button>At most twice</button></div>
+  <p class="why"><code>by lazy</code> is synchronized by default: "the value is computed only in one thread, but all threads will see the same value". <code>CheckThenAct</code> printed <code>created 1 time</code>.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Write <code>count++</code> as its three bytecode steps. Then write an interleaving of two threads that loses an update.</li>
+    <li>Name the six thread states and one way to put a thread into each.</li>
+    <li>From memory, write a <code>CountDownLatch</code> start gate that releases 8 threads at once, in either language.</li>
+    <li>Write the Java <code>ReentrantLock</code> idiom with <code>try</code>/<code>finally</code>, then the Kotlin one-liner that replaces it.</li>
+    <li>Explain in two sentences why an <code>AtomicInteger</code> balance still overdraws if you <code>get()</code> then <code>addAndGet()</code>.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  <a href="https://jcip.net/"><em>Java Concurrency in Practice</em></a> by Brian Goetz and others, chapters 1–3 ("Introduction", "Thread Safety", "Sharing Objects"). It's the book the whole phase rests on, and its advice hasn't aged even though its examples predate lambdas. Free alternatives: Oracle's <a href="https://docs.oracle.com/javase/tutorial/essential/concurrency/">Concurrency</a> lesson in the Java Tutorials (frozen at JDK 8, but the basics on threads, interference and synchronization still hold), <a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html">JLS chapter 17</a> for the exact rules, and <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-intro.pdf"><em>OSTEP</em> chapter 26</a> for what the OS does underneath.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/concurrency.html">Concurrency</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "is this class thread-safe?", "why did my test pass if the code is broken?" or "lock or atomic here?" are exactly the right kind. Paste in your counter tests for a review; reasoning about shared state out loud is the best practice there is.</p>
+
+<div class="lesson-nav">
+  <a href="0025-annotations-reflection-and-builds.html">← L25 · Annotations, Reflection &amp; Builds</a>
+  <a href="0027-the-memory-model-and-deadlock.html">L27 · The Memory Model &amp; Deadlock →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/threadviz.js"></script>
+</body>
+</html>

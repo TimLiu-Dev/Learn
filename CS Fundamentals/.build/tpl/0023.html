@@ -1,0 +1,1107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L23 · Inside the JVM</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l23">
+<main>
+
+<div class="kicker">Lesson 23 · Phase 7 How the Machine Runs Your Code · <a href="../reference/roadmap.html#p7">roadmap</a></div>
+<h1>Inside the JVM</h1>
+<p class="subtitle">What your Kotlin and Java actually turn into. Reading bytecode with <code>javap</code>, watching classes load one by one, seeing the JIT compiler kick in mid-run, and how Android's runtime does the same job differently.</p>
+
+<div class="lesson-meta">
+  <span><b>~110–120 min</b> · warm-up + 4 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You open any <code>.class</code> file and read it: the null checks kotlinc slipped in, the lambda that <code>inline</code> made disappear, the <code>switch</code> that became a jump table. Then you run a hot loop and point at the exact batch where the JIT compiler took over. "The JVM is magic" becomes "the JVM is a stack machine with a very clever compiler behind it".
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Bytecode and <code>javap</code></a><span class="t">30 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Class loading and runtime data areas</a><span class="t">20 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · The interpreter and the JIT</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">4 · Android's ART vs the JVM</a><span class="t">10 min</span></li>
+  <li data-part="p5"><a href="#p5">Final exercise: bytecode detective</a><span class="t">20 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l23/</code> on its own branch (<code>git switch -c l23</code>). This lesson lives in the terminal: compile Java with <code>javac -d out File.java</code> and Kotlin with <code>kotlinc File.kt -d out</code>, then look inside with <code>javap -c -cp out ClassName</code>. Run Kotlin with <code>kotlin -cp out FileKt</code>; the <code>kotlin</code> runner that Homebrew installed (L1) adds the Kotlin standard library for you. All output is real, from JDK 26.0.1 and kotlinc 2.4.20 on an Apple M5 Max. Long paths are shortened to <code>…</code>.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L4, L7, L9, L14 and L22</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Draw the stack and heap for <code>val p = Point(1, 2)</code> inside <code>main</code>: which frame holds what, and where does the object live? (L4)</li>
+    <li>List every member a Kotlin <code>data class Point(val x: Int, val y: Int)</code> gets for free, then do the same for a Java <code>record</code>. (L7) Part 1 checks your list against the real class file.</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="2">
+  <p class="q">A JVM running your program shows up in <code>ps</code> as one process. What does that process get from the OS? (L22)</p>
+  <div class="opts"><button>Direct access to physical RAM</button><button>A slice of another process</button><button>Its own virtual address space</button><button>Only a single thread forever</button></div>
+  <p class="why">Each process sees its own virtual address space, which the OS maps onto physical memory. The JVM's heap, thread stacks and compiled code are all regions inside that space, as Part 2 shows with <code>jcmd</code>.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">Where does a method's local <code>int</code> variable live while the method runs? (L4)</p>
+  <div class="opts"><button>In its stack frame</button><button>On the shared heap</button><button>In the class file</button><button>In a CPU register</button></div>
+  <p class="why">Each call gets a frame on its thread's stack, holding its local variables. Part 1 opens up that frame: a local-variable array plus a small operand stack.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="3">
+  <p class="q">From Java, what do you call a Kotlin <code>companion object</code> function that has no <code>@JvmStatic</code>? (L9)</p>
+  <div class="opts"><button><code>Config.create()</code></button><button><code>Config.INSTANCE.create()</code></button><button><code>ConfigKt.create()</code></button><button><code>Config.Companion.create()</code></button></div>
+  <p class="why">The companion is a real nested class called <code>Companion</code>, held in a static field. You'll see both in <code>javap</code> output today.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="1">
+  <p class="q">A Java lambda like <code>x -&gt; x * 2</code> compiles to which bytecode instruction at the call site? (L14)</p>
+  <div class="opts"><button><code>new</code></button><button><code>invokedynamic</code></button><button><code>invokestatic</code></button><button><code>checkcast</code></button></div>
+  <p class="why">L14's <code>javap</code> peek showed <code>invokedynamic</code>: the JVM links the lambda at runtime on first use. Records use the same trick for <code>equals</code>, as Part 1 shows.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Bytecode and <code>javap</code></h2><span class="t">~30 min</span></div>
+
+<p>Neither <code>javac</code> nor <code>kotlinc</code> produces machine code. Both produce <dfn>class files</dfn>: one <code>.class</code> per class, in a format the JVM specification defines byte by byte (<a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-4.html">JVMS ch. 4: The class File Format</a>). The JVM doesn't know or care which language produced them. That's the whole reason Kotlin can call Java and back (L9).</p>
+
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Calc.kt</figcaption>
+<!--CODE:l23/Calc.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Calc.java</figcaption>
+<!--CODE:l23/Calc.java--></figure>
+</div>
+<pre class="term"><span class="p">$ </span>javac -d out Calc.java
+<span class="p">$ </span>kotlinc Calc.kt -d out
+<span class="p">$ </span>ls out
+Calc.class
+CalcKt.class
+META-INF
+<span class="p">$ </span>java -cp out Calc
+5 10
+<span class="p">$ </span>kotlin -cp out CalcKt
+5 10</pre>
+<p>Kotlin's top-level functions had to live in <em>some</em> class, so kotlinc made one named after the file: <code>CalcKt</code> (L9).</p>
+
+<h3>Every class file starts with <code>CAFEBABE</code></h3>
+<pre class="term"><span class="p">$ </span>xxd -l 16 out/Calc.class
+00000000: cafe babe 0000 0046 0037 0a00 0200 0307  .......F.7......
+<span class="p">$ </span>xxd -l 16 out/CalcKt.class
+00000000: cafe babe 0000 0034 0049 0100 0643 616c  .......4.I...Cal
+<span class="p">$ </span>javap -v -cp out Calc | grep version
+  minor version: 0
+  major version: 70</pre>
+<ul>
+  <li><b>Bytes 0–3</b> are the magic number: "it has the value <code>0xCAFEBABE</code>" (<a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-4.html#jvms-4.1">JVMS §4.1</a>). If those four bytes are wrong, the JVM refuses to load the file.</li>
+  <li><b>Bytes 4–7</b> are the minor and major version. <code>0x46</code> is 70, which is Java SE 26: a JVM "which conforms to Java SE 26 supports precisely" major versions 45 through 70. Run a version-70 class on an older JVM and you get an <code>UnsupportedClassVersionError</code>.</li>
+  <li><b>Kotlin wrote <code>0x34</code> = 52</b>, which is Java 8's version. That's deliberate: kotlinc's <code>-jvm-target</code> option says "Possible values are 1.8, 9, 10, ..., 26. The default value is 1.8" (<a href="https://kotlinlang.org/docs/compiler-reference.html#jvm-target-version">Kotlin compiler options</a>), so a plain <code>kotlinc</code> build runs on any JVM from Java 8 up. In a Gradle project the toolchain sets the target instead; your L1 projects use 21.</li>
+</ul>
+
+<h3>The JVM is a stack machine</h3>
+<p><code>javap -c</code> disassembles the bytecode of each method:</p>
+<div class="pair">
+<pre class="out">static int add(int, int);
+  Code:
+     0: iload_0
+     1: iload_1
+     2: iadd
+     3: ireturn</pre>
+<pre class="out">public static final int add(int, int);
+  Code:
+     0: iload_0
+     1: iload_1
+     2: iadd
+     3: ireturn</pre>
+</div>
+<p>Left is <code>javap -c -cp out Calc</code>, right is <code>javap -c -cp out CalcKt</code>: identical instructions. To read them you need the frame from L4, opened up. The spec says each frame "has its own array of local variables, its own operand stack, and a reference to the run-time constant pool" (<a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-2.html#jvms-2.6">JVMS §2.6</a>):</p>
+<ul>
+  <li>The <b>local-variable array</b> holds the parameters and locals, numbered from 0. For a static method, slot 0 is the first parameter. For an instance method, slot 0 is <code>this</code>.</li>
+  <li>The <b>operand stack</b> is a scratchpad. Instructions pop their inputs off it and push their results back. <code>iadd</code> has no operands of its own: it pops two ints and pushes their sum.</li>
+  <li>The letter prefix is the type: <code>i</code> for int, <code>l</code> for long, <code>d</code> for double, <code>a</code> for a reference. <code>iload_0</code> means "push the int in local slot 0".</li>
+</ul>
+<p>Step through it. The traces below are generated from the real <code>javap</code> output, so every state is what the bytecode actually does:</p>
+
+<div class="bytecodeviz" data-src="bc-calc"></div>
+<script type="application/json" id="bc-calc">{"methods": [{"name": "Java · add(2, 3)", "code": [" 0: iload_0", " 1: iload_1", " 2: iadd", " 3: ireturn"], "pcs": [0, 1, 2, 3], "locals": ["a", "b"], "start": [2, 3], "steps": [{"pc": 0, "locals": [2, 3], "stack": [2], "note": "Copy local 0 (a = 2) onto the stack."}, {"pc": 1, "locals": [2, 3], "stack": [2, 3], "note": "Copy local 1 (b = 3) onto the stack."}, {"pc": 2, "locals": [2, 3], "stack": [5], "note": "Pop 3 and 2, push 2 + 3 = 5."}, {"pc": 3, "locals": [2, 3], "stack": [5], "note": "Pop 5 and return it to the caller. The frame is discarded (L4)."}]}, {"name": "Java · sumTo(3)", "code": [" 0: iconst_0", " 1: istore_1", " 2: iconst_1", " 3: istore_2", " 4: iload_2", " 5: iload_0", " 6: if_icmpgt 19", " 9: iload_1", "10: iload_2", "11: iadd", "12: istore_1", "13: iinc 2, 1", "16: goto 4", "19: iload_1", "20: ireturn"], "pcs": [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 16, 19, 20], "locals": ["n", "total", "i"], "start": [3, null, null], "steps": [{"pc": 0, "locals": [3, null, null], "stack": [0], "note": "Push the constant 0."}, {"pc": 1, "locals": [3, 0, null], "stack": [], "note": "Pop 0 into local 1 (total)."}, {"pc": 2, "locals": [3, 0, null], "stack": [1], "note": "Push the constant 1."}, {"pc": 3, "locals": [3, 0, 1], "stack": [], "note": "Pop 1 into local 2 (i)."}, {"pc": 4, "locals": [3, 0, 1], "stack": [1], "note": "Copy local 2 (i = 1) onto the stack."}, {"pc": 5, "locals": [3, 0, 1], "stack": [1, 3], "note": "Copy local 0 (n = 3) onto the stack."}, {"pc": 6, "locals": [3, 0, 1], "stack": [], "note": "Pop 3 and 1. Is 1 > 3? No: fall through."}, {"pc": 9, "locals": [3, 0, 1], "stack": [0], "note": "Copy local 1 (total = 0) onto the stack."}, {"pc": 10, "locals": [3, 0, 1], "stack": [0, 1], "note": "Copy local 2 (i = 1) onto the stack."}, {"pc": 11, "locals": [3, 0, 1], "stack": [1], "note": "Pop 1 and 0, push 0 + 1 = 1."}, {"pc": 12, "locals": [3, 1, 1], "stack": [], "note": "Pop 1 into local 1 (total)."}, {"pc": 13, "locals": [3, 1, 2], "stack": [], "note": "Add 1 to local 2 (i) in place, now 2. The stack isn't touched."}, {"pc": 16, "locals": [3, 1, 2], "stack": [], "note": "Jump back to 4."}, {"pc": 4, "locals": [3, 1, 2], "stack": [2], "note": "Copy local 2 (i = 2) onto the stack."}, {"pc": 5, "locals": [3, 1, 2], "stack": [2, 3], "note": "Copy local 0 (n = 3) onto the stack."}, {"pc": 6, "locals": [3, 1, 2], "stack": [], "note": "Pop 3 and 2. Is 2 > 3? No: fall through."}, {"pc": 9, "locals": [3, 1, 2], "stack": [1], "note": "Copy local 1 (total = 1) onto the stack."}, {"pc": 10, "locals": [3, 1, 2], "stack": [1, 2], "note": "Copy local 2 (i = 2) onto the stack."}, {"pc": 11, "locals": [3, 1, 2], "stack": [3], "note": "Pop 2 and 1, push 1 + 2 = 3."}, {"pc": 12, "locals": [3, 3, 2], "stack": [], "note": "Pop 3 into local 1 (total)."}, {"pc": 13, "locals": [3, 3, 3], "stack": [], "note": "Add 1 to local 2 (i) in place, now 3. The stack isn't touched."}, {"pc": 16, "locals": [3, 3, 3], "stack": [], "note": "Jump back to 4."}, {"pc": 4, "locals": [3, 3, 3], "stack": [3], "note": "Copy local 2 (i = 3) onto the stack."}, {"pc": 5, "locals": [3, 3, 3], "stack": [3, 3], "note": "Copy local 0 (n = 3) onto the stack."}, {"pc": 6, "locals": [3, 3, 3], "stack": [], "note": "Pop 3 and 3. Is 3 > 3? No: fall through."}, {"pc": 9, "locals": [3, 3, 3], "stack": [3], "note": "Copy local 1 (total = 3) onto the stack."}, {"pc": 10, "locals": [3, 3, 3], "stack": [3, 3], "note": "Copy local 2 (i = 3) onto the stack."}, {"pc": 11, "locals": [3, 3, 3], "stack": [6], "note": "Pop 3 and 3, push 3 + 3 = 6."}, {"pc": 12, "locals": [3, 6, 3], "stack": [], "note": "Pop 6 into local 1 (total)."}, {"pc": 13, "locals": [3, 6, 4], "stack": [], "note": "Add 1 to local 2 (i) in place, now 4. The stack isn't touched."}, {"pc": 16, "locals": [3, 6, 4], "stack": [], "note": "Jump back to 4."}, {"pc": 4, "locals": [3, 6, 4], "stack": [4], "note": "Copy local 2 (i = 4) onto the stack."}, {"pc": 5, "locals": [3, 6, 4], "stack": [4, 3], "note": "Copy local 0 (n = 3) onto the stack."}, {"pc": 6, "locals": [3, 6, 4], "stack": [], "note": "Pop 3 and 4. Is 4 > 3? Yes: jump to 19."}, {"pc": 19, "locals": [3, 6, 4], "stack": [6], "note": "Copy local 1 (total = 6) onto the stack."}, {"pc": 20, "locals": [3, 6, 4], "stack": [6], "note": "Pop 6 and return it to the caller. The frame is discarded (L4)."}]}, {"name": "Kotlin · sumTo(3)", "code": [" 0: iconst_0", " 1: istore_1", " 2: iconst_1", " 3: istore_2", " 4: iload_2", " 5: iload_0", " 6: if_icmpgt 24", " 9: iload_1", "10: iload_2", "11: iadd", "12: istore_1", "13: iload_2", "14: iload_0", "15: if_icmpeq 24", "18: iinc 2, 1", "21: goto 9", "24: iload_1", "25: ireturn"], "pcs": [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 18, 21, 24, 25], "locals": ["n", "total", "i"], "start": [3, null, null], "steps": [{"pc": 0, "locals": [3, null, null], "stack": [0], "note": "Push the constant 0."}, {"pc": 1, "locals": [3, 0, null], "stack": [], "note": "Pop 0 into local 1 (total)."}, {"pc": 2, "locals": [3, 0, null], "stack": [1], "note": "Push the constant 1."}, {"pc": 3, "locals": [3, 0, 1], "stack": [], "note": "Pop 1 into local 2 (i)."}, {"pc": 4, "locals": [3, 0, 1], "stack": [1], "note": "Copy local 2 (i = 1) onto the stack."}, {"pc": 5, "locals": [3, 0, 1], "stack": [1, 3], "note": "Copy local 0 (n = 3) onto the stack."}, {"pc": 6, "locals": [3, 0, 1], "stack": [], "note": "Pop 3 and 1. Is 1 > 3? No: fall through."}, {"pc": 9, "locals": [3, 0, 1], "stack": [0], "note": "Copy local 1 (total = 0) onto the stack."}, {"pc": 10, "locals": [3, 0, 1], "stack": [0, 1], "note": "Copy local 2 (i = 1) onto the stack."}, {"pc": 11, "locals": [3, 0, 1], "stack": [1], "note": "Pop 1 and 0, push 0 + 1 = 1."}, {"pc": 12, "locals": [3, 1, 1], "stack": [], "note": "Pop 1 into local 1 (total)."}, {"pc": 13, "locals": [3, 1, 1], "stack": [1], "note": "Copy local 2 (i = 1) onto the stack."}, {"pc": 14, "locals": [3, 1, 1], "stack": [1, 3], "note": "Copy local 0 (n = 3) onto the stack."}, {"pc": 15, "locals": [3, 1, 1], "stack": [], "note": "Pop 3 and 1. Is 1 == 3? No: fall through."}, {"pc": 18, "locals": [3, 1, 2], "stack": [], "note": "Add 1 to local 2 (i) in place, now 2. The stack isn't touched."}, {"pc": 21, "locals": [3, 1, 2], "stack": [], "note": "Jump back to 9."}, {"pc": 9, "locals": [3, 1, 2], "stack": [1], "note": "Copy local 1 (total = 1) onto the stack."}, {"pc": 10, "locals": [3, 1, 2], "stack": [1, 2], "note": "Copy local 2 (i = 2) onto the stack."}, {"pc": 11, "locals": [3, 1, 2], "stack": [3], "note": "Pop 2 and 1, push 1 + 2 = 3."}, {"pc": 12, "locals": [3, 3, 2], "stack": [], "note": "Pop 3 into local 1 (total)."}, {"pc": 13, "locals": [3, 3, 2], "stack": [2], "note": "Copy local 2 (i = 2) onto the stack."}, {"pc": 14, "locals": [3, 3, 2], "stack": [2, 3], "note": "Copy local 0 (n = 3) onto the stack."}, {"pc": 15, "locals": [3, 3, 2], "stack": [], "note": "Pop 3 and 2. Is 2 == 3? No: fall through."}, {"pc": 18, "locals": [3, 3, 3], "stack": [], "note": "Add 1 to local 2 (i) in place, now 3. The stack isn't touched."}, {"pc": 21, "locals": [3, 3, 3], "stack": [], "note": "Jump back to 9."}, {"pc": 9, "locals": [3, 3, 3], "stack": [3], "note": "Copy local 1 (total = 3) onto the stack."}, {"pc": 10, "locals": [3, 3, 3], "stack": [3, 3], "note": "Copy local 2 (i = 3) onto the stack."}, {"pc": 11, "locals": [3, 3, 3], "stack": [6], "note": "Pop 3 and 3, push 3 + 3 = 6."}, {"pc": 12, "locals": [3, 6, 3], "stack": [], "note": "Pop 6 into local 1 (total)."}, {"pc": 13, "locals": [3, 6, 3], "stack": [3], "note": "Copy local 2 (i = 3) onto the stack."}, {"pc": 14, "locals": [3, 6, 3], "stack": [3, 3], "note": "Copy local 0 (n = 3) onto the stack."}, {"pc": 15, "locals": [3, 6, 3], "stack": [], "note": "Pop 3 and 3. Is 3 == 3? Yes: jump to 24."}, {"pc": 24, "locals": [3, 6, 3], "stack": [6], "note": "Copy local 1 (total = 6) onto the stack."}, {"pc": 25, "locals": [3, 6, 3], "stack": [6], "note": "Pop 6 and return it to the caller. The frame is discarded (L4)."}]}]}</script>
+
+<p>Here's the full <code>sumTo</code> listing for both languages:</p>
+<div class="pair">
+<pre class="out">// Java: for (int i = 1; i &lt;= n; i++)
+ 0: iconst_0
+ 1: istore_1          // total = 0
+ 2: iconst_1
+ 3: istore_2          // i = 1
+ 4: iload_2
+ 5: iload_0
+ 6: if_icmpgt  19     // i &gt; n? exit
+ 9: iload_1
+10: iload_2
+11: iadd
+12: istore_1          // total = total + i
+13: iinc       2, 1   // i++
+16: goto       4
+19: iload_1
+20: ireturn</pre>
+<pre class="out">// Kotlin: for (i in 1..n)
+ 0: iconst_0
+ 1: istore_1          // total = 0
+ 2: iconst_1
+ 3: istore_2          // i = 1
+ 4: iload_2
+ 5: iload_0
+ 6: if_icmpgt  24     // empty range? skip
+ 9: iload_1
+10: iload_2
+11: iadd
+12: istore_1          // total = total + i
+13: iload_2
+14: iload_0
+15: if_icmpeq  24     // i == n? done
+18: iinc       2, 1   // i++
+21: goto       9
+24: iload_1
+25: ireturn</pre>
+</div>
+<p>The comments are mine; <code>javap</code> prints only the instructions. Loops are just a conditional jump plus a <code>goto</code> back. There's no "for" in bytecode. But look at the shapes. Kotlin checks the range once up front, then tests <code>i == n</code> <em>before</em> incrementing. Why? Because Java's version has a bug at the edge of the int range. If <code>n</code> is <code>Int.MAX_VALUE</code>, <code>i &lt;= n</code> is always true and <code>i++</code> overflows to a negative number (L2):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · RangeEdge.kt</figcaption>
+<!--CODE:l23/RangeEdge.kt--></figure>
+  <figure class="java"><figcaption>JAVA · RangeEdge.java</figcaption>
+<!--CODE:l23/RangeEdge.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">Kotlin loop ran 3 times</pre>
+<pre class="out">Java loop ran 10 times (stopped by the safety valve)</pre>
+</div>
+
+<h3>Decompiling a data class and a record</h3>
+<p>Now check your warm-up list. <code>javap -p</code> lists every member, including private ones:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Point.kt</figcaption>
+<!--CODE:l23/Point.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Point.java</figcaption>
+<!--CODE:l23/Point.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">public final class Point {
+  private final int x;
+  private final int y;
+  public Point(int, int);
+  public final int getX();
+  public final int getY();
+  public final int component1();
+  public final int component2();
+  public final Point copy(int, int);
+  public static Point copy$default(Point, int, int, int, java.lang.Object);
+  public java.lang.String toString();
+  public int hashCode();
+  public boolean equals(java.lang.Object);
+}</pre>
+<pre class="out">final class Point extends java.lang.Record {
+  private final int x;
+  private final int y;
+  Point(int, int);
+  public static void main(java.lang.String[]);
+  public final java.lang.String toString();
+  public final int hashCode();
+  public final boolean equals(java.lang.Object);
+  public int x();
+  public int y();
+}</pre>
+</div>
+<ul>
+  <li><b>Kotlin</b> wrote getters (<code>getX</code>), <code>componentN</code> for destructuring, <code>copy</code>, and a hidden static <code>copy$default</code>. The extra <code>int</code> parameter in <code>copy$default</code> is a bitmask saying which arguments were left out, so their defaults (the current values) get used. That's how default arguments work on a JVM that has no such feature.</li>
+  <li><b>Java</b> wrote accessors named after the components (<code>x()</code>, not <code>getX()</code>), and the class extends <code>java.lang.Record</code>. No <code>copy</code>, no destructuring methods: records do destructuring through pattern matching instead (L7).</li>
+</ul>
+<p>The bodies differ even more. Kotlin's <code>equals</code> is 49 bytes of ordinary bytecode: an identity check, <code>instanceof</code>, then a field-by-field compare. The record's <code>equals</code> is four instructions:</p>
+<div class="pair">
+<pre class="out">// Kotlin Point.equals (start)
+ 0: aload_0
+ 1: aload_1
+ 2: if_acmpne     7     // same object?
+ 5: iconst_1
+ 6: ireturn
+ 7: aload_1
+ 8: instanceof    #2    // class Point
+   …
+22: getfield      #13   // Field x:I
+   …</pre>
+<pre class="out">// Java record Point.equals
+0: aload_0
+1: aload_1
+2: invokedynamic #53,  0  // InvokeDynamic #1:equals:(LPoint;Ljava/lang/Object;)Z
+7: ireturn
+
+// javap -v, BootstrapMethods:
+1: #79 REF_invokeStatic java/lang/runtime/ObjectMethods.bootstrap:(…)
+  Method arguments:
+    #8 Point
+    #69 x;y
+    #71 REF_getField Point.x:I
+    #72 REF_getField Point.y:I</pre>
+</div>
+<p>The record hands the job to <code>invokedynamic</code>, the same instruction as L14's lambdas. On first call the JVM asks <code>ObjectMethods.bootstrap</code> to build an implementation from the list of components (<code>x;y</code>) and their getters. The API docs describe it as "bootstrap methods for state-driven implementations of core methods, including <code>Object.equals(Object)</code>, <code>Object.hashCode()</code>, and <code>Object.toString()</code>" (<a href="https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/lang/runtime/ObjectMethods.html">ObjectMethods</a>; see also <a href="https://openjdk.org/jeps/395">JEP 395</a>). The class file stays tiny, and the JDK can improve the implementation without you recompiling.</p>
+
+<h3>What else kotlinc slips in</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Inserted.kt</figcaption>
+<!--CODE:l23/Inserted.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Inserted.java</figcaption>
+<!--CODE:l23/Inserted.java--></figure>
+</div>
+<pre class="out">Hi, Ada Wed Config            (Kotlin)
+Hi, Ada Wed Inserted          (Java)</pre>
+<p><b>1 · Null checks on every public parameter.</b> Here's <code>javap -c</code> for <code>greet</code>:</p>
+<pre class="out">public static final java.lang.String greet(java.lang.String);
+  Code:
+     0: aload_0
+     1: ldc           #9      // String name
+     3: invokestatic  #15     // Method kotlin/jvm/internal/Intrinsics.checkNotNullParameter:(Ljava/lang/Object;Ljava/lang/String;)V
+     6: new           #17     // class java/lang/StringBuilder
+     …</pre>
+<p>Your Kotlin said <code>name: String</code>, never null. But a Java caller can pass <code>null</code> anyway, so "Kotlin generates runtime checks for all public functions that expect non-nulls. This way we get a <code>NullPointerException</code> in the Java code immediately" (<a href="https://kotlinlang.org/docs/java-to-kotlin-interop.html#null-safety">Calling Kotlin from Java</a>). The parameter's <em>name</em> is passed along, so the error message can say which parameter was null. Java's <code>greet</code> has no such check.</p>
+
+<p><b>2 · Companion objects are real classes.</b> <code>javap -p</code> on the two classes kotlinc made:</p>
+<pre class="out">public final class Config {
+  public static final Config$Companion Companion;
+  public static final int MAX;
+  public Config();
+  static {};
+}
+public final class Config$Companion {
+  private Config$Companion();
+  public final Config create();
+  public Config$Companion(kotlin.jvm.internal.DefaultConstructorMarker);
+}</pre>
+<p>That's the L9 story in bytes: <code>create</code> is an instance method on the <code>Companion</code> singleton, which lives in a static field. <code>const val MAX</code> became a real <code>static final</code> field. <code>static {}</code> is the class initializer, which Part 2 is about.</p>
+
+<p><b>3 · A dense <code>when</code> becomes a jump table</b>, in both languages:</p>
+<div class="pair">
+<pre class="out">// Kotlin dayName
+0: iload_0
+1: tableswitch   { // 1 to 4
+             1: 32
+             2: 37
+             3: 42
+             4: 47
+       default: 52
+  }
+32: ldc  #36   // String Mon
+…</pre>
+<pre class="out">// Java dayName
+0: iload_0
+1: tableswitch   { // 1 to 4
+             1: 32
+             2: 35
+             3: 38
+             4: 41
+       default: 44
+  }
+32: ldc  #14   // String Mon
+…</pre>
+</div>
+<p><code>tableswitch</code> uses the value as an index into a table of jump targets, so it costs one step no matter how many cases there are. For sparse values like <code>1, 100, 5000</code>, both compilers emit <code>lookupswitch</code> instead (I checked with <code>javap</code> on a three-case version): a table of key/target pairs that "are sorted to support lookup routines that are quicker than linear search" (<a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-6.html#jvms-6.5.lookupswitch">JVMS: lookupswitch</a>), such as L18's binary search. That's why a <code>when</code> on an int is not a chain of <code>if</code>s.</p>
+
+<p><b>4 · String templates depend on the target.</b> With kotlinc's default target (1.8), <code>"${add(2, 3)} ${sumTo(4)}"</code> becomes a <code>StringBuilder</code>. Raise the target and it becomes the same <code>invokedynamic</code> that <code>javac</code> emits:</p>
+<div class="pair">
+<pre class="out">// kotlinc Calc.kt   (target 1.8)
+ 0: new           #18  // class java/lang/StringBuilder
+ 3: dup
+ 4: invokespecial #21  // Method java/lang/StringBuilder."&lt;init&gt;":()V
+ 7: iconst_2
+ 8: iconst_3
+ 9: invokestatic  #23  // Method add:(II)I
+12: invokevirtual #27  // Method java/lang/StringBuilder.append:(I)…
+…</pre>
+<pre class="out">// kotlinc Calc.kt -jvm-target 21
+0: iconst_2
+1: iconst_3
+2: invokestatic  #18   // Method add:(II)I
+5: iconst_4
+6: invokestatic  #20   // Method sumTo:(I)I
+9: invokedynamic #32,  0   // InvokeDynamic #0:makeConcatWithConstants:(II)Ljava/lang/String;
+…</pre>
+</div>
+<p>kotlinc's own help text says so: the default is "'indy-with-constants' for JVM targets 9 or greater, 'inline' otherwise" (<code>kotlinc -X</code>, option <code>-Xstring-concat</code>). Same source, different bytecode, depending on a build setting.</p>
+
+<p><b>5 · <code>inline</code> makes the lambda vanish.</b></p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Inline.kt</figcaption>
+<!--CODE:l23/Inline.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Inline.java</figcaption>
+<!--CODE:l23/Inline.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">// Kotlin main()
+ 0: iconst_0
+ 1: istore_0          // count = 0
+ …
+ 6: iload_0
+ 7: iconst_1
+ 8: iadd
+ 9: istore_0          // count++  (first block() call, pasted in)
+ …
+13: iload_0
+14: iconst_1
+15: iadd
+16: istore_0          // count++  (second block() call)
+ …
+19: invokedynamic #45,  0   // InvokeDynamic #0:invoke:()Lkotlin/jvm/functions/Function0;
+24: invokestatic  #47       // Method twiceNoInline:(Lkotlin/jvm/functions/Function0;)V</pre>
+<pre class="out">// Java main
+ 0: iconst_1
+ 1: newarray       int    // int[] count = {0}
+ …
+ 9: invokedynamic #12,  0 // InvokeDynamic #0:run:([I)Ljava/lang/Runnable;
+14: invokestatic  #15     // Method twice:(Ljava/lang/Runnable;)V
+17: invokedynamic #21,  0 // InvokeDynamic #1:run:()Ljava/lang/Runnable;
+22: invokestatic  #15     // Method twice:(Ljava/lang/Runnable;)V</pre>
+</div>
+<p>There's no call to <code>twice</code> at all: kotlinc pasted its body, and the lambda's body, straight into <code>main</code>, twice. "The <code>inline</code> modifier affects both the function itself and the lambdas passed to it: all of those will be inlined into the call site" (<a href="https://kotlinlang.org/docs/inline-functions.html">Kotlin docs: Inline functions</a>). Because the lambda is gone, <code>count</code> stays a plain local int. L14 showed that a captured <code>var</code> in a non-inline lambda gets boxed in a <code>Ref$IntRef</code>. The non-inline <code>twiceNoInline</code> call still builds a <code>Function0</code> object via <code>invokedynamic</code>, just as Java's version builds a <code>Runnable</code>. Java has no <code>inline</code>, so it needs the <code>int[]</code> trick from L14.</p>
+<p class="note">One more thing in every Kotlin class file: a <code>@kotlin.Metadata</code> annotation (visible in <code>javap -v</code>). It "is present on any class file produced by the Kotlin compiler and is read by the compiler and reflection" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin/-metadata/">Metadata API</a>). It records the Kotlin-only facts the JVM format can't express, like which types are nullable.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you</strong> (and you can now prove it in the bytecode).
+  <ul>
+    <li>A runtime <code>Intrinsics.checkNotNullParameter</code> guards every non-null parameter of a public function, so null from Java fails fast, at the boundary.</li>
+    <li>Data classes get <code>componentN</code>, <code>copy</code> and <code>copy$default</code> on top of <code>equals</code>/<code>hashCode</code>/<code>toString</code>, all as plain bytecode.</li>
+    <li><code>inline</code> pastes lambdas into the call site, so there's no lambda object and no boxing of captured vars.</li>
+    <li>Range loops are compiled overflow-safe at <code>Int.MAX_VALUE</code>.</li>
+    <li>Top-level functions get a <code>FileKt</code> class, and companions become a nested class plus a static field: things Java makes you write by hand.</li>
+  </ul>
+  What's the same: it's all ordinary JVM bytecode in an ordinary class file. A <code>when</code> and a <code>switch</code> compile to the same <code>tableswitch</code>.
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: hand-trace, then check with javap</div>
+  <ol>
+    <li>In both languages, write <code>mul3(a, b, c) = a * b * c</code> and a <code>countDown(n)</code> that subtracts 2 from <code>n</code> while it's positive and returns how many steps it took (<code>countDown(7)</code> = 4).</li>
+    <li><b>Before compiling,</b> write down on paper the bytecode you expect for <code>mul3</code>, and the operand stack after each instruction for <code>mul3(2, 3, 4)</code>.</li>
+    <li>Compile, run (<code>24 4</code>), and compare with <code>javap -c</code>. Then find the one difference between the Kotlin and Java <code>countDown</code> listings, and explain it.</li>
+  </ol>
+  <details class="solution"><summary>Reference solutions and real javap output</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex1.kt</figcaption>
+<!--CODE:l23/Ex1.kt--></figure>
+      <figure class="java"><figcaption>JAVA · Ex1.java</figcaption>
+<!--CODE:l23/Ex1.java--></figure>
+    </div>
+    <p><code>mul3</code> is identical in both: <code>iload_0, iload_1, imul, iload_2, imul, ireturn</code>. The stack goes <code>[2]</code> → <code>[2,3]</code> → <code>[6]</code> → <code>[6,4]</code> → <code>[24]</code>, and then 24 is returned.</p>
+    <div class="pair">
+<pre class="out">// Kotlin countDown
+ 0: iload_0
+ 1: istore_1        // n = start   (copy!)
+ 2: iconst_0
+ 3: istore_2        // steps = 0
+ 4: iload_1
+ 5: ifle       17
+ 8: iinc       1, -2
+11: iinc       2, 1
+14: goto       4
+17: iload_2
+18: ireturn</pre>
+<pre class="out">// Java countDown
+ 0: iconst_0
+ 1: istore_1        // steps = 0
+ 2: iload_0
+ 3: ifle       15
+ 6: iinc       0, -2   // modifies the parameter slot
+ 9: iinc       1, 1
+12: goto       2
+15: iload_1
+16: ireturn</pre>
+    </div>
+    <p>The difference: Kotlin parameters are read-only (<code>val</code>), so the Kotlin version needed <code>var n = start</code>, and that copy is the extra <code>iload_0, istore_1</code>. Java reassigned its parameter in place, slot 0. Note also <code>iinc 1, -2</code>: <code>iinc</code> changes a local slot directly, without touching the operand stack.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Bytecode" data-answer="2">
+  <p class="q">What does <code>iadd</code> do?</p>
+  <div class="opts"><button>Adds two named local variables together</button><button>Adds a constant to a register</button><button>Pops two ints, pushes their sum</button><button>Adds one to a loop counter</button></div>
+  <p class="why">It's a stack instruction with no operands: its inputs are whatever is on top of the operand stack (JVMS §2.6.2). Adding a constant to a local is <code>iinc</code>.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Bytecode" data-answer="0">
+  <p class="q">A plain <code>kotlinc File.kt</code> writes class-file major version 52. Why?</p>
+  <div class="opts"><button>Its default JVM target is 1.8</button><button>Kotlin cannot emit any newer bytecode</button><button>JDK 26 rewrites the version number</button><button>Version 52 means it's Kotlin 2.4</button></div>
+  <p class="why">kotlinc's <code>-jvm-target</code> defaults to 1.8 (major version 52), so the output runs on Java 8 and up. Gradle toolchains raise it, and higher targets unlock things like <code>invokedynamic</code> string concatenation.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Bytecode" data-answer="3">
+  <p class="q">Why does kotlinc insert <code>Intrinsics.checkNotNullParameter</code> at the start of public functions?</p>
+  <div class="opts"><button>To speed up later field access</button><button>The JVM requires it for strings</button><button>To support Kotlin's smart cast feature</button><button>Java callers might pass null anyway</button></div>
+  <p class="why">Kotlin's type system can't stop Java code passing null, so the check makes it fail immediately at the boundary, with the parameter's name in the message, instead of deep inside your code.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Bytecode" data-answer="1">
+  <p class="q">How does a Java record implement <code>equals</code> in its class file?</p>
+  <div class="opts"><button>A field-by-field compare written by javac</button><button>A runtime invokedynamic call to ObjectMethods.bootstrap</button><button>Inherited unchanged from the java.lang.Object class</button><button>Reflection over all the declared fields</button></div>
+  <p class="why">The record's <code>equals</code> is just <code>aload_0, aload_1, invokedynamic, ireturn</code>. The real implementation is built at runtime by <code>java.lang.runtime.ObjectMethods</code> from the component list. Kotlin's data class instead contains the full compare as ordinary bytecode.</p>
+</div>
+<div class="quiz" data-id="p1-5" data-group="Part 1 · Bytecode" data-answer="2">
+  <p class="q">After <code>twice { count++ }</code>, where <code>twice</code> is <code>inline</code>, what does <code>main</code>'s bytecode contain?</p>
+  <div class="opts"><button>A call to twice</button><button>A new Function0 object</button><button>The pasted lambda body</button><button>A boxed Ref$IntRef counter</button></div>
+  <p class="why">kotlinc copies the function body and the lambda body into the caller, so <code>count++</code> appears twice as plain <code>iload/iadd/istore</code>, with no object and no call.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Class loading and runtime data areas</h2><span class="t">~20 min</span></div>
+
+<p>A class file on disk does nothing. Before your code runs, the JVM goes through three steps, which JVMS chapter 5 defines (<a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-5.html">JVMS ch. 5: Loading, Linking, and Initializing</a>):</p>
+<ol>
+  <li><b>Loading:</b> find the bytes for a class (a <code>.class</code> file, a jar entry, the JDK's own modules) and create the class from them.</li>
+  <li><b>Linking:</b> <em>verify</em> that the bytecode is well-formed and type-safe, so a hand-crafted class file can't corrupt memory; <em>prepare</em> the static fields with default values; and <em>resolve</em> symbolic references like <code>java/lang/StringBuilder</code> to the real classes.</li>
+  <li><b>Initialization:</b> "consists of executing the class or interface initialization method <code>&lt;clinit&gt;</code>". That's your Java <code>static {}</code> blocks and static field initializers, or the Kotlin <code>object</code>/<code>companion</code> <code>init</code> blocks.</li>
+</ol>
+<p>The important word is <em>lazy</em>. A class is initialized only on first active use: "Upon execution of a <code>new</code>, <code>getstatic</code>, <code>putstatic</code>, or <code>invokestatic</code> instruction" that refers to it (<a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-5.html#jvms-5.5">JVMS §5.5</a>).</p>
+
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · InitOrder.kt</figcaption>
+<!--CODE:l23/InitOrder.kt--></figure>
+  <figure class="java"><figcaption>JAVA · InitOrder.java</figcaption>
+<!--CODE:l23/InitOrder.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">main starts
+  [Registry initialised]
+Registry: [a, b]
+  [Settings.Companion initialised]
+Settings: dark
+Registry again: [a, b]</pre>
+<pre class="out">main starts
+  [Registry initialised]
+Registry: [a, b]
+  [Settings initialised]
+Settings: dark
+Registry again: [a, b]</pre>
+</div>
+<p>Nothing is initialized up front. Each class wakes up exactly when first touched, and only once. A Kotlin <code>object</code> is a thread-safe lazy singleton for exactly this reason: its <code>init</code> runs in the class initializer, which the JVM guarantees runs once. You can even watch the classes <em>load</em>, with <code>-Xlog:class+load</code>, or <code>-verbose:class</code>, which "displays information about each loaded class" (<a href="https://docs.oracle.com/en/java/javase/26/docs/specs/man/java.html">the java command</a>):</p>
+<pre class="term"><span class="p">$ </span>java -Xlog:class+load -cp out InitOrder     <span class="c"># ~600 JDK classes before main trimmed</span>
+[0.010s][info][class,load] InitOrder source: file:/…/out/
+main starts
+[0.011s][info][class,load] InitOrder$Registry source: file:/…/out/
+  [Registry initialised]
+[0.013s][info][class,load] java.lang.invoke.LambdaForm$MH/0x0000060001040800 source: __JVM_LookupDefineClass__
+Registry: [a, b]
+[0.013s][info][class,load] InitOrder$Settings source: file:/…/out/
+  [Settings initialised]
+Settings: dark
+Registry again: [a, b]</pre>
+<p><code>InitOrder$Settings</code> isn't even <em>read from disk</em> until the line that needs it. (The <code>LambdaForm</code> line is the JDK wiring up the <code>invokedynamic</code> for string concatenation.) Counting every line of that log for each program:</p>
+<table class="vs">
+  <tr><th></th><th>classes loaded</th><th>from the JDK's shared archive</th><th>from <code>kotlin-stdlib</code></th></tr>
+  <tr><td>Java <code>InitOrder</code></td><td>614</td><td>608</td><td>0</td></tr>
+  <tr><td>Kotlin <code>InitOrderKt</code></td><td>775</td><td>745</td><td>20</td></tr>
+</table>
+<p>A "hello world" loads hundreds of classes, but most come from the <em>shared archive</em>, a pre-parsed snapshot of common JDK classes that the JVM maps into memory instead of loading one by one. That's the "sharing" in <code>java -version</code>'s "mixed mode, sharing" line (class data sharing, <a href="https://docs.oracle.com/en/java/javase/26/docs/specs/man/java.html">the java command: -Xshare</a>). The Kotlin version also loads <code>kotlin.collections.CollectionsKt</code> and friends for <code>listOf</code>.</p>
+
+<h3>Class loaders</h3>
+<p>Classes are loaded by <dfn>class loaders</dfn>, and the JDK has three built in (<a href="https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/lang/ClassLoader.html">ClassLoader API</a>):</p>
+<ul>
+  <li><b>Bootstrap:</b> "the virtual machine's built-in class loader, typically represented as <code>null</code>". It loads core classes like <code>String</code>.</li>
+  <li><b>Platform:</b> the rest of the Java SE APIs, like <code>java.sql</code>.</li>
+  <li><b>System</b>, also called application: "used to define classes on the application class path". That's your code, and any jar on <code>-cp</code>, including <code>kotlin-stdlib</code>.</li>
+</ul>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Loaders.kt</figcaption>
+<!--CODE:l23/Loaders.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Loaders.java</figcaption>
+<!--CODE:l23/Loaders.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">String     -&gt; null
+java.sql   -&gt; jdk.internal.loader.ClassLoaders$PlatformClassLoader@18b4aac2
+kotlin.Unit-&gt; jdk.internal.loader.ClassLoaders$AppClassLoader@41e986c9
+Mine       -&gt; jdk.internal.loader.ClassLoaders$AppClassLoader@41e986c9
+Mine's parent  -&gt; jdk.internal.loader.ClassLoaders$PlatformClassLoader@18b4aac2</pre>
+<pre class="out">String     -&gt; null
+java.sql   -&gt; jdk.internal.loader.ClassLoaders$PlatformClassLoader@764c12b6
+Mine       -&gt; jdk.internal.loader.ClassLoaders$AppClassLoader@41e986c9
+Mine's parent  -&gt; jdk.internal.loader.ClassLoaders$PlatformClassLoader@764c12b6</pre>
+</div>
+<p><b>Parent delegation:</b> "When requested to find a class or resource, a ClassLoader instance will usually delegate the search for the class or resource to its parent class loader before attempting to find the class or resource itself." So when your code asks for <code>java.lang.String</code>, the app loader asks the platform loader, which asks bootstrap, which finds the real one. You can't accidentally replace <code>String</code> by putting your own <code>String.class</code> on the classpath. Notice that <code>kotlin.Unit</code> comes from the <em>app</em> loader: to the JVM, the Kotlin standard library is just another jar. (Run <code>java Loaders.java</code> in source mode and <code>Mine</code> shows a different loader, <code>com.sun.tools.javac.launcher.MemoryClassLoader</code>: the source launcher compiles into memory and loads from there. Frameworks use custom loaders like this all the time.)</p>
+<p>That jar has to be there at runtime. Run the Kotlin classes with plain <code>java</code> and no stdlib on the classpath:</p>
+<pre class="err">$ java -cp out InitOrderKt
+main starts
+  [Registry initialised]
+Exception in thread "main" java.lang.NoClassDefFoundError: kotlin/collections/CollectionsKt
+	at Registry.&lt;clinit&gt;(InitOrder.kt:3)
+	at InitOrderKt.main(InitOrder.kt:15)
+	at InitOrderKt.main(InitOrder.kt)
+Caused by: java.lang.ClassNotFoundException: kotlin.collections.CollectionsKt
+	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:580)
+	at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:502)
+	... 3 more
+$ java -cp out InsertedKt
+Exception in thread "main" java.lang.NoClassDefFoundError: kotlin/jvm/internal/Intrinsics
+	at InsertedKt.greet(Inserted.kt)
+	…</pre>
+<p>Laziness again: the program <em>starts fine</em> and only crashes when <code>Registry</code>'s initializer first needs <code>listOf</code>. The second one dies on the null check from Part 1. This is the classic "works on my machine" error: compiling found the class, running didn't. The fix is the classpath: <code>kotlin -cp out …</code>, or the stdlib jar in <code>-cp</code>, or a fat jar, which L25 builds with Gradle.</p>
+
+<h3>The runtime data areas</h3>
+<p>Once loaded, where does everything live? JVMS §2.5 names the areas (<a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-2.html#jvms-2.5">Run-Time Data Areas</a>). L4's stack-and-heap picture was the simplified version:</p>
+<table class="vs">
+  <tr><th>Area</th><th>Per thread?</th><th>Holds</th><th>Fails with</th></tr>
+  <tr><td>pc register</td><td>yes</td><td>which bytecode instruction is running</td><td>–</td></tr>
+  <tr><td>JVM stack</td><td>yes</td><td>frames: locals + operand stack (Part 1)</td><td><code>StackOverflowError</code> (L4)</td></tr>
+  <tr><td>Native method stack</td><td>yes</td><td>frames of native (C) code</td><td><code>StackOverflowError</code></td></tr>
+  <tr><td>Heap</td><td>shared</td><td>all objects and arrays</td><td><code>OutOfMemoryError</code> (L4, L24)</td></tr>
+  <tr><td>Method area</td><td>shared</td><td>per-class data: constant pool, method code. "Analogous to the 'text' segment" of a process</td><td><code>OutOfMemoryError</code></td></tr>
+</table>
+<p>The spec leaves the layout to each JVM. HotSpot keeps class metadata in an area called <em>Metaspace</em>, outside the heap. You can see all of it inside your process's address space (L22) with Native Memory Tracking, which you turn on with <code>-XX:NativeMemoryTracking=summary</code>; it "tracks memory usage only by JVM subsystems, such as Java heap, class, code, and thread" (<a href="https://docs.oracle.com/en/java/javase/26/docs/specs/man/java.html">the java command</a>, <a href="https://docs.oracle.com/en/java/javase/26/docs/specs/man/jcmd.html">jcmd</a>):</p>
+<div class="pair">
+  <figure class="java"><figcaption>JAVA · Sleeper.java</figcaption>
+<!--CODE:l23/Sleeper.java--></figure>
+<pre class="term"><span class="p">$ </span>java -XX:NativeMemoryTracking=summary -Xmx512m -cp out Sleeper &amp;
+pid 9468, holding 25000000 ints
+<span class="p">$ </span>jcmd 9468 VM.native_memory summary scale=MB   <span class="c"># trimmed</span>
+Total: reserved=1981MB, committed=194MB
+-                 Java Heap (reserved=512MB, committed=105MB)
+-                     Class (reserved=1024MB, committed=0MB)
+                            (classes #839)
+-                    Thread (reserved=46MB, committed=1MB)
+                            (threads #23)
+                            (stack: reserved=46MB, committed=1MB, peak=1MB)
+-                      Code (reserved=244MB, committed=8MB)
+-                        GC (reserved=72MB, committed=63MB)
+-        Shared class space (reserved=16MB, committed=14MB, readonly=0MB)
+-                 Metaspace (reserved=64MB, committed=0MB)</pre>
+</div>
+<ul>
+  <li><b>Reserved vs committed</b> is L22's virtual memory in action. The JVM <em>reserves</em> 512 MB of address space for the heap (our <code>-Xmx</code>), but only <em>commits</em> (backs with real memory) the 105 MB it uses, which is mostly our 100 MB array.</li>
+  <li><b>Thread:</b> 23 threads for a program that started one. The rest are the JVM's own: JIT compiler threads, GC threads, and others. Each has a stack.</li>
+  <li><b>Code:</b> where the JIT compiler puts the machine code it generates (Part 3). <b>GC:</b> the collector's own bookkeeping, which is L24's topic. <b>Shared class space:</b> that archive again.</li>
+</ul>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>object</code> gives you a lazy, thread-safe singleton by riding on the JVM's once-only class initialization. Java's equivalent is the holder-class idiom from L15, written by hand.</li>
+    <li>The <code>kotlin</code> runner puts the stdlib on the classpath for you.</li>
+  </ul>
+  What it costs: Kotlin programs <em>need</em> <code>kotlin-stdlib</code> at runtime (about 1.8 MB) and load a few dozen extra classes. Class loading, linking and initialization rules are identical for both languages. The JVM never knows which one you wrote.
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: predict the initialization order</div>
+  <p>Type this in both languages, but <b>predict the output before running it</b>. Where exactly does <code>[Limits initialised]</code> appear?</p>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · Ex2.kt</figcaption>
+<!--CODE:l23/Ex2.kt--></figure>
+    <figure class="java"><figcaption>JAVA · Ex2.java</figcaption>
+<!--CODE:l23/Ex2.java--></figure>
+  </div>
+  <details class="solution"><summary>Real output and explanation</summary>
+<pre class="out">A: 50
+  [Limits initialised]
+B: limits
+C: 50</pre>
+    <p>The same in both languages. Reading <code>MAX</code> does <em>not</em> initialize <code>Limits</code>, because <code>const val</code> and a Java <code>static final int</code> with a constant value are compile-time constants. The compiler copies the value into the caller, so at runtime there's no <code>getstatic</code> at all. <code>javap -c</code> shows that both compilers even folded the whole string:</p>
+<pre class="out">// Java main                                  // Kotlin main
+3: ldc  #15   // String A: 50                 0: ldc  #8   // String A: 50
+…
+11: getstatic #23  // Field Ex2$Limits.label  …</pre>
+    <p>Reading <code>label</code>, a value computed at runtime, needs a real <code>getstatic</code>, and that's what triggers initialization (JVMS §5.5). The flip side is a real trap: if a library changes a constant, code compiled against the old value keeps the old value until it's recompiled.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Class loading" data-answer="1">
+  <p class="q">When does a class's <code>static {}</code> block (or Kotlin <code>object</code> <code>init</code>) run?</p>
+  <div class="opts"><button>When the JVM starts</button><button>On first active use</button><button>When main method returns</button><button>At compile time already</button></div>
+  <p class="why">Initialization is lazy: the first <code>new</code>, <code>getstatic</code>, <code>putstatic</code> or <code>invokestatic</code> that refers to the class triggers <code>&lt;clinit&gt;</code>, exactly once (JVMS §5.5).</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Class loading" data-answer="3">
+  <p class="q">What does <code>String.class.getClassLoader()</code> return?</p>
+  <div class="opts"><button>The application's own class loader</button><button>The JDK's platform class loader</button><button>A brand new MemoryClassLoader instance</button><button>null, meaning the bootstrap loader</button></div>
+  <p class="why">The bootstrap loader is built into the JVM and "typically represented as <code>null</code>" (ClassLoader API). Core classes like <code>String</code> come from it.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Class loading" data-answer="0">
+  <p class="q">A Kotlin program compiles, then crashes at runtime with <code>NoClassDefFoundError: kotlin/jvm/internal/Intrinsics</code>. Most likely cause?</p>
+  <div class="opts"><button>kotlin-stdlib is missing from the classpath</button><button>A null value passed from Java</button><button>Class file version is too new</button><button>The heap ran out of memory</button></div>
+  <p class="why">The class was there at compile time but not at runtime. Run with <code>kotlin -cp …</code>, add the stdlib jar to <code>-cp</code>, or build a fat jar.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Class loading" data-answer="2">
+  <p class="q">Which runtime data area is shared by all threads?</p>
+  <div class="opts"><button>The pc register</button><button>The JVM stack</button><button>The object heap</button><button>The operand stack</button></div>
+  <p class="why">The heap and the method area are shared. The pc register and the JVM stack, with its frames and their operand stacks, are per thread (JVMS §2.5). That sharing is exactly why Phase 8 (concurrency) is hard.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>The interpreter and the JIT</h2><span class="t">~25 min</span></div>
+
+<p>So who runs the bytecode? At first, an <dfn>interpreter</dfn>: a loop that reads one instruction, does it, and moves to the next, exactly like the widget in Part 1. That's simple and starts instantly, but it's slow. So HotSpot counts how often each method runs and how many times its loops go round. Hot code gets handed to a <dfn>just-in-time (JIT) compiler</dfn>, which turns it into real machine code for this CPU while the program keeps running. <code>java -version</code> says "mixed mode" because both run together.</p>
+<p>HotSpot has two JIT compilers: <b>C1</b>, which compiles fast with basic optimizations, and <b>C2</b>, which compiles slowly with aggressive ones. <dfn>Tiered compilation</dfn> uses both (<a href="https://docs.oracle.com/en/java/javase/26/vm/java-hotspot-virtual-machine-performance-enhancements.html">HotSpot performance enhancements: Tiered Compilation</a>). The HotSpot source names five levels (<a href="https://github.com/openjdk/jdk/blob/master/src/hotspot/share/compiler/compilationPolicy.hpp">compilationPolicy.hpp</a>, implementation detail):</p>
+<table class="vs">
+  <tr><th>Level</th><th>Who</th><th>What</th></tr>
+  <tr><td>0</td><td>interpreter</td><td>runs bytecode and collects a profile</td></tr>
+  <tr><td>1–3</td><td>C1</td><td>quick machine code; level 3 also keeps profiling</td></tr>
+  <tr><td>4</td><td>C2</td><td>"full profile guided optimization"</td></tr>
+</table>
+
+<h3>Watching warm-up</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Hot.kt</figcaption>
+<!--CODE:l23/Hot.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Hot.java</figcaption>
+<!--CODE:l23/Hot.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">batch 1:    583 µs
+batch 2:    289 µs
+batch 3:    290 µs
+batch 4:    271 µs
+batch 5:    274 µs
+batch 6:    270 µs
+batch 7:     91 µs
+batch 8:     99 µs
+batch 9:     92 µs
+batch 10:     89 µs
+sink=5999600</pre>
+<pre class="out">batch 1:    596 µs
+batch 2:    289 µs
+batch 3:    279 µs
+batch 4:    276 µs
+batch 5:    275 µs
+batch 6:    170 µs
+batch 7:     94 µs
+batch 8:     98 µs
+batch 9:     89 µs
+batch 10:     94 µs
+sink=5999600</pre>
+</div>
+<p>On my machine the same work runs at three speeds: about 590 µs, then about 280 µs, then about 92 µs. That's three tiers you can see. Now ask the JVM what it was doing. <code>-XX:+PrintCompilation</code> prints "a message to the console every time a method is compiled" (<a href="https://docs.oracle.com/en/java/javase/26/docs/specs/man/java.html">the java command</a>):</p>
+<pre class="term"><span class="p">$ </span>java -XX:+PrintCompilation -cp out Hot | grep 'Hot::'
+10    8 %     3       Hot::work @ 4 (29 bytes)
+10    9       3       Hot::work (29 bytes)
+10   10 %     4       Hot::work @ 4 (29 bytes)
+10    8 %     3       Hot::work @ 4 (29 bytes)   made not entrant: OSR invalidation of lower level
+19  105       4       Hot::work (29 bytes)
+20    9       3       Hot::work (29 bytes)   made not entrant: not used</pre>
+<p>The columns, as printed by HotSpot's <a href="https://github.com/openjdk/jdk/blob/master/src/hotspot/share/compiler/compileTask.cpp"><code>CompileTask::print</code></a> (implementation detail; the format isn't a documented contract):</p>
+<ul>
+  <li><b>10</b>: milliseconds since the JVM started. <b>8, 9, 10, 105</b>: compile IDs.</li>
+  <li><b>%</b>: an <dfn>on-stack replacement</dfn> (OSR) compile. The loop in <code>work</code> was hot <em>while still running</em>, so HotSpot compiled the loop and switched to it mid-loop. <code>@ 4</code> is the bytecode offset it jumps in at: offset 4 is the loop's <code>iload_3</code>, the target of its <code>goto 4</code>.</li>
+  <li><b>3</b> or <b>4</b>: the tier. C1 with profiling, then C2.</li>
+  <li><b>(29 bytes)</b>: the method's bytecode size. The Kotlin version also says <code>HotKt::work (29 bytes)</code>: same bytecode, same JIT story.</li>
+  <li><b>made not entrant</b>: old compiled code that's retired once the better version arrives.</li>
+</ul>
+<p>So C1 versions appeared at about 10 ms and C2's full-method version (ID 105) at about 19 ms: three kinds of code, matching the three speeds in the output. Pinning a compile to an exact batch needs both clocks side by side, which is your job in the final exercise. For contrast, run with <code>-Xint</code>, which "runs the application in interpreted-only mode":</p>
+<pre class="term"><span class="p">$ </span>java -Xint -cp out Hot
+batch 1:    993 µs
+batch 2:    853 µs
+batch 3:    804 µs
+…
+batch 10:    833 µs</pre>
+<p>About 830 µs per batch forever, roughly nine times slower than the C2 code. This is why L16 said to warm up before timing anything: the first runs measure the interpreter and the compiler, not your algorithm.</p>
+
+<h3>Three things the JIT does that javac doesn't</h3>
+<p><code>javac</code> and <code>kotlinc</code> barely optimize; you saw them translate almost line by line. The real optimizing happens at runtime, where C2 can see which code is actually hot and which types actually show up.</p>
+<p><b>1 · Inlining.</b> Calling a tiny method costs more than the method body. C2 copies small, hot callees into the caller, like <code>inline</code> but done automatically at runtime and only where it pays off. Watch it with <code>-XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining</code> (<a href="https://docs.oracle.com/en/java/javase/26/docs/specs/man/java.html">the java command</a>) on the next program:</p>
+<pre class="term"><span class="p">$ </span>java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining -XX:+PrintCompilation -cp out Escape   <span class="c"># excerpt</span>
+32  143 %     4       Escape::sumPoints @ 4 (45 bytes)
+                              @ 17   Escape$Point::&lt;init&gt; (15 bytes)   inline (hot)
+                                @ 1   java.lang.Record::&lt;init&gt; (5 bytes)   inline (hot)
+                                  @ 1   java.lang.Object::&lt;init&gt; (1 bytes)   inline (hot)
+                              @ 25   Escape$Point::x (5 bytes)   accessor
+                              @ 30   Escape$Point::y (5 bytes)   accessor</pre>
+<p>The constructor chain and both accessors were pasted into <code>sumPoints</code>. Once the code is hot, a getter costs essentially nothing, so don't avoid them for speed.</p>
+
+<p><b>2 · Escape analysis.</b> Once everything is inlined, C2 can see that each <code>Point</code> never leaves the method. "Escape analysis is a technique by which the Java HotSpot Server Compiler can analyze the scope of a new object's uses and decide whether to allocate the object on the Java heap." An object that doesn't escape is "scalar replaceable": C2 keeps its fields in registers and never allocates it. Note that it "does not replace a heap allocation with a stack allocation" (<a href="https://docs.oracle.com/en/java/javase/26/vm/java-hotspot-virtual-machine-performance-enhancements.html">HotSpot performance enhancements: Escape Analysis</a>). We can measure it, because the JDK can report how many bytes the current thread has allocated:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Escape.kt</figcaption>
+<!--CODE:l23/Escape.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Escape.java</figcaption>
+<!--CODE:l23/Escape.java--></figure>
+</div>
+<div class="pair">
+<pre class="term"><span class="p">$ </span>java -cp out Escape
+round 1: 6,403,912 bytes allocated
+round 2: 4,521,960 bytes allocated
+round 3: 196,584 bytes allocated
+round 4: 196,584 bytes allocated
+round 5: 0 bytes allocated
+sink=5000000000000</pre>
+<pre class="term"><span class="p">$ </span>java -XX:-DoEscapeAnalysis -cp out Escape
+round 1: 24,005,056 bytes allocated
+round 2: 24,000,000 bytes allocated
+round 3: 24,000,000 bytes allocated
+round 4: 24,000,000 bytes allocated
+round 5: 24,000,000 bytes allocated
+sink=5000000000000</pre>
+</div>
+<p>With escape analysis turned off (<code>-XX:-DoEscapeAnalysis</code>; it's "enabled by default"), every round allocates exactly 24,000,000 bytes: one million <code>Point</code>s at 24 bytes each on this JVM. With it on, allocation falls as the method moves up the tiers, and reaches <b>zero</b> once C2's version runs. A million <code>new Point(…)</code> calls in your source, and not one object on the heap. The Kotlin data class version gives the same pattern (6.2 MB, 4.9 MB, 196,584, 196,584, 0). Less allocation means less garbage for L24's collector.</p>
+
+<p><b>3 · Dead-code elimination.</b> If a result is never used, C2 may not compute it at all. That's great for your program, and a trap for your benchmarks:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · DeadCode.kt</figcaption>
+<!--CODE:l23/DeadCode.kt--></figure>
+  <figure class="java"><figcaption>JAVA · DeadCode.java</figcaption>
+<!--CODE:l23/DeadCode.java--></figure>
+</div>
+<div class="pair">
+<pre class="out">round 1: discarded  1571 µs, used  30558 µs
+round 2: discarded  4389 µs, used  29697 µs
+round 3: discarded     0 µs, used  29815 µs
+round 4: discarded     0 µs, used  29832 µs
+round 5: discarded     0 µs, used  30440 µs</pre>
+<pre class="out">round 1: discarded  1385 µs, used  31332 µs
+round 2: discarded  2999 µs, used  30039 µs
+round 3: discarded     0 µs, used  29846 µs
+round 4: discarded  3205 µs, used  29819 µs
+round 5: discarded     0 µs, used  29782 µs</pre>
+</div>
+<p>Ten million <code>Math.log</code> calls in 0 µs? Of course not. Once <code>wrong()</code> is inlined, C2 sees that its result goes nowhere and deletes the loop. A naive benchmark of <code>wrong()</code> would "prove" that <code>log</code> is free. This is the example from JMH's own samples (<a href="https://github.com/openjdk/jmh/blob/master/jmh-samples/src/main/java/org/openjdk/jmh/samples/JMHSample_08_DeadCode.java">JMHSample_08_DeadCode</a>). JMH, the benchmark harness you'll run for real in L24, exists to defeat exactly this, plus the warm-up problem above.</p>
+<p class="note">I also tried to show dead-code elimination with a plain arithmetic loop (<code>s += i</code>, result discarded). On JDK 26, C2 did <em>not</em> remove it: discarded and used took the same time. The JIT is free to optimize or not, which is another reason to measure instead of guessing.</p>
+
+<h3>Startup vs peak: AOT caches</h3>
+<p>The JIT's price is warm-up: every run starts slow, loading and linking classes and interpreting code. Recent JDKs attack this with <dfn>ahead-of-time (AOT) caches</dfn> from Project Leyden. You do a training run once, the JVM saves the work it did, and later runs start from that snapshot:</p>
+<ul>
+  <li><a href="https://openjdk.org/jeps/483">JEP 483</a> (JDK 24): Ahead-of-Time Class Loading &amp; Linking.</li>
+  <li><a href="https://openjdk.org/jeps/514">JEP 514</a> (JDK 25): a one-step <code>-XX:AOTCacheOutput</code>.</li>
+  <li><a href="https://openjdk.org/jeps/515">JEP 515</a> (JDK 25): method profiles in the cache, so the JIT warms up faster.</li>
+  <li><a href="https://openjdk.org/jeps/516">JEP 516</a> (JDK 26): AOT object caching with any GC.</li>
+</ul>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Startup.kt</figcaption>
+<!--CODE:l23/Startup.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Startup.java</figcaption>
+<!--CODE:l23/Startup.java--></figure>
+</div>
+<pre class="term"><span class="p">$ </span>jar --create --file app.jar -C out .
+<span class="p">$ </span>java -XX:AOTCacheOutput=app.aot -cp app.jar Startup      <span class="c"># training run + cache</span>
+{cat=1, end=1, mat=1, on=1, sat=1, the=3} Tuesday 20 October 2026
+Temporary AOTConfiguration recorded: app.aot.config
+Launching child process …/bin/java to assemble AOT cache app.aot using configuration app.aot.config
+Picked up JAVA_TOOL_OPTIONS: -Djava.class.path=app.jar -XX:AOTCacheOutput=app.aot -XX:AOTConfiguration=app.aot.config -XX:AOTMode=create
+Reading AOTConfiguration app.aot.config and writing AOTCache app.aot
+AOTCache creation is complete: app.aot 13418496 bytes
+Removed temporary AOT configuration file app.aot.config
+<span class="p">$ </span>java -XX:AOTCache=app.aot -cp app.jar Startup             <span class="c"># production runs</span>
+{cat=1, end=1, mat=1, on=1, sat=1, the=3} Tuesday 20 October 2026</pre>
+<table class="vs">
+  <tr><th>median of 20 runs, my machine</th><th>no cache</th><th>with <code>-XX:AOTCache</code></th></tr>
+  <tr><td>Java <code>Startup</code></td><td>43 ms</td><td>32 ms</td></tr>
+  <tr><td>Kotlin <code>StartupKt</code> (jar built with <code>-include-runtime</code>)</td><td>51 ms</td><td>31 ms</td></tr>
+</table>
+<p>With the cache, <code>-Xlog:class+load</code> shows all 1,143 classes coming from the cache, and none read from the jar or the JDK's modules. Without it, 24 classes were loaded from files. For a tiny program that's a few milliseconds. For a Spring Boot app that loads tens of thousands of classes, it's the difference that matters, which is why these JEPs exist.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you</strong> (here, mostly nothing, and that's the lesson).
+  <ul>
+    <li>At runtime there's no "Kotlin JIT". <code>HotKt::work</code> and <code>Hot::work</code> were both 29 bytes and got the same tiers at the same moments. Escape analysis removed the data class allocations exactly as it removed the record's.</li>
+    <li>The one Kotlin-specific runtime tool you saw is compile-time <code>inline</code> (Part 1), which guarantees inlining for lambdas instead of hoping C2 does it.</li>
+  </ul>
+  Your performance intuition for Java transfers to Kotlin one to one.
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: predict, then switch tiering off</div>
+  <ol>
+    <li>Rerun <code>Hot</code> with <code>-XX:-TieredCompilation</code>, which "disables the use of tiered compilation" so it's interpreter then C2, with no C1 (<a href="https://docs.oracle.com/en/java/javase/26/docs/specs/man/java.html">the java command</a>). <b>Before running,</b> predict: does warm-up take longer, shorter, or the same?</li>
+    <li>Add <code>-XX:+PrintCompilation | grep 'Hot::'</code> and explain what you see.</li>
+    <li>Run <code>Escape</code> once more and explain to yourself why round 5 says 0 bytes but round 1 doesn't.</li>
+  </ol>
+  <details class="solution"><summary>Real output and explanation</summary>
+<pre class="term"><span class="p">$ </span>java -XX:-TieredCompilation -cp out Hot
+batch 1:    671 µs
+batch 2:     94 µs
+batch 3:     97 µs
+…
+<span class="p">$ </span>java -XX:-TieredCompilation -XX:+PrintCompilation -cp out Hot | grep 'Hot::'
+10    4 %           Hot::work @ 4 (29 bytes)
+10    5             Hot::work (29 bytes)</pre>
+    <p>Surprise, at least it was for me: for this tiny loop, warm-up was <em>shorter</em>. Without tiers, HotSpot compiled straight to C2 during batch 1, with an OSR compile first, then the full method. No tier column is printed because there are no tiers. The C1 stage exists to make <em>large</em> programs start fast while C2 takes its time; a 29-byte method doesn't need it. That's the general lesson: predict, then measure, because the JIT's choices depend on the program. (Four runs gave 671, 707 and 635 µs for batch 1 in Java and 614 µs in Kotlin, then about 95 µs from batch 2 on.)</p>
+    <p>For <code>Escape</code>: rounds 1–4 run partly in the interpreter and in C1, which allocate every <code>Point</code> for real. Only C2 does escape analysis, and its version takes over during round 3, which is why that round already allocates far less.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · JIT" data-answer="0">
+  <p class="q">In <code>-XX:+PrintCompilation</code> output, what does <code>%</code> mark?</p>
+  <div class="opts"><button>An on-stack replacement (OSR) compile</button><button>A method that threw exceptions</button><button>A compile of synchronized code</button><button>A compile attempt that failed</button></div>
+  <p class="why">OSR: a hot loop compiled while its method is still running, and entered at the bytecode offset after <code>@</code>. (<code>s</code> marks synchronized, <code>!</code> exception handlers, <code>n</code> native.)</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · JIT" data-answer="2">
+  <p class="q">Why did <code>-XX:-DoEscapeAnalysis</code> make every round allocate 24 MB?</p>
+  <div class="opts"><button>Points moved onto the stack</button><button>The GC stopped running entirely</button><button>No Point allocation was removed</button><button>The flag disabled C2 entirely</button></div>
+  <p class="why">Escape analysis is what lets C2 scalar-replace non-escaping objects, keeping their fields in registers. Without it, all one million <code>Point</code>s are allocated on the heap each round. HotSpot never moves them to the stack.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · JIT" data-answer="3">
+  <p class="q">A loop calls <code>Math.log(x)</code> ten million times, ignores the result, and takes 0 µs. Why?</p>
+  <div class="opts"><button>Math.log is cached by the JDK</button><button>The timer has no precision there</button><button>The CPU predicted every single result</button><button>C2 removed the unused computation entirely</button></div>
+  <p class="why">Dead-code elimination: after inlining, the result is provably unused, so the work is deleted. JMH's <code>Blackhole</code> and returned values exist to stop this (L24).</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · JIT" data-answer="1">
+  <p class="q">What does a JDK 25+ AOT cache (<code>-XX:AOTCache</code>) mainly speed up?</p>
+  <div class="opts"><button>Garbage collection pauses</button><button>Startup and warm-up</button><button>Peak C2 throughput</button><button>Class file size</button></div>
+  <p class="why">It stores classes already loaded and linked, plus profiles, from a training run, so later runs skip that work (JEPs 483, 514, 515). Peak speed still comes from the JIT.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ PART 4 ═════════════════════════ -->
+<div class="part-label">Part 4</div>
+<div class="part-head" id="p4" data-title="Part 4"><h2>Android's ART vs the JVM</h2><span class="t">~10 min</span></div>
+
+<p class="note">This part is docs only. I didn't build or run any Android code for it, and every claim links to the Android docs.</p>
+<p>Your Android app is written in the same Kotlin and compiled by the same kotlinc into the same JVM class files. But a phone doesn't run HotSpot. Here's the pipeline:</p>
+<ol>
+  <li><b><code>.class</code> → DEX.</b> "d8 is a command-line tool that Android Studio and the Android Gradle plugin use to compile your project's Java bytecode into DEX bytecode that runs on Android devices" (<a href="https://developer.android.com/tools/d8">d8</a>).</li>
+  <li><b>Shrinking.</b> In release builds, R8 removes unused code and renames things. "Obfuscation (also known as minification): To reduce the size of the DEX file, R8 shortens the names of classes, fields, and methods (for example, <code>com.example.MyActivity</code> could become <code>a.b.a</code>)" (<a href="https://developer.android.com/topic/performance/app-optimization/enable-app-optimization">Enable app optimization with R8</a>). This is why release stack traces need a mapping file.</li>
+  <li><b>ART runs the DEX.</b> "Android runtime (ART) is the managed runtime used by apps and some system services on Android… ART as the runtime executes the Dalvik executable (DEX) format and DEX bytecode specification" (<a href="https://source.android.com/docs/core/runtime">ART and Dalvik</a>).</li>
+</ol>
+<p><b>A different instruction set.</b> JVM bytecode is stack-based, as you saw in Part 1. DEX is register-based: "The machine is register-based, and frames are fixed in size upon creation. Each frame consists of a particular number of registers" (<a href="https://source.android.com/docs/core/runtime/dalvik-bytecode">Dalvik bytecode format</a>). So <code>a + b</code> is one instruction naming its registers, something like "add v0, v1, v2", instead of <code>iload, iload, iadd, istore</code>: fewer instructions, but each one is bigger.</p>
+<p><b>A different compilation strategy.</b> ART mixes interpreting, JIT and ahead-of-time compilation:</p>
+<ul>
+  <li><b>AOT:</b> "ART compiles apps using the on-device <code>dex2oat</code> tool. This utility accepts DEX files as input and generates a compiled app executable for the target device."</li>
+  <li><b>JIT with profiling:</b> "The JIT compiler complements ART's current ahead-of-time (AOT) compiler… JIT makes use of runtime type information, can do better inlining, and makes on stack replacement (OSR) compilation possible" (<a href="https://source.android.com/docs/core/runtime/jit-compiler">Implement ART JIT</a>). The profile it records is later used by <code>dex2oat</code> to AOT-compile the hot methods while the phone is idle.</li>
+  <li><b>Baseline Profiles:</b> ship that profile <em>with</em> your app, so even the first launch is precompiled. They "improve code execution speed by about 30% from the first launch by avoiding interpretation and just-in-time (JIT) compilation steps for included code paths" (<a href="https://developer.android.com/topic/performance/baselineprofiles/overview">Baseline Profiles</a>). It's the same idea as Part 3's AOT cache, arrived at from the phone side.</li>
+</ul>
+<table class="vs">
+  <tr><th></th><th>HotSpot JVM (desktop/server)</th><th>ART (Android)</th></tr>
+  <tr><td>Input</td><td><code>.class</code> files / jars</td><td><code>.dex</code> files inside the APK</td></tr>
+  <tr><td>Instruction set</td><td>stack-based bytecode</td><td>register-based DEX bytecode</td></tr>
+  <tr><td>Execution</td><td>interpreter → C1 → C2 JIT (+ optional AOT cache)</td><td>interpreter + JIT + profile-guided AOT (<code>dex2oat</code>)</td></tr>
+  <tr><td>Warm-up fix</td><td>AOT cache (JEPs 483/514/515)</td><td>Baseline Profiles, cloud profiles</td></tr>
+  <tr><td>Default GC</td><td>G1 here (<code>-XX:+UseG1GC</code> printed by the JVM)</td><td>Concurrent Copying since Android 8 (<a href="https://source.android.com/docs/core/runtime/gc-debug">ART GC</a>)</td></tr>
+</table>
+<p><b>What this means for you:</b> almost everything in this lesson's Parts 1–2 carries over. Kotlin compiles to JVM bytecode first, so <code>inline</code>, the null checks, data class members and lazy <code>object</code> init are all still there in your Android app, just translated to DEX. What changes is the runtime: the JIT details, the flags and the GC. L24's leak hunting applies directly, though, because a leaked <code>Activity</code> is the classic Android memory bug.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you on Android.</strong>
+  <ul>
+    <li>The same compiler output (null checks, <code>inline</code>, data classes) reaches the phone, because d8 translates the class files kotlinc wrote.</li>
+    <li>R8 "identifies and removes unreachable code from your application and its library dependencies", and <code>kotlin-stdlib</code> is one of those dependencies, so the extra jar from Part 2 shrinks in release builds.</li>
+  </ul>
+  (Both points follow from the d8 and R8 docs linked above. I didn't build an APK to check them.)
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: from memory</div>
+  <p>Without looking, fill in a three-row table: "How does <code>a + b</code> look", "Who compiles to machine code, and when", "How do you fix slow first runs". One column for HotSpot, one for ART. Then explain in two sentences why a crash stack trace from a release Android build might mention <code>a.b.a</code>.</p>
+  <details class="solution"><summary>Reference answer</summary>
+    <ul>
+      <li><b><code>a + b</code>:</b> HotSpot uses stack bytecode, <code>iload_0, iload_1, iadd</code>. ART uses one register instruction naming source and destination registers.</li>
+      <li><b>Machine code:</b> HotSpot's C1/C2 JIT compiles hot methods at runtime. ART interprets plus JIT-compiles at runtime, and <code>dex2oat</code> compiles ahead of time, at install or when the phone is idle, guided by profiles.</li>
+      <li><b>Slow first runs:</b> HotSpot has AOT caches (<code>-XX:AOTCacheOutput</code>/<code>-XX:AOTCache</code>). ART has Baseline Profiles shipped in the app.</li>
+      <li><b><code>a.b.a</code>:</b> R8 obfuscates class names in release builds to shrink the DEX, so traces show the short names. The mapping file R8 writes translates them back.</li>
+    </ul>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p4-1" data-group="Part 4 · ART" data-answer="1">
+  <p class="q">Which tool turns your app's <code>.class</code> files into DEX?</p>
+  <div class="opts"><button><code>dex2oat</code></button><button><code>d8</code></button><button><code>javap</code></button><button><code>kotlinc</code></button></div>
+  <p class="why">d8 compiles Java bytecode to DEX at build time. <code>dex2oat</code> runs later, on the device, turning DEX into machine code.</p>
+</div>
+<div class="quiz" data-id="p4-2" data-group="Part 4 · ART" data-answer="3">
+  <p class="q">How does DEX bytecode differ from JVM bytecode?</p>
+  <div class="opts"><button>It has no method calls</button><button>It is plain machine code</button><button>It cannot represent any loops</button><button>It is register based instead</button></div>
+  <p class="why">"The machine is register-based, and frames are fixed in size upon creation" (Dalvik bytecode format). JVM bytecode is stack-based.</p>
+</div>
+<div class="quiz" data-id="p4-3" data-group="Part 4 · ART" data-answer="0">
+  <p class="q">What do Baseline Profiles give an Android app?</p>
+  <div class="opts"><button>Precompiled hot paths from first launch</button><button>A smaller DEX file after shrinking</button><button>A faster garbage collector at runtime</button><button>Readable names in crash stack traces</button></div>
+  <p class="why">ART uses the shipped profile to AOT-compile the listed code paths at install, avoiding interpretation and JIT for them: "about 30%" faster from the first launch.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Part 4 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p5" data-title="Final exercise"><h2>Bytecode detective</h2><span class="t">~20 min</span></div>
+
+<p>Two cases, both done from the terminal with AI completion off. Keep a text file of your predictions. The point is to commit to an answer <em>before</em> <code>javap</code> tells you.</p>
+<div class="task">
+  <p><b>Case 1: predict the bytecode.</b> Type these four functions in both languages, from the listing below. Before compiling, write one line per function saying what you expect <code>javap -c -p</code> to show. Then compile and check.</p>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · Detective.kt</figcaption>
+<!--CODE:l23/Detective.kt--></figure>
+    <figure class="java"><figcaption>JAVA · Detective.java</figcaption>
+<!--CODE:l23/Detective.java--></figure>
+  </div>
+<pre class="out">CASE CLOSED
+3
+L ?
+true</pre>
+  <p>Questions to answer in your predictions:</p>
+  <ol>
+    <li><code>shout</code>: which version checks for null, and how? What does Kotlin's <code>uppercase()</code> really call?</li>
+    <li><code>countEvens</code>: which version contains an <code>invokedynamic</code>, and which a plain loop? Is there any lambda method left in the Kotlin class?</li>
+    <li><code>size</code>: <code>tableswitch</code> or <code>lookupswitch</code>? Would the answer change for cases 1, 100 and 5000?</li>
+    <li><code>Money</code> equality: what does <code>==</code> compile to in Kotlin's <code>main</code>? How is <code>equals</code> implemented in each class?</li>
+  </ol>
+  <p><b>Case 2: catch the JIT in the act.</b> From a blank file, write a program that runs a hot function in 8 timed batches and prints, after each batch, the JVM's uptime in milliseconds (<code>ManagementFactory.getRuntimeMXBean().uptime</code>) and the batch time. Run it once plainly and once with <code>-XX:+PrintCompilation | grep yourFunction</code>, then name the batch during which C2's full-method compile (tier 4, no <code>%</code>) landed.</p>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: bytecode detective (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: bytecode detective (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-javap" data-label="Final: could read the javap output"><span class="who">JAVAP</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+  <details class="solution"><summary>Case 1: the real javap answers</summary>
+    <p><b>shout.</b> Kotlin checks the parameter, then calls <code>toUpperCase(Locale.ROOT)</code>: <code>uppercase()</code> uses "Unicode mapping rules of the invariant locale" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.text/uppercase.html">uppercase</a>), unlike Java's no-argument <code>toUpperCase()</code>, which uses the default locale. It also checks that the Java method's <em>result</em> isn't null (<code>checkNotNullExpressionValue</code>), because <code>toUpperCase</code> is a Java method with a platform-type result (L9). Java just calls <code>toUpperCase()</code>.</p>
+    <div class="pair">
+<pre class="out">// Kotlin
+ 0: aload_0
+ 1: ldc           #9   // String s
+ 3: invokestatic  #15  // Method kotlin/jvm/internal/Intrinsics.checkNotNullParameter:…
+ 6: aload_0
+ 7: getstatic     #21  // Field java/util/Locale.ROOT:Ljava/util/Locale;
+10: invokevirtual #27  // Method java/lang/String.toUpperCase:(Ljava/util/Locale;)Ljava/lang/String;
+13: dup
+14: ldc           #29  // String toUpperCase(...)
+16: invokestatic  #32  // Method kotlin/jvm/internal/Intrinsics.checkNotNullExpressionValue:…
+19: areturn</pre>
+<pre class="out">// Java
+0: aload_0
+1: invokevirtual #7  // Method java/lang/String.toUpperCase:()Ljava/lang/String;
+4: areturn</pre>
+    </div>
+    <p><b>countEvens.</b> <code>forEach</code> is <code>inline</code>, so Kotlin's version is a plain array loop: <code>arraylength</code>, <code>iaload</code>, <code>irem</code>, <code>if_icmpge</code> and <code>goto</code>, with no lambda anywhere in the class. Java's stream version builds an <code>IntPredicate</code> via <code>invokedynamic</code>, and the lambda body lives in a synthetic private method:</p>
+    <div class="pair">
+<pre class="out">// Kotlin (excerpt)
+15: aload_2
+16: arraylength
+17: istore        5
+19: iload         4
+21: iload         5
+23: if_icmpge     57
+26: aload_2
+27: iload         4
+29: iaload
+ …
+39: iload         7
+41: iconst_2
+42: irem
+43: ifne          50
+46: iload_1
+47: iconst_1
+48: iadd
+49: istore_1
+ …
+54: goto          19</pre>
+<pre class="out">// Java
+ 0: aload_0
+ 1: invokestatic  #13     // Method java/util/Arrays.stream:([I)Ljava/util/stream/IntStream;
+ 4: invokedynamic #19,  0 // InvokeDynamic #0:test:()Ljava/util/function/IntPredicate;
+ 9: invokeinterface #23,  2 // InterfaceMethod java/util/stream/IntStream.filter:…
+14: invokeinterface #29,  1 // InterfaceMethod java/util/stream/IntStream.count:()J
+19: lreturn
+
+private static boolean lambda$countEvens$0(int);
+ 0: iload_0
+ 1: iconst_2
+ 2: irem
+ 3: ifne          10
+ …</pre>
+    </div>
+    <p><b>size.</b> Both produce <code>tableswitch { // 0 to 3 … default: 52 }</code>. Cases 0–3 are dense. With 1, 100 and 5000 you'd see <code>lookupswitch</code>, because a table with 5,000 slots would be mostly empty.</p>
+    <p><b>Money.</b> Kotlin's <code>==</code> compiles to <code>Intrinsics.areEqual(a, b)</code>, a null-safe <code>equals</code> (L5). Kotlin's <code>Money.equals</code> is spelled out: <code>if_acmpne</code> for identity, <code>instanceof</code>, <code>lcmp</code> on <code>cents</code>, then <code>Intrinsics.areEqual</code> on <code>currency</code>. The record's <code>equals</code> is again <code>aload_0, aload_1, invokedynamic #25 … equals, ireturn</code>.</p>
+  </details>
+  <details class="solution"><summary>Case 2: reference solution and real output</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · HotHunt.kt</figcaption>
+<!--CODE:l23/HotHunt.kt--></figure>
+      <figure class="java"><figcaption>JAVA · HotHunt.java</figcaption>
+<!--CODE:l23/HotHunt.java--></figure>
+    </div>
+<pre class="term"><span class="p">$ </span>java -cp out HotHunt
+batch 1 ends at  19 ms:   487 µs
+batch 2 ends at  24 ms:   369 µs
+batch 3 ends at  25 ms:   171 µs
+batch 4 ends at  25 ms:   157 µs
+batch 5 ends at  25 ms:   166 µs
+batch 6 ends at  25 ms:   142 µs
+batch 7 ends at  26 ms:   144 µs
+batch 8 ends at  26 ms:   130 µs
+sink=1072800
+<span class="p">$ </span>java -XX:+PrintCompilation -cp out HotHunt | grep collatz
+17   79       3       HotHunt::collatzSteps (42 bytes)
+17   80 %     4       HotHunt::collatzSteps @ 2 (42 bytes)
+23  141       4       HotHunt::collatzSteps (42 bytes)
+23   79       3       HotHunt::collatzSteps (42 bytes)   made not entrant: not used</pre>
+    <p>The tier-4 full-method compile (ID 141) lands at about 23 ms, inside batch 2, which ends at 24 ms. So batch 3 is the first batch that runs entirely on C2 code, and the time drops from about 370 µs to about 170 µs. The Kotlin version (<code>HotHuntKt::collatzSteps (43 bytes)</code>) showed the same pattern: tier 4 at 27 ms, during batch 2, with batch 3 at 168 µs. Your numbers will differ, and they'll differ between runs too, which is why you print both clocks and line them up instead of guessing.</p>
+    <p>Two notes. (1) Don't run both flags in one terminal without <code>grep</code>: PrintCompilation and your <code>println</code>s write to the same output and garble each other's lines. (2) Kotlin's <code>collatzSteps</code> is one byte longer, because <code>start</code> is copied into a <code>var</code>, as in Part 1's exercise.</p>
+  </details>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p5"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">L16 said to run warm-up iterations before timing. Which part of today explains why?</p>
+  <div class="opts"><button>Class file version numbers</button><button>Interpreter then JIT tiers</button><button>Parent delegation in loaders</button><button>DEX's register-based instruction set</button></div>
+  <p class="why">Early runs measure the interpreter and C1, and include compile time. Only after C2 takes over (the ~90 µs batches in <code>Hot</code>) are you timing the steady state.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">L13 said generics are erased. Where would you look to see that for yourself?</p>
+  <div class="opts"><button>In the -Xlog:gc output</button><button>In the NMT summary</button><button>In the PrintInlining tree</button><button>In javap method descriptors</button></div>
+  <p class="why"><code>javap -c</code> shows descriptors like <code>(Ljava/lang/Object;)…</code> plus <code>checkcast</code> where a type parameter was used. L13 showed exactly that with <code>javap -s</code>.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">Kotlin: <code>data class Money(val cents: Long, val currency: String)</code> used as a <code>HashMap</code> key. Is it safe? (L19)</p>
+  <div class="opts"><button>Yes, equals and hashCode are generated</button><button>No, data classes never override hashCode</button><button>Only after adding a manual equals</button><button>Only when using a TreeMap instead</button></div>
+  <p class="why">You saw the generated <code>equals</code> and <code>hashCode</code> in <code>javap -p</code>. With immutable <code>val</code> properties, the key can't change while it's in the map.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">A JUnit test calls a Kotlin function with <code>null</code> from Java code. When does it fail? (L11)</p>
+  <div class="opts"><button>When the test class compiles</button><button>Deep inside the function body</button><button>At the function's first instruction</button><button>Never: Kotlin substitutes empty strings</button></div>
+  <p class="why"><code>Intrinsics.checkNotNullParameter</code> is the very first call in the method, so the NPE names the parameter at the boundary. That's handy in an <code>assertThrows</code>.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Write, from memory, the bytecode for <code>static int add(int a, int b)</code>, and draw the operand stack after each instruction.</li>
+    <li>Name three things kotlinc inserts that you'd never see in <code>javac</code> output.</li>
+    <li>Loading, linking, initialization: one sentence each. What triggers initialization, and why doesn't reading a <code>const val</code> trigger it?</li>
+    <li>Explain the PrintCompilation line <code>10   10 %     4       Hot::work @ 4 (29 bytes)</code> word by word.</li>
+    <li>What does escape analysis remove, and what does it <em>not</em> do? Why does that make naive benchmarks lie?</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  <a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-2.html">The JVM Specification, Java SE 26, chapter 2 (Structure)</a>, especially §2.5 (data areas) and §2.6 (frames), then <a href="https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-5.html">chapter 5 (Loading, Linking, and Initializing)</a>. It's a spec, so read it with <code>javap</code> open next to it. For the JIT, read the short <a href="https://docs.oracle.com/en/java/javase/26/vm/java-hotspot-virtual-machine-performance-enhancements.html">HotSpot performance enhancements</a> chapter. For Android, read <a href="https://source.android.com/docs/core/runtime">ART and Dalvik</a> and <a href="https://source.android.com/docs/core/runtime/jit-compiler">Implement ART JIT</a>.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/runtime-and-os.html">Runtime &amp; OS</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "why is the record's <code>equals</code> an <code>invokedynamic</code> but the data class's isn't?" or "how would I read the bytecode of a <code>suspend</code> function?" are exactly the right kind.</p>
+
+<div class="lesson-nav">
+  <a href="0022-the-os-and-the-memory-hierarchy.html">← L22 · The OS &amp; the Memory Hierarchy</a>
+  <a href="0024-garbage-collection-and-profiling.html">L24 · Garbage Collection &amp; Profiling →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/bytecodeviz.js"></script>
+</body>
+</html>
