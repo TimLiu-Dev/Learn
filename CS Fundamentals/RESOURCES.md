@@ -18,6 +18,16 @@
 - [Docs: _Comparison to Java_ by JetBrains](https://kotlinlang.org/docs/comparison-to-java.html)
   Lists what Kotlin fixes, what Java has that Kotlin lacks (checked exceptions, primitives, statics, ternary), and what Kotlin adds. Use for: a quick side-by-side when you're writing the same thing in both languages.
 
+### Generics and Functional Style
+- [Docs: _Generics: in, out, where_ by JetBrains](https://kotlinlang.org/docs/generics.html)
+  Kotlin's generics page explains declaration-site variance (`out`/`in`), use-site projections and star projections by contrasting them with Java's wildcards. Use for: the one page that teaches variance in both languages at once (L13).
+- [Tutorials: _Generics_ and _Lambda Expressions_ by Oracle (dev.java)](https://dev.java/learn/language/fp/generics/intro/)
+  The Java side: wildcards, type erasure, generics restrictions, and the [lambda tutorial](https://dev.java/learn/language/fp/lambdas/) (functional interfaces, method references). Use for: Java's version of L13–L14.
+- [Docs: _Sequences_, _Scope functions_ and _Delegation_ by JetBrains](https://kotlinlang.org/docs/sequences.html)
+  Short, precise pages on lazy sequences vs eager collections, the five scope functions (with a selection table), and [delegated properties](https://kotlinlang.org/docs/delegated-properties.html) and [class delegation](https://kotlinlang.org/docs/delegation.html). Use for: writing idiomatic Kotlin pipelines and choosing a scope function (L15).
+- [API: _java.util.stream_ package summary by Oracle](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/stream/package-summary.html)
+  The authoritative explanation of stream laziness, intermediate vs terminal and stateless vs stateful operations, and side-effect rules. Use for: understanding exactly what a Java stream will and won't do.
+
 ### Data Representation
 - [Book: _Computer Systems: A Programmer's Perspective, 3rd ed._ by Randal E. Bryant & David R. O'Hallaron](https://csapp.cs.cmu.edu/)
   The CMU textbook. Chapter 2, "Representing and Manipulating Information", is the canonical treatment of binary, hex, two's complement, overflow, and IEEE 754 floating point. Paid, and the examples are in C. Use for: really understanding why `Int.MAX_VALUE + 1` is negative and how bits become numbers.

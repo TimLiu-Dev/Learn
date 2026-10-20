@@ -24,3 +24,6 @@
 
 ## Status
 - 2026-10-18: user asked to generate all of Parts 0–1 (sessions 1–12) without answering the setup questions yet (Kotlin vs Java, interview timeline, prior knowledge). Defaults: Kotlin + Java side by side; no reordering.
+- 2026-10-19: sessions 1–12, 4 reference sheets, components (quiz, steps, recall, delay-calc, subnet-trainer, fill-in) written. No learning records yet; the user hasn't started. Write the first records when they bring answers from session 1.
+- Unverified across Part 1: Wireshark UI labels (Wireshark wasn't installed while writing; filters checked against dfref); which DHCP messages macOS sends on "Renew DHCP Lease"; Kurose & Ross section numbers. Watch for mismatches when the user reports what they see.
+- User's network facts observed while writing (do NOT reveal; useful for judging their answers): /24 home LAN, MAC is locally administered, IPv6 shows link-local + ULA only (no global), CDN-served university sites ~20 ms.

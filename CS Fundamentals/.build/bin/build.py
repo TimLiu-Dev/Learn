@@ -6,6 +6,7 @@ Placeholders in a template:
 usage: python3 build.py template.html output.html
 """
 import html
+import importlib.util
 import json
 import re
 import sys
@@ -23,13 +24,8 @@ def code_block(rel):
     return f'<pre><code class="language-{lang}">{html.escape(src(rel), quote=False)}</code></pre>'
 
 
-def S(kt, jv, note, stack, heap=()):
-    return {"kt": kt, "jv": jv, "note": note,
-            "stack": [{"name": n, "vars": [list(v) for v in vs]} for n, vs in stack],
-            "heap": [{"id": i, "type": t, "fields": [list(f) for f in fs]} for i, t, fs in heap]}
+from vizlib import S, D  # noqa: E402
 
-
-D = "—"  # not assigned yet
 
 VIZ = {
     "frames": {
@@ -161,6 +157,17 @@ VIZ = {
 }
 
 
+def load_extra_viz():
+    """Merge VIZ dicts from ../viz/*.py, so each lesson keeps its specs in its own file."""
+    for path in sorted((ROOT / "viz").glob("*.py")):
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for name, cfg in mod.VIZ.items():
+            assert name not in VIZ, f"duplicate viz name {name} in {path.name}"
+            VIZ[name] = cfg
+
+
 def viz_block(name):
     cfg = VIZ[name]
     spec = {"steps": cfg["steps"]}
@@ -178,6 +185,7 @@ def viz_block(name):
 
 
 def build(template, out):
+    load_extra_viz()
     text = Path(template).read_text()
     text = re.sub(r"<!--CODE:([\w/.]+)-->", lambda m: code_block(m.group(1)), text)
     text = re.sub(r"<!--VIZ:(\w+)-->", lambda m: viz_block(m.group(1)), text)

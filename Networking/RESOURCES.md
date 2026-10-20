@@ -7,6 +7,8 @@
   The standard university text; teaches from the application layer down, which matches how a programmer meets networks. Use for: layering, TCP internals, routing, the "why" behind every layer.
 - [Kurose & Ross Wireshark Labs](https://gaia.cs.umass.edu/kurose_ross/wireshark.php)
   Free guided labs (HTTP, DNS, TCP, UDP, IP, ARP, DHCP, TLS). Use for: hands-on exercises that match the textbook chapters.
+- [Kurose & Ross Interactive Problems](https://gaia.cs.umass.edu/kurose_ross/interactive/)
+  Auto-generated end-of-chapter problems with worked solutions (delay, layering, subnetting, longest-prefix match, NAT, TCP, DNS…). Use for: extra spaced practice in review sessions.
 - [Book: _Computer Networks: A Systems Approach_ by Peterson & Davie (free online)](https://book.systemsapproach.org/)
   Rigorous, open-licensed second opinion with more systems/implementation depth. Use for: congestion control, IP/routing details, QUIC.
 - [Book: _High Performance Browser Networking_ by Ilya Grigorik (free online)](https://hpbn.co/)
@@ -21,6 +23,7 @@
 - [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) — methods, status codes, headers, shared by all HTTP versions.
 - [RFC 9113 — HTTP/2](https://www.rfc-editor.org/rfc/rfc9113) · [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114) · [RFC 9000 — QUIC](https://www.rfc-editor.org/rfc/rfc9000)
 - [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446)
+- Link/internet layer (Part 1): [RFC 791 — IPv4](https://www.rfc-editor.org/rfc/rfc791) · [RFC 792 — ICMP](https://www.rfc-editor.org/rfc/rfc792) · [RFC 826 — ARP](https://www.rfc-editor.org/rfc/rfc826) · [RFC 2131 — DHCP](https://www.rfc-editor.org/rfc/rfc2131) · [RFC 4632 — CIDR](https://www.rfc-editor.org/rfc/rfc4632) · [RFC 1918 — private addresses](https://www.rfc-editor.org/rfc/rfc1918) · [RFC 3022 — NAT](https://www.rfc-editor.org/rfc/rfc3022) · [RFC 8200 — IPv6](https://www.rfc-editor.org/rfc/rfc8200) · [RFC 4291 — IPv6 addressing](https://www.rfc-editor.org/rfc/rfc4291) · [RFC 4861 — NDP](https://www.rfc-editor.org/rfc/rfc4861) · [RFC 5952 — IPv6 text form](https://www.rfc-editor.org/rfc/rfc5952) · [RFC 1122 — host requirements](https://www.rfc-editor.org/rfc/rfc1122)
 - [RFC 6265 — Cookies](https://www.rfc-editor.org/rfc/rfc6265) · [RFC 6455 — WebSocket](https://www.rfc-editor.org/rfc/rfc6455)
   Use the RFCs to settle "is that actually true?" questions — lessons cite the relevant section.
 
@@ -58,4 +61,5 @@
 
 ## Gaps
 - No Kotlin-first networking text found yet; using Java resources (the APIs are the same in Kotlin).
+- Kurose & Ross isn't freely available online, so section numbers cited in lessons (8th edition) couldn't be checked against the text. Systems Approach and RFC citations were checked.
 - No hard data on interview-question frequency; ★ ratings in CURRICULUM.md are informed judgment, cross-checked against common question lists.
