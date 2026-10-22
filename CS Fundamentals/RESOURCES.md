@@ -124,6 +124,10 @@
 ### Databases
 - [Interactive: _SQLBolt_](https://sqlbolt.com/)
   Interactive SQL lessons in the browser: SELECT, filtering, joins, aggregates, and then INSERT, UPDATE, and CREATE TABLE. Use for: writing your first few hundred queries by hand.
+- [Docs: _SQLite Documentation_ (Query Planner, EXPLAIN QUERY PLAN, Foreign Keys, Datatypes, Quirks)](https://www.sqlite.org/docs.html)
+  Short, precise pages on how SQLite really behaves: type affinity, foreign keys being off by default, the rowid B-tree, and how the planner picks indexes. Use for: the dialect-specific truth behind L34–L36 and the capstone's SQLite store.
+- [Docs: _PostgreSQL: Transaction Isolation_](https://www.postgresql.org/docs/current/transaction-iso.html)
+  The clearest official table of isolation levels vs anomalies, plus what PostgreSQL actually does: snapshot isolation for REPEATABLE READ, and SSI for SERIALIZABLE with retryable failures. Use for: reasoning about isolation in a production database (L36).
 - [Book: _Use The Index, Luke_ by Markus Winand](https://use-the-index-luke.com/)
   The free web edition of "SQL Performance Explained": B-tree indexes, WHERE clauses, joins (including the N+1 problem), sorting, and pagination, across PostgreSQL, MySQL, Oracle, and others. Use for: understanding why a query is slow, which you'll need for Spring Data and JPA.
 - [Video lectures: _CMU 15-445/645 Intro to Database Systems (Fall 2024)_ by Andy Pavlo (Carnegie Mellon)](https://www.youtube.com/playlist?list=PLSE8ODhjZXjYDBpQnSymaectKjxCy6BYq)

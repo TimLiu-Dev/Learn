@@ -1,0 +1,6 @@
+CREATE TABLE t (n INTEGER);
+INSERT INTO t VALUES (42), ('42'), ('forty-two'), (4.5);
+SELECT n, typeof(n) FROM t;
+CREATE TABLE s (n INTEGER) STRICT;
+INSERT INTO s VALUES ('42');
+INSERT INTO s VALUES ('forty-two');

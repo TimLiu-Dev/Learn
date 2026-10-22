@@ -1,0 +1,3000 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L36 · Transactions &amp; JDBC</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l36">
+<main>
+
+<div class="kicker">Lesson 36 · Phase 10 Databases · <a href="../reference/roadmap.html#p10">roadmap</a></div>
+<h1>Transactions &amp; JDBC</h1>
+<p class="subtitle">L34 taught you to ask a database questions, and L35 made those questions fast. This lesson is about changing data safely when things go wrong: a crash halfway through a transfer, two users editing the same row, eight people borrowing the last copy of a book at once. Then you write the data layer for the library by hand, in plain JDBC.</p>
+
+<div class="lesson-meta">
+  <span><b>~110–120 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll make a database refuse to lose money: transfers that are all-or-nothing, counters that survive four threads hammering them, and a lending system where eight simultaneous borrowers produce exactly one loan. You'll see every classic isolation anomaly happen for real, and know which setting stops each one.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · ACID and transactions</a><span class="t">25 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Isolation levels and anomalies</a><span class="t">35 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · JDBC by hand</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: the library's data layer</a><span class="t">30 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l36/</code>. Every output on this page was captured from real runs on JDK 26.0.1 and Kotlin 2.4.20, with SQLite JDBC 3.53.4.0, H2 2.5.252 and the macOS <code>/usr/bin/sqlite3</code> (3.51.0). Timings are from one Apple Silicon Mac. Yours will differ.</p>
+
+<div class="callout">
+  <p><b>Setup.</b> You need two JDBC drivers, both single jars:</p>
+  <ul>
+    <li><b>SQLite JDBC</b> (<code>org.xerial:sqlite-jdbc:3.53.4.0</code>): the same SQLite you used from the command line in L34 and L35, as a Java library. It contains native code, so JDK 26 wants <code>--enable-native-access=ALL-UNNAMED</code> on the <code>java</code> command line.</li>
+    <li><b>H2</b> (<code>com.h2database:h2:2.5.252</code>): a database written in Java. Part 2 uses it because it has real, configurable isolation levels. SQLite has essentially one.</li>
+  </ul>
+<pre class="term"><span class="p">$</span> CP=sqlite-jdbc-3.53.4.0.jar:h2-2.5.252.jar
+<span class="p">$</span> java --enable-native-access=ALL-UNNAMED -cp $CP Autocommit.java
+<span class="p">$</span> kotlinc -cp $CP Autocommit.kt -include-runtime -d a.jar &amp;&amp; java --enable-native-access=ALL-UNNAMED -cp a.jar:$CP AutocommitKt</pre>
+  <p>Part 3 reads the library database from L34. This lesson's copy of <code>library.sql</code> adds one table for the money examples:</p>
+<pre><code class="language-sql">-- L36: money moves between these two rows. The CHECK makes overdrafts fail.
+CREATE TABLE accounts (
+  id            INTEGER PRIMARY KEY,
+  owner         TEXT,
+  balance_cents INTEGER NOT NULL CHECK (balance_cents >= 0)
+);
+
+INSERT INTO accounts (id, owner, balance_cents) VALUES
+  (1, 'Ada', 10000),
+  (2, 'Bob',  5000);</code></pre>
+<pre class="term"><span class="p">$</span> /usr/bin/sqlite3 library.db &lt; library.sql</pre>
+  <p>Call <code>/usr/bin/sqlite3</code> by its full path if you have Android Studio: its SDK ships an older <code>sqlite3</code> that may come first on your <code>PATH</code>.</p>
+</div>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L27, L33, L34 and L35</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Write the SQL for "every member, with how many loans they have, including members with none". Which join, and why <code>COUNT(l.id)</code> rather than <code>COUNT(*)</code>? (L34)</li>
+    <li>Draw the shape of a B-tree index on <code>loans(member_id)</code>. Why is a lookup O(log n), and what does an index cost on every <code>INSERT</code>? (L35)</li>
+    <li>Two threads each run <code>count++</code> on a shared field 1,000 times. Explain in two sentences why the total can come out below 2,000. (L26, L27)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="1">
+  <p class="q">With an index on <code>loans(member_id)</code>, which plan does <code>EXPLAIN QUERY PLAN SELECT * FROM loans WHERE member_id = 3</code> print? (L35)</p>
+  <div class="opts"><button><code>SCAN loans</code></button><button><code>SEARCH loans USING INDEX idx_loans_member (member_id=?)</code></button><button><code>SCAN loans USING COVERING INDEX idx_loans_member</code></button><button><code>USE TEMP B-TREE FOR ORDER BY</code></button></div>
+  <p class="why">SEARCH means the B-tree was used to jump straight to the matching rows. SCAN would read every row. Real output on the L34 data: <code>`--SEARCH loans USING INDEX idx_loans_member (member_id=?)</code>.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">Ken never borrowed anything. <code>SELECT COUNT(l.id) FROM members m LEFT JOIN loans l ON l.member_id = m.id WHERE m.name = 'Ken Thompson'</code> (L34)</p>
+  <div class="opts"><button>Gives 0</button><button>Gives 1</button><button>Gives null</button><button>Row missing</button></div>
+  <p class="why">The LEFT JOIN keeps Ken with NULLs in every <code>loans</code> column, and <code>COUNT(column)</code> skips NULLs, so it's 0. <code>COUNT(*)</code> would count the row itself and say 1.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="2">
+  <p class="q">How do you stop a value the user typed from changing the meaning of your SQL? (L33)</p>
+  <div class="opts"><button>Escape every quote with regex</button><button>Wrap the value in quotes</button><button>Bind it as a parameter</button><button>Strip semicolons from all input</button></div>
+  <p class="why">A <code>PreparedStatement</code> sends the SQL and the values separately, so a value can never become code (<a href="https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html">OWASP</a>). Part 3 shows the one place this doesn't work: column names.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="3">
+  <p class="q">Two threads lock accounts A and B in opposite orders and hang forever. The standard fix? (L27)</p>
+  <div class="opts"><button>Add more threads to help</button><button>Use a bigger thread pool</button><button>Sleep before taking each lock</button><button>Always lock in one order</button></div>
+  <p class="why">A deadlock needs a cycle of waits. If everyone takes locks in the same global order (say, by id), no cycle can form. Part 2 does the same thing with database rows.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>ACID and transactions</h2><span class="t">~25 min</span></div>
+
+<p>A <dfn>transaction</dfn> is a group of statements the database treats as one unit. PostgreSQL's tutorial puts it well: "The essential point of a transaction is that it bundles multiple steps into a single, all-or-nothing operation. The intermediate states between the steps are not visible to other concurrent transactions, and if some failure occurs that prevents the transaction from completing, then none of the steps affect the database at all" (<a href="https://www.postgresql.org/docs/current/tutorial-transactions.html">PostgreSQL: Transactions</a>). The guarantees go by the acronym <dfn>ACID</dfn>. Kleppmann's <em>Designing Data-Intensive Applications</em>, chapter 7 "Transactions", is the best long treatment.</p>
+<table class="cmds">
+  <tr><th>Letter</th><th>Means</th><th>In this lesson</th></tr>
+  <tr><td><b>A</b>tomicity</td><td>All of the statements happen, or none of them do.</td><td>The transfer below: either both balances change, or neither does.</td></tr>
+  <tr><td><b>C</b>onsistency</td><td>Rules you declared (CHECK, UNIQUE, foreign keys) hold before and after.</td><td>The <code>CHECK (balance_cents &gt;= 0)</code>. DDIA ch. 7 points out that most of "consistency" is really your application's job; the database only enforces what you declare.</td></tr>
+  <tr><td><b>I</b>solation</td><td>Concurrent transactions don't see each other's half-finished work. How strictly is configurable.</td><td>All of Part 2.</td></tr>
+  <tr><td><b>D</b>urability</td><td>Once <code>COMMIT</code> returns, the data survives a crash or power cut.</td><td>The journal below, and why Part 3's batched inserts are so much faster.</td></tr>
+</table>
+
+<h3>Atomicity in <code>sqlite3</code></h3>
+<p>Move 150.00 from Ada (100.00) to Bob. The first <code>UPDATE</code> succeeds and the second breaks the <code>CHECK</code>:</p>
+<pre class="term"><span class="p">$</span> /usr/bin/sqlite3 -box bank.db
+BEGIN;
+UPDATE accounts SET balance_cents = balance_cents + 15000 WHERE id = 2;
+UPDATE accounts SET balance_cents = balance_cents - 15000 WHERE id = 1;
+Runtime error near line 4: CHECK constraint failed: balance_cents >= 0 (19)
+SELECT * FROM accounts;
+┌────┬───────┬───────────────┐
+│ id │ owner │ balance_cents │
+├────┼───────┼───────────────┤
+│ 1  │ Ada   │ 10000         │
+│ 2  │ Bob   │ 20000         │
+└────┴───────┴───────────────┘
+ROLLBACK;
+SELECT * FROM accounts;
+┌────┬───────┬───────────────┐
+│ id │ owner │ balance_cents │
+├────┼───────┼───────────────┤
+│ 1  │ Ada   │ 10000         │
+│ 2  │ Bob   │ 5000          │
+└────┴───────┴───────────────┘</pre>
+<p>Look at the middle <code>SELECT</code>: inside the transaction, Bob already has 200.00. <code>ROLLBACK</code> undoes everything since <code>BEGIN</code>. Now the trap. Same start, but <code>COMMIT</code> instead of <code>ROLLBACK</code> after the error:</p>
+<pre class="term">BEGIN;
+UPDATE accounts SET balance_cents = balance_cents + 15000 WHERE id = 2;
+UPDATE accounts SET balance_cents = balance_cents - 15000 WHERE id = 1;
+Runtime error near line 4: CHECK constraint failed: balance_cents >= 0 (19)
+COMMIT;
+SELECT * FROM accounts;
+┌────┬───────┬───────────────┐
+│ id │ owner │ balance_cents │
+├────┼───────┼───────────────┤
+│ 1  │ Ada   │ 10000         │
+│ 2  │ Bob   │ 20000         │
+└────┴───────┴───────────────┘</pre>
+<p>150.00 appeared from nowhere. A failing statement does <em>not</em> roll back the whole transaction. SQLite's default conflict rule, ABORT, "backs out any changes made by the current SQL statement; but changes caused by prior SQL statements within the same transaction are preserved and the transaction remains active. This is the default behavior and the behavior specified by the SQL standard" (<a href="https://www.sqlite.org/lang_conflict.html">SQLite: ON CONFLICT</a>). Deciding to roll back is <b>your</b> job, which is why every JDBC transaction below has a <code>catch</code> that calls <code>rollback()</code>.</p>
+
+<h3>Durability: the journal</h3>
+<p>How can a database promise all-or-nothing if the power fails halfway through writing a page? "Prior to making any changes to the database file, SQLite first creates a separate rollback journal file and writes into the rollback journal the original content of the database pages that are to be altered" (<a href="https://www.sqlite.org/atomiccommit.html">SQLite: Atomic Commit</a>). After a crash, SQLite finds the journal and puts the old pages back. <code>PRAGMA journal_mode;</code> on our file prints <code>delete</code>, the default: the journal is deleted on commit. The other common mode, <code>WAL</code> (write-ahead log), appends changes to a log instead and lets readers keep going while one connection writes. Every commit has to wait until the data really is on disk. Remember that cost; you'll measure it in Part 3.</p>
+
+<h3>Transactions from JDBC: autocommit is on</h3>
+<p>JDBC hides <code>BEGIN</code>. "By default, new connections are in auto-commit mode. The commit occurs when the statement completes" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/Connection.html">Connection</a>). So, by default, every statement is its own transaction. Here's what that means for a transfer interrupted by a crash, simulated with an exception between the two <code>UPDATE</code>s:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Autocommit.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+
+// Runs block inside one transaction: commit if it returns, roll back if it throws.
+inline fun &lt;T&gt; Connection.transaction(block: (Connection) -&gt; T): T {
+    autoCommit = false
+    try {
+        val result = block(this)
+        commit()
+        return result
+    } catch (e: Throwable) {
+        rollback()
+        throw e
+    } finally {
+        autoCommit = true
+    }
+}
+
+fun Connection.exec(sql: String) = createStatement().use { it.executeUpdate(sql) }
+
+fun Connection.balances(): String =
+    createStatement().use { st -&gt;
+        st.executeQuery("SELECT owner, balance_cents FROM accounts ORDER BY id").use { rs -&gt;
+            buildList { while (rs.next()) add("${rs.getString(1)}=${rs.getInt(2)}") }.joinToString(" ")
+        }
+    }
+
+fun reset(c: Connection) {
+    c.exec("DROP TABLE IF EXISTS accounts")
+    c.exec("CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT, " +
+           "balance_cents INTEGER NOT NULL CHECK (balance_cents &gt;= 0))")
+    c.exec("INSERT INTO accounts VALUES (1, 'Ada', 10000), (2, 'Bob', 5000)")
+}
+
+fun transfer(c: Connection, from: Int, to: Int, cents: Int, crash: Boolean = false) {
+    c.prepareStatement("UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?").use {
+        it.setInt(1, cents); it.setInt(2, to); it.executeUpdate()
+    }
+    if (crash) error("power cut between the two UPDATEs")
+    c.prepareStatement("UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ?").use {
+        it.setInt(1, cents); it.setInt(2, from); it.executeUpdate()
+    }
+}
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite::memory:").use { c -&gt;
+        println("autocommit by default: ${c.autoCommit}")
+
+        reset(c)
+        try { transfer(c, 1, 2, 2500, crash = true) } catch (e: IllegalStateException) { println("1. crashed: ${e.message}") }
+        println("   autocommit:  ${c.balances()}")
+
+        reset(c)
+        try { c.transaction { transfer(it, 1, 2, 2500, crash = true) } } catch (e: IllegalStateException) { println("2. crashed: ${e.message}") }
+        println("   transaction: ${c.balances()}")
+
+        reset(c)
+        try { c.transaction { transfer(it, 1, 2, 15000) } } catch (e: java.sql.SQLException) { println("3. ${e.message}") }
+        println("   transaction: ${c.balances()}")
+
+        c.transaction { transfer(it, 1, 2, 2500) }
+        println("4. committed:   ${c.balances()}")
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Autocommit.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+
+public class Autocommit {
+    // java.util.function interfaces can't throw SQLException, so we declare our own.
+    @FunctionalInterface
+    interface SqlWork&lt;T&gt; { T run(Connection c) throws SQLException; }
+
+    // Runs work inside one transaction: commit if it returns, roll back if it throws.
+    static &lt;T&gt; T transaction(Connection c, SqlWork&lt;T&gt; work) throws SQLException {
+        c.setAutoCommit(false);
+        try {
+            T result = work.run(c);
+            c.commit();
+            return result;
+        } catch (SQLException | RuntimeException e) {
+            c.rollback();
+            throw e;
+        } finally {
+            c.setAutoCommit(true);
+        }
+    }
+
+    static void exec(Connection c, String sql) throws SQLException {
+        try (Statement st = c.createStatement()) { st.executeUpdate(sql); }
+    }
+
+    static String balances(Connection c) throws SQLException {
+        StringBuilder sb = new StringBuilder();
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT owner, balance_cents FROM accounts ORDER BY id")) {
+            while (rs.next()) sb.append(sb.isEmpty() ? "" : " ").append(rs.getString(1)).append('=').append(rs.getInt(2));
+        }
+        return sb.toString();
+    }
+
+    static void reset(Connection c) throws SQLException {
+        exec(c, "DROP TABLE IF EXISTS accounts");
+        exec(c, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT, "
+              + "balance_cents INTEGER NOT NULL CHECK (balance_cents &gt;= 0))");
+        exec(c, "INSERT INTO accounts VALUES (1, 'Ada', 10000), (2, 'Bob', 5000)");
+    }
+
+    static Void transfer(Connection c, int from, int to, int cents, boolean crash) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement("UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?")) {
+            ps.setInt(1, cents); ps.setInt(2, to); ps.executeUpdate();
+        }
+        if (crash) throw new IllegalStateException("power cut between the two UPDATEs");
+        try (PreparedStatement ps = c.prepareStatement("UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ?")) {
+            ps.setInt(1, cents); ps.setInt(2, from); ps.executeUpdate();
+        }
+        return null;
+    }
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite::memory:")) {
+            System.out.println("autocommit by default: " + c.getAutoCommit());
+
+            reset(c);
+            try { transfer(c, 1, 2, 2500, true); } catch (IllegalStateException e) { System.out.println("1. crashed: " + e.getMessage()); }
+            System.out.println("   autocommit:  " + balances(c));
+
+            reset(c);
+            try { transaction(c, conn -&gt; transfer(conn, 1, 2, 2500, true)); } catch (IllegalStateException e) { System.out.println("2. crashed: " + e.getMessage()); }
+            System.out.println("   transaction: " + balances(c));
+
+            reset(c);
+            try { transaction(c, conn -&gt; transfer(conn, 1, 2, 15000, false)); } catch (SQLException e) { System.out.println("3. " + e.getMessage()); }
+            System.out.println("   transaction: " + balances(c));
+
+            transaction(c, conn -&gt; transfer(conn, 1, 2, 2500, false));
+            System.out.println("4. committed:   " + balances(c));
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">autocommit by default: true
+1. crashed: power cut between the two UPDATEs
+   autocommit:  Ada=10000 Bob=7500
+2. crashed: power cut between the two UPDATEs
+   transaction: Ada=10000 Bob=5000
+3. [SQLITE_CONSTRAINT_CHECK] A CHECK constraint failed (CHECK constraint failed: balance_cents >= 0)
+   transaction: Ada=10000 Bob=5000
+4. committed:   Ada=7500 Bob=7500</pre>
+<p>Both languages print exactly this. Run 1 is the bug: Bob's credit was committed the moment its statement finished, and Ada's debit never ran. Runs 2 and 3 use the helper: <code>setAutoCommit(false)</code>, run the work, <code>commit()</code> if it returns, <code>rollback()</code> if it throws, and switch autocommit back on in <code>finally</code>. That's the whole pattern, and the same one frameworks automate.</p>
+
+<h3>Savepoints: rolling back part of a transaction</h3>
+<p>A <code>Savepoint</code> is "a point within the current transaction that can be referenced from the Connection.rollback method. When a transaction is rolled back to a savepoint all changes made after that savepoint are undone" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/Savepoint.html">Savepoint</a>). Here, a bulk sign-up skips the one bad row instead of throwing away the whole batch:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Savepoints.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.DriverManager
+import java.sql.SQLException
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite::memory:").use { c -&gt;
+        c.createStatement().use { it.executeUpdate("CREATE TABLE members (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL)") }
+        val signups = listOf("Ada" to "ada@example.com", "Alan" to "alan@example.com",
+                             "Ada again" to "ada@example.com", "Grace" to "grace@example.com")
+
+        c.autoCommit = false
+        c.prepareStatement("INSERT INTO members (name, email) VALUES (?, ?)").use { ps -&gt;
+            for ((name, email) in signups) {
+                val sp = c.setSavepoint()              // a bookmark inside the transaction
+                try {
+                    ps.setString(1, name); ps.setString(2, email); ps.executeUpdate()
+                    c.releaseSavepoint(sp)
+                } catch (e: SQLException) {
+                    c.rollback(sp)                     // undo only this row
+                    println("skipped $name: ${e.message}")
+                }
+            }
+        }
+        c.commit()
+        c.autoCommit = true
+
+        c.createStatement().use { st -&gt;
+            st.executeQuery("SELECT id, name FROM members ORDER BY id").use { rs -&gt;
+                while (rs.next()) println("${rs.getInt(1)} ${rs.getString(2)}")
+            }
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Savepoints.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.List;
+
+public class Savepoints {
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite::memory:")) {
+            try (Statement st = c.createStatement()) {
+                st.executeUpdate("CREATE TABLE members (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL)");
+            }
+            List&lt;String[]&gt; signups = List.of(new String[]{"Ada", "ada@example.com"}, new String[]{"Alan", "alan@example.com"},
+                                             new String[]{"Ada again", "ada@example.com"}, new String[]{"Grace", "grace@example.com"});
+
+            c.setAutoCommit(false);
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO members (name, email) VALUES (?, ?)")) {
+                for (String[] s : signups) {
+                    Savepoint sp = c.setSavepoint();          // a bookmark inside the transaction
+                    try {
+                        ps.setString(1, s[0]); ps.setString(2, s[1]); ps.executeUpdate();
+                        c.releaseSavepoint(sp);
+                    } catch (SQLException e) {
+                        c.rollback(sp);                       // undo only this row
+                        System.out.println("skipped " + s[0] + ": " + e.getMessage());
+                    }
+                }
+            }
+            c.commit();
+            c.setAutoCommit(true);
+
+            try (Statement st = c.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT id, name FROM members ORDER BY id")) {
+                while (rs.next()) System.out.println(rs.getInt(1) + " " + rs.getString(2));
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">skipped Ada again: [SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: members.email)
+1 Ada
+2 Alan
+3 Grace</pre>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b><code>inline fun &lt;T&gt; Connection.transaction(block)</code></b> reads like a language feature: <code>c.transaction { … }</code>. Because it's <code>inline</code> (L14), there's no lambda object, and the block can even <code>return</code> from the enclosing function.</li>
+    <li><b>No checked exceptions</b> (L10). The block may throw <code>SQLException</code> freely. Java's <code>java.util.function</code> interfaces can't throw checked exceptions, so the Java version declares its own <code>SqlWork&lt;T&gt;</code>, and the transfer has to return <code>Void</code>/<code>null</code> to fit it.</li>
+    <li><b><code>use { }</code></b> closes statements and connections like try-with-resources, but as an ordinary extension function you can nest anywhere, including inside an expression.</li>
+    <li><b><code>c.autoCommit = false</code></b>: JDBC's <code>getAutoCommit</code>/<code>setAutoCommit</code> pair becomes a property (L9).</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a transfer that can't lose money</div>
+  <p>From a blank file, in both languages. The transfer above has a silent bug: <code>UPDATE … WHERE id = 99</code> changes zero rows without any error, so money sent to a non-existent account just vanishes. <code>executeUpdate</code> returns "the row count for SQL Data Manipulation Language (DML) statements" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/Statement.html#executeUpdate(java.lang.String)">Statement.executeUpdate</a>). Use it.</p>
+  <ol>
+    <li>Write <code>transfer(c, from, to, cents)</code> returning a sealed result (L7, L10): <code>Done</code>, or <code>Rejected(reason)</code>.</li>
+    <li>Reject non-positive amounts before touching the database. Reject unknown accounts by checking that each <code>UPDATE</code> changed exactly one row. Turn the <code>CHECK</code> failure into <code>Rejected("overdraft")</code>.</li>
+    <li>Every rejection must leave both balances untouched.</li>
+  </ol>
+<pre class="out">1 -> 2  2500: Done  | Ada=7500 Bob=7500
+1 -> 99  1000: Rejected(reason=no account 99)  | Ada=7500 Bob=7500
+99 -> 2  1000: Rejected(reason=no account 99)  | Ada=7500 Bob=7500
+2 -> 1  99999: Rejected(reason=overdraft)  | Ada=7500 Bob=7500
+1 -> 2  -5: Rejected(reason=amount must be positive)  | Ada=7500 Bob=7500</pre>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex1.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.SQLException
+
+inline fun &lt;T&gt; Connection.transaction(block: (Connection) -&gt; T): T {
+    autoCommit = false
+    try { return block(this).also { commit() } }
+    catch (e: Throwable) { rollback(); throw e }
+    finally { autoCommit = true }
+}
+
+sealed interface TransferResult {
+    data object Done : TransferResult
+    data class Rejected(val reason: String) : TransferResult
+}
+
+fun Connection.move(id: Int, delta: Int): Int =
+    prepareStatement("UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?").use {
+        it.setInt(1, delta); it.setInt(2, id); it.executeUpdate()   // number of rows changed
+    }
+
+fun transfer(c: Connection, from: Int, to: Int, cents: Int): TransferResult =
+    try {
+        c.transaction {
+            require(cents &gt; 0) { "amount must be positive" }
+            check(it.move(to, cents) == 1) { "no account $to" }
+            check(it.move(from, -cents) == 1) { "no account $from" }
+            TransferResult.Done
+        }
+    } catch (e: IllegalArgumentException) { TransferResult.Rejected(e.message!!) }
+      catch (e: IllegalStateException) { TransferResult.Rejected(e.message!!) }
+      catch (e: SQLException) { TransferResult.Rejected("overdraft") }
+
+fun Connection.balances(): String = createStatement().use { st -&gt;
+    st.executeQuery("SELECT owner, balance_cents FROM accounts ORDER BY id").use { rs -&gt;
+        buildList { while (rs.next()) add("${rs.getString(1)}=${rs.getInt(2)}") }.joinToString(" ")
+    }
+}
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite::memory:").use { c -&gt;
+        c.createStatement().use {
+            it.executeUpdate("CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT, balance_cents INTEGER NOT NULL CHECK (balance_cents &gt;= 0))")
+            it.executeUpdate("INSERT INTO accounts VALUES (1, 'Ada', 10000), (2, 'Bob', 5000)")
+        }
+        for ((from, to, cents) in listOf(Triple(1, 2, 2500), Triple(1, 99, 1000), Triple(99, 2, 1000),
+                                         Triple(2, 1, 99999), Triple(1, 2, -5))) {
+            println("$from -&gt; $to  $cents: ${transfer(c, from, to, cents)}  | ${c.balances()}")
+        }
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex1.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+
+public class Ex1 {
+    sealed interface TransferResult permits Done, Rejected {}
+    record Done() implements TransferResult {}
+    record Rejected(String reason) implements TransferResult {}
+
+    static int move(Connection c, int id, int delta) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement("UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?")) {
+            ps.setInt(1, delta); ps.setInt(2, id);
+            return ps.executeUpdate();                       // number of rows changed
+        }
+    }
+
+    static TransferResult transfer(Connection c, int from, int to, int cents) throws SQLException {
+        if (cents &lt;= 0) return new Rejected("amount must be positive");
+        c.setAutoCommit(false);
+        try {
+            if (move(c, to, cents) != 1) { c.rollback(); return new Rejected("no account " + to); }
+            if (move(c, from, -cents) != 1) { c.rollback(); return new Rejected("no account " + from); }
+            c.commit();
+            return new Done();
+        } catch (SQLException e) {
+            c.rollback();
+            return new Rejected("overdraft");
+        } finally {
+            c.setAutoCommit(true);
+        }
+    }
+
+    static String balances(Connection c) throws SQLException {
+        StringBuilder sb = new StringBuilder();
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT owner, balance_cents FROM accounts ORDER BY id")) {
+            while (rs.next()) sb.append(sb.isEmpty() ? "" : " ").append(rs.getString(1)).append('=').append(rs.getInt(2));
+        }
+        return sb.toString();
+    }
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite::memory:")) {
+            try (Statement st = c.createStatement()) {
+                st.executeUpdate("CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT, balance_cents INTEGER NOT NULL CHECK (balance_cents &gt;= 0))");
+                st.executeUpdate("INSERT INTO accounts VALUES (1, 'Ada', 10000), (2, 'Bob', 5000)");
+            }
+            int[][] cases = {{1, 2, 2500}, {1, 99, 1000}, {99, 2, 1000}, {2, 1, 99999}, {1, 2, -5}};
+            for (int[] t : cases) {
+                System.out.println(t[0] + " -&gt; " + t[1] + "  " + t[2] + ": " + transfer(c, t[0], t[1], t[2]) + "  | " + balances(c));
+            }
+        }
+    }
+}</code></pre></figure>
+    </div>
+    <p>The Kotlin version leans on <code>require</code> and <code>check</code> (L10) inside the transaction: they throw, the helper rolls back, and the outer <code>catch</code> turns the exception into a result. The Java version (printing <code>Done[]</code> and <code>Rejected[reason=…]</code>, the record format) rolls back by hand at each early return. Either way, the credit to <code>to</code> happens first, so the rollback is what saves you.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · ACID" data-answer="1">
+  <p class="q">A brand-new JDBC connection runs two <code>UPDATE</code>s. When does each one commit?</p>
+  <div class="opts"><button>Nothing commits until you call commit</button><button>Each statement commits on its own</button><button>The driver commits once per minute</button><button>Both commit when the connection closes</button></div>
+  <p class="why">"By default, new connections are in auto-commit mode." Each statement is its own transaction, which is exactly how run 1 above lost Ada's debit.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · ACID" data-answer="2">
+  <p class="q"><code>BEGIN;</code> Bob +15000 (works); Ada −15000 (fails the CHECK); <code>COMMIT;</code> Bob started at 5000. His balance now?</p>
+  <div class="opts"><button><code>5000</code></button><button><code>-10000</code></button><button><code>20000</code></button><button><code>15000</code></button></div>
+  <p class="why">The failed statement is undone, but the earlier one isn't, and the transaction stays open. <code>COMMIT</code> keeps Bob's +15000. You must <code>ROLLBACK</code> yourself (<a href="https://www.sqlite.org/lang_conflict.html">SQLite: ABORT</a>).</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · ACID" data-answer="0">
+  <p class="q">Why does the Java version declare its own <code>SqlWork&lt;T&gt;</code> instead of using <code>Function&lt;Connection, T&gt;</code>?</p>
+  <div class="opts"><button>Function's apply method cannot throw SQLException</button><button>Function cannot take a Connection parameter</button><button>Lambdas are not allowed with JDBC</button><button>Generic interfaces are slower than custom</button></div>
+  <p class="why"><code>Function.apply</code> declares no checked exceptions, and <code>SQLException</code> is checked (L10). Kotlin has no checked exceptions, so its helper takes a plain function type.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · ACID" data-answer="3">
+  <p class="q">Inside one transaction you insert rows 1, 2 and 3, roll back to a savepoint taken before row 3, then commit. What is saved?</p>
+  <div class="opts"><button>Nothing at all is saved</button><button>Only row 3 is saved</button><button>All three rows are saved</button><button>Rows 1 and 2 only</button></div>
+  <p class="why">Rolling back to a savepoint undoes only what came after it. The transaction stays open, and <code>commit()</code> keeps everything before the savepoint.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Isolation levels and anomalies</h2><span class="t">~35 min</span></div>
+
+<p>Atomicity protects you from crashes. <dfn>Isolation</dfn> protects you from other users. A server handles many requests at once (L28), each with its own connection, and they all touch the same rows. This is L26's race condition again, except the shared memory is now a table. Perfect isolation would mean every transaction behaves as if it ran alone, which is slow. So databases offer <dfn>isolation levels</dfn>: weaker levels allow certain <dfn>anomalies</dfn> in exchange for speed.</p>
+<p>The SQL standard names three anomalies. In PostgreSQL's wording (<a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL: Transaction Isolation</a>):</p>
+<ul>
+  <li><b>Dirty read:</b> "A transaction reads data written by a concurrent uncommitted transaction."</li>
+  <li><b>Non-repeatable read:</b> "A transaction re-reads data it has previously read and finds that data has been modified by another transaction (that committed since the initial read)."</li>
+  <li><b>Phantom read:</b> "A transaction re-executes a query returning a set of rows that satisfy a search condition and finds that the set of rows satisfying the condition has changed due to another recently-committed transaction."</li>
+</ul>
+<p>DDIA ch. 7 adds two that bite real applications more often:</p>
+<ul>
+  <li><b>Lost update:</b> two transactions read a value, both compute a new one from what they read, and both write. The second write silently overwrites the first. It's <code>count++</code> from L26, in SQL.</li>
+  <li><b>Write skew:</b> two transactions read the <em>same</em> rows, then each updates a <em>different</em> row based on what it read. Each write is fine alone; together they break a rule. The classic example is two doctors who both check "is someone else on call?" and both go home.</li>
+</ul>
+<p>The standard's table, as PostgreSQL's docs reproduce it (Table 13.1):</p>
+<table class="cmds">
+  <tr><th>Level</th><th>Dirty read</th><th>Non-repeatable</th><th>Phantom</th></tr>
+  <tr><td>READ UNCOMMITTED</td><td>possible</td><td>possible</td><td>possible</td></tr>
+  <tr><td>READ COMMITTED</td><td>not possible</td><td>possible</td><td>possible</td></tr>
+  <tr><td>REPEATABLE READ</td><td>not possible</td><td>not possible</td><td>possible</td></tr>
+  <tr><td>SERIALIZABLE</td><td>not possible</td><td>not possible</td><td>not possible</td></tr>
+</table>
+<p>That table says what a level <em>must</em> prevent. A real database may prevent more, and the details vary a lot between products. So instead of trusting the table, we'll measure one. H2's docs: it "supports read uncommitted, read committed, repeatable read, snapshot, and serializable (partially, see below) isolation levels". Read committed "is the default level", and serializable "currently doesn't ensure equivalence of concurrent and serializable execution of transactions that perform write operations" (<a href="https://h2database.com/html/advanced.html#transaction_isolation">H2: Transaction Isolation</a>). Keep that last sentence in mind.</p>
+
+<h3>Every anomaly, for real</h3>
+<p>The trick for a reproducible demo: open <em>two</em> connections, T1 and T2, and drive them step by step from <em>one</em> thread. No real concurrency, so no luck involved; the interleaving is exactly the one written in the code. If a step has to wait for a lock, H2 gives up after <code>SET LOCK_TIMEOUT 300</code> milliseconds instead of hanging the thread.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Anomalies.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.SQLException
+
+const val URL = "jdbc:h2:mem:bank;DB_CLOSE_DELAY=-1"   // one in-memory DB, shared by name
+
+fun open(level: String): Connection = DriverManager.getConnection(URL).apply {
+    createStatement().use {
+        it.execute("SET LOCK_TIMEOUT 300")                                    // wait 0.3 s at most
+        it.execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL $level")
+    }
+    autoCommit = false
+}
+
+fun Connection.int(sql: String): Int = createStatement().use { st -&gt; st.executeQuery(sql).use { it.next(); it.getInt(1) } }
+fun Connection.run(sql: String) = createStatement().use { it.executeUpdate(sql) }
+
+fun reset() = DriverManager.getConnection(URL).use { c -&gt;
+    c.run("DROP TABLE IF EXISTS accounts"); c.run("DROP TABLE IF EXISTS doctors")
+    c.run("CREATE TABLE accounts (id INT PRIMARY KEY, owner VARCHAR(20), balance_cents INT NOT NULL)")
+    c.run("INSERT INTO accounts VALUES (1, 'Ada', 10000), (2, 'Bob', 5000)")
+    c.run("CREATE TABLE doctors (name VARCHAR(20) PRIMARY KEY, on_call BOOLEAN)")
+    c.run("INSERT INTO doctors VALUES ('alice', TRUE), ('bob', TRUE)")
+}
+
+// Each scenario interleaves two transactions step by step on ONE thread, so the output is reproducible.
+fun dirtyRead(t1: Connection, t2: Connection): String {
+    t1.run("UPDATE accounts SET balance_cents = 0 WHERE id = 1")             // not committed
+    val seen = t2.int("SELECT balance_cents FROM accounts WHERE id = 1")
+    t1.rollback()
+    return if (seen == 0) "HAPPENS (saw 0)" else "no (saw $seen)"
+}
+
+fun nonRepeatableRead(t1: Connection, t2: Connection): String {
+    val first = t1.int("SELECT balance_cents FROM accounts WHERE id = 1")
+    t2.run("UPDATE accounts SET balance_cents = 9000 WHERE id = 1"); t2.commit()
+    val second = t1.int("SELECT balance_cents FROM accounts WHERE id = 1")
+    return if (first != second) "HAPPENS ($first, $second)" else "no ($first, $second)"
+}
+
+fun phantomRead(t1: Connection, t2: Connection): String {
+    val first = t1.int("SELECT COUNT(*) FROM accounts WHERE balance_cents &gt; 1000")
+    t2.run("INSERT INTO accounts VALUES (3, 'Cy', 7000)"); t2.commit()
+    val second = t1.int("SELECT COUNT(*) FROM accounts WHERE balance_cents &gt; 1000")
+    return if (first != second) "HAPPENS ($first, $second)" else "no ($first, $second)"
+}
+
+fun lostUpdate(t1: Connection, t2: Connection): String {
+    val b1 = t1.int("SELECT balance_cents FROM accounts WHERE id = 1")       // both read 10000
+    val b2 = t2.int("SELECT balance_cents FROM accounts WHERE id = 1")
+    t1.run("UPDATE accounts SET balance_cents = ${b1 + 1000} WHERE id = 1"); t1.commit()
+    return try {
+        t2.run("UPDATE accounts SET balance_cents = ${b2 + 1000} WHERE id = 1"); t2.commit()
+        "HAPPENS (final ${t1.int("SELECT balance_cents FROM accounts WHERE id = 1")})"
+    } catch (e: SQLException) { "no: T2 got ${e.sqlState}" }
+}
+
+fun writeSkew(t1: Connection, t2: Connection): String {
+    // Rule: at least one doctor must stay on call.
+    val n1 = t1.int("SELECT COUNT(*) FROM doctors WHERE on_call")            // both check first: 2 on call
+    val n2 = t2.int("SELECT COUNT(*) FROM doctors WHERE on_call")
+    if (n1 &gt;= 2) t1.run("UPDATE doctors SET on_call = FALSE WHERE name = 'alice'")
+    if (n2 &gt;= 2) t2.run("UPDATE doctors SET on_call = FALSE WHERE name = 'bob'")
+    t1.commit(); t2.commit()
+    val left = t1.int("SELECT COUNT(*) FROM doctors WHERE on_call")
+    return if (left == 0) "HAPPENS (0 on call)" else "no ($left on call)"
+}
+
+fun main() {
+    val levels = listOf("READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE")
+    val scenarios = listOf("dirty read" to ::dirtyRead, "non-repeatable read" to ::nonRepeatableRead,
+                           "phantom read" to ::phantomRead, "lost update" to ::lostUpdate, "write skew" to ::writeSkew)
+    for (level in levels) {
+        println("== $level")
+        for ((name, scenario) in scenarios) {
+            reset()
+            open(level).use { t1 -&gt; open(level).use { t2 -&gt; println("  %-20s %s".format(name, scenario(t1, t2))) } }
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Anomalies.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public class Anomalies {
+    static final String URL = "jdbc:h2:mem:bank;DB_CLOSE_DELAY=-1";   // one in-memory DB, shared by name
+
+    @FunctionalInterface interface Scenario { String run(Connection t1, Connection t2) throws SQLException; }
+
+    static Connection open(String level) throws SQLException {
+        Connection c = DriverManager.getConnection(URL);
+        try (Statement st = c.createStatement()) {
+            st.execute("SET LOCK_TIMEOUT 300");                                   // wait 0.3 s at most
+            st.execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL " + level);
+        }
+        c.setAutoCommit(false);
+        return c;
+    }
+
+    static int intOf(Connection c, String sql) throws SQLException {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) { rs.next(); return rs.getInt(1); }
+    }
+    static void run(Connection c, String sql) throws SQLException {
+        try (Statement st = c.createStatement()) { st.executeUpdate(sql); }
+    }
+
+    static void reset() throws SQLException {
+        try (Connection c = DriverManager.getConnection(URL)) {
+            run(c, "DROP TABLE IF EXISTS accounts"); run(c, "DROP TABLE IF EXISTS doctors");
+            run(c, "CREATE TABLE accounts (id INT PRIMARY KEY, owner VARCHAR(20), balance_cents INT NOT NULL)");
+            run(c, "INSERT INTO accounts VALUES (1, 'Ada', 10000), (2, 'Bob', 5000)");
+            run(c, "CREATE TABLE doctors (name VARCHAR(20) PRIMARY KEY, on_call BOOLEAN)");
+            run(c, "INSERT INTO doctors VALUES ('alice', TRUE), ('bob', TRUE)");
+        }
+    }
+
+    // Each scenario interleaves two transactions step by step on ONE thread, so the output is reproducible.
+    static String dirtyRead(Connection t1, Connection t2) throws SQLException {
+        run(t1, "UPDATE accounts SET balance_cents = 0 WHERE id = 1");             // not committed
+        int seen = intOf(t2, "SELECT balance_cents FROM accounts WHERE id = 1");
+        t1.rollback();
+        return seen == 0 ? "HAPPENS (saw 0)" : "no (saw " + seen + ")";
+    }
+
+    static String nonRepeatableRead(Connection t1, Connection t2) throws SQLException {
+        int first = intOf(t1, "SELECT balance_cents FROM accounts WHERE id = 1");
+        run(t2, "UPDATE accounts SET balance_cents = 9000 WHERE id = 1"); t2.commit();
+        int second = intOf(t1, "SELECT balance_cents FROM accounts WHERE id = 1");
+        return (first != second ? "HAPPENS (" : "no (") + first + ", " + second + ")";
+    }
+
+    static String phantomRead(Connection t1, Connection t2) throws SQLException {
+        int first = intOf(t1, "SELECT COUNT(*) FROM accounts WHERE balance_cents &gt; 1000");
+        run(t2, "INSERT INTO accounts VALUES (3, 'Cy', 7000)"); t2.commit();
+        int second = intOf(t1, "SELECT COUNT(*) FROM accounts WHERE balance_cents &gt; 1000");
+        return (first != second ? "HAPPENS (" : "no (") + first + ", " + second + ")";
+    }
+
+    static String lostUpdate(Connection t1, Connection t2) throws SQLException {
+        int b1 = intOf(t1, "SELECT balance_cents FROM accounts WHERE id = 1");       // both read 10000
+        int b2 = intOf(t2, "SELECT balance_cents FROM accounts WHERE id = 1");
+        run(t1, "UPDATE accounts SET balance_cents = " + (b1 + 1000) + " WHERE id = 1"); t1.commit();
+        try {
+            run(t2, "UPDATE accounts SET balance_cents = " + (b2 + 1000) + " WHERE id = 1"); t2.commit();
+            return "HAPPENS (final " + intOf(t1, "SELECT balance_cents FROM accounts WHERE id = 1") + ")";
+        } catch (SQLException e) { return "no: T2 got " + e.getSQLState(); }
+    }
+
+    static String writeSkew(Connection t1, Connection t2) throws SQLException {
+        // Rule: at least one doctor must stay on call.
+        int n1 = intOf(t1, "SELECT COUNT(*) FROM doctors WHERE on_call");          // both check first: 2 on call
+        int n2 = intOf(t2, "SELECT COUNT(*) FROM doctors WHERE on_call");
+        if (n1 &gt;= 2) run(t1, "UPDATE doctors SET on_call = FALSE WHERE name = 'alice'");
+        if (n2 &gt;= 2) run(t2, "UPDATE doctors SET on_call = FALSE WHERE name = 'bob'");
+        t1.commit(); t2.commit();
+        int left = intOf(t1, "SELECT COUNT(*) FROM doctors WHERE on_call");
+        return left == 0 ? "HAPPENS (0 on call)" : "no (" + left + " on call)";
+    }
+
+    public static void main(String[] args) throws SQLException {
+        List&lt;String&gt; levels = List.of("READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE");
+        Map&lt;String, Scenario&gt; scenarios = new LinkedHashMap&lt;&gt;();
+        scenarios.put("dirty read", Anomalies::dirtyRead);
+        scenarios.put("non-repeatable read", Anomalies::nonRepeatableRead);
+        scenarios.put("phantom read", Anomalies::phantomRead);
+        scenarios.put("lost update", Anomalies::lostUpdate);
+        scenarios.put("write skew", Anomalies::writeSkew);
+        for (String level : levels) {
+            System.out.println("== " + level);
+            for (var e : scenarios.entrySet()) {
+                reset();
+                try (Connection t1 = open(level); Connection t2 = open(level)) {
+                    System.out.printf("  %-20s %s%n", e.getKey(), e.getValue().run(t1, t2));
+                }
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">== READ UNCOMMITTED
+  dirty read           HAPPENS (saw 0)
+  non-repeatable read  HAPPENS (10000, 9000)
+  phantom read         HAPPENS (2, 3)
+  lost update          HAPPENS (final 11000)
+  write skew           HAPPENS (0 on call)
+== READ COMMITTED
+  dirty read           no (saw 10000)
+  non-repeatable read  HAPPENS (10000, 9000)
+  phantom read         HAPPENS (2, 3)
+  lost update          HAPPENS (final 11000)
+  write skew           HAPPENS (0 on call)
+== REPEATABLE READ
+  dirty read           no (saw 10000)
+  non-repeatable read  no (10000, 10000)
+  phantom read         no (2, 2)
+  lost update          no: T2 got 40001
+  write skew           HAPPENS (0 on call)
+== SERIALIZABLE
+  dirty read           no (saw 10000)
+  non-repeatable read  no (10000, 10000)
+  phantom read         no (2, 2)
+  lost update          no: T2 got 40001
+  write skew           HAPPENS (0 on call)</pre>
+<p>Kotlin and Java print the same 24 lines. What the measurement says that the textbook table doesn't:</p>
+<ul>
+  <li><b>READ COMMITTED, the default, allows lost updates.</b> Two deposits of 10.00 on a balance of 100.00 left 110.00. Your code has to handle this; Part 2's next section shows how.</li>
+  <li><b>H2's REPEATABLE READ blocked the phantom</b>, although its own docs say phantoms "are possible" at that level. H2 reads from a snapshot (MVCC), so the re-run count still saw 2. The docs describe what's allowed; this run shows what one version actually did. Don't rely on behaviour the docs don't promise.</li>
+  <li><b>The lost update is caught by an error, not prevented by waiting.</b> At REPEATABLE READ, T2's <code>UPDATE</code> of a row T1 had changed since T2's snapshot fails with SQLState <code>40001</code>. The message is misleading. The real one reads <code>Deadlock detected. The current transaction was rolled back. Details: "ACCOUNTS"</code>, although there was no deadlock, only a conflicting update. T2 was rolled back, and the application must <b>retry</b> it.</li>
+  <li><b>Write skew happens even at SERIALIZABLE</b>, which is exactly the caveat in H2's docs. On PostgreSQL, SERIALIZABLE would abort one of the two doctors (see below). Here, you have to prevent it yourself; the exercise shows how.</li>
+</ul>
+<p>Step through each scenario. Pick a level to see how the same steps play out:</p>
+<div class="txviz" data-src="tx-anomalies"></div>
+<script type="application/json" id="tx-anomalies">
+{ "levels": ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
+  "modes": [
+    { "name": "Dirty read", "row": "Ada (committed)",
+      "verdict": { "READ UNCOMMITTED": "happens", "READ COMMITTED": "prevented", "REPEATABLE READ": "prevented", "SERIALIZABLE": "prevented" },
+      "steps": [
+        { "t1": "UPDATE Ada = 0", "t2": "", "row": "10000",
+          "note": "T1 sets Ada's balance to 0 but has <b>not</b> committed. The committed value is still 10000." },
+        { "t1": "", "t2": { "*": "SELECT → 10000", "READ UNCOMMITTED": "SELECT → 0" }, "row": "10000",
+          "note": { "*": "T2 reads the last <em>committed</em> value. H2: \"if connection A updates a row but doesn't commit this change yet, connection B will see the old value.\"", "READ UNCOMMITTED": "T2 reads T1's <em>uncommitted</em> 0. That's a dirty read." } },
+        { "t1": "ROLLBACK", "t2": "", "row": "10000",
+          "note": { "*": "T1 rolls back. T2 never saw a value that didn't really exist.", "READ UNCOMMITTED": "T1 rolls back. T2 acted on a 0 that never existed." } } ] },
+    { "name": "Non-repeatable read", "row": "Ada (committed)",
+      "verdict": { "READ UNCOMMITTED": "happens", "READ COMMITTED": "happens", "REPEATABLE READ": "prevented", "SERIALIZABLE": "prevented" },
+      "steps": [
+        { "t1": "SELECT → 10000", "t2": "", "row": "10000", "note": "T1 reads Ada's balance." },
+        { "t1": "", "t2": "UPDATE Ada = 9000; COMMIT", "row": "9000", "note": "T2 changes it and commits." },
+        { "t1": { "*": "SELECT → 10000", "READ UNCOMMITTED": "SELECT → 9000", "READ COMMITTED": "SELECT → 9000" }, "t2": "", "row": "9000",
+          "note": { "*": "T1 reads again and still gets 10000: it reads from the snapshot taken at its first read.", "READ UNCOMMITTED": "T1 reads again and gets 9000. Same query, same transaction, different answer.", "READ COMMITTED": "T1 reads again and gets 9000. Each statement sees whatever is committed <em>now</em>." } } ] },
+    { "name": "Phantom read", "row": "rows > 1000",
+      "verdict": { "READ UNCOMMITTED": "happens", "READ COMMITTED": "happens", "REPEATABLE READ": "prevented", "SERIALIZABLE": "prevented" },
+      "steps": [
+        { "t1": "COUNT(*) WHERE balance > 1000 → 2", "t2": "", "row": "2", "note": "T1 counts accounts with more than 10.00." },
+        { "t1": "", "t2": "INSERT Cy 7000; COMMIT", "row": "3", "note": "T2 inserts a new matching row and commits." },
+        { "t1": { "*": "same COUNT → 2", "READ UNCOMMITTED": "same COUNT → 3", "READ COMMITTED": "same COUNT → 3" }, "t2": "", "row": "3",
+          "note": { "*": "Still 2. H2's docs allow phantoms at REPEATABLE READ, but its snapshot hid the new row in this run.", "SERIALIZABLE": "Still 2: the new row is invisible to T1's snapshot.", "READ UNCOMMITTED": "3: a phantom row appeared.", "READ COMMITTED": "3: a phantom row appeared." } } ] },
+    { "name": "Lost update", "row": "Ada (committed)",
+      "verdict": { "READ UNCOMMITTED": "happens", "READ COMMITTED": "happens", "REPEATABLE READ": "prevented", "SERIALIZABLE": "prevented" },
+      "steps": [
+        { "t1": "SELECT → 10000", "t2": "", "row": "10000", "note": "T1 reads the balance, planning to add 1000." },
+        { "t1": "", "t2": "SELECT → 10000", "row": "10000", "note": "T2 reads the same balance, also planning to add 1000." },
+        { "t1": "UPDATE = 11000; COMMIT", "t2": "", "row": "11000", "note": "T1 writes 10000 + 1000 and commits." },
+        { "t1": "", "t2": { "*": "UPDATE = 11000; COMMIT", "REPEATABLE READ": "ERROR 40001, rolled back", "SERIALIZABLE": "ERROR 40001, rolled back" },
+          "row": { "*": "11000 (should be 12000)", "REPEATABLE READ": "11000 (T2 must retry)", "SERIALIZABLE": "11000 (T2 must retry)" },
+          "note": { "*": "T2 writes 10000 + 1000 too. T1's deposit is silently gone.", "REPEATABLE READ": "H2 refuses: the row changed since T2's snapshot. T2 is rolled back with SQLState 40001 and must start over.", "SERIALIZABLE": "H2 refuses: the row changed since T2's snapshot. T2 is rolled back with SQLState 40001 and must start over." } } ] },
+    { "name": "Write skew", "row": "doctors on call",
+      "verdict": { "READ UNCOMMITTED": "happens", "READ COMMITTED": "happens", "REPEATABLE READ": "happens", "SERIALIZABLE": "happens" },
+      "steps": [
+        { "t1": "COUNT on call → 2", "t2": "", "row": "2", "note": "Rule: at least one doctor stays on call. Alice's transaction checks: 2 on call, so she may leave." },
+        { "t1": "", "t2": "COUNT on call → 2", "row": "2", "note": "Bob's transaction checks too: 2 on call, so he may leave." },
+        { "t1": "UPDATE alice off", "t2": "", "row": "2", "note": "Alice updates <em>her</em> row." },
+        { "t1": "", "t2": "UPDATE bob off", "row": "2", "note": "Bob updates <em>his</em> row. Different rows, so there's no lock conflict." },
+        { "t1": "COMMIT", "t2": "COMMIT", "row": "0: rule broken",
+          "note": { "*": "Both commit. Nobody is on call.", "SERIALIZABLE": "Both commit, even at SERIALIZABLE. H2's docs warn about exactly this; PostgreSQL's SERIALIZABLE would abort one of them." } } ] } ] }
+</script>
+
+<h3>Fixing the lost update</h3>
+<p>Now the realistic version of the problem: four threads, each making 250 deposits of one cent, at the default READ COMMITTED level. The balance should end at 1000. Four ways to write "add one cent":</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LostUpdate.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+
+const val URL = "jdbc:h2:mem:counter;DB_CLOSE_DELAY=-1"
+const val THREADS = 4
+const val DEPOSITS = 250                       // each thread adds 1 cent this many times: expect 1000
+
+fun connect(): Connection = DriverManager.getConnection(URL).apply {
+    createStatement().use { it.execute("SET LOCK_TIMEOUT 10000") }   // READ COMMITTED: H2's default
+    autoCommit = false
+}
+
+fun Connection.int(sql: String, vararg args: Int): Int = prepareStatement(sql).use { ps -&gt;
+    args.forEachIndexed { i, a -&gt; ps.setInt(i + 1, a) }
+    ps.executeQuery().use { it.next(); it.getInt(1) }
+}
+fun Connection.update(sql: String, vararg args: Int): Int = prepareStatement(sql).use { ps -&gt;
+    args.forEachIndexed { i, a -&gt; ps.setInt(i + 1, a) }
+    ps.executeUpdate()
+}
+
+val retries = AtomicInteger()
+
+// Four ways to add one cent. Each call is one transaction.
+val strategies: Map&lt;String, (Connection) -&gt; Unit&gt; = linkedMapOf(
+    "read, then write" to { c -&gt;
+        val b = c.int("SELECT balance_cents FROM accounts WHERE id = 1")
+        c.update("UPDATE accounts SET balance_cents = ? WHERE id = 1", b + 1)
+        c.commit()
+    },
+    "atomic UPDATE" to { c -&gt;
+        c.update("UPDATE accounts SET balance_cents = balance_cents + 1 WHERE id = 1")
+        c.commit()
+    },
+    "SELECT FOR UPDATE" to { c -&gt;
+        val b = c.int("SELECT balance_cents FROM accounts WHERE id = 1 FOR UPDATE")   // row locked until commit
+        c.update("UPDATE accounts SET balance_cents = ? WHERE id = 1", b + 1)
+        c.commit()
+    },
+    "optimistic version" to { c -&gt;
+        while (true) {
+            val (b, v) = c.prepareStatement("SELECT balance_cents, version FROM accounts WHERE id = 1").use { ps -&gt;
+                ps.executeQuery().use { it.next(); it.getInt(1) to it.getInt(2) }   // ONE read: a consistent pair
+            }
+            val changed = c.update("UPDATE accounts SET balance_cents = ?, version = version + 1 " +
+                                   "WHERE id = 1 AND version = ?", b + 1, v)
+            c.commit()
+            if (changed == 1) break                   // nobody else wrote since we read
+            retries.incrementAndGet()                 // someone did: read again and retry
+        }
+    },
+)
+
+fun main() {
+    for ((name, deposit) in strategies) {
+        repeat(if (name == "read, then write") 3 else 1) {
+            connect().use { c -&gt;
+                c.update("DROP TABLE IF EXISTS accounts")
+                c.update("CREATE TABLE accounts (id INT PRIMARY KEY, balance_cents INT NOT NULL, version INT NOT NULL)")
+                c.update("INSERT INTO accounts VALUES (1, 0, 0)"); c.commit()
+            }
+            retries.set(0)
+            val gate = CountDownLatch(1)
+            val start = System.nanoTime()
+            Executors.newFixedThreadPool(THREADS).use { pool -&gt;
+                repeat(THREADS) {
+                    pool.submit { connect().use { c -&gt; gate.await(); repeat(DEPOSITS) { deposit(c) } } }
+                }
+                gate.countDown()
+            }                                               // close() waits for every task
+            val ms = (System.nanoTime() - start) / 1_000_000
+            val total = connect().use { it.int("SELECT balance_cents FROM accounts WHERE id = 1") }
+            println("%-19s balance %4d of %d  (%d ms%s)".format(name, total, THREADS * DEPOSITS, ms,
+                if (name.startsWith("optimistic")) ", ${retries.get()} retries" else ""))
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LostUpdate.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class LostUpdate {
+    static final String URL = "jdbc:h2:mem:counter;DB_CLOSE_DELAY=-1";
+    static final int THREADS = 4, DEPOSITS = 250;   // each thread adds 1 cent this many times: expect 1000
+    static final AtomicInteger retries = new AtomicInteger();
+
+    @FunctionalInterface interface Deposit { void run(Connection c) throws SQLException; }
+
+    static Connection connect() throws SQLException {
+        Connection c = DriverManager.getConnection(URL);
+        try (Statement st = c.createStatement()) { st.execute("SET LOCK_TIMEOUT 10000"); }   // READ COMMITTED: H2's default
+        c.setAutoCommit(false);
+        return c;
+    }
+    static int intOf(Connection c, String sql, int... args) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            for (int i = 0; i &lt; args.length; i++) ps.setInt(i + 1, args[i]);
+            try (ResultSet rs = ps.executeQuery()) { rs.next(); return rs.getInt(1); }
+        }
+    }
+    static int update(Connection c, String sql, int... args) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            for (int i = 0; i &lt; args.length; i++) ps.setInt(i + 1, args[i]);
+            return ps.executeUpdate();
+        }
+    }
+
+    public static void main(String[] a) throws Exception {
+        // Four ways to add one cent. Each call is one transaction.
+        Map&lt;String, Deposit&gt; strategies = new LinkedHashMap&lt;&gt;();
+        strategies.put("read, then write", c -&gt; {
+            int b = intOf(c, "SELECT balance_cents FROM accounts WHERE id = 1");
+            update(c, "UPDATE accounts SET balance_cents = ? WHERE id = 1", b + 1);
+            c.commit();
+        });
+        strategies.put("atomic UPDATE", c -&gt; {
+            update(c, "UPDATE accounts SET balance_cents = balance_cents + 1 WHERE id = 1");
+            c.commit();
+        });
+        strategies.put("SELECT FOR UPDATE", c -&gt; {
+            int b = intOf(c, "SELECT balance_cents FROM accounts WHERE id = 1 FOR UPDATE");   // row locked until commit
+            update(c, "UPDATE accounts SET balance_cents = ? WHERE id = 1", b + 1);
+            c.commit();
+        });
+        strategies.put("optimistic version", c -&gt; {
+            while (true) {
+                int b, v;
+                try (PreparedStatement ps = c.prepareStatement("SELECT balance_cents, version FROM accounts WHERE id = 1");
+                     ResultSet rs = ps.executeQuery()) {
+                    rs.next(); b = rs.getInt(1); v = rs.getInt(2);        // ONE read: a consistent pair
+                }
+                int changed = update(c, "UPDATE accounts SET balance_cents = ?, version = version + 1 "
+                                      + "WHERE id = 1 AND version = ?", b + 1, v);
+                c.commit();
+                if (changed == 1) break;                  // nobody else wrote since we read
+                retries.incrementAndGet();                // someone did: read again and retry
+            }
+        });
+
+        for (var e : strategies.entrySet()) {
+            int runs = e.getKey().equals("read, then write") ? 3 : 1;
+            for (int r = 0; r &lt; runs; r++) {
+                try (Connection c = connect()) {
+                    update(c, "DROP TABLE IF EXISTS accounts");
+                    update(c, "CREATE TABLE accounts (id INT PRIMARY KEY, balance_cents INT NOT NULL, version INT NOT NULL)");
+                    update(c, "INSERT INTO accounts VALUES (1, 0, 0)"); c.commit();
+                }
+                retries.set(0);
+                CountDownLatch gate = new CountDownLatch(1);
+                long start = System.nanoTime();
+                try (ExecutorService pool = Executors.newFixedThreadPool(THREADS)) {
+                    for (int t = 0; t &lt; THREADS; t++) {
+                        pool.submit(() -&gt; {
+                            try (Connection c = connect()) {
+                                gate.await();
+                                for (int i = 0; i &lt; DEPOSITS; i++) e.getValue().run(c);
+                            }
+                            return null;
+                        });
+                    }
+                    gate.countDown();
+                }                                         // close() waits for every task
+                long ms = (System.nanoTime() - start) / 1_000_000;
+                int total;
+                try (Connection c = connect()) { total = intOf(c, "SELECT balance_cents FROM accounts WHERE id = 1"); }
+                System.out.printf("%-19s balance %4d of %d  (%d ms%s)%n", e.getKey(), total, THREADS * DEPOSITS, ms,
+                        e.getKey().startsWith("optimistic") ? ", " + retries.get() + " retries" : "");
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">read, then write    balance  311 of 1000  (43 ms)
+read, then write    balance  271 of 1000  (20 ms)
+read, then write    balance  281 of 1000  (18 ms)
+atomic UPDATE       balance 1000 of 1000  (13 ms)
+SELECT FOR UPDATE   balance 1000 of 1000  (24 ms)
+optimistic version  balance 1000 of 1000  (24 ms, 1871 retries)</pre>
+<pre class="out">read, then write    balance  280 of 1000  (39 ms)
+read, then write    balance  294 of 1000  (17 ms)
+read, then write    balance  299 of 1000  (14 ms)
+atomic UPDATE       balance 1000 of 1000  (13 ms)
+SELECT FOR UPDATE   balance 1000 of 1000  (26 ms)
+optimistic version  balance 1000 of 1000  (24 ms, 1995 retries)</pre>
+</div>
+<p>Real concurrency, so your numbers will differ from run to run. That's the point: "read, then write" lost about 70% of the deposits, and differently every time.</p>
+<ul>
+  <li><b>Atomic <code>UPDATE … SET balance = balance + 1</code>:</b> the read and the write are one statement, and the row lock is held between them. Use this whenever the new value can be computed in SQL. It's the <code>AtomicInteger.incrementAndGet()</code> of databases (L26).</li>
+  <li><b><code>SELECT … FOR UPDATE</code>:</b> pessimistic locking. The read takes the row lock, so the next transaction's <code>SELECT … FOR UPDATE</code> waits until this one commits. Use it when the new value needs Kotlin or Java code to compute. H2 supports it; the waiting shows up as slightly more time.</li>
+  <li><b>Optimistic locking with a <code>version</code> column:</b> no locks while you think. Write with <code>WHERE id = ? AND version = ?</code>. If the update count is 0, someone else got there first, so read again and retry. It's L26's compare-and-set loop in SQL, and it's how JPA's <code>@Version</code> works. It shines when conflicts are rare. Here, with four threads fighting over one row, it needed nearly 2,000 retries for 1,000 deposits.</li>
+</ul>
+<p class="callout"><b>A bug I wrote first, and what it shows.</b> My first optimistic version read the balance and the version with <em>two separate</em> <code>SELECT</code>s. At READ COMMITTED, another transaction can commit between them. I'd pair an old balance with a new version, the version check would pass, and a deposit would vanish. That run printed <code>optimistic version  balance  727 of 1000  (25 ms, 1599 retries)</code>: wrong, despite all the retrying. Reading both columns in <b>one</b> statement fixed it. A version check only protects the values you read <em>with</em> that version.</p>
+
+<h3>Deadlock in the database</h3>
+<p>L27's deadlock, with rows instead of locks. Two transfers lock the two account rows in opposite orders; a barrier makes sure each holds its first row before reaching for the second:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Deadlock.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.SQLException
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executors
+
+const val URL = "jdbc:h2:mem:dl;DB_CLOSE_DELAY=-1"
+
+fun connect(): Connection = DriverManager.getConnection(URL).apply {
+    createStatement().use { it.execute("SET LOCK_TIMEOUT 5000") }
+    autoCommit = false
+}
+
+fun Connection.add(id: Int, cents: Int) =
+    prepareStatement("UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?").use {
+        it.setInt(1, cents); it.setInt(2, id); it.executeUpdate()
+    }
+
+// Unordered: lock src then dst, and wait at the barrier so both threads hold their first row.
+// Ordered: always lock the lower id first. (No barrier: the second thread waits on the row lock instead.)
+fun transfer(src: Int, dst: Int, cents: Int, ordered: Boolean, barrier: CyclicBarrier): String =
+    connect().use { c -&gt;
+        try {
+            val first = if (!ordered || src &lt; dst) src else dst
+            val second = if (first == src) dst else src
+            c.add(first, if (first == src) -cents else cents)
+            if (!ordered) barrier.await()
+            c.add(second, if (second == src) -cents else cents)
+            c.commit()
+            "$src-&gt;$dst committed"
+        } catch (e: SQLException) {
+            c.rollback()
+            "$src-&gt;$dst [${e.sqlState}] ${e.message!!.substringBefore(" Details")}"
+        }
+    }
+
+fun main() {
+    DriverManager.getConnection(URL).use { c -&gt;
+        c.createStatement().use {
+            it.execute("CREATE TABLE accounts (id INT PRIMARY KEY, balance_cents INT NOT NULL)")
+            it.execute("INSERT INTO accounts VALUES (1, 10000), (2, 5000)")
+        }
+    }
+    for (ordered in listOf(false, true)) {
+        println(if (ordered) "== lock in id order" else "== lock in argument order")
+        val barrier = CyclicBarrier(2)
+        val start = System.nanoTime()
+        Executors.newFixedThreadPool(2).use { pool -&gt;
+            val a = pool.submit&lt;String&gt; { transfer(1, 2, 100, ordered, barrier) }
+            val b = pool.submit&lt;String&gt; { transfer(2, 1, 300, ordered, barrier) }
+            println("  " + a.get()); println("  " + b.get())
+        }
+        println("  took ${(System.nanoTime() - start) / 1_000_000} ms")
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Deadlock.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.concurrent.*;
+
+public class Deadlock {
+    static final String URL = "jdbc:h2:mem:dl;DB_CLOSE_DELAY=-1";
+
+    static Connection connect() throws SQLException {
+        Connection c = DriverManager.getConnection(URL);
+        try (Statement st = c.createStatement()) { st.execute("SET LOCK_TIMEOUT 5000"); }
+        c.setAutoCommit(false);
+        return c;
+    }
+
+    static void add(Connection c, int id, int cents) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement("UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?")) {
+            ps.setInt(1, cents); ps.setInt(2, id); ps.executeUpdate();
+        }
+    }
+
+    // Unordered: lock src then dst, and wait at the barrier so both threads hold their first row.
+    // Ordered: always lock the lower id first. (No barrier: the second thread waits on the row lock instead.)
+    static String transfer(int src, int dst, int cents, boolean ordered, CyclicBarrier barrier) throws Exception {
+        try (Connection c = connect()) {
+            try {
+                int first = (!ordered || src &lt; dst) ? src : dst;
+                int second = first == src ? dst : src;
+                add(c, first, first == src ? -cents : cents);
+                if (!ordered) barrier.await();
+                add(c, second, second == src ? -cents : cents);
+                c.commit();
+                return src + "-&gt;" + dst + " committed";
+            } catch (SQLException e) {
+                c.rollback();
+                return src + "-&gt;" + dst + " [" + e.getSQLState() + "] " + e.getMessage().split(" Details")[0];
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        try (Connection c = DriverManager.getConnection(URL); Statement st = c.createStatement()) {
+            st.execute("CREATE TABLE accounts (id INT PRIMARY KEY, balance_cents INT NOT NULL)");
+            st.execute("INSERT INTO accounts VALUES (1, 10000), (2, 5000)");
+        }
+        for (boolean ordered : new boolean[]{false, true}) {
+            System.out.println(ordered ? "== lock in id order" : "== lock in argument order");
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            long start = System.nanoTime();
+            try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+                Future&lt;String&gt; a = pool.submit(() -&gt; transfer(1, 2, 100, ordered, barrier));
+                Future&lt;String&gt; b = pool.submit(() -&gt; transfer(2, 1, 300, ordered, barrier));
+                System.out.println("  " + a.get()); System.out.println("  " + b.get());
+            }
+            System.out.println("  took " + (System.nanoTime() - start) / 1_000_000 + " ms");
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">== lock in argument order
+  1->2 committed
+  2->1 [40001] Deadlock detected. The current transaction was rolled back.
+  took 13 ms
+== lock in id order
+  1->2 committed
+  2->1 committed
+  took 0 ms</pre>
+<pre class="out">== lock in argument order
+  1->2 committed
+  2->1 [40001] Deadlock detected. The current transaction was rolled back.
+  took 8 ms
+== lock in id order
+  1->2 committed
+  2->1 committed
+  took 0 ms</pre>
+</div>
+<p>Unlike L27's JVM deadlock, which hung until your watchdog noticed, H2 found the cycle in about 10 ms and rolled one transaction back. Which one is the victim varies; in an earlier run it was <code>1->2</code>. Databases detect deadlocks because applications can't, but the victim's work is lost, so the cure is the same as in L27: lock in one global order, here by id. When a lock is merely <em>held</em> too long rather than deadlocked, H2 waits for the lock timeout and then fails with SQLState <code>HYT00</code>, "Timeout trying to lock table". With the 300 ms setting, that took 313 ms in a separate run.</p>
+
+<h3>SQLite: one writer at a time</h3>
+<p>SQLite takes a much simpler approach. "All transactions in SQLite show 'serializable' isolation. SQLite implements serializable transactions by actually serializing the writes. There can only be a single writer at a time to an SQLite database" (<a href="https://www.sqlite.org/isolation.html">SQLite: Isolation</a>). A second writer waits up to its busy timeout, then gets <code>SQLITE_BUSY</code>:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · SqliteBusy.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.SQLException
+
+fun Connection.sql(s: String) = createStatement().use { it.executeUpdate(s) }
+fun Connection.balance(): Int = createStatement().use { st -&gt;
+    st.executeQuery("SELECT balance_cents FROM accounts WHERE id = 1").use { it.next(); it.getInt(1) }
+}
+
+fun main() {
+    val file = Files.createTempFile("bank", ".db")
+    val url = "jdbc:sqlite:$file"
+    try {
+        DriverManager.getConnection(url).use { a -&gt;
+            DriverManager.getConnection(url).use { b -&gt;
+                a.sql("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance_cents INTEGER NOT NULL)")
+                a.sql("INSERT INTO accounts VALUES (1, 10000)")
+                b.sql("PRAGMA busy_timeout = 200")              // wait at most 0.2 s for the write lock
+
+                a.autoCommit = false
+                a.sql("UPDATE accounts SET balance_cents = 9000 WHERE id = 1")   // a now holds the write lock
+                println("b reads while a writes: ${b.balance()}")              // sees the committed 10000
+                val t0 = System.nanoTime()
+                try {
+                    b.sql("UPDATE accounts SET balance_cents = 8000 WHERE id = 1")
+                } catch (e: SQLException) {
+                    println("b writes after ${(System.nanoTime() - t0) / 1_000_000} ms: ${e.message}")
+                }
+                a.commit()
+                b.sql("UPDATE accounts SET balance_cents = balance_cents - 1000 WHERE id = 1")
+                println("after a commits, b's write works: ${b.balance()}")
+            }
+        }
+    } finally {
+        Files.deleteIfExists(file)
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · SqliteBusy.java</figcaption>
+<pre><code class="language-java">import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.*;
+
+public class SqliteBusy {
+    static void sql(Connection c, String s) throws SQLException {
+        try (Statement st = c.createStatement()) { st.executeUpdate(s); }
+    }
+    static int balance(Connection c) throws SQLException {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT balance_cents FROM accounts WHERE id = 1")) {
+            rs.next(); return rs.getInt(1);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path file = Files.createTempFile("bank", ".db");
+        String url = "jdbc:sqlite:" + file;
+        try (Connection a = DriverManager.getConnection(url); Connection b = DriverManager.getConnection(url)) {
+            sql(a, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance_cents INTEGER NOT NULL)");
+            sql(a, "INSERT INTO accounts VALUES (1, 10000)");
+            sql(b, "PRAGMA busy_timeout = 200");              // wait at most 0.2 s for the write lock
+
+            a.setAutoCommit(false);
+            sql(a, "UPDATE accounts SET balance_cents = 9000 WHERE id = 1");   // a now holds the write lock
+            System.out.println("b reads while a writes: " + balance(b));      // sees the committed 10000
+            long t0 = System.nanoTime();
+            try {
+                sql(b, "UPDATE accounts SET balance_cents = 8000 WHERE id = 1");
+            } catch (SQLException e) {
+                System.out.println("b writes after " + (System.nanoTime() - t0) / 1_000_000 + " ms: " + e.getMessage());
+            }
+            a.commit();
+            sql(b, "UPDATE accounts SET balance_cents = balance_cents - 1000 WHERE id = 1");
+            System.out.println("after a commits, b's write works: " + balance(b));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">b reads while a writes: 10000
+b writes after 259 ms: [SQLITE_BUSY] The database file is locked (database is locked)
+after a commits, b's write works: 8000</pre>
+<p>Readers aren't blocked; they see the last committed value. Writers queue. The SQLite JDBC driver's default busy timeout is 3000 ms (its <code>SQLiteConfig</code> source); this demo lowers it to 200 so you don't wait. One subtlety matters in the final: SQLite's default transaction is <code>DEFERRED</code>, which "does not actually start until the database is first accessed". A transaction that reads first and writes later may be unable to upgrade: "If some other database connection has already modified the database … the write statement will fail with SQLITE_BUSY". <code>IMMEDIATE</code> instead "causes the database connection to start a new write immediately" (<a href="https://www.sqlite.org/lang_transaction.html">SQLite: BEGIN TRANSACTION</a>). You'll see the difference in a failing test.</p>
+
+<h3>PostgreSQL, for comparison (from its docs; not run here)</h3>
+<p>PostgreSQL isn't installed for this course, but you'll meet it in Spring projects, so know how it differs. Its REPEATABLE READ "only sees data committed before the transaction began" and "prevents all of the phenomena described in Table 13.1 except for serialization anomalies". When a repeatable-read transaction tries to change a row someone else changed, it fails with <code>ERROR: could not serialize access due to concurrent update</code>, and "the application … should abort the current transaction and retry the whole transaction from the beginning". Its SERIALIZABLE uses Serializable Snapshot Isolation, which does detect write skew and aborts one transaction (<a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL: Transaction Isolation</a>). The lesson carries over: <b>stronger isolation turns silent bugs into errors, and errors mean retries</b>.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Function types for strategies.</b> <code>Map&lt;String, (Connection) -&gt; Unit&gt;</code> holds the four deposit strategies directly. Java needs its own <code>Deposit</code> interface again, because a lambda passed as <code>Consumer&lt;Connection&gt;</code> can't throw <code>SQLException</code>.</li>
+    <li><b>Destructuring.</b> <code>val (b, v) = … it.getInt(1) to it.getInt(2)</code> returns the balance and version as a <code>Pair</code> from one read. Java declares two variables and assigns them inside the try block.</li>
+    <li><b><code>Executors.newFixedThreadPool(4).use { }</code></b>: since JDK 19, <code>ExecutorService</code> is <code>AutoCloseable</code> (L28), and Kotlin's <code>use</code> works on it as on any closeable.</li>
+    <li><b>Nothing new at runtime.</b> Isolation is a database property. Both languages send identical SQL, which is why they print identical tables.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: stop the write skew</div>
+  <p>From a blank file, in both languages. Write skew happened at every H2 level, so isolation alone won't save the doctors. Make the conflict concrete instead: if both transactions <em>lock the rows they read</em>, the second checker has to wait for the first one's decision.</p>
+  <ol>
+    <li>Create <code>doctors(name, on_call)</code> with Alice and Bob on call. Write <code>goOffCall(name, lock)</code>: count the doctors on call, and if there are at least 2, set yourself off call, then commit.</li>
+    <li>Run Alice and Bob on two real threads. With a plain <code>SELECT</code>, use a latch so both check before either writes. Show that 0 doctors are left.</li>
+    <li>Change the check to <code>SELECT name FROM doctors WHERE on_call FOR UPDATE</code> and count the rows in code. Show that exactly 1 doctor is left, on every run.</li>
+  </ol>
+<pre class="out">== plain SELECT
+  alice saw 2 on call, went off
+  bob saw 2 on call, went off
+  on call now: 0
+== with FOR UPDATE
+  alice saw 1 on call, stayed
+  bob saw 2 on call, went off
+  on call now: 1</pre>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex2.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+
+const val URL = "jdbc:h2:mem:oncall;DB_CLOSE_DELAY=-1"
+
+fun connect(): Connection = DriverManager.getConnection(URL).apply {
+    createStatement().use { it.execute("SET LOCK_TIMEOUT 5000") }
+    autoCommit = false
+}
+
+fun Connection.onCall(lock: Boolean): Int =
+    createStatement().use { st -&gt;
+        // FOR UPDATE locks every row it returns until commit, so a second checker must wait its turn.
+        st.executeQuery("SELECT name FROM doctors WHERE on_call" + if (lock) " FOR UPDATE" else "").use { rs -&gt;
+            var n = 0; while (rs.next()) n++; n
+        }
+    }
+
+fun goOffCall(name: String, lock: Boolean, bothChecked: CountDownLatch): String = connect().use { c -&gt;
+    val seen = c.onCall(lock)
+    bothChecked.countDown()
+    if (!lock) bothChecked.await()          // unlocked run: make both check before either writes
+    val result = if (seen &gt;= 2) {
+        c.prepareStatement("UPDATE doctors SET on_call = FALSE WHERE name = ?").use { it.setString(1, name); it.executeUpdate() }
+        "$name saw $seen on call, went off"
+    } else "$name saw $seen on call, stayed"
+    c.commit()
+    result
+}
+
+fun main() {
+    for (lock in listOf(false, true)) {
+        connect().use { c -&gt;
+            c.createStatement().use {
+                it.execute("DROP TABLE IF EXISTS doctors")
+                it.execute("CREATE TABLE doctors (name VARCHAR(20) PRIMARY KEY, on_call BOOLEAN)")
+                it.execute("INSERT INTO doctors VALUES ('alice', TRUE), ('bob', TRUE)")
+            }
+            c.commit()
+        }
+        println(if (lock) "== with FOR UPDATE" else "== plain SELECT")
+        val bothChecked = CountDownLatch(2)
+        Executors.newFixedThreadPool(2).use { pool -&gt;
+            val a = pool.submit&lt;String&gt; { goOffCall("alice", lock, bothChecked) }
+            val b = pool.submit&lt;String&gt; { goOffCall("bob", lock, bothChecked) }
+            println("  " + a.get()); println("  " + b.get())
+        }
+        println("  on call now: " + connect().use { it.onCall(false) })
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex2.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.concurrent.*;
+
+public class Ex2 {
+    static final String URL = "jdbc:h2:mem:oncall;DB_CLOSE_DELAY=-1";
+
+    static Connection connect() throws SQLException {
+        Connection c = DriverManager.getConnection(URL);
+        try (Statement st = c.createStatement()) { st.execute("SET LOCK_TIMEOUT 5000"); }
+        c.setAutoCommit(false);
+        return c;
+    }
+
+    static int onCall(Connection c, boolean lock) throws SQLException {
+        // FOR UPDATE locks every row it returns until commit, so a second checker must wait its turn.
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT name FROM doctors WHERE on_call" + (lock ? " FOR UPDATE" : ""))) {
+            int n = 0; while (rs.next()) n++; return n;
+        }
+    }
+
+    static String goOffCall(String name, boolean lock, CountDownLatch bothChecked) throws Exception {
+        try (Connection c = connect()) {
+            int seen = onCall(c, lock);
+            bothChecked.countDown();
+            if (!lock) bothChecked.await();          // unlocked run: make both check before either writes
+            String result;
+            if (seen &gt;= 2) {
+                try (PreparedStatement ps = c.prepareStatement("UPDATE doctors SET on_call = FALSE WHERE name = ?")) {
+                    ps.setString(1, name); ps.executeUpdate();
+                }
+                result = name + " saw " + seen + " on call, went off";
+            } else result = name + " saw " + seen + " on call, stayed";
+            c.commit();
+            return result;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        for (boolean lock : new boolean[]{false, true}) {
+            try (Connection c = connect(); Statement st = c.createStatement()) {
+                st.execute("DROP TABLE IF EXISTS doctors");
+                st.execute("CREATE TABLE doctors (name VARCHAR(20) PRIMARY KEY, on_call BOOLEAN)");
+                st.execute("INSERT INTO doctors VALUES ('alice', TRUE), ('bob', TRUE)");
+                c.commit();
+            }
+            System.out.println(lock ? "== with FOR UPDATE" : "== plain SELECT");
+            CountDownLatch bothChecked = new CountDownLatch(2);
+            try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+                Future&lt;String&gt; a = pool.submit(() -&gt; goOffCall("alice", lock, bothChecked));
+                Future&lt;String&gt; b = pool.submit(() -&gt; goOffCall("bob", lock, bothChecked));
+                System.out.println("  " + a.get()); System.out.println("  " + b.get());
+            }
+            try (Connection c = connect()) { System.out.println("  on call now: " + onCall(c, false)); }
+        }
+    }
+}</code></pre></figure>
+    </div>
+    <p>Which doctor wins the race varies; in this run Bob locked the rows first, so Alice waited, then saw only 1 doctor on call and stayed. I ran both versions three times each and always got 0 without the lock and 1 with it. Why <code>FOR UPDATE</code> and not <code>COUNT(*) … FOR UPDATE</code>? You need to lock the actual rows. An aggregate returns one computed row, not the rows you're relying on. Note what this fix needs: the rows you read must exist. If the rule were "at most 3 bookings for a time slot", there might be no row to lock yet. DDIA ch. 7 calls the fix for that case "materializing conflicts".</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Isolation" data-answer="0">
+  <p class="q">H2, READ COMMITTED: T1 reads 10000, T2 updates the row to 9000 and commits, T1 reads again.</p>
+  <div class="opts"><button>Gives 9000</button><button>Gives 10000</button><button>Throws exception</button><button>Waits forever</button></div>
+  <p class="why">A non-repeatable read. At READ COMMITTED, each statement sees whatever is committed when it runs. At REPEATABLE READ, the second read gave 10000.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Isolation" data-answer="2">
+  <p class="q">H2, REPEATABLE READ: T1 and T2 both read 10000, T1 writes 11000 and commits, then T2 writes 11000. What happens to T2?</p>
+  <div class="opts"><button>Gives 12000</button><button>Gives 11000</button><button>Throws exception</button><button>Waits forever</button></div>
+  <p class="why">SQLState 40001 ("Deadlock detected…"), and T2 is rolled back. The lost update is caught, not prevented, so the application must retry T2. At READ COMMITTED, the same steps silently ended at 11000.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Isolation" data-answer="1">
+  <p class="q">H2, SERIALIZABLE: both doctors count 2 on call, each takes only themselves off call, both commit. How many on call?</p>
+  <div class="opts"><button>Gives 1</button><button>Gives 0</button><button>Gives 2</button><button>Throws exception</button></div>
+  <p class="why">Write skew got through even at SERIALIZABLE, as H2's docs warn ("doesn't ensure equivalence … for transactions that perform write operations"). Locking the rows you read with <code>FOR UPDATE</code> fixed it.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Isolation" data-answer="3">
+  <p class="q"><code>UPDATE accounts SET balance_cents = ?, version = version + 1 WHERE id = 1 AND version = 7</code> returns 0. What does that mean?</p>
+  <div class="opts"><button>The SQL syntax was invalid</button><button>The table needs an index</button><button>The commit already happened twice</button><button>Another transaction changed it first</button></div>
+  <p class="why">The row's version is no longer 7, so someone committed a change after you read it. Optimistic locking says: read again, recompute, retry. (A deleted row would also give 0, which a real app should check for.)</p>
+</div>
+<div class="quiz" data-id="p2-5" data-group="Part 2 · Isolation" data-answer="1">
+  <p class="q">SQLite: connection A holds the write lock in an open transaction. Connection B, with <code>busy_timeout = 200</code>, runs an <code>UPDATE</code>.</p>
+  <div class="opts"><button>Waits forever</button><button>Throws exception</button><button>Overwrites silently</button><button>Merges both</button></div>
+  <p class="why">After waiting about 200 ms, B gets <code>[SQLITE_BUSY] The database file is locked</code>. SQLite allows one writer at a time. Readers still see the last committed value.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>JDBC by hand</h2><span class="t">~25 min</span></div>
+
+<p><dfn>JDBC</dfn> (Java Database Connectivity, package <code>java.sql</code>) is the standard API every JVM database library is built on. Spring's <code>JdbcTemplate</code>, Hibernate and Android's Room (which uses Android's own SQLite API rather than JDBC, but the same ideas) all end up sending SQL like yours. There are four types to know:</p>
+<table class="cmds">
+  <tr><th>Type</th><th>What it is</th><th>You get it from</th></tr>
+  <tr><td><code>Connection</code></td><td>A session with the database; owns the transaction</td><td><code>DriverManager.getConnection(url)</code></td></tr>
+  <tr><td><code>PreparedStatement</code></td><td>SQL with <code>?</code> placeholders, compiled once, run with values</td><td><code>c.prepareStatement(sql)</code></td></tr>
+  <tr><td><code>ResultSet</code></td><td>A cursor over the result rows</td><td><code>ps.executeQuery()</code></td></tr>
+  <tr><td><code>SQLException</code></td><td>Everything that goes wrong, with <code>getSQLState()</code></td><td>thrown by all of the above</td></tr>
+</table>
+<p>All three resources must be closed, innermost first: <code>use { }</code> in Kotlin, try-with-resources in Java (L10, L22). A <code>Connection</code> you forget to close is a leak (L24): it holds memory, a file handle and possibly locks.</p>
+
+<h3>The tour: queries, nulls, keys and update counts</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · JdbcTour.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.DriverManager
+import java.sql.ResultSet
+import java.sql.Statement
+import java.sql.Types
+
+data class Book(val id: Int, val title: String, val year: Int?)
+
+// Read every row with map, then return a List. The ResultSet is still open while we read it.
+fun &lt;T&gt; ResultSet.toList(map: (ResultSet) -&gt; T): List&lt;T&gt; = buildList { while (next()) add(map(this@toList)) }
+
+// getInt returns 0 for SQL NULL; wasNull() tells you which it really was.
+fun ResultSet.intOrNull(column: String): Int? = getInt(column).takeUnless { wasNull() }
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite:library.db").use { c -&gt;
+        // 1. A query with parameters, mapped to a data class.
+        val sql = "SELECT b.id, b.title, b.year FROM books b JOIN authors a ON a.id = b.author_id " +
+                  "WHERE a.name = ? ORDER BY b.year"
+        val books = c.prepareStatement(sql).use { ps -&gt;
+            ps.setString(1, "Anonymous")
+            ps.executeQuery().use { rs -&gt; rs.toList { Book(it.getInt("id"), it.getString("title"), it.intOrNull("year")) } }
+        }
+        books.forEach(::println)
+
+        c.autoCommit = false                                  // everything below gets rolled back
+        // 2. INSERT and read back the generated key; setNull for an unknown value.
+        val newId = c.prepareStatement("INSERT INTO members (name, email, joined) VALUES (?, ?, ?)",
+                                       Statement.RETURN_GENERATED_KEYS).use { ps -&gt;
+            ps.setString(1, "Frances Allen"); ps.setString(2, "frances@example.com"); ps.setNull(3, Types.VARCHAR)
+            println("rows inserted: ${ps.executeUpdate()}")
+            ps.generatedKeys.use { keys -&gt; keys.next(); keys.getInt(1) }
+        }
+        println("new member id: $newId")
+
+        // 3. executeUpdate returns how many rows changed.
+        val returned = c.prepareStatement("UPDATE loans SET returned = ? WHERE returned IS NULL AND member_id = ?").use { ps -&gt;
+            ps.setString(1, "2026-10-21"); ps.setInt(2, 1); ps.executeUpdate()
+        }
+        println("loans returned for member 1: $returned")
+
+        // 4. Streaming: a Sequence reads rows on demand, but only while the ResultSet is open.
+        c.createStatement().use { st -&gt;
+            st.executeQuery("SELECT title FROM books ORDER BY price_cents DESC, title").use { rs -&gt;
+                val titles = generateSequence { if (rs.next()) rs.getString(1) else null }
+                println("priciest: " + titles.take(3).joinToString())
+            }
+        }
+        c.rollback()
+        c.autoCommit = true
+        println("members after rollback: " + c.createStatement().use { st -&gt;
+            st.executeQuery("SELECT COUNT(*) FROM members").use { it.next(); it.getInt(1) } })
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · JdbcTour.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class JdbcTour {
+    record Book(int id, String title, Integer year) {}
+
+    @FunctionalInterface interface RowMapper&lt;T&gt; { T map(ResultSet rs) throws SQLException; }
+
+    // Read every row with mapper, then return a List. The ResultSet is still open while we read it.
+    static &lt;T&gt; List&lt;T&gt; toList(ResultSet rs, RowMapper&lt;T&gt; mapper) throws SQLException {
+        List&lt;T&gt; out = new ArrayList&lt;&gt;();
+        while (rs.next()) out.add(mapper.map(rs));
+        return out;
+    }
+
+    // getInt returns 0 for SQL NULL; wasNull() tells you which it really was.
+    static Integer intOrNull(ResultSet rs, String column) throws SQLException {
+        int v = rs.getInt(column);
+        return rs.wasNull() ? null : v;
+    }
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:library.db")) {
+            // 1. A query with parameters, mapped to a record.
+            String sql = "SELECT b.id, b.title, b.year FROM books b JOIN authors a ON a.id = b.author_id "
+                       + "WHERE a.name = ? ORDER BY b.year";
+            List&lt;Book&gt; books;
+            try (PreparedStatement ps = c.prepareStatement(sql)) {
+                ps.setString(1, "Anonymous");
+                try (ResultSet rs = ps.executeQuery()) {
+                    books = toList(rs, r -&gt; new Book(r.getInt("id"), r.getString("title"), intOrNull(r, "year")));
+                }
+            }
+            books.forEach(System.out::println);
+
+            c.setAutoCommit(false);                              // everything below gets rolled back
+            // 2. INSERT and read back the generated key; setNull for an unknown value.
+            int newId;
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO members (name, email, joined) VALUES (?, ?, ?)",
+                                                           Statement.RETURN_GENERATED_KEYS)) {
+                ps.setString(1, "Frances Allen"); ps.setString(2, "frances@example.com"); ps.setNull(3, Types.VARCHAR);
+                System.out.println("rows inserted: " + ps.executeUpdate());
+                try (ResultSet keys = ps.getGeneratedKeys()) { keys.next(); newId = keys.getInt(1); }
+            }
+            System.out.println("new member id: " + newId);
+
+            // 3. executeUpdate returns how many rows changed.
+            try (PreparedStatement ps = c.prepareStatement("UPDATE loans SET returned = ? WHERE returned IS NULL AND member_id = ?")) {
+                ps.setString(1, "2026-10-21"); ps.setInt(2, 1);
+                System.out.println("loans returned for member 1: " + ps.executeUpdate());
+            }
+
+            // 4. Streaming: read only as many rows as you need, while the ResultSet is open.
+            try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT title FROM books ORDER BY price_cents DESC, title")) {
+                List&lt;String&gt; titles = new ArrayList&lt;&gt;();
+                while (titles.size() &lt; 3 &amp;&amp; rs.next()) titles.add(rs.getString(1));
+                System.out.println("priciest: " + String.join(", ", titles));
+            }
+            c.rollback();
+            c.setAutoCommit(true);
+            try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM members")) {
+                rs.next(); System.out.println("members after rollback: " + rs.getInt(1));
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">Book(id=19, title=Beowulf, year=null)
+Book(id=20, title=Sir Gawain and the Green Knight, year=1400)
+rows inserted: 1
+new member id: 9
+loans returned for member 1: 1
+priciest: Exhalation, Death's End, Stories of Your Life and Others
+members after rollback: 8</pre>
+<pre class="out">Book[id=19, title=Beowulf, year=null]
+Book[id=20, title=Sir Gawain and the Green Knight, year=1400]
+rows inserted: 1
+new member id: 9
+loans returned for member 1: 1
+priciest: Exhalation, Death's End, Stories of Your Life and Others
+members after rollback: 8</pre>
+</div>
+<ul>
+  <li><b>The cursor.</b> "Initially the cursor is positioned before the first row. The next method moves the cursor to the next row, and because it returns false when there are no more rows … it can be used in a while loop" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/ResultSet.html">ResultSet</a>). Columns are numbered from <b>1</b>, not 0.</li>
+  <li><b>NULL hides as 0.</b> <code>getInt</code> returns "the column value; if the value is SQL NULL, the value returned is 0". Beowulf's unknown year would quietly become the year 0. <code>wasNull()</code> "reports whether the last column read had a value of SQL NULL", and the <code>intOrNull</code> helper turns that into a proper <code>Int?</code> / <code>Integer</code>. Going the other way, <code>setNull(index, Types.VARCHAR)</code> writes a NULL.</li>
+  <li><b>Generated keys.</b> Pass <code>Statement.RETURN_GENERATED_KEYS</code>, then <code>getGeneratedKeys()</code> "retrieves any auto-generated keys created as a result of executing this Statement object". That's how you learn the new member got id 9.</li>
+  <li><b>Update counts.</b> <code>executeUpdate</code> returned 1 for the <code>INSERT</code> and 1 for the <code>UPDATE</code>, the number of rows changed. Exercise 1 used this to catch the missing account.</li>
+  <li><b>The rollback at the end</b> leaves <code>library.db</code> exactly as L34 left it: 8 members, not 9.</li>
+</ul>
+
+<p class="callout"><b>A lazy trap (Kotlin).</b> The tour reads three titles through a <code>Sequence</code> (L15) <em>while the <code>ResultSet</code> is open</em>. Return that sequence from inside <code>use { }</code> and iterate it later, and the rows are gone:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LateSequence.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.DriverManager
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite:library.db").use { c -&gt;
+        val titles: Sequence&lt;String&gt; = c.createStatement().use { st -&gt;
+            st.executeQuery("SELECT title FROM books ORDER BY id").use { rs -&gt;
+                generateSequence { if (rs.next()) rs.getString(1) else null }   // lazy: nothing read yet
+            }
+        }                                                   // ResultSet and Statement are closed here
+        println(titles.take(2).toList())
+    }
+}</code></pre></figure>
+  <figure class="kotlin"><figcaption>KOTLIN · LateSequenceH2.kt</figcaption>
+<pre><code class="language-kotlin">// Same lazy Sequence as LateSequence.kt, on H2 instead of SQLite: H2 follows the JDBC spec and throws.
+import java.sql.DriverManager
+fun main() {
+    DriverManager.getConnection("jdbc:h2:mem:x").use { c -&gt;
+        c.createStatement().use { it.execute("CREATE TABLE books(id INT, title VARCHAR(20)); INSERT INTO books VALUES (1,'A'),(2,'B')") }
+        val titles: Sequence&lt;String&gt; = c.createStatement().use { st -&gt;
+            st.executeQuery("SELECT title FROM books ORDER BY id").use { rs -&gt; generateSequence { if (rs.next()) rs.getString(1) else null } }
+        }
+        println(runCatching { titles.take(2).toList() })
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">[]</pre>
+<pre class="out">Failure(org.h2.jdbc.JdbcSQLNonTransientException: The object is already closed [90007-252])</pre>
+</div>
+<p>Same code, two drivers, two behaviours. The JDBC spec says <code>next()</code> throws <code>SQLException</code> "if a database access error occurs or this method is called on a closed result set". H2 obeys it. The SQLite driver just returns <code>false</code>, so your query silently returns <em>nothing</em>. That's the worst kind of bug: no error, wrong answer. The rule: finish reading (<code>toList()</code>) before the <code>use</code> block ends. Java's <code>ResultSet</code> has no built-in lazy wrapper, so you'd only hit this there if you built your own <code>Iterator</code> or <code>Stream</code> over one.</p>
+
+<h3>Batching and transactions: the cost of a commit</h3>
+<p>Insert 10,000 loans into a fresh file database, four ways. <code>addBatch()</code> queues a row; <code>executeBatch()</code> sends the whole queue:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Batch.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.sql.Connection
+import java.sql.DriverManager
+
+const val ROWS = 10_000
+
+fun freshDb(): Connection {
+    val file = Files.createTempFile("batch", ".db").also { it.toFile().deleteOnExit() }
+    return DriverManager.getConnection("jdbc:sqlite:$file").apply {
+        createStatement().use { it.executeUpdate("CREATE TABLE loans (id INTEGER PRIMARY KEY, book_id INTEGER, member_id INTEGER, loaned TEXT)") }
+    }
+}
+
+fun timed(label: String, work: (Connection) -&gt; Unit) = freshDb().use { c -&gt;
+    val t0 = System.nanoTime()
+    work(c)
+    val ms = (System.nanoTime() - t0) / 1_000_000
+    val n = c.createStatement().use { st -&gt; st.executeQuery("SELECT COUNT(*) FROM loans").use { it.next(); it.getInt(1) } }
+    println("%-30s %6d ms  (%d rows)".format(label, ms, n))
+}
+
+const val INSERT = "INSERT INTO loans (book_id, member_id, loaned) VALUES (?, ?, ?)"
+
+fun main() {
+    timed("one by one, autocommit") { c -&gt;
+        c.prepareStatement(INSERT).use { ps -&gt;
+            repeat(ROWS) { i -&gt; ps.setInt(1, i % 20 + 1); ps.setInt(2, i % 8 + 1); ps.setString(3, "2026-10-21"); ps.executeUpdate() }
+        }
+    }
+    timed("addBatch, autocommit") { c -&gt;
+        c.prepareStatement(INSERT).use { ps -&gt;
+            repeat(ROWS) { i -&gt; ps.setInt(1, i % 20 + 1); ps.setInt(2, i % 8 + 1); ps.setString(3, "2026-10-21"); ps.addBatch() }
+            ps.executeBatch()
+        }
+    }
+    timed("one by one, one transaction") { c -&gt;
+        c.autoCommit = false
+        c.prepareStatement(INSERT).use { ps -&gt;
+            repeat(ROWS) { i -&gt; ps.setInt(1, i % 20 + 1); ps.setInt(2, i % 8 + 1); ps.setString(3, "2026-10-21"); ps.executeUpdate() }
+        }
+        c.commit()
+    }
+    timed("addBatch, one transaction") { c -&gt;
+        c.autoCommit = false
+        c.prepareStatement(INSERT).use { ps -&gt;
+            repeat(ROWS) { i -&gt; ps.setInt(1, i % 20 + 1); ps.setInt(2, i % 8 + 1); ps.setString(3, "2026-10-21"); ps.addBatch() }
+            ps.executeBatch()
+        }
+        c.commit()
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Batch.java</figcaption>
+<pre><code class="language-java">import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.*;
+
+public class Batch {
+    static final int ROWS = 10_000;
+    static final String INSERT = "INSERT INTO loans (book_id, member_id, loaned) VALUES (?, ?, ?)";
+
+    @FunctionalInterface interface Work { void run(Connection c) throws SQLException; }
+
+    static Connection freshDb() throws Exception {
+        Path file = Files.createTempFile("batch", ".db");
+        file.toFile().deleteOnExit();
+        Connection c = DriverManager.getConnection("jdbc:sqlite:" + file);
+        try (Statement st = c.createStatement()) {
+            st.executeUpdate("CREATE TABLE loans (id INTEGER PRIMARY KEY, book_id INTEGER, member_id INTEGER, loaned TEXT)");
+        }
+        return c;
+    }
+
+    static void timed(String label, Work work) throws Exception {
+        try (Connection c = freshDb()) {
+            long t0 = System.nanoTime();
+            work.run(c);
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM loans")) {
+                rs.next();
+                System.out.printf("%-30s %6d ms  (%d rows)%n", label, ms, rs.getInt(1));
+            }
+        }
+    }
+
+    static void fill(PreparedStatement ps, int i) throws SQLException {
+        ps.setInt(1, i % 20 + 1); ps.setInt(2, i % 8 + 1); ps.setString(3, "2026-10-21");
+    }
+
+    public static void main(String[] args) throws Exception {
+        timed("one by one, autocommit", c -&gt; {
+            try (PreparedStatement ps = c.prepareStatement(INSERT)) {
+                for (int i = 0; i &lt; ROWS; i++) { fill(ps, i); ps.executeUpdate(); }
+            }
+        });
+        timed("addBatch, autocommit", c -&gt; {
+            try (PreparedStatement ps = c.prepareStatement(INSERT)) {
+                for (int i = 0; i &lt; ROWS; i++) { fill(ps, i); ps.addBatch(); }
+                ps.executeBatch();
+            }
+        });
+        timed("one by one, one transaction", c -&gt; {
+            c.setAutoCommit(false);
+            try (PreparedStatement ps = c.prepareStatement(INSERT)) {
+                for (int i = 0; i &lt; ROWS; i++) { fill(ps, i); ps.executeUpdate(); }
+            }
+            c.commit();
+        });
+        timed("addBatch, one transaction", c -&gt; {
+            c.setAutoCommit(false);
+            try (PreparedStatement ps = c.prepareStatement(INSERT)) {
+                for (int i = 0; i &lt; ROWS; i++) { fill(ps, i); ps.addBatch(); }
+                ps.executeBatch();
+            }
+            c.commit();
+        });
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">one by one, autocommit           2399 ms  (10000 rows)
+addBatch, autocommit             1669 ms  (10000 rows)
+one by one, one transaction        18 ms  (10000 rows)
+addBatch, one transaction           4 ms  (10000 rows)</pre>
+<pre class="out">one by one, autocommit           1761 ms  (10000 rows)
+addBatch, autocommit             1687 ms  (10000 rows)
+one by one, one transaction        16 ms  (10000 rows)
+addBatch, one transaction           4 ms  (10000 rows)</pre>
+</div>
+<p>One transaction made it about <b>100 times</b> faster. Batching on its own barely helped. With autocommit on, each row is still its own transaction, and each commit has to wait for the disk (Part 1's durability, L22's latency ladder). Group work into transactions; batch on top of that for the last bit. In memory you wouldn't see the gap, which is why this runs on a temp file.</p>
+
+<h3>SQL injection, once more: the column-name hole</h3>
+<p>L33's rule was "bind every value". But a sort column isn't a value, and you can't bind it:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · OrderBy.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+
+fun Connection.titles(sql: String, bind: String? = null): String = prepareStatement(sql).use { ps -&gt;
+    if (bind != null) ps.setString(1, bind)
+    ps.executeQuery().use { rs -&gt; buildList { while (rs.next()) add(rs.getString(1)) }.joinToString(" | ") }
+}
+
+// The only column names a user may sort by, mapped to real SQL. Anything else is rejected.
+val SORTABLE = mapOf("title" to "title", "year" to "year", "price" to "price_cents")
+
+fun safeOrderBy(sort: String, descending: Boolean): String {
+    val column = SORTABLE[sort] ?: throw IllegalArgumentException("can't sort by '$sort'")
+    return "ORDER BY $column ${if (descending) "DESC" else "ASC"}, id"
+}
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite:library.db").use { c -&gt;
+        val base = "SELECT title FROM books WHERE author_id = 5 "
+
+        println("1. bound   ORDER BY ?  ('year'):  " + c.titles(base + "ORDER BY ?", "year"))
+        println("2. glued   ORDER BY year:         " + c.titles(base + "ORDER BY " + "year"))
+
+        // Blind injection: the attacker can't see members, but the sort ORDER answers a yes/no question.
+        for (guess in listOf("a", "b")) {
+            val evil = "CASE WHEN (SELECT substr(email, 1, 1) FROM members WHERE id = 1) = '$guess' THEN title ELSE year END"
+            println("3. glued   ORDER BY &lt;guess '$guess'&gt;: " + c.titles(base + "ORDER BY " + evil))
+        }
+        val evil = "(SELECT email FROM members WHERE id = 1)"
+        for (sort in listOf("year", "price", "email", evil)) {
+            try { println("4. allowlist '$sort': " + c.titles(base + safeOrderBy(sort, descending = true))) }
+            catch (e: IllegalArgumentException) { println("4. allowlist rejected: ${e.message}") }
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · OrderBy.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+public class OrderBy {
+    static String titles(Connection c, String sql, String bind) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            if (bind != null) ps.setString(1, bind);
+            try (ResultSet rs = ps.executeQuery()) {
+                List&lt;String&gt; out = new ArrayList&lt;&gt;();
+                while (rs.next()) out.add(rs.getString(1));
+                return String.join(" | ", out);
+            }
+        }
+    }
+
+    // The only column names a user may sort by, mapped to real SQL. Anything else is rejected.
+    static final Map&lt;String, String&gt; SORTABLE = Map.of("title", "title", "year", "year", "price", "price_cents");
+
+    static String safeOrderBy(String sort, boolean descending) {
+        String column = SORTABLE.get(sort);
+        if (column == null) throw new IllegalArgumentException("can't sort by '" + sort + "'");
+        return "ORDER BY " + column + (descending ? " DESC" : " ASC") + ", id";
+    }
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:library.db")) {
+            String base = "SELECT title FROM books WHERE author_id = 5 ";
+
+            System.out.println("1. bound   ORDER BY ?  ('year'):  " + titles(c, base + "ORDER BY ?", "year"));
+            System.out.println("2. glued   ORDER BY year:         " + titles(c, base + "ORDER BY " + "year", null));
+
+            // Blind injection: the attacker can't see members, but the sort ORDER answers a yes/no question.
+            for (String guess : List.of("a", "b")) {
+                String evil = "CASE WHEN (SELECT substr(email, 1, 1) FROM members WHERE id = 1) = '" + guess + "' THEN title ELSE year END";
+                System.out.println("3. glued   ORDER BY &lt;guess '" + guess + "'&gt;: " + titles(c, base + "ORDER BY " + evil, null));
+            }
+            String evil = "(SELECT email FROM members WHERE id = 1)";
+
+            for (String sort : List.of("year", "price", "email", evil)) {
+                try { System.out.println("4. allowlist '" + sort + "': " + titles(c, base + safeOrderBy(sort, true), null)); }
+                catch (IllegalArgumentException e) { System.out.println("4. allowlist rejected: " + e.getMessage()); }
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">1. bound   ORDER BY ?  ('year'):  Guards! Guards! | Small Gods | Going Postal | Mort
+2. glued   ORDER BY year:         Mort | Guards! Guards! | Small Gods | Going Postal
+3. glued   ORDER BY &lt;guess 'a'&gt;: Going Postal | Guards! Guards! | Mort | Small Gods
+3. glued   ORDER BY &lt;guess 'b'&gt;: Mort | Guards! Guards! | Small Gods | Going Postal
+4. allowlist 'year': Going Postal | Small Gods | Guards! Guards! | Mort
+4. allowlist 'price': Going Postal | Guards! Guards! | Small Gods | Mort
+4. allowlist rejected: can't sort by 'email'
+4. allowlist rejected: can't sort by '(SELECT email FROM members WHERE id = 1)'</pre>
+<ol>
+  <li><b>Binding doesn't sort.</b> <code>ORDER BY ?</code> with <code>'year'</code> sorts by the <em>string</em> <code>'year'</code>, the same constant for every row. No error; the rows simply come back in storage order.</li>
+  <li><b>Gluing works</b> for honest input.</li>
+  <li><b>Gluing leaks data.</b> The attacker can't see the <code>members</code> table, but a <code>CASE</code> expression turns a yes/no question into a sort order. Guess "a": sorted by title, so Ada's email starts with "a". Guess "b": sorted by year, so no. Twenty-odd requests per character spell out the whole email. This is "blind" SQL injection.</li>
+  <li><b>The fix is an allowlist.</b> OWASP: for "parts of SQL queries that can't use bind variables, such as table names, column names, or sort order indicators (ASC or DESC), input validation or query redesign is the most appropriate defense", and developers "should map the parameter values to the legal/expected table or column names" (<a href="https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html">OWASP SQL Injection Prevention</a>). The user picks a <em>key</em>; only your code's strings reach the SQL.</li>
+</ol>
+
+<h3>The N+1 query problem</h3>
+<p>List all 20 books with their authors. The innocent-looking version loads the books, then asks for each author separately:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · NPlusOne.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.ResultSet
+
+var queries = 0                                           // every SELECT goes through query(), which counts
+
+fun &lt;T&gt; Connection.query(sql: String, vararg args: Any, map: (ResultSet) -&gt; T): List&lt;T&gt; {
+    queries++
+    return prepareStatement(sql).use { ps -&gt;
+        args.forEachIndexed { i, a -&gt; ps.setObject(i + 1, a) }
+        ps.executeQuery().use { rs -&gt; buildList { while (rs.next()) add(map(rs)) } }
+    }
+}
+
+data class Row(val title: String, val author: String)
+
+fun nPlusOne(c: Connection): List&lt;Row&gt; {
+    val books = c.query("SELECT title, author_id FROM books ORDER BY id") { it.getString(1) to it.getInt(2) }
+    return books.map { (title, authorId) -&gt;                // one more query PER book
+        Row(title, c.query("SELECT name FROM authors WHERE id = ?", authorId) { it.getString(1) }.single())
+    }
+}
+
+fun join(c: Connection): List&lt;Row&gt; =
+    c.query("SELECT b.title, a.name FROM books b JOIN authors a ON a.id = b.author_id ORDER BY b.id") {
+        Row(it.getString(1), it.getString(2))
+    }
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite:library.db").use { c -&gt;
+        for ((name, load) in listOf("N+1" to ::nPlusOne, "JOIN" to ::join)) {
+            queries = 0
+            val t0 = System.nanoTime()
+            val rows = load(c)
+            println("%-4s %2d rows, %2d queries, %5.2f ms   first: %s".format(
+                name, rows.size, queries, (System.nanoTime() - t0) / 1e6, rows.first()))
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · NPlusOne.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class NPlusOne {
+    static int queries = 0;                                  // every SELECT goes through query(), which counts
+
+    @FunctionalInterface interface RowMapper&lt;T&gt; { T map(ResultSet rs) throws SQLException; }
+
+    static &lt;T&gt; List&lt;T&gt; query(Connection c, String sql, RowMapper&lt;T&gt; mapper, Object... args) throws SQLException {
+        queries++;
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            for (int i = 0; i &lt; args.length; i++) ps.setObject(i + 1, args[i]);
+            try (ResultSet rs = ps.executeQuery()) {
+                List&lt;T&gt; out = new ArrayList&lt;&gt;();
+                while (rs.next()) out.add(mapper.map(rs));
+                return out;
+            }
+        }
+    }
+
+    record Row(String title, String author) {}
+    record BookRef(String title, int authorId) {}
+
+    static List&lt;Row&gt; nPlusOne(Connection c) throws SQLException {
+        List&lt;Row&gt; rows = new ArrayList&lt;&gt;();
+        for (BookRef b : query(c, "SELECT title, author_id FROM books ORDER BY id", rs -&gt; new BookRef(rs.getString(1), rs.getInt(2)))) {
+            String author = query(c, "SELECT name FROM authors WHERE id = ?", rs -&gt; rs.getString(1), b.authorId()).getFirst();
+            rows.add(new Row(b.title(), author));            // one more query PER book
+        }
+        return rows;
+    }
+
+    static List&lt;Row&gt; join(Connection c) throws SQLException {
+        return query(c, "SELECT b.title, a.name FROM books b JOIN authors a ON a.id = b.author_id ORDER BY b.id",
+                     rs -&gt; new Row(rs.getString(1), rs.getString(2)));
+    }
+
+    @FunctionalInterface interface Loader { List&lt;Row&gt; load(Connection c) throws SQLException; }
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:library.db")) {
+            String[] names = {"N+1", "JOIN"};
+            Loader[] loaders = {NPlusOne::nPlusOne, NPlusOne::join};
+            for (int i = 0; i &lt; 2; i++) {
+                queries = 0;
+                long t0 = System.nanoTime();
+                List&lt;Row&gt; rows = loaders[i].load(c);
+                System.out.printf("%-4s %2d rows, %2d queries, %5.2f ms   first: %s%n",
+                        names[i], rows.size(), queries, (System.nanoTime() - t0) / 1e6, rows.getFirst());
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">N+1  20 rows, 21 queries,  9.58 ms   first: Row(title=A Wizard of Earthsea, author=Ursula K. Le Guin)
+JOIN 20 rows,  1 queries,  0.36 ms   first: Row(title=A Wizard of Earthsea, author=Ursula K. Le Guin)</pre>
+<pre class="out">N+1  20 rows, 21 queries,  4.41 ms   first: Row[title=A Wizard of Earthsea, author=Ursula K. Le Guin]
+JOIN 20 rows,  1 queries,  0.22 ms   first: Row[title=A Wizard of Earthsea, author=Ursula K. Le Guin]</pre>
+</div>
+<p>Same answer, 21 queries instead of 1. The timings flatter the JOIN, because N+1 ran first and paid for the JIT warming up (L23), so trust the query <em>count</em>. Here SQLite is a file on the same machine. With a database server across a network, each query is a round trip of maybe a millisecond (L30), and N+1 over 1,000 rows means a second of pure waiting. This is the classic ORM trap: with JPA or Room, <code>book.author</code> looks like a field access but can quietly run a query each time. When a page is slow, count its queries first.</p>
+
+<h3>Connections are expensive: pools</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · ConnCost.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+
+const val N = 500
+
+fun Connection.countBooks(): Int = createStatement().use { st -&gt;
+    st.executeQuery("SELECT COUNT(*) FROM books").use { it.next(); it.getInt(1) }
+}
+
+fun main() {
+    val url = "jdbc:sqlite:library.db"
+    repeat(2) { round -&gt;                                  // round 1 includes JIT warm-up
+        var t0 = System.nanoTime()
+        repeat(N) { DriverManager.getConnection(url).use { it.countBooks() } }
+        val fresh = (System.nanoTime() - t0) / 1e6
+
+        t0 = System.nanoTime()
+        DriverManager.getConnection(url).use { c -&gt; repeat(N) { c.countBooks() } }
+        val reused = (System.nanoTime() - t0) / 1e6
+        println("round ${round + 1}: $N queries, new connection each %.1f ms, one reused connection %.1f ms".format(fresh, reused))
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · ConnCost.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+
+public class ConnCost {
+    static final int N = 500;
+
+    static int countBooks(Connection c) throws SQLException {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM books")) {
+            rs.next(); return rs.getInt(1);
+        }
+    }
+
+    public static void main(String[] args) throws SQLException {
+        String url = "jdbc:sqlite:library.db";
+        for (int round = 1; round &lt;= 2; round++) {            // round 1 includes JIT warm-up
+            long t0 = System.nanoTime();
+            for (int i = 0; i &lt; N; i++) {
+                try (Connection c = DriverManager.getConnection(url)) { countBooks(c); }
+            }
+            double fresh = (System.nanoTime() - t0) / 1e6;
+
+            t0 = System.nanoTime();
+            try (Connection c = DriverManager.getConnection(url)) {
+                for (int i = 0; i &lt; N; i++) countBooks(c);
+            }
+            double reused = (System.nanoTime() - t0) / 1e6;
+            System.out.printf("round %d: %d queries, new connection each %.1f ms, one reused connection %.1f ms%n", round, N, fresh, reused);
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">round 1: 500 queries, new connection each 293.0 ms, one reused connection 2.9 ms
+round 2: 500 queries, new connection each 28.3 ms, one reused connection 2.4 ms</pre>
+<pre class="out">round 1: 500 queries, new connection each 264.2 ms, one reused connection 2.7 ms</pre>
+</div>
+<p>Even warmed up (round 2), opening a fresh connection per query cost about ten times more, and that's for a local file. A networked database adds a TCP handshake (L30), TLS (L31) and authentication on top. So servers keep a <dfn>connection pool</dfn>: a fixed set of open connections that requests borrow and return, much like L28's thread pools. You won't write one; in the JVM world that's <a href="https://github.com/brettwooldridge/HikariCP">HikariCP</a>'s job, and Spring Boot uses it by default. When a pool is involved, "closing" a connection returns it to the pool, so still always close.</p>
+
+<p class="note">Bridge: Spring's <code>@Transactional</code> is the <code>transaction { }</code> helper from Part 1, applied by a proxy around your method. <code>JdbcTemplate</code> is the <code>query</code>/<code>toList</code> helpers. Spring Data JPA writes the SQL from method names, and N+1 is its best-known pitfall. Android's Room generates DAOs over SQLite and refuses database calls on the main thread (L29). After this lesson, none of these are magic: they're the code you just wrote.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Extension functions tidy JDBC.</b> <code>fun &lt;T&gt; ResultSet.toList(map: (ResultSet) -&gt; T)</code> and <code>ResultSet.intOrNull(column)</code> read like methods JDBC should have had. Java needs static helpers and its own <code>RowMapper</code> interface, again because of <code>SQLException</code>.</li>
+    <li><b><code>Int?</code> models SQL NULL.</b> A nullable type makes "this column can be NULL" part of the row type. Java records need a boxed <code>Integer</code>, and nothing stops you reading it as <code>int</code>.</li>
+    <li><b><code>buildList { while (rs.next()) add(…) }</code></b> is one expression. Java declares a list, loops and returns.</li>
+    <li><b><code>vararg args: Any</code> + <code>setObject</code></b> gives a tiny query helper that takes any parameters, which Java matches with <code>Object... args</code>.</li>
+    <li><b>The flip side:</b> <code>generateSequence</code> makes lazy reading so easy that the closed-<code>ResultSet</code> trap is easier to fall into in Kotlin.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a search with optional filters</div>
+  <p>From a blank file, in both languages. A search screen sends an optional author fragment, an optional minimum year and a sort key. Write <code>findBooks(c, authorContains, minYear, sort)</code> returning <code>Hit(title, author, year?)</code> rows.</p>
+  <ol>
+    <li>Build the <code>WHERE</code> clause from fixed pieces only: add <code>a.name LIKE ?</code> and <code>b.year &gt;= ?</code> only when that filter is given, and collect the values in a parameter list in the same order.</li>
+    <li>Sort with an allowlist (<code>title</code>, <code>year</code>, <code>author</code>), and break ties by <code>b.id</code> so the order is stable.</li>
+    <li>Prove the injection attempts fail: an author of <code>' OR '1'='1</code> matches nothing, and a sort of <code>price_cents; DROP TABLE books</code> is rejected before any SQL runs.</li>
+  </ol>
+<pre class="out">[Exhalation, Stories of Your Life and Others]
+[2010 Death's End, 2015 The Fifth Season, 2016 The Obelisk Gate, 2017 The Stone Sky, 2019 Exhalation]
+[The Dispossessed]
+0
+can't sort by 'price_cents; DROP TABLE books'</pre>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex3.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.Connection
+import java.sql.DriverManager
+
+data class Hit(val title: String, val author: String, val year: Int?)
+
+val SORTS = mapOf("title" to "b.title", "year" to "b.year", "author" to "a.name")
+
+// Build the SQL from fixed pieces only; every user VALUE goes in as a ? parameter.
+fun findBooks(c: Connection, authorContains: String? = null, minYear: Int? = null, sort: String = "title"): List&lt;Hit&gt; {
+    val where = mutableListOf&lt;String&gt;()
+    val params = mutableListOf&lt;Any&gt;()
+    if (authorContains != null) { where += "a.name LIKE ?"; params += "%$authorContains%" }
+    if (minYear != null) { where += "b.year &gt;= ?"; params += minYear }
+    val orderBy = SORTS[sort] ?: throw IllegalArgumentException("can't sort by '$sort'")
+    val sql = "SELECT b.title, a.name, b.year FROM books b JOIN authors a ON a.id = b.author_id" +
+              (if (where.isEmpty()) "" else " WHERE " + where.joinToString(" AND ")) +
+              " ORDER BY $orderBy, b.id"
+    return c.prepareStatement(sql).use { ps -&gt;
+        params.forEachIndexed { i, p -&gt; ps.setObject(i + 1, p) }
+        ps.executeQuery().use { rs -&gt;
+            buildList { while (rs.next()) add(Hit(rs.getString(1), rs.getString(2), rs.getInt(3).takeUnless { rs.wasNull() })) }
+        }
+    }
+}
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite:library.db").use { c -&gt;
+        println(findBooks(c, authorContains = "Chiang").map { it.title })
+        println(findBooks(c, minYear = 2010, sort = "year").map { "${it.year} ${it.title}" })
+        println(findBooks(c, authorContains = "Le Guin", minYear = 1970).map { it.title })
+        println(findBooks(c, authorContains = "' OR '1'='1").size)
+        println(runCatching { findBooks(c, sort = "price_cents; DROP TABLE books") }.exceptionOrNull()?.message)
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex3.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+public class Ex3 {
+    record Hit(String title, String author, Integer year) {}
+
+    static final Map&lt;String, String&gt; SORTS = Map.of("title", "b.title", "year", "b.year", "author", "a.name");
+
+    // Build the SQL from fixed pieces only; every user VALUE goes in as a ? parameter.
+    static List&lt;Hit&gt; findBooks(Connection c, String authorContains, Integer minYear, String sort) throws SQLException {
+        List&lt;String&gt; where = new ArrayList&lt;&gt;();
+        List&lt;Object&gt; params = new ArrayList&lt;&gt;();
+        if (authorContains != null) { where.add("a.name LIKE ?"); params.add("%" + authorContains + "%"); }
+        if (minYear != null) { where.add("b.year &gt;= ?"); params.add(minYear); }
+        String orderBy = SORTS.get(sort);
+        if (orderBy == null) throw new IllegalArgumentException("can't sort by '" + sort + "'");
+        String sql = "SELECT b.title, a.name, b.year FROM books b JOIN authors a ON a.id = b.author_id"
+                   + (where.isEmpty() ? "" : " WHERE " + String.join(" AND ", where))
+                   + " ORDER BY " + orderBy + ", b.id";
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            for (int i = 0; i &lt; params.size(); i++) ps.setObject(i + 1, params.get(i));
+            try (ResultSet rs = ps.executeQuery()) {
+                List&lt;Hit&gt; hits = new ArrayList&lt;&gt;();
+                while (rs.next()) {
+                    int y = rs.getInt(3);
+                    hits.add(new Hit(rs.getString(1), rs.getString(2), rs.wasNull() ? null : y));
+                }
+                return hits;
+            }
+        }
+    }
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:library.db")) {
+            System.out.println(findBooks(c, "Chiang", null, "title").stream().map(Hit::title).toList());
+            System.out.println(findBooks(c, null, 2010, "year").stream().map(h -&gt; h.year() + " " + h.title()).toList());
+            System.out.println(findBooks(c, "Le Guin", 1970, "title").stream().map(Hit::title).toList());
+            System.out.println(findBooks(c, "' OR '1'='1", null, "title").size());
+            try { findBooks(c, null, null, "price_cents; DROP TABLE books"); }
+            catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        }
+    }
+}</code></pre></figure>
+    </div>
+    <p>The <code>%</code> wildcards go into the <em>value</em> (<code>"%Chiang%"</code>), not the SQL, so they're bound too. That's how a user-typed <code>%</code> or <code>'</code> stays harmless. The pattern of "a list of fixed fragments plus a parallel list of values" is exactly what query builders like jOOQ and Exposed automate.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · JDBC" data-answer="0">
+  <p class="q">Beowulf's <code>year</code> is SQL NULL. What does <code>rs.getInt("year")</code> return for that row?</p>
+  <div class="opts"><button>Gives 0</button><button>Gives null</button><button>Throws exception</button><button>Gives -1</button></div>
+  <p class="why">"If the value is SQL NULL, the value returned is 0." Call <code>wasNull()</code> right after to tell a real 0 from NULL.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · JDBC" data-answer="1">
+  <p class="q">In SQLite, <code>ORDER BY ?</code> with the string <code>"year"</code> bound to the placeholder. Result?</p>
+  <div class="opts"><button>Rows sorted by year column</button><button>Rows unsorted, constant sort key</button><button>Syntax error and statement rejected</button><button>Rows sorted alphabetically by title</button></div>
+  <p class="why">The bound value is the string <code>'year'</code>, the same for every row, so nothing gets sorted. Identifiers can't be bound; use an allowlist.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · JDBC" data-answer="2">
+  <p class="q">10,000 inserts into a file database: autocommit vs one transaction. Roughly how much faster was one transaction?</p>
+  <div class="opts"><button><code>≈ 1×</code></button><button><code>≈ 2×</code></button><button><code>≈ 100×</code></button><button><code>≈ 10000×</code></button></div>
+  <p class="why">2399 ms vs 18 ms on this machine. Each autocommit insert is its own durable commit. One transaction commits once.</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · JDBC" data-answer="3">
+  <p class="q">Load 20 books, then run one <code>SELECT</code> per book to fetch its author. How many queries in total?</p>
+  <div class="opts"><button><code>1</code></button><button><code>2</code></button><button><code>20</code></button><button><code>21</code></button></div>
+  <p class="why">1 for the books plus 1 per book: the N+1 problem. A JOIN does it in 1.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise · Phase 10 milestone</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>The library's data layer</h2><span class="t">~30 min (more if you test-drive it)</span></div>
+
+<p>Design a schema and a repository for lending books, from a blank Gradle project, Kotlin first and then Java. This is the data layer the capstone (L45–L47) will put behind an HTTP API.</p>
+
+<div class="task">
+  <p><b>The schema</b> (SQLite, a file in a temp directory):</p>
+  <ul>
+    <li><code>books(id, title, year)</code>, with a CHECK on <code>year</code>. <code>members(id, name, email UNIQUE)</code>. <code>loans(id, book_id → books, member_id → members, loaned, returned)</code>, with dates as ISO text.</li>
+    <li><b>The database itself must refuse a double loan.</b> A partial unique index allows at most one <em>open</em> loan per book: <code>CREATE UNIQUE INDEX … ON loans(book_id) WHERE returned IS NULL</code>. Code can have bugs; the index can't be bypassed.</li>
+    <li>Run <code>PRAGMA foreign_keys = ON</code> on <em>every</em> connection. It's off by default in SQLite (L34).</li>
+  </ul>
+  <p><b>The <code>LibraryRepository</code>:</b></p>
+  <ul>
+    <li><code>addMember(name, email)</code> and <code>addBook(title, year)</code> return the generated id.</li>
+    <li><code>lend(bookId, memberId, today)</code> returns a sealed <code>LendResult</code> (L7, L10): <code>Lent(loanId)</code>, <code>AlreadyOnLoan</code>, <code>NoSuchBook</code> or <code>NoSuchMember</code>. The checks and the insert run in <b>one transaction</b>.</li>
+    <li><code>returnBook(bookId, today)</code> returns whether an open loan was closed (check the update count).</li>
+    <li><code>overdueLoans(today)</code>: open loans older than 14 days, oldest first.</li>
+    <li><code>topBorrowers(limit)</code>: a JOIN + GROUP BY from L34, ordered by count descending, then name.</li>
+  </ul>
+  <p><b>Test-first, in this order</b> (L11), each test on a fresh database file:</p>
+  <ol>
+    <li>Lending an already-lent book returns <code>AlreadyOnLoan</code> and leaves exactly one loan row: no partial writes.</li>
+    <li>An unknown book or member is reported as a result, not thrown.</li>
+    <li>Returning a book makes it available again, and returning it twice reports <code>false</code>.</li>
+    <li>Overdue means open <em>and</em> older than 14 days; a returned book never counts.</li>
+    <li>Top borrowers break ties by name.</li>
+    <li>A member named <code>Robert'); DROP TABLE members; --</code> is stored as plain text, and the table survives (L33).</li>
+    <li>The database refuses a second open loan even when you bypass the repository with raw SQL.</li>
+    <li>Eight threads lend the same book at once (L26's latch start gate): exactly one <code>Lent</code>, seven <code>AlreadyOnLoan</code>.</li>
+  </ol>
+  <p><b>Gradle:</b> start from <code>gradle init --type kotlin-application</code> (and <code>java-application</code>), and swap the generated Guava dependency for the driver. These are the lines that changed:</p>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · build files (excerpt)</figcaption>
+<pre><code class="language-kotlin">// app/build.gradle.kts
+dependencies {
+    …
+    // Added for L36: the SQLite JDBC driver (replaces the generated guava line)
+    implementation(libs.sqlite.jdbc)
+}
+
+// gradle/libs.versions.toml
+[versions]
+sqlite-jdbc = "3.53.4.0"
+[libraries]
+sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqlite-jdbc" }</code></pre></figure>
+    <figure class="java"><figcaption>JAVA · build files (excerpt)</figcaption>
+<pre><code class="language-kotlin">// app/build.gradle.kts
+dependencies {
+    …
+    // Added for L36: the SQLite JDBC driver (replaces the generated guava line)
+    implementation(libs.sqlite.jdbc)
+}
+
+// gradle/libs.versions.toml
+[versions]
+sqlite-jdbc = "3.53.4.0"
+[libraries]
+sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqlite-jdbc" }</code></pre></figure>
+  </div>
+  <p>Both projects also add L11's <code>testLogging</code> block, so each test prints a line. The Gradle builds run on the JDK 21 toolchain that <code>gradle init</code> chose.</p>
+
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: library data layer (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: library data layer (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-tests" data-label="Final: tests written first"><span class="who">TESTS</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+
+  <details class="solution"><summary>Reference solution: schema</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · library/Schema.kt</figcaption>
+<pre><code class="language-kotlin">package library
+
+// One string per statement, so JDBC can run them one at a time.
+val SCHEMA = listOf(
+    """CREATE TABLE IF NOT EXISTS books (
+         id          INTEGER PRIMARY KEY,
+         title       TEXT NOT NULL,
+         year        INTEGER CHECK (year BETWEEN 1400 AND 2100)
+       )""",
+    """CREATE TABLE IF NOT EXISTS members (
+         id     INTEGER PRIMARY KEY,
+         name   TEXT NOT NULL,
+         email  TEXT UNIQUE NOT NULL
+       )""",
+    """CREATE TABLE IF NOT EXISTS loans (
+         id        INTEGER PRIMARY KEY,
+         book_id   INTEGER NOT NULL REFERENCES books(id),
+         member_id INTEGER NOT NULL REFERENCES members(id),
+         loaned    TEXT NOT NULL,          -- ISO dates: 'YYYY-MM-DD' sorts correctly as text
+         returned  TEXT
+       )""",
+    // A partial unique index: at most ONE open loan per book. The database itself refuses a double loan.
+    "CREATE UNIQUE INDEX IF NOT EXISTS one_open_loan_per_book ON loans(book_id) WHERE returned IS NULL",
+)</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · library/Schema.java</figcaption>
+<pre><code class="language-java">package library;
+
+import java.util.List;
+
+final class Schema {
+    private Schema() {}
+
+    // One string per statement, so JDBC can run them one at a time.
+    static final List&lt;String&gt; STATEMENTS = List.of(
+        """
+        CREATE TABLE IF NOT EXISTS books (
+          id          INTEGER PRIMARY KEY,
+          title       TEXT NOT NULL,
+          year        INTEGER CHECK (year BETWEEN 1400 AND 2100)
+        )""",
+        """
+        CREATE TABLE IF NOT EXISTS members (
+          id     INTEGER PRIMARY KEY,
+          name   TEXT NOT NULL,
+          email  TEXT UNIQUE NOT NULL
+        )""",
+        """
+        CREATE TABLE IF NOT EXISTS loans (
+          id        INTEGER PRIMARY KEY,
+          book_id   INTEGER NOT NULL REFERENCES books(id),
+          member_id INTEGER NOT NULL REFERENCES members(id),
+          loaned    TEXT NOT NULL,          -- ISO dates: 'YYYY-MM-DD' sorts correctly as text
+          returned  TEXT
+        )""",
+        // A partial unique index: at most ONE open loan per book. The database itself refuses a double loan.
+        "CREATE UNIQUE INDEX IF NOT EXISTS one_open_loan_per_book ON loans(book_id) WHERE returned IS NULL");
+}</code></pre></figure>
+    </div>
+  </details>
+
+  <details class="solution"><summary>Reference solution: the repository</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · library/LibraryRepository.kt</figcaption>
+<pre><code class="language-kotlin">package library
+
+import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.ResultSet
+import java.sql.Statement
+import java.time.LocalDate
+
+sealed interface LendResult {
+    data class Lent(val loanId: Long) : LendResult
+    data object AlreadyOnLoan : LendResult
+    data object NoSuchBook : LendResult
+    data object NoSuchMember : LendResult
+}
+
+data class Overdue(val title: String, val member: String, val loaned: LocalDate)
+data class Borrower(val name: String, val loans: Int)
+
+class LibraryRepository(dbFile: String) {
+    // IMMEDIATE: every transaction takes the write lock at BEGIN, so two lenders queue up
+    // instead of both reading "available" and then failing with SQLITE_BUSY.
+    private val url = "jdbc:sqlite:$dbFile?transaction_mode=IMMEDIATE"
+
+    private fun connect(): Connection = DriverManager.getConnection(url).also { c -&gt;
+        c.createStatement().use { it.execute("PRAGMA foreign_keys = ON") }      // off by default in SQLite
+    }
+
+    private inline fun &lt;T&gt; transaction(block: (Connection) -&gt; T): T = connect().use { c -&gt;
+        c.autoCommit = false
+        try { block(c).also { c.commit() } } catch (e: Throwable) { c.rollback(); throw e }
+    }
+
+    private fun &lt;T&gt; ResultSet.toList(map: (ResultSet) -&gt; T): List&lt;T&gt; = buildList { while (next()) add(map(this@toList)) }
+
+    private fun Connection.exists(sql: String, id: Long): Boolean = prepareStatement(sql).use { ps -&gt;
+        ps.setLong(1, id)
+        ps.executeQuery().use { it.next() }
+    }
+
+    private fun Connection.insert(sql: String, vararg args: Any?): Long =
+        prepareStatement(sql, Statement.RETURN_GENERATED_KEYS).use { ps -&gt;
+            args.forEachIndexed { i, a -&gt; ps.setObject(i + 1, a) }
+            ps.executeUpdate()
+            ps.generatedKeys.use { it.next(); it.getLong(1) }
+        }
+
+    fun createSchema() = transaction { c -&gt; c.createStatement().use { st -&gt; SCHEMA.forEach(st::executeUpdate) } }
+
+    fun addMember(name: String, email: String): Long =
+        transaction { it.insert("INSERT INTO members (name, email) VALUES (?, ?)", name, email) }
+
+    fun addBook(title: String, year: Int?): Long =
+        transaction { it.insert("INSERT INTO books (title, year) VALUES (?, ?)", title, year) }
+
+    fun memberName(id: Long): String? = connect().use { c -&gt;
+        c.prepareStatement("SELECT name FROM members WHERE id = ?").use { ps -&gt;
+            ps.setLong(1, id)
+            ps.executeQuery().use { rs -&gt; if (rs.next()) rs.getString(1) else null }
+        }
+    }
+
+    // Check and insert in ONE transaction: nobody can lend the book between our check and our insert.
+    fun lend(bookId: Long, memberId: Long, today: LocalDate): LendResult = transaction { c -&gt;
+        when {
+            !c.exists("SELECT 1 FROM books WHERE id = ?", bookId) -&gt; LendResult.NoSuchBook
+            !c.exists("SELECT 1 FROM members WHERE id = ?", memberId) -&gt; LendResult.NoSuchMember
+            c.exists("SELECT 1 FROM loans WHERE book_id = ? AND returned IS NULL", bookId) -&gt; LendResult.AlreadyOnLoan
+            else -&gt; LendResult.Lent(c.insert("INSERT INTO loans (book_id, member_id, loaned) VALUES (?, ?, ?)",
+                                             bookId, memberId, today.toString()))
+        }
+    }
+
+    fun returnBook(bookId: Long, today: LocalDate): Boolean = transaction { c -&gt;
+        c.prepareStatement("UPDATE loans SET returned = ? WHERE book_id = ? AND returned IS NULL").use { ps -&gt;
+            ps.setString(1, today.toString()); ps.setLong(2, bookId)
+            ps.executeUpdate() == 1
+        }
+    }
+
+    fun overdueLoans(today: LocalDate, loanDays: Long = 14): List&lt;Overdue&gt; = connect().use { c -&gt;
+        c.prepareStatement(
+            """SELECT b.title, m.name, l.loaned FROM loans l
+               JOIN books b ON b.id = l.book_id JOIN members m ON m.id = l.member_id
+               WHERE l.returned IS NULL AND l.loaned &lt; ? ORDER BY l.loaned, b.title""").use { ps -&gt;
+            ps.setString(1, today.minusDays(loanDays).toString())
+            ps.executeQuery().use { rs -&gt; rs.toList { Overdue(it.getString(1), it.getString(2), LocalDate.parse(it.getString(3))) } }
+        }
+    }
+
+    fun topBorrowers(limit: Int): List&lt;Borrower&gt; = connect().use { c -&gt;
+        c.prepareStatement(
+            """SELECT m.name, COUNT(*) AS n FROM loans l JOIN members m ON m.id = l.member_id
+               GROUP BY m.id, m.name ORDER BY n DESC, m.name LIMIT ?""").use { ps -&gt;
+            ps.setInt(1, limit)
+            ps.executeQuery().use { rs -&gt; rs.toList { Borrower(it.getString(1), it.getInt(2)) } }
+        }
+    }
+
+    fun loanCount(): Int = connect().use { c -&gt;
+        c.createStatement().use { st -&gt; st.executeQuery("SELECT COUNT(*) FROM loans").use { it.next(); it.getInt(1) } }
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · library/LibraryRepository.java</figcaption>
+<pre><code class="language-java">package library;
+
+import java.sql.*;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.List;
+
+public class LibraryRepository {
+    public sealed interface LendResult permits Lent, AlreadyOnLoan, NoSuchBook, NoSuchMember {}
+    public record Lent(long loanId) implements LendResult {}
+    public record AlreadyOnLoan() implements LendResult {}
+    public record NoSuchBook() implements LendResult {}
+    public record NoSuchMember() implements LendResult {}
+
+    public record Overdue(String title, String member, LocalDate loaned) {}
+    public record Borrower(String name, int loans) {}
+
+    @FunctionalInterface interface SqlWork&lt;T&gt; { T run(Connection c) throws SQLException; }
+    @FunctionalInterface interface RowMapper&lt;T&gt; { T map(ResultSet rs) throws SQLException; }
+
+    private final String url;
+
+    public LibraryRepository(String dbFile) {
+        // IMMEDIATE: every transaction takes the write lock at BEGIN, so two lenders queue up
+        // instead of both reading "available" and then failing with SQLITE_BUSY.
+        this.url = "jdbc:sqlite:" + dbFile + "?transaction_mode=IMMEDIATE";
+    }
+
+    private Connection connect() throws SQLException {
+        Connection c = DriverManager.getConnection(url);
+        try (Statement st = c.createStatement()) { st.execute("PRAGMA foreign_keys = ON"); }   // off by default in SQLite
+        return c;
+    }
+
+    private &lt;T&gt; T transaction(SqlWork&lt;T&gt; work) throws SQLException {
+        try (Connection c = connect()) {
+            c.setAutoCommit(false);
+            try {
+                T result = work.run(c);
+                c.commit();
+                return result;
+            } catch (SQLException | RuntimeException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private static &lt;T&gt; List&lt;T&gt; toList(ResultSet rs, RowMapper&lt;T&gt; mapper) throws SQLException {
+        List&lt;T&gt; out = new ArrayList&lt;&gt;();
+        while (rs.next()) out.add(mapper.map(rs));
+        return out;
+    }
+
+    private static boolean exists(Connection c, String sql, long id) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private static long insert(Connection c, String sql, Object... args) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            for (int i = 0; i &lt; args.length; i++) ps.setObject(i + 1, args[i]);
+            ps.executeUpdate();
+            try (ResultSet keys = ps.getGeneratedKeys()) { keys.next(); return keys.getLong(1); }
+        }
+    }
+
+    public void createSchema() throws SQLException {
+        transaction(c -&gt; {
+            try (Statement st = c.createStatement()) { for (String s : Schema.STATEMENTS) st.executeUpdate(s); }
+            return null;
+        });
+    }
+
+    public long addMember(String name, String email) throws SQLException {
+        return transaction(c -&gt; insert(c, "INSERT INTO members (name, email) VALUES (?, ?)", name, email));
+    }
+
+    public long addBook(String title, Integer year) throws SQLException {
+        return transaction(c -&gt; insert(c, "INSERT INTO books (title, year) VALUES (?, ?)", title, year));
+    }
+
+    public String memberName(long id) throws SQLException {
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("SELECT name FROM members WHERE id = ?")) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next() ? rs.getString(1) : null; }
+        }
+    }
+
+    // Check and insert in ONE transaction: nobody can lend the book between our check and our insert.
+    public LendResult lend(long bookId, long memberId, LocalDate today) throws SQLException {
+        return transaction(c -&gt; {
+            if (!exists(c, "SELECT 1 FROM books WHERE id = ?", bookId)) return new NoSuchBook();
+            if (!exists(c, "SELECT 1 FROM members WHERE id = ?", memberId)) return new NoSuchMember();
+            if (exists(c, "SELECT 1 FROM loans WHERE book_id = ? AND returned IS NULL", bookId)) return new AlreadyOnLoan();
+            return new Lent(insert(c, "INSERT INTO loans (book_id, member_id, loaned) VALUES (?, ?, ?)",
+                                   bookId, memberId, today.toString()));
+        });
+    }
+
+    public boolean returnBook(long bookId, LocalDate today) throws SQLException {
+        return transaction(c -&gt; {
+            try (PreparedStatement ps = c.prepareStatement("UPDATE loans SET returned = ? WHERE book_id = ? AND returned IS NULL")) {
+                ps.setString(1, today.toString()); ps.setLong(2, bookId);
+                return ps.executeUpdate() == 1;
+            }
+        });
+    }
+
+    public List&lt;Overdue&gt; overdueLoans(LocalDate today) throws SQLException { return overdueLoans(today, 14); }
+
+    public List&lt;Overdue&gt; overdueLoans(LocalDate today, long loanDays) throws SQLException {
+        String sql = """
+            SELECT b.title, m.name, l.loaned FROM loans l
+            JOIN books b ON b.id = l.book_id JOIN members m ON m.id = l.member_id
+            WHERE l.returned IS NULL AND l.loaned &lt; ? ORDER BY l.loaned, b.title""";
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, today.minusDays(loanDays).toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return toList(rs, r -&gt; new Overdue(r.getString(1), r.getString(2), LocalDate.parse(r.getString(3))));
+            }
+        }
+    }
+
+    public List&lt;Borrower&gt; topBorrowers(int limit) throws SQLException {
+        String sql = """
+            SELECT m.name, COUNT(*) AS n FROM loans l JOIN members m ON m.id = l.member_id
+            GROUP BY m.id, m.name ORDER BY n DESC, m.name LIMIT ?""";
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) { return toList(rs, r -&gt; new Borrower(r.getString(1), r.getInt(2))); }
+        }
+    }
+
+    public int loanCount() throws SQLException {
+        try (Connection c = connect(); Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM loans")) {
+            rs.next(); return rs.getInt(1);
+        }
+    }
+}</code></pre></figure>
+    </div>
+    <ul>
+      <li><b><code>?transaction_mode=IMMEDIATE</code></b> is a SQLite JDBC connection setting: every transaction starts with <code>BEGIN IMMEDIATE</code> and takes the write lock up front. See the red run below for why it's there.</li>
+      <li><b>One connection per call.</b> Each method opens, uses and closes its own connection, so the repository is safe to share between threads. A real server would borrow from a pool instead (Part 3).</li>
+      <li><b>Dates as <code>'YYYY-MM-DD'</code> text</b> compare correctly as strings, so <code>l.loaned &lt; ?</code> works without date functions.</li>
+    </ul>
+  </details>
+
+  <details class="solution"><summary>Reference solution: the tests</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · LibraryRepositoryTest.kt</figcaption>
+<pre><code class="language-kotlin">package library
+
+import java.nio.file.Files
+import java.nio.file.Path
+import java.sql.DriverManager
+import java.sql.SQLException
+import java.time.LocalDate
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertTrue
+
+class LibraryRepositoryTest {
+    private lateinit var file: Path
+    private lateinit var repo: LibraryRepository
+    private val day = LocalDate.parse("2026-10-01")
+
+    @BeforeTest
+    fun freshDatabase() {                                     // every test starts from an empty file
+        file = Files.createTempFile("library-test", ".db")
+        repo = LibraryRepository(file.toString()).apply { createSchema() }
+    }
+
+    @AfterTest
+    fun deleteDatabase() { Files.deleteIfExists(file) }
+
+    @Test
+    fun `lending a book that is already on loan fails and leaves no partial rows`() {
+        val book = repo.addBook("Dune", 1965)
+        val ada = repo.addMember("Ada", "ada@example.com")
+        val alan = repo.addMember("Alan", "alan@example.com")
+        assertIs&lt;LendResult.Lent&gt;(repo.lend(book, ada, day))
+        assertEquals(LendResult.AlreadyOnLoan, repo.lend(book, alan, day))
+        assertEquals(1, repo.loanCount())
+    }
+
+    @Test
+    fun `unknown book or member is reported, not thrown`() {
+        val ada = repo.addMember("Ada", "ada@example.com")
+        val book = repo.addBook("Dune", 1965)
+        assertEquals(LendResult.NoSuchBook, repo.lend(99, ada, day))
+        assertEquals(LendResult.NoSuchMember, repo.lend(book, 99, day))
+        assertEquals(0, repo.loanCount())
+    }
+
+    @Test
+    fun `returning a book makes it available again`() {
+        val book = repo.addBook("Dune", 1965)
+        val ada = repo.addMember("Ada", "ada@example.com")
+        repo.lend(book, ada, day)
+        assertTrue(repo.returnBook(book, day.plusDays(3)))
+        assertFalse(repo.returnBook(book, day.plusDays(4)))          // nothing left to return
+        assertIs&lt;LendResult.Lent&gt;(repo.lend(book, ada, day.plusDays(5)))
+    }
+
+    @Test
+    fun `overdue means open and older than 14 days`() {
+        val ada = repo.addMember("Ada", "ada@example.com")
+        val old = repo.addBook("Old", 2000)
+        val recent = repo.addBook("Recent", 2001)
+        val returned = repo.addBook("Returned", 2002)
+        repo.lend(old, ada, LocalDate.parse("2026-09-01"))
+        repo.lend(recent, ada, LocalDate.parse("2026-10-15"))
+        repo.lend(returned, ada, LocalDate.parse("2026-09-01"))
+        repo.returnBook(returned, LocalDate.parse("2026-09-10"))
+        assertEquals(listOf(Overdue("Old", "Ada", LocalDate.parse("2026-09-01"))),
+                     repo.overdueLoans(LocalDate.parse("2026-10-21")))
+    }
+
+    @Test
+    fun `top borrowers are ordered by count, then name`() {
+        val (a, b, c) = listOf("Cy", "Bea", "Al").map { repo.addMember(it, "$it@example.com") }
+        val books = (1..5).map { repo.addBook("Book $it", 2000 + it) }
+        repo.lend(books[0], a, day); repo.lend(books[1], a, day)          // Cy: 2
+        repo.lend(books[2], b, day); repo.lend(books[3], b, day)          // Bea: 2
+        repo.lend(books[4], c, day)                                       // Al: 1
+        assertEquals(listOf(Borrower("Bea", 2), Borrower("Cy", 2)), repo.topBorrowers(2))
+    }
+
+    @Test
+    fun `an SQL injection attempt is stored as plain text`() {
+        val evil = "Robert'); DROP TABLE members; --"
+        val id = repo.addMember(evil, "bobby@example.com")
+        assertEquals(evil, repo.memberName(id))
+        assertEquals("Ada", repo.memberName(repo.addMember("Ada", "ada@example.com")))   // table still there
+    }
+
+    @Test
+    fun `the database itself refuses a second open loan`() {
+        val book = repo.addBook("Dune", 1965)
+        val ada = repo.addMember("Ada", "ada@example.com")
+        repo.lend(book, ada, day)
+        val error = assertFailsWith&lt;SQLException&gt; {                       // bypass the repository's check
+            DriverManager.getConnection("jdbc:sqlite:$file").use { c -&gt;
+                c.createStatement().use { it.executeUpdate("INSERT INTO loans (book_id, member_id, loaned) VALUES ($book, $ada, '2026-10-02')") }
+            }
+        }
+        assertTrue("UNIQUE" in error.message!!)
+    }
+
+    @Test
+    fun `eight concurrent lenders, exactly one wins`() {
+        val book = repo.addBook("Dune", 1965)
+        val members = (1..8).map { repo.addMember("M$it", "m$it@example.com") }
+        val gate = CountDownLatch(1)
+        val results = Executors.newFixedThreadPool(8).use { pool -&gt;
+            val futures = members.map { m -&gt; pool.submit&lt;LendResult&gt; { gate.await(); repo.lend(book, m, day) } }
+            gate.countDown()
+            futures.map { it.get() }
+        }
+        assertEquals(1, results.count { it is LendResult.Lent })
+        assertEquals(7, results.count { it == LendResult.AlreadyOnLoan })
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · LibraryRepositoryTest.java</figcaption>
+<pre><code class="language-java">package library;
+
+import library.LibraryRepository.*;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class LibraryRepositoryTest {
+    private Path file;
+    private LibraryRepository repo;
+    private final LocalDate day = LocalDate.parse("2026-10-01");
+
+    @BeforeEach
+    void freshDatabase() throws Exception {                   // every test starts from an empty file
+        file = Files.createTempFile("library-test", ".db");
+        repo = new LibraryRepository(file.toString());
+        repo.createSchema();
+    }
+
+    @AfterEach
+    void deleteDatabase() throws Exception { Files.deleteIfExists(file); }
+
+    @Test
+    void lendingABookAlreadyOnLoanFailsAndLeavesNoPartialRows() throws SQLException {
+        long book = repo.addBook("Dune", 1965);
+        long ada = repo.addMember("Ada", "ada@example.com");
+        long alan = repo.addMember("Alan", "alan@example.com");
+        assertInstanceOf(Lent.class, repo.lend(book, ada, day));
+        assertEquals(new AlreadyOnLoan(), repo.lend(book, alan, day));
+        assertEquals(1, repo.loanCount());
+    }
+
+    @Test
+    void unknownBookOrMemberIsReportedNotThrown() throws SQLException {
+        long ada = repo.addMember("Ada", "ada@example.com");
+        long book = repo.addBook("Dune", 1965);
+        assertEquals(new NoSuchBook(), repo.lend(99, ada, day));
+        assertEquals(new NoSuchMember(), repo.lend(book, 99, day));
+        assertEquals(0, repo.loanCount());
+    }
+
+    @Test
+    void returningABookMakesItAvailableAgain() throws SQLException {
+        long book = repo.addBook("Dune", 1965);
+        long ada = repo.addMember("Ada", "ada@example.com");
+        repo.lend(book, ada, day);
+        assertTrue(repo.returnBook(book, day.plusDays(3)));
+        assertFalse(repo.returnBook(book, day.plusDays(4)));        // nothing left to return
+        assertInstanceOf(Lent.class, repo.lend(book, ada, day.plusDays(5)));
+    }
+
+    @Test
+    void overdueMeansOpenAndOlderThan14Days() throws SQLException {
+        long ada = repo.addMember("Ada", "ada@example.com");
+        long old = repo.addBook("Old", 2000);
+        long recent = repo.addBook("Recent", 2001);
+        long returned = repo.addBook("Returned", 2002);
+        repo.lend(old, ada, LocalDate.parse("2026-09-01"));
+        repo.lend(recent, ada, LocalDate.parse("2026-10-15"));
+        repo.lend(returned, ada, LocalDate.parse("2026-09-01"));
+        repo.returnBook(returned, LocalDate.parse("2026-09-10"));
+        assertEquals(List.of(new Overdue("Old", "Ada", LocalDate.parse("2026-09-01"))),
+                     repo.overdueLoans(LocalDate.parse("2026-10-21")));
+    }
+
+    @Test
+    void topBorrowersAreOrderedByCountThenName() throws SQLException {
+        long cy = repo.addMember("Cy", "cy@example.com");
+        long bea = repo.addMember("Bea", "bea@example.com");
+        long al = repo.addMember("Al", "al@example.com");
+        List&lt;Long&gt; books = new ArrayList&lt;&gt;();
+        for (int i = 1; i &lt;= 5; i++) books.add(repo.addBook("Book " + i, 2000 + i));
+        repo.lend(books.get(0), cy, day); repo.lend(books.get(1), cy, day);      // Cy: 2
+        repo.lend(books.get(2), bea, day); repo.lend(books.get(3), bea, day);    // Bea: 2
+        repo.lend(books.get(4), al, day);                                        // Al: 1
+        assertEquals(List.of(new Borrower("Bea", 2), new Borrower("Cy", 2)), repo.topBorrowers(2));
+    }
+
+    @Test
+    void anSqlInjectionAttemptIsStoredAsPlainText() throws SQLException {
+        String evil = "Robert'); DROP TABLE members; --";
+        long id = repo.addMember(evil, "bobby@example.com");
+        assertEquals(evil, repo.memberName(id));
+        assertEquals("Ada", repo.memberName(repo.addMember("Ada", "ada@example.com")));   // table still there
+    }
+
+    @Test
+    void theDatabaseItselfRefusesASecondOpenLoan() throws SQLException {
+        long book = repo.addBook("Dune", 1965);
+        long ada = repo.addMember("Ada", "ada@example.com");
+        repo.lend(book, ada, day);
+        SQLException error = assertThrows(SQLException.class, () -&gt; {   // bypass the repository's check
+            try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + file); Statement st = c.createStatement()) {
+                st.executeUpdate("INSERT INTO loans (book_id, member_id, loaned) VALUES (" + book + ", " + ada + ", '2026-10-02')");
+            }
+        });
+        assertTrue(error.getMessage().contains("UNIQUE"));
+    }
+
+    @Test
+    void eightConcurrentLendersExactlyOneWins() throws Exception {
+        long book = repo.addBook("Dune", 1965);
+        List&lt;Long&gt; members = new ArrayList&lt;&gt;();
+        for (int i = 1; i &lt;= 8; i++) members.add(repo.addMember("M" + i, "m" + i + "@example.com"));
+        CountDownLatch gate = new CountDownLatch(1);
+        List&lt;LendResult&gt; results = new ArrayList&lt;&gt;();
+        try (ExecutorService pool = Executors.newFixedThreadPool(8)) {
+            List&lt;Future&lt;LendResult&gt;&gt; futures = new ArrayList&lt;&gt;();
+            for (long m : members) futures.add(pool.submit(() -&gt; { gate.await(); return repo.lend(book, m, day); }));
+            gate.countDown();
+            for (Future&lt;LendResult&gt; f : futures) results.add(f.get());
+        }
+        assertEquals(1, results.stream().filter(r -&gt; r instanceof Lent).count());
+        assertEquals(7, results.stream().filter(r -&gt; r.equals(new AlreadyOnLoan())).count());
+    }
+}</code></pre></figure>
+    </div>
+<pre class="term"><span class="p">$</span> ./gradlew test
+LibraryRepositoryTest > an SQL injection attempt is stored as plain text() PASSED
+LibraryRepositoryTest > top borrowers are ordered by count, then name() PASSED
+LibraryRepositoryTest > the database itself refuses a second open loan() PASSED
+LibraryRepositoryTest > eight concurrent lenders, exactly one wins() PASSED
+LibraryRepositoryTest > overdue means open and older than 14 days() PASSED
+LibraryRepositoryTest > unknown book or member is reported, not thrown() PASSED
+LibraryRepositoryTest > returning a book makes it available again() PASSED
+LibraryRepositoryTest > lending a book that is already on loan fails and leaves no partial rows() PASSED
+BUILD SUCCESSFUL in 972ms</pre>
+<pre class="term"><span class="p">$</span> ./gradlew test        <span class="c"># the Java project</span>
+LibraryRepositoryTest > eightConcurrentLendersExactlyOneWins() PASSED
+LibraryRepositoryTest > topBorrowersAreOrderedByCountThenName() PASSED
+LibraryRepositoryTest > theDatabaseItselfRefusesASecondOpenLoan() PASSED
+LibraryRepositoryTest > unknownBookOrMemberIsReportedNotThrown() PASSED
+LibraryRepositoryTest > returningABookMakesItAvailableAgain() PASSED
+LibraryRepositoryTest > overdueMeansOpenAndOlderThan14Days() PASSED
+LibraryRepositoryTest > lendingABookAlreadyOnLoanFailsAndLeavesNoPartialRows() PASSED
+LibraryRepositoryTest > anSqlInjectionAttemptIsStoredAsPlainText() PASSED
+BUILD SUCCESSFUL in 1s</pre>
+    <p><b>The red run that justifies <code>IMMEDIATE</code>.</b> I deleted <code>?transaction_mode=IMMEDIATE</code> from the Kotlin URL and reran:</p>
+<pre class="err">LibraryRepositoryTest > eight concurrent lenders, exactly one wins() FAILED
+    java.util.concurrent.ExecutionException: org.sqlite.SQLiteException: [SQLITE_BUSY] The database file is locked (database is locked)
+        at library.LibraryRepositoryTest.eight concurrent lenders, exactly one wins(LibraryRepositoryTest.kt:115)</pre>
+    <p>With the default <code>DEFERRED</code> transactions, all eight lenders start by <em>reading</em> ("is the book on loan?"), then one writes. The others hold read transactions they can't upgrade. SQLite's docs say such a write "will fail with SQLITE_BUSY", and waiting doesn't help. The driver's 3-second busy timeout made no difference: in a separate 8-thread probe, 7 of 8 failed every time with <code>DEFERRED</code>, and none did with <code>IMMEDIATE</code>. The other seven tests passed either way. Only a test with real concurrency could catch it, which is the L26 lesson again.</p>
+  </details>
+
+  <details class="solution"><summary>Reference solution: a small demo run</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · library/App.kt</figcaption>
+<pre><code class="language-kotlin">package library
+
+import java.nio.file.Files
+import java.time.LocalDate
+
+fun main() {
+    val file = Files.createTempFile("library", ".db")
+    try {
+        val repo = LibraryRepository(file.toString()).apply { createSchema() }
+        val ada = repo.addMember("Ada Lovelace", "ada@example.com")
+        val alan = repo.addMember("Alan Turing", "alan@example.com")
+        val dune = repo.addBook("Dune", 1965)
+        val mort = repo.addBook("Mort", 1987)
+
+        val day = LocalDate.parse("2026-10-01")
+        println("Ada borrows Dune:  " + repo.lend(dune, ada, day))
+        println("Alan borrows Dune: " + repo.lend(dune, alan, day))
+        println("Alan borrows Mort: " + repo.lend(mort, alan, day.plusDays(10)))
+        println("Ada borrows #99:   " + repo.lend(99, ada, day))
+        println("overdue on 10-21:  " + repo.overdueLoans(LocalDate.parse("2026-10-21")))
+        println("Dune returned:     " + repo.returnBook(dune, LocalDate.parse("2026-10-21")))
+        println("Alan borrows Dune: " + repo.lend(dune, alan, LocalDate.parse("2026-10-21")))
+        println("top borrowers:     " + repo.topBorrowers(5))
+    } finally {
+        Files.deleteIfExists(file)
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · library/App.java</figcaption>
+<pre><code class="language-java">package library;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDate;
+
+public class App {
+    public static void main(String[] args) throws Exception {
+        Path file = Files.createTempFile("library", ".db");
+        try {
+            LibraryRepository repo = new LibraryRepository(file.toString());
+            repo.createSchema();
+            long ada = repo.addMember("Ada Lovelace", "ada@example.com");
+            long alan = repo.addMember("Alan Turing", "alan@example.com");
+            long dune = repo.addBook("Dune", 1965);
+            long mort = repo.addBook("Mort", 1987);
+
+            LocalDate day = LocalDate.parse("2026-10-01");
+            System.out.println("Ada borrows Dune:  " + repo.lend(dune, ada, day));
+            System.out.println("Alan borrows Dune: " + repo.lend(dune, alan, day));
+            System.out.println("Alan borrows Mort: " + repo.lend(mort, alan, day.plusDays(10)));
+            System.out.println("Ada borrows #99:   " + repo.lend(99, ada, day));
+            System.out.println("overdue on 10-21:  " + repo.overdueLoans(LocalDate.parse("2026-10-21")));
+            System.out.println("Dune returned:     " + repo.returnBook(dune, LocalDate.parse("2026-10-21")));
+            System.out.println("Alan borrows Dune: " + repo.lend(dune, alan, LocalDate.parse("2026-10-21")));
+            System.out.println("top borrowers:     " + repo.topBorrowers(5));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+<pre class="out">Ada borrows Dune:  Lent(loanId=1)
+Alan borrows Dune: AlreadyOnLoan
+Alan borrows Mort: Lent(loanId=2)
+Ada borrows #99:   NoSuchBook
+overdue on 10-21:  [Overdue(title=Dune, member=Ada Lovelace, loaned=2026-10-01)]
+Dune returned:     true
+Alan borrows Dune: Lent(loanId=3)
+top borrowers:     [Borrower(name=Alan Turing, loans=2), Borrower(name=Ada Lovelace, loans=1)]</pre>
+<pre class="out">Ada borrows Dune:  Lent[loanId=1]
+Alan borrows Dune: AlreadyOnLoan[]
+Alan borrows Mort: Lent[loanId=2]
+Ada borrows #99:   NoSuchBook[]
+overdue on 10-21:  [Overdue[title=Dune, member=Ada Lovelace, loaned=2026-10-01]]
+Dune returned:     true
+Alan borrows Dune: Lent[loanId=3]
+top borrowers:     [Borrower[name=Alan Turing, loans=2], Borrower[name=Ada Lovelace, loans=1]]</pre>
+    </div>
+  </details>
+
+  <p class="note">Bridge: a Spring service would put <code>@Transactional</code> on <code>lend</code> and let a pool hand it a connection. Room would generate the DAO from annotated interfaces. Neither removes a single decision you made here: what one transaction must contain, which rule the database enforces itself, and what happens when eight requests arrive at once.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="2">
+  <p class="q">Why does "read the balance, then write balance + 1" lose deposits under concurrency? (L26)</p>
+  <div class="opts"><button>SQLite caches stale pages forever</button><button>JDBC reorders statements for speed</button><button>Both read before either writes</button><button>Integers overflow at one thousand</button></div>
+  <p class="why">The same interleaving as <code>count++</code> in L26: two transactions read the same old value, each adds one, and the second write overwrites the first. An atomic <code>UPDATE … = balance + 1</code> removes the gap.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q"><code>lend</code> returns <code>AlreadyOnLoan</code> instead of throwing when the book is out. Why? (L10)</p>
+  <div class="opts"><button>Exceptions can never cross transaction boundaries</button><button>SQLite forbids throwing from inside JDBC</button><button>Sealed types run much faster always</button><button>It is an expected, normal outcome</button></div>
+  <p class="why">L10's rule: exceptions for bugs and broken environments, return values for outcomes the caller should handle. "Someone else has it" is an everyday answer, and a sealed type makes the caller handle every case.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="1">
+  <p class="q">A request handler opens a <code>Connection</code> and never closes it. After thousands of requests? (L24)</p>
+  <div class="opts"><button>The JIT closes them</button><button>Connections and memory leak</button><button>SQLite merges them together</button><button>Nothing happens at all</button></div>
+  <p class="why">Each open connection holds memory and a file handle (L22), and the code keeps it reachable. Like L24's listener leak, the GC can't help. Close with <code>use</code>/try-with-resources, or return it to the pool.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="0">
+  <p class="q">Kotlin: a function returns <code>generateSequence { if (rs.next()) … }</code> from inside <code>use { }</code>, and the caller does <code>.toList()</code>. On SQLite? (L15)</p>
+  <div class="opts"><button>Gives empty</button><button>Gives all</button><button>Throws exception</button><button>Compile error</button></div>
+  <p class="why">The sequence is lazy (L15), so it runs after <code>use</code> has closed the <code>ResultSet</code>. The SQLite driver's <code>next()</code> then returns <code>false</code>: <code>[]</code>, silently. H2 throws "The object is already closed", as the JDBC spec requires.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Spell out ACID with one sentence each. Which letter does the database enforce only as far as you declare constraints?</li>
+    <li>A statement fails inside <code>BEGIN … COMMIT</code>. What happened to the earlier statements, and what must you do?</li>
+    <li>Write the JDBC transaction pattern from memory: <code>setAutoCommit(false)</code>, then what goes in <code>try</code>, <code>catch</code> and <code>finally</code>?</li>
+    <li>Define dirty read, non-repeatable read, phantom, lost update and write skew. Which one did H2 allow even at SERIALIZABLE?</li>
+    <li>Three fixes for a lost update. When would you pick each?</li>
+    <li>Why can't you bind a column name, and what do you do instead?</li>
+    <li>Why were 10,000 autocommit inserts about 100 times slower than one transaction?</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  Read <em>Designing Data-Intensive Applications</em> (Kleppmann), chapter 7, "Transactions". It's the clearest explanation anywhere of what isolation levels really guarantee, with the lost-update and write-skew examples this lesson borrowed. Then read PostgreSQL's <a href="https://www.postgresql.org/docs/current/transaction-iso.html">Transaction Isolation</a> page, to see how one serious database implements the standard, and SQLite's short <a href="https://www.sqlite.org/isolation.html">Isolation In SQLite</a> and <a href="https://www.sqlite.org/lang_transaction.html">BEGIN TRANSACTION</a> pages. For JDBC itself, the <a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/package-summary.html"><code>java.sql</code> package docs</a> are short and precise. For the injection rules, the <a href="https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html">OWASP cheat sheet</a>. For practice queries, <a href="https://sqlbolt.com/">SQLBolt</a>.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/databases.html">Databases</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. "Which isolation level should my app use?", "optimistic or pessimistic locking here?" and "why did my test pass alone but fail with threads?" are exactly the right questions. Paste your <code>LibraryRepository</code> in for a review; transaction boundaries are worth a second pair of eyes.</p>
+
+<div class="lesson-nav">
+  <a href="0035-schema-design-and-indexes.html">← L35 · Schema Design &amp; Indexes</a>
+  <span style="color:var(--ink-soft)">L37 · Clean Code &amp; Refactoring (Phase 11, next)</span>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/txviz.js"></script>
+</body>
+</html>

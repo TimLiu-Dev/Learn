@@ -1,4 +1,5 @@
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 
 @Serializable
@@ -19,5 +20,11 @@ fun main() {
     println(withoutNulls.encodeToString(s))           // nulls skipped too
 
     val parsed = Json.decodeFromString<Settings>("""{"email":"ada@example.com"}""")
-    println(parsed)                                                   // missing keys -> defaults
+    println(parsed)                                   // missing keys -> defaults
+
+    try {
+        Json.decodeFromString<Settings>("""{"theme":"dark"}""")    // no "email" key at all
+    } catch (e: SerializationException) {
+        println("${e::class.simpleName}: ${e.message}")
+    }
 }

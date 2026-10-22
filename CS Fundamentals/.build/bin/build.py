@@ -20,7 +20,8 @@ def src(rel):
 
 
 def code_block(rel):
-    lang = "kotlin" if rel.endswith(".kt") else "java"
+    exts = {".kt": "kotlin", ".kts": "kotlin", ".sql": "sql", ".sh": "bash", ".json": "json"}
+    lang = next((v for k, v in exts.items() if rel.endswith(k)), "java")
     return f'<pre><code class="language-{lang}">{html.escape(src(rel), quote=False)}</code></pre>'
 
 

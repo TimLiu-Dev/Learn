@@ -82,7 +82,7 @@
       const y = top + k * row + 14, x1 = x(s.msg.from), x2full = x(s.msg.to);
       const dir = Math.sign(x2full - x1);
       const x2 = s.msg.lost ? x1 + (x2full - x1) * 0.55 : x2full - dir * 3;
-      const mid = (x1 + x2full) / 2;
+      const mid = s.msg.lost ? (x1 + x2) / 2 : (x1 + x2full) / 2;   // keep a lost label clear of the cross
       out += `<g class="${now.trim()}"><line class="nv-msg" x1="${x1 + dir * 3}" y1="${y}" x2="${x2}" y2="${y}"` +
         (s.msg.lost ? "" : ` marker-end="url(#nv-${now ? "n" : "a"}-${id})"`) + `/>` +
         `<text class="nv-mlabel" x="${mid}" y="${y - 6}" text-anchor="middle">${esc(s.msg.label)}</text>` +
