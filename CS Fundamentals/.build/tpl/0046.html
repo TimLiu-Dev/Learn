@@ -1,0 +1,1324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L46 · Make It Production-Shaped</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l46">
+<main>
+
+<div class="kicker">Lesson 46 · Capstone: No-Framework REST API · <a href="../reference/roadmap.html#p13">roadmap</a></div>
+<h1>Make It Production-Shaped</h1>
+<p class="subtitle">Shelf v1 passes its tests. Today you put it under load and watch it break, then fix what breaks. Next you add the L41 cache and the L43 rate limiter and measure what they really change. Finally you give Shelf the things an operator needs at 3 a.m.: structured logs, metrics, configuration from the environment, and a shutdown that doesn't drop requests.</p>
+
+<div class="lesson-meta">
+  <span><b>~115–130 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  Shelf v2, in Kotlin and in Java. A load generator found three real concurrency bugs in v1, all of them invisible to its 33 passing tests, and you fixed each one:
+  <ul>
+    <li>double loans answered with 500s;</li>
+    <li>a member holding 10 books when the limit is 3;</li>
+    <li>sign-ups with one email answered with 500s.</li>
+  </ul>
+  A fourth bug, in my own first cache, showed up only when the measurements were pushed. With the pool, cache and rate limiter on, database reads drop from about 4,350 to under 700 and the median request from 3.5 ms to 0.6 ms. Every request leaves one JSON log line that joins the caller's trace, and a shutdown lets in-flight requests finish. 44 tests per language pass.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Thread safety under load</a><span class="t">35 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Add the cache and the rate limiter, and measure</a><span class="t">30 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Structured logging, metrics, config, shutdown</a><span class="t">30 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: Shelf v2</a><span class="t">20 min+</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Keep working in your L45 projects, <code>~/katas/shelf-kotlin/</code> and <code>~/katas/shelf-java/</code>. Commit v1 first (L12), so you can always diff against it. Every output on this page was captured from real runs on my machine (an 18-core Apple M5 Max) with Gradle 9.7.1, its JDK 21 toolchain, Kotlin 2.4.0, kotlinx.serialization 1.12.0, Jackson 3.2.4 and sqlite-jdbc 3.53.4.0. All numbers are from localhost; your timings will differ, and that's fine. Servers bind to <code>127.0.0.1</code> only.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L28, L36, L41, L43 and L45</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Write the steps of v1's <code>LendingService.lend</code> in order. Between which two steps could a second request sneak in? (L45)</li>
+    <li>Name the three outcomes of <code>Router.match</code> and the status code each one leads to. (L45)</li>
+    <li>Write cache-aside in four lines of pseudocode: the read path and the write path. (L41)</li>
+    <li>Name the four golden signals, and say which one a token bucket's 429s show up in. (L43)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="2">
+  <p class="q">v1 opens a connection with <code>transaction_mode=IMMEDIATE</code>. What does IMMEDIATE change? (L36)</p>
+  <div class="opts"><button>Reads skip the journal entirely</button><button>Statements commit one by one</button><button>BEGIN takes the write lock</button><button>Queries run in parallel threads</button></div>
+  <p class="why">A deferred transaction takes SQLite's write lock at its first write, so two writers can both start and one fails halfway. IMMEDIATE takes it at <code>BEGIN</code>, so writers queue up front. Part 1 depends on exactly this.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">50 requests miss the cache for the same key at the same moment. Request coalescing makes… (L41)</p>
+  <div class="opts"><button>One trip to the database</button><button>Fifty trips, one after another</button><button>No trips, because they fail</button><button>Two trips: read, then write</button></div>
+  <p class="why">The first miss starts the load and registers a future; the other 49 wait on that future instead of starting their own. L41 measured 50 queries without it and 1 with it.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="3">
+  <p class="q">A token bucket has capacity 5 and refills 1 token per second. A client sends 8 requests at once. How many get through? (L43)</p>
+  <div class="opts"><button><code>8</code></button><button><code>1</code></button><button><code>3</code></button><button><code>5</code></button></div>
+  <p class="why">A full bucket holds 5 tokens, so a burst can spend 5; the other 3 get 429. You'll see exactly this shape in Part 3's <code>curl</code> session, with capacity 5: the 4th and 5th requests are refused.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="1">
+  <p class="q">Shelf gives <code>HttpServer</code> a virtual-thread-per-task executor. What does that mean for shared objects? (L28)</p>
+  <div class="opts"><button>Only one request runs at once</button><button>Many requests touch them at once</button><button>Each request gets its own copies</button><button>The JVM locks them for you</button></div>
+  <p class="why">Every request runs on its own virtual thread, at the same time as the others. Anything they share (stores, caches, counters) must be thread-safe. v1 never tested that. Today you do.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Thread safety under load</h2><span class="t">~35 min</span></div>
+
+<h3>A load generator, written by hand</h3>
+<p>Tests send one request at a time. Real traffic doesn't. The tool you need is small: start a Shelf on port 0, make all the requests wait at a start line (a <code>CountDownLatch</code>, L26), then release them together on virtual threads, and count the status codes. Put it in the <b>test</b> source set, since it's a tool, not part of the app. A Gradle task runs any <code>main</code> from there:</p>
+<pre><code class="language-kotlin">// app/build.gradle.kts (both languages): run a main() from the test source set
+tasks.register&lt;JavaExec&gt;("runMain") {
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass = providers.gradleProperty("main")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+}</code></pre>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · test/load/RaceDemo.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/test/kotlin/shelf/load/RaceDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · test/load/RaceDemo.java (Api.java is in the solution below)</figcaption>
+<!--CODE:l46/cap_java/app/src/test/java/shelf/load/RaceDemo.java--></figure>
+</div>
+<p>Run it against <b>v1</b>, with <code>./gradlew -q runMain -Pmain=shelf.load.RaceDemoKt</code> (Java: <code>-Pmain=shelf.load.RaceDemo</code>):</p>
+<div class="pair">
+<pre class="err">Race 1: 20 members borrow the SAME book at once (5 rounds)
+  round 1: 201×1  409×2  500×17
+  round 2: 201×1  409×8  500×11
+  round 3: 201×1  409×3  500×16
+  round 4: 201×1  409×6  500×13
+  round 5: 201×1  409×6  500×13
+Race 2: ONE member borrows 10 DIFFERENT books at once (limit is 3)
+  201×10 -&gt; member 21 now has 10 open loans</pre>
+<pre class="err">Race 1: 20 members borrow the SAME book at once (5 rounds)
+  round 1: 201×1  409×2  500×17
+  round 2: 201×1  409×3  500×16
+  round 3: 201×1  409×3  500×16
+  round 4: 201×1  409×2  500×17
+  round 5: 201×1  409×3  500×16
+Race 2: ONE member borrows 10 DIFFERENT books at once (limit is 3)
+  201×10 -&gt; member 21 now has 10 open loans</pre>
+</div>
+<p>And the server's own error log, one line per 500 (Kotlin, then Java; 70 and 82 lines in these runs):</p>
+<pre class="err">ERROR POST /loans: org.sqlite.SQLiteException: [SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: loans.book_id)
+ERROR POST /loans: shelf.store.Db$DbException: org.sqlite.SQLiteException: [SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: loans.book_id)</pre>
+<p>Two different bugs, and the second is the dangerous one.</p>
+<ul>
+  <li><b>Race 1: right answer, wrong status.</b> All 20 requests passed <code>openForBook(bookId) == null</code> before any of them inserted. The first insert won. Every later insert hit L36's partial unique index, which refused it. The data stayed correct, but most clients got <code>500 Internal Server Error</code> instead of <code>409 Conflict</code>: a bug report and an alert, for a perfectly normal situation.</li>
+  <li><b>Race 2: wrong data, and no error at all.</b> All 10 requests counted the member's open loans as 0, all 10 passed the limit check, and all 10 inserted. Nothing in the schema says "at most 3 per member", so the database had no reason to object. This is the check-then-act race of L26, with a SQL table playing the shared variable. No test, log or alert notices it.</li>
+</ul>
+
+<h3>Step A: map the constraint violation (fixes Race 1 only)</h3>
+<p>The tempting fix: catch the unique-constraint error and turn it into <code>BookOnLoan</code>. sqlite-jdbc throws an <code>SQLiteException</code> whose <code>resultCode</code> says which constraint failed:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · step A: SqliteLoanStore.add and LendingService.lend</figcaption>
+<pre><code class="language-kotlin">override fun add(bookId: Long, memberId: Long, loaned: LocalDate): Loan = try {
+    db.transaction { c -&gt;
+        val id = c.insert("INSERT INTO loans (book_id, member_id, loaned) VALUES (?, ?, ?)", bookId, memberId, loaned.toString())
+        Loan(id, bookId, memberId, loaned, null)
+    }
+} catch (e: SQLiteException) {
+    // The partial unique index refused a second open loan: someone else won the race.
+    if (e.resultCode == SQLiteErrorCode.SQLITE_CONSTRAINT_UNIQUE) throw BookAlreadyOnLoan(bookId) else throw e
+}</code></pre>
+<pre><code class="language-kotlin">/** Thrown by LoanStore.add when the book already has an open loan. */
+class BookAlreadyOnLoan(bookId: Long) : RuntimeException("book $bookId is already on loan")</code></pre>
+<pre><code class="language-kotlin">fun lend(bookId: Long, memberId: Long): LendResult {
+    books.find(bookId) ?: return LendResult.UnknownBook
+    members.find(memberId) ?: return LendResult.UnknownMember
+    // Check-then-act across separate store calls: two requests can both pass this check.
+    // The partial unique index still refuses the second loan; L46 load-tests and fixes it.
+    if (loans.openForBook(bookId) != null) return LendResult.BookOnLoan
+    if (loans.forMember(memberId).count { it.isOpen } &gt;= MAX_OPEN_LOANS) return LendResult.LimitReached
+    return try {
+        LendResult.Lent(loans.add(bookId, memberId, LocalDate.now(clock)))
+    } catch (e: BookAlreadyOnLoan) {
+        LendResult.BookOnLoan                         // lost the race: same answer as the check above
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · step A: SqliteLoanStore.add and LendingService.lend</figcaption>
+<pre><code class="language-java">@Override
+public Loan add(long bookId, long memberId, LocalDate loaned) {
+    try {
+        return db.transaction(c -&gt; {
+            long id = insert(c, "INSERT INTO loans (book_id, member_id, loaned) VALUES (?, ?, ?)", bookId, memberId, loaned.toString());
+            return new Loan(id, bookId, memberId, loaned, null);
+        });
+    } catch (Db.DbException e) {
+        // The partial unique index refused a second open loan: someone else won the race.
+        if (e.getCause() instanceof SQLiteException s &amp;&amp; s.getResultCode() == SQLiteErrorCode.SQLITE_CONSTRAINT_UNIQUE) {
+            throw new BookAlreadyOnLoan(bookId);
+        }
+        throw e;
+    }
+}</code></pre>
+<pre><code class="language-java">/** Thrown by LoanStore.add when the book already has an open loan. */
+public final class BookAlreadyOnLoan extends RuntimeException {
+    public BookAlreadyOnLoan(long bookId) {
+        super("book " + bookId + " is already on loan");
+    }
+}</code></pre>
+<pre><code class="language-java">public LendResult lend(long bookId, long memberId) {
+    if (books.find(bookId).isEmpty()) return new LendResult.UnknownBook();
+    if (members.find(memberId).isEmpty()) return new LendResult.UnknownMember();
+    // Check-then-act across separate store calls: two requests can both pass this check.
+    // The partial unique index still refuses the second loan; L46 load-tests and fixes it.
+    if (loans.openForBook(bookId).isPresent()) return new LendResult.BookOnLoan();
+    long open = loans.forMember(memberId).stream().filter(Loan::isOpen).count();
+    if (open &gt;= MAX_OPEN_LOANS) return new LendResult.LimitReached();
+    try {
+        return new LendResult.Lent(loans.add(bookId, memberId, LocalDate.now(clock)));
+    } catch (BookAlreadyOnLoan e) {
+        return new LendResult.BookOnLoan();         // lost the race: same answer as the check above
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">Race 1: 20 members borrow the SAME book at once (5 rounds)
+  round 1: 201×1  409×19
+  round 2: 201×1  409×19
+  round 3: 201×1  409×19
+  round 4: 201×1  409×19
+  round 5: 201×1  409×19
+Race 2: ONE member borrows 10 DIFFERENT books at once (limit is 3)
+  201×10 -&gt; member 21 now has 10 open loans</pre>
+<pre class="out">Race 1: 20 members borrow the SAME book at once (5 rounds)
+  round 1: 201×1  409×19
+  round 2: 201×1  409×19
+  round 3: 201×1  409×19
+  round 4: 201×1  409×19
+  round 5: 201×1  409×19
+Race 2: ONE member borrows 10 DIFFERENT books at once (limit is 3)
+  201×10 -&gt; member 21 now has 10 open loans</pre>
+</div>
+<p>Race 1 is cured: one 201 and nineteen 409s, every round, and no errors in the log. Race 2 is untouched: still 10 loans. A fix that relies on an index can only protect rules that the index expresses.</p>
+
+<h3>Step B: make check-and-insert one atomic step</h3>
+<p>Both rules must be checked and the loan inserted <em>without anyone else writing in between</em>. That's what a transaction is for. Shelf's <code>Db</code> already opens transactions with <code>IMMEDIATE</code>, so <code>BEGIN</code> takes SQLite's single write lock; while you hold it, no other writer can run its checks (L36). The checks just have to move <em>inside</em> the transaction. They can't stay in the service, because the service calls the store three separate times, and each call is its own short transaction. So the store gets one new method that does all of it:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · store/Stores.kt (added)</figcaption>
+<pre><code class="language-kotlin">    /** Check both lending rules and insert the loan as ONE atomic step. */
+    fun tryLend(bookId: Long, memberId: Long, loaned: LocalDate, maxOpen: Int): TryLend
+}
+
+sealed interface TryLend {
+    data class Lent(val loan: Loan) : TryLend
+    data object BookTaken : TryLend
+    data object AtLimit : TryLend
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · store/LoanStore.java (added)</figcaption>
+<pre><code class="language-java">/** Check both lending rules and insert the loan as ONE atomic step. */
+TryLend tryLend(long bookId, long memberId, LocalDate loaned, int maxOpen);
+
+sealed interface TryLend {
+    record Lent(Loan loan) implements TryLend {}
+    record BookTaken() implements TryLend {}
+    record AtLimit() implements TryLend {}
+}</code></pre></figure>
+</div>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · store/SqliteStores.kt: SqliteLoanStore.tryLend</figcaption>
+<pre><code class="language-kotlin">// One IMMEDIATE transaction: BEGIN takes SQLite's write lock, so no other writer can slip in
+// between the two checks and the INSERT. Check-then-act becomes atomic (L26, L36).
+override fun tryLend(bookId: Long, memberId: Long, loaned: LocalDate, maxOpen: Int): TryLend = db.transaction { c -&gt;
+    val bookTaken = c.query("SELECT 1 FROM loans WHERE book_id = ? AND returned IS NULL", bookId) { true }.isNotEmpty()
+    val open = c.query("SELECT COUNT(*) FROM loans WHERE member_id = ? AND returned IS NULL", memberId) { it.getInt(1) }.single()
+    when {
+        bookTaken -&gt; TryLend.BookTaken
+        open &gt;= maxOpen -&gt; TryLend.AtLimit
+        else -&gt; {
+            val id = c.insert("INSERT INTO loans (book_id, member_id, loaned) VALUES (?, ?, ?)", bookId, memberId, loaned.toString())
+            TryLend.Lent(Loan(id, bookId, memberId, loaned, null))
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · store/SqliteLoanStore.java: tryLend</figcaption>
+<pre><code class="language-java">// One IMMEDIATE transaction: BEGIN takes SQLite's write lock, so no other writer can slip in
+// between the two checks and the INSERT. Check-then-act becomes atomic (L26, L36).
+@Override
+public TryLend tryLend(long bookId, long memberId, LocalDate loaned, int maxOpen) {
+    return db.transaction(c -&gt; {
+        boolean bookTaken = !query(c, "SELECT 1 FROM loans WHERE book_id = ? AND returned IS NULL", rs -&gt; true, bookId).isEmpty();
+        int open = query(c, "SELECT COUNT(*) FROM loans WHERE member_id = ? AND returned IS NULL", rs -&gt; rs.getInt(1), memberId).getFirst();
+        if (bookTaken) return new TryLend.BookTaken();
+        if (open &gt;= maxOpen) return new TryLend.AtLimit();
+        long id = insert(c, "INSERT INTO loans (book_id, member_id, loaned) VALUES (?, ?, ?)", bookId, memberId, loaned.toString());
+        return new TryLend.Lent(new Loan(id, bookId, memberId, loaned, null));
+    });
+}</code></pre></figure>
+</div>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · service/LendingService.kt: lend</figcaption>
+<pre><code class="language-kotlin">fun lend(bookId: Long, memberId: Long): LendResult {
+    books.find(bookId) ?: return LendResult.UnknownBook
+    members.find(memberId) ?: return LendResult.UnknownMember
+    // v1 checked the rules here and inserted later: two requests could both pass the checks.
+    // v2 hands both rules to the store, which checks and inserts in one transaction.
+    return when (val r = loans.tryLend(bookId, memberId, LocalDate.now(clock), MAX_OPEN_LOANS)) {
+        is TryLend.Lent -&gt; LendResult.Lent(r.loan)
+        TryLend.BookTaken -&gt; LendResult.BookOnLoan
+        TryLend.AtLimit -&gt; LendResult.LimitReached
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · service/LendingService.java: lend</figcaption>
+<pre><code class="language-java">public LendResult lend(long bookId, long memberId) {
+    if (books.find(bookId).isEmpty()) return new LendResult.UnknownBook();
+    if (members.find(memberId).isEmpty()) return new LendResult.UnknownMember();
+    // v1 checked the rules here and inserted later: two requests could both pass the checks.
+    // v2 hands both rules to the store, which checks and inserts in one transaction.
+    return switch (loans.tryLend(bookId, memberId, LocalDate.now(clock), MAX_OPEN_LOANS)) {
+        case TryLend.Lent(Loan loan) -&gt; new LendResult.Lent(loan);
+        case TryLend.BookTaken() -&gt; new LendResult.BookOnLoan();
+        case TryLend.AtLimit() -&gt; new LendResult.LimitReached();
+    };
+}</code></pre></figure>
+</div>
+<p>The memory fake gets the same method, marked <code>@Synchronized</code> / <code>synchronized</code> like all its others, so its check and add share one lock. Now the race demo again:</p>
+<div class="pair">
+<pre class="out">Race 1: 20 members borrow the SAME book at once (5 rounds)
+  round 1: 201×1  409×19
+  round 2: 201×1  409×19
+  round 3: 201×1  409×19
+  round 4: 201×1  409×19
+  round 5: 201×1  409×19
+Race 2: ONE member borrows 10 DIFFERENT books at once (limit is 3)
+  201×3  409×7 -&gt; member 21 now has 3 open loans</pre>
+<pre class="out">Race 1: 20 members borrow the SAME book at once (5 rounds)
+  round 1: 201×1  409×19
+  round 2: 201×1  409×19
+  round 3: 201×1  409×19
+  round 4: 201×1  409×19
+  round 5: 201×1  409×19
+Race 2: ONE member borrows 10 DIFFERENT books at once (limit is 3)
+  201×3  409×7 -&gt; member 21 now has 3 open loans</pre>
+</div>
+<p>Both races are gone, and the error logs are empty. Notice the trade-off: the "max 3 open loans" rule now lives partly in SQL, passed in as <code>maxOpen</code>. The alternative is to let the <em>service</em> open a transaction around several store calls (a "unit of work"). That keeps rules in the service but leaks transactions into it. Spring's <code>@Transactional</code> is exactly that alternative, done for you: L47 shows it.</p>
+
+<h3>Pin it with a test that can fail</h3>
+<p>Add two cases to the L45 contract suite, so they run against both the memory fake and SQLite:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · test/store/StoreContract.kt (added)</figcaption>
+<pre><code class="language-kotlin">@Test
+fun `tryLend refuses a book that is out and a member at the limit`() {
+    val (b1, b2) = books.add("Dune", "Herbert", 1965).id to books.add("Emma", "Austen", 1815).id
+    val (ada, bob) = members.add("Ada", "ada@example.com").id to members.add("Bob", "bob@example.com").id
+    assertTrue(loans.tryLend(b1, ada, day1, maxOpen = 1) is TryLend.Lent)
+    assertEquals(TryLend.BookTaken, loans.tryLend(b1, bob, day1, maxOpen = 1))
+    assertEquals(TryLend.AtLimit, loans.tryLend(b2, ada, day1, maxOpen = 1))
+}
+
+// L46: v1 checked in the service and inserted later, so a burst of requests could break both rules.
+@Test
+fun `tryLend keeps both rules under a burst of concurrent calls`() {
+    val book = books.add("Dune", "Herbert", 1965).id
+    val crowd = (1..20).map { members.add("M$it", "m$it@example.com").id }
+    val sameBook = burst(20) { i -&gt; loans.tryLend(book, crowd[i], day1, maxOpen = 3) }
+    assertEquals(1, sameBook.count { it is TryLend.Lent })
+
+    val greedy = members.add("Greedy", "greedy@example.com").id
+    val shelf = (1..10).map { books.add("Book $it", "Anon", null).id }
+    val oneMember = burst(10) { i -&gt; loans.tryLend(shelf[i], greedy, day1, maxOpen = 3) }
+    assertEquals(3, oneMember.count { it is TryLend.Lent })
+    assertEquals(3, loans.forMember(greedy).count { it.isOpen })
+}
+
+@Test
+fun `tryAdd lets exactly one of ten simultaneous sign-ups with one email through`() {
+    val results = burst(10) { members.tryAdd("Ada", "ada@example.com") }
+    assertEquals(1, results.count { it != null })
+    assertEquals(results.single { it != null }, members.findByEmail("ada@example.com"))
+}
+
+private fun &lt;T&gt; burst(n: Int, call: (Int) -&gt; T): List&lt;T&gt; {
+    val start = CountDownLatch(1)
+    Executors.newVirtualThreadPerTaskExecutor().use { pool -&gt;
+        val futures = (0 until n).map { i -&gt; pool.submit&lt;T&gt; { start.await(); call(i) } }
+        start.countDown()
+        return futures.map { it.get() }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · test/store/StoreContract.java (added)</figcaption>
+<pre><code class="language-java">@Test
+void tryLendRefusesABookThatIsOutAndAMemberAtTheLimit() {
+    long b1 = books.add("Dune", "Herbert", 1965).id();
+    long b2 = books.add("Emma", "Austen", 1815).id();
+    long ada = members.add("Ada", "ada@example.com").id();
+    long bob = members.add("Bob", "bob@example.com").id();
+    assertTrue(loans.tryLend(b1, ada, day1, 1) instanceof TryLend.Lent);
+    assertEquals(new TryLend.BookTaken(), loans.tryLend(b1, bob, day1, 1));
+    assertEquals(new TryLend.AtLimit(), loans.tryLend(b2, ada, day1, 1));
+}
+
+// L46: v1 checked in the service and inserted later, so a burst of requests could break both rules.
+@Test
+void tryLendKeepsBothRulesUnderABurstOfConcurrentCalls() throws Exception {
+    long book = books.add("Dune", "Herbert", 1965).id();
+    List&lt;Long&gt; crowd = new ArrayList&lt;&gt;();
+    for (int i = 1; i &lt;= 20; i++) crowd.add(members.add("M" + i, "m" + i + "@example.com").id());
+    List&lt;TryLend&gt; sameBook = burst(20, i -&gt; loans.tryLend(book, crowd.get(i), day1, 3));
+    assertEquals(1, sameBook.stream().filter(r -&gt; r instanceof TryLend.Lent).count());
+
+    long greedy = members.add("Greedy", "greedy@example.com").id();
+    List&lt;Long&gt; shelf = new ArrayList&lt;&gt;();
+    for (int i = 1; i &lt;= 10; i++) shelf.add(books.add("Book " + i, "Anon", null).id());
+    List&lt;TryLend&gt; oneMember = burst(10, i -&gt; loans.tryLend(shelf.get(i), greedy, day1, 3));
+    assertEquals(3, oneMember.stream().filter(r -&gt; r instanceof TryLend.Lent).count());
+    assertEquals(3, loans.forMember(greedy).stream().filter(Loan::isOpen).count());
+}
+
+@Test
+void tryAddLetsExactlyOneOfTenSimultaneousSignUpsWithOneEmailThrough() throws Exception {
+    List&lt;Optional&lt;Member&gt;&gt; results = burst(10, i -&gt; members.tryAdd("Ada", "ada@example.com"));
+    assertEquals(1, results.stream().filter(Optional::isPresent).count());
+    assertEquals(results.stream().flatMap(Optional::stream).findFirst(), members.findByEmail("ada@example.com"));
+}
+
+private static &lt;T&gt; List&lt;T&gt; burst(int n, IntFunction&lt;T&gt; call) throws Exception {
+    CountDownLatch start = new CountDownLatch(1);
+    try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+        List&lt;Future&lt;T&gt;&gt; futures = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; n; i++) {
+            int k = i;
+            futures.add(pool.submit(() -&gt; { start.await(); return call.apply(k); }));
+        }
+        start.countDown();
+        List&lt;T&gt; out = new ArrayList&lt;&gt;();
+        for (Future&lt;T&gt; f : futures) out.add(f.get());
+        return out;
+    }
+}</code></pre></figure>
+</div>
+<p>Does the concurrency test actually catch the bug? Prove it the TDD way (L11): temporarily write a naive <code>tryLend</code> that calls <code>openForBook</code>, <code>forMember</code> and <code>add</code> as three separate transactions, and run the tests:</p>
+<pre><code class="language-kotlin">// NAIVE (for the red run): three separate transactions, so other writers can slip in between.
+override fun tryLend(bookId: Long, memberId: Long, loaned: LocalDate, maxOpen: Int): TryLend = when {
+    openForBook(bookId) != null -&gt; TryLend.BookTaken
+    forMember(memberId).count { it.isOpen } &gt;= maxOpen -&gt; TryLend.AtLimit
+    else -&gt; TryLend.Lent(add(bookId, memberId, loaned))
+}</code></pre>
+<pre class="err">SqliteStoreTest &gt; tryLend keeps both rules under a burst of concurrent calls() FAILED
+    java.util.concurrent.ExecutionException: org.sqlite.SQLiteException: [SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: loans.book_id)
+        at java.base/java.util.concurrent.FutureTask.report(FutureTask.java:122)
+        at java.base/java.util.concurrent.FutureTask.get(FutureTask.java:191)
+        at shelf.store.StoreContract.burst(StoreContract.kt:121)
+        at shelf.store.StoreContract.tryLend keeps both rules under a burst of concurrent calls(StoreContract.kt:106)
+…
+        Caused by:
+        org.sqlite.SQLiteException: [SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: loans.book_id)
+…
+37 tests completed, 1 failed
+…
+BUILD FAILED in 1s</pre>
+<p>Red, but only on SQLite. <code>MemoryStoreTest</code> passed, because the fake's <code>tryLend</code> is still <code>synchronized</code>, so the fake can't race. That's the case for contract tests in one picture: the fast fake checks the rules, and only the run against the real store can show the concurrency bug. (I put the atomic version back; the suite is green again.)</p>
+
+<h3>SQLite write contention, and a bug that hid it</h3>
+<p>IMMEDIATE makes writers queue for the lock. How long does a queued writer wait? SQLite's <code>busy_timeout</code>: its busy handler "sleeps for a specified amount of time when a table is locked … After at least "ms" milliseconds of sleeping, the handler returns 0 which causes sqlite3_step() to return SQLITE_BUSY" (<a href="https://www.sqlite.org/c3ref/busy_timeout.html">sqlite3_busy_timeout</a>). v2 sets it explicitly in the URL, so it's visible and configurable. To see why it matters, 200 writers add a book at the same instant:</p>
+<div class="pair">
+<pre class="out">Busy timeout: 200 writers add a book at the same instant
+  busy_timeout=0 ms: 5 added, 195 failed with SQLITE_BUSY
+  busy_timeout=3000 ms: 200 added, 0 failed with SQLITE_BUSY</pre>
+<pre class="out">Busy timeout: 200 writers add a book at the same instant
+  busy_timeout=0 ms: 5 added, 195 failed with SQLITE_BUSY
+  busy_timeout=3000 ms: 200 added, 0 failed with SQLITE_BUSY</pre>
+</div>
+<p>With no timeout, a writer that finds the lock taken gives up at once, so only 5 of 200 succeeded. With 3 seconds of patience, all 200 queue and succeed, because each transaction holds the lock for well under a millisecond.</p>
+<p>Getting that first line was harder than it looks. My first run of this demo crashed with a different error:</p>
+<pre class="err">Busy timeout: 200 writers add a book at the same instant
+Exception in thread "main" java.util.concurrent.ExecutionException: org.sqlite.SQLiteException: [SQLITE_ERROR] SQL error or missing database (cannot rollback - no transaction is active)
+	at java.base/java.util.concurrent.FutureTask.report(FutureTask.java:122)
+	at java.base/java.util.concurrent.FutureTask.get(FutureTask.java:191)
+	at shelf.load.DbDemoKt.together(DbDemo.kt:51)
+	at shelf.load.DbDemoKt.main(DbDemo.kt:21)
+	at shelf.load.DbDemoKt.main(DbDemo.kt)
+Caused by: org.sqlite.SQLiteException: [SQLITE_ERROR] SQL error or missing database (cannot rollback - no transaction is active)
+	at org.sqlite.core.DB.newSQLException(DB.java:1182)
+	at org.sqlite.core.DB.newSQLException(DB.java:1193)
+	at org.sqlite.core.DB.throwex(DB.java:1153)
+	at org.sqlite.core.DB.exec(DB.java:199)</pre>
+<p>"cannot rollback - no transaction is active" is not the real problem. When SQLite refused the write lock at <code>BEGIN</code>, no transaction had started, so v1's <code>catch</code> block called <code>rollback()</code>, which threw <em>its own</em> exception, and that exception replaced the real <code>SQLITE_BUSY</code>. The old code hit this in 1 of my 3 runs, depending on where the lock was refused. It's the same lesson as L10's suppressed exceptions: keep the original, and attach the secondary one to it. v1's <code>Db</code> had this bug in both languages. v2's <code>transaction</code> fixes it; you'll see the fix in the <code>Db</code> listing just below.</p>
+
+<h3>Connection-per-request vs a pool</h3>
+<p>v1 opened a fresh SQLite connection for every store call: open the file, run <code>PRAGMA foreign_keys</code>, query, close. v2's <code>Db</code> can keep a fixed set of open connections in an <code>ArrayBlockingQueue</code> (L27). <code>take()</code> waits when all of them are in use, so the pool also caps how many requests touch the database at once.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · store/Db.kt (v2)</figcaption>
+<pre><code class="language-kotlin">class Db(file: Path, poolSize: Int = 0, busyTimeoutMs: Int = 3000) : AutoCloseable {
+    // IMMEDIATE: a transaction takes SQLite's write lock at BEGIN, so writers queue
+    // instead of failing with SQLITE_BUSY halfway through (L36).
+    // busy_timeout: how long a queued writer waits for that lock before giving up with SQLITE_BUSY.
+    private val url = "jdbc:sqlite:$file?transaction_mode=IMMEDIATE&amp;busy_timeout=$busyTimeoutMs"
+
+    // poolSize 0 = a fresh connection per call (v1). Otherwise a fixed set of open connections,
+    // handed out through a BlockingQueue (L27): take() waits when all are busy, so it also caps concurrency.
+    private val pool: ArrayBlockingQueue&lt;Connection&gt;? =
+        if (poolSize &gt; 0) ArrayBlockingQueue&lt;Connection&gt;(poolSize).also { q -&gt; repeat(poolSize) { q.add(connect()) } }
+        else null
+
+    fun connect(): Connection = DriverManager.getConnection(url).also { c -&gt;
+        c.createStatement().use { it.execute("PRAGMA foreign_keys = ON") }   // off by default (L34)
+    }
+
+    private fun borrow(): Connection = pool?.take() ?: connect()
+
+    private fun release(c: Connection) {
+        if (pool == null) return c.close()
+        if (!c.autoCommit) c.autoCommit = true          // hand it back clean
+        pool.put(c)
+    }
+
+    fun &lt;T&gt; read(block: (Connection) -&gt; T): T {
+        val c = borrow()
+        try { return block(c) } finally { release(c) }
+    }
+
+    fun &lt;T&gt; transaction(block: (Connection) -&gt; T): T {
+        val c = borrow()
+        try {
+            c.autoCommit = false
+            try {
+                return block(c).also { c.commit() }
+            } catch (e: Throwable) {
+                // If BEGIN itself failed (e.g. SQLITE_BUSY), rollback() throws "no transaction is active"
+                // and would hide the real error. Keep the real one; attach the other as suppressed (L10).
+                runCatching { c.rollback() }.onFailure(e::addSuppressed)
+                throw e
+            }
+        } finally {
+            release(c)
+        }
+    }
+
+    /** For /health: can we still run a query? */
+    fun ping(): Boolean = runCatching { read { c -&gt; c.query("SELECT 1") { it.getInt(1) } == listOf(1) } }.getOrDefault(false)
+
+    /** For /metrics: idle pooled connections (null without a pool). */
+    val idleConnections: Int? get() = pool?.size
+
+    override fun close() {
+        pool?.forEach { it.close() }
+    }</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · store/Db.java (v2)</figcaption>
+<pre><code class="language-java">public final class Db implements AutoCloseable {
+    // IMMEDIATE: a transaction takes SQLite's write lock at BEGIN, so writers queue
+    // instead of failing with SQLITE_BUSY halfway through (L36).
+    // busy_timeout: how long a queued writer waits for that lock before giving up with SQLITE_BUSY.
+    private final String url;
+    // poolSize 0 = a fresh connection per call (v1). Otherwise a fixed set of open connections,
+    // handed out through a BlockingQueue (L27): take() waits when all are busy, so it also caps concurrency.
+    private final ArrayBlockingQueue&lt;Connection&gt; pool;
+
+    public Db(Path file) {
+        this(file, 0, 3000);
+    }
+
+    public Db(Path file, int poolSize, int busyTimeoutMs) {
+        this.url = "jdbc:sqlite:" + file + "?transaction_mode=IMMEDIATE&amp;busy_timeout=" + busyTimeoutMs;
+        if (poolSize == 0) {
+            this.pool = null;
+            return;
+        }
+        this.pool = new ArrayBlockingQueue&lt;&gt;(poolSize);
+        try {
+            for (int i = 0; i &lt; poolSize; i++) pool.add(connect());
+        } catch (SQLException e) {
+            throw new DbException(e);
+        }
+    }
+
+    @FunctionalInterface
+    public interface Work&lt;T&gt; {
+        T run(Connection c) throws SQLException;
+    }
+
+    @FunctionalInterface
+    public interface Row&lt;T&gt; {
+        T map(ResultSet rs) throws SQLException;
+    }
+
+    /** SQLException is checked; the stores rethrow it unchecked so callers aren't forced to catch it. */
+    public static final class DbException extends RuntimeException {
+        DbException(SQLException cause) {
+            super(cause);
+        }
+    }
+
+    public Connection connect() throws SQLException {
+        Connection c = DriverManager.getConnection(url);
+        try (Statement st = c.createStatement()) {
+            st.execute("PRAGMA foreign_keys = ON");               // off by default (L34)
+        }
+        return c;
+    }
+
+    private Connection borrow() throws SQLException {
+        if (pool == null) return connect();
+        try {
+            return pool.take();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("interrupted while waiting for a connection", e);
+        }
+    }
+
+    private void release(Connection c) throws SQLException {
+        if (pool == null) {
+            c.close();
+            return;
+        }
+        if (!c.getAutoCommit()) c.setAutoCommit(true);           // hand it back clean
+        pool.add(c);
+    }
+
+    public &lt;T&gt; T read(Work&lt;T&gt; work) {
+        try {
+            Connection c = borrow();
+            try {
+                return work.run(c);
+            } finally {
+                release(c);
+            }
+        } catch (SQLException e) {
+            throw new DbException(e);
+        }
+    }
+
+    public &lt;T&gt; T transaction(Work&lt;T&gt; work) {
+        try {
+            Connection c = borrow();
+            try {
+                c.setAutoCommit(false);
+                try {
+                    T result = work.run(c);
+                    c.commit();
+                    return result;
+                } catch (SQLException | RuntimeException e) {
+                    // If BEGIN itself failed (e.g. SQLITE_BUSY), rollback() throws "no transaction is active"
+                    // and would hide the real error. Keep the real one; attach the other as suppressed (L10).
+                    try {
+                        c.rollback();
+                    } catch (SQLException r) {
+                        e.addSuppressed(r);
+                    }
+                    throw e;
+                }
+            } finally {
+                release(c);
+            }
+        } catch (SQLException e) {
+            throw new DbException(e);
+        }
+    }
+
+    /** For /health: can we still run a query? */
+    public boolean ping() {
+        try {
+            return read(c -&gt; query(c, "SELECT 1", rs -&gt; rs.getInt(1))).equals(List.of(1));
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** For /metrics: idle pooled connections, or -1 without a pool. */
+    public int idleConnections() {
+        return pool == null ? -1 : pool.size();
+    }
+
+    @Override
+    public void close() {
+        if (pool == null) return;
+        for (Connection c : pool) {
+            try {
+                c.close();
+            } catch (SQLException ignored) {
+                // closing anyway
+            }
+        }
+    }</code></pre></figure>
+</div>
+<p>Measured, with 64 virtual threads each doing 500 lookups (each size run twice, so the JIT is warm for the second pass):</p>
+<div class="pair">
+<pre class="out">Connections: 64 virtual threads x 500 book lookups each
+  new connection per call    702 ms  (45,584 lookups/s)
+  pool of 4                  145 ms  (220,689 lookups/s)
+  pool of 8                  116 ms  (275,862 lookups/s)
+  pool of 16                 126 ms  (253,968 lookups/s)
+  new connection per call    659 ms  (48,558 lookups/s)
+  pool of 4                  119 ms  (268,907 lookups/s)
+  pool of 8                  110 ms  (290,909 lookups/s)
+  pool of 16                 115 ms  (278,260 lookups/s)</pre>
+<pre class="out">Connections: 64 virtual threads x 500 book lookups each
+  new connection per call    714 ms  (44,817 lookups/s)
+  pool of 4                  139 ms  (230,215 lookups/s)
+  pool of 8                  117 ms  (273,504 lookups/s)
+  pool of 16                 126 ms  (253,968 lookups/s)
+  new connection per call    666 ms  (48,048 lookups/s)
+  pool of 4                  121 ms  (264,462 lookups/s)
+  pool of 8                  112 ms  (285,714 lookups/s)
+  pool of 16                 115 ms  (278,260 lookups/s)</pre>
+</div>
+<p>A pool is about 6× faster here, and the size hardly matters past 4: with a file on a fast SSD, the cost being saved is opening the connection, not waiting for the disk. Production apps use a pool library such as <a href="https://github.com/brettwooldridge/HikariCP">HikariCP</a> ("a 'zero-overhead' production ready JDBC connection pool"), which adds what this one lacks: timeouts on <code>take</code>, health checks, and replacing broken connections. Its wiki page <a href="https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing">About Pool Sizing</a> explains why bigger pools are usually <em>slower</em>.</p>
+
+<h3>Audit: what do request threads share?</h3>
+<table class="vs">
+  <tr><th>Shared object</th><th>Why it's safe</th></tr>
+  <tr><td>Router's route list</td><td>Filled before <code>server.start()</code>, only read afterwards. Starting a thread happens-before anything it does (JLS §17.4.5, L27), so every request sees the full list.</td></tr>
+  <tr><td>Services and stores</td><td>No mutable fields: every call works on its own connection or its own arguments.</td></tr>
+  <tr><td><code>Db</code>'s pool</td><td>An <code>ArrayBlockingQueue</code>, a thread-safe class from <code>java.util.concurrent</code>. A connection belongs to one request at a time.</td></tr>
+  <tr><td>Memory fakes</td><td>Every method locks the same monitor, <code>tryLend</code> and <code>tryAdd</code> included.</td></tr>
+  <tr><td>Caches, rate-limit buckets, metrics (Part 2–3)</td><td>A <code>ReentrantLock</code> (LRU), <code>synchronized</code> (token bucket), atomics and <code>LongAdder</code> (metrics), <code>ConcurrentHashMap</code> (in-flight loads).</td></tr>
+  <tr><td>JSON mappers</td><td>Created once at startup and reused. Jackson 3 made mappers "immutable and fully thread-safe" (<a href="https://github.com/FasterXML/jackson-databind">jackson-databind README</a>). The kotlinx <code>Json</code> instance is only read; L32's compiler warning asks you to create it once and reuse it.</td></tr>
+  <tr><td><code>SecureRandom</code> (request ids)</td><td>"SecureRandom objects are safe for use by multiple concurrent threads" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/security/SecureRandom.html">API docs</a>).</td></tr>
+</table>
+<p class="callout">One more race remains in v2 as I first wrote it, of exactly the same shape. Exercise 1 is finding it.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>sealed interface TryLend</code> with <code>data object BookTaken</code>: singleton results with <code>equals</code> and <code>toString</code> for free. Java uses empty records, <code>new TryLend.BookTaken()</code>, which compare equal because records do (L7).</li>
+    <li><code>runCatching { c.rollback() }.onFailure(e::addSuppressed)</code> is one line. Java needs a nested <code>try</code>/<code>catch</code> inside the <code>catch</code>.</li>
+    <li>No checked exceptions: Kotlin's <code>borrow()</code> just calls <code>pool.take()</code>. Java must catch <code>InterruptedException</code>, restore the interrupt flag (L26), and convert it to an <code>SQLException</code>.</li>
+    <li>Default parameter values (<code>poolSize: Int = 0, busyTimeoutMs: Int = 3000</code>) keep v1's <code>Db(file)</code> call working. Java adds a second constructor.</li>
+    <li>The same JDBC and the same SQLite underneath: both languages produced the same race counts, the same busy counts and the same pool speed-up.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise 1: find the race that's left</div>
+  <ol>
+    <li>Read <code>LendingService.register</code> as v1 wrote it (and as my first v2 still had it): <code>findByEmail</code>, then <code>add</code>. Predict what ten simultaneous sign-ups with the <em>same</em> email will return.</li>
+    <li>Write <code>RegisterRace</code>, a load tool like <code>RaceDemo</code>: three rounds of ten simultaneous <code>POST /members</code> with one email per round. Run it. Here's what my first v2 printed:
+<pre class="err">round 1: 201×1  500×9
+round 2: 201×1  409×3  500×6
+round 3: 201×1  409×4  500×5</pre></li>
+    <li>Fix it so that the database decides, in one statement. Add a contract test (ten simultaneous attempts, exactly one wins) and run the tool again.</li>
+  </ol>
+  <details class="solution"><summary>Reference solutions</summary>
+    <p>It's Race 1 again, on <code>members.email</code>: every request saw "no such email", the first insert won, and the <code>UNIQUE</code> constraint refused the rest with a 500. This time SQL has a one-statement answer, an UPSERT: "UPSERT is a clause added to INSERT that causes the INSERT to behave as an UPDATE or a no-op if the INSERT would violate a uniqueness constraint" (<a href="https://www.sqlite.org/lang_upsert.html">SQLite: UPSERT</a>). <code>ON CONFLICT (email) DO NOTHING</code> inserts nothing for a taken email, and <code>executeUpdate</code>'s row count says which case happened. No check-then-act is left to race.</p>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · SqliteMemberStore.tryAdd and LendingService.register</figcaption>
+<pre><code class="language-kotlin">// ON CONFLICT DO NOTHING: the UNIQUE index decides, inside one statement, so two sign-ups can't both win.
+override fun tryAdd(name: String, email: String): Member? = db.transaction { c -&gt;
+    val inserted = c.update("INSERT INTO members (name, email) VALUES (?, ?) ON CONFLICT (email) DO NOTHING", name, email)
+    if (inserted == 0) null
+    else Member(c.query("SELECT last_insert_rowid()") { it.getLong(1) }.single(), name, email)
+}</code></pre>
+<pre><code class="language-kotlin">// v1 checked findByEmail, then added: a burst of sign-ups with one email got 500s (Exercise 1).
+fun register(name: String, email: String): RegisterResult =
+    members.tryAdd(name, email)?.let { RegisterResult.Registered(it) } ?: RegisterResult.EmailTaken</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · SqliteMemberStore.tryAdd and LendingService.register</figcaption>
+<pre><code class="language-java">// ON CONFLICT DO NOTHING: the UNIQUE index decides, inside one statement, so two sign-ups can't both win.
+@Override
+public Optional&lt;Member&gt; tryAdd(String name, String email) {
+    return db.transaction(c -&gt; {
+        int inserted = update(c, "INSERT INTO members (name, email) VALUES (?, ?) ON CONFLICT (email) DO NOTHING", name, email);
+        if (inserted == 0) return Optional.&lt;Member&gt;empty();
+        long id = query(c, "SELECT last_insert_rowid()", rs -&gt; rs.getLong(1)).getFirst();
+        return Optional.of(new Member(id, name, email));
+    });
+}</code></pre>
+<pre><code class="language-java">// v1 checked findByEmail, then added: a burst of sign-ups with one email got 500s (Exercise 1).
+public RegisterResult register(String name, String email) {
+    return members.tryAdd(name, email)
+        .&lt;RegisterResult&gt;map(RegisterResult.Registered::new)
+        .orElseGet(RegisterResult.EmailTaken::new);
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · test/load/RegisterRace.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/test/kotlin/shelf/load/RegisterRace.kt--></figure>
+      <figure class="java"><figcaption>JAVA · test/load/RegisterRace.java</figcaption>
+<!--CODE:l46/cap_java/app/src/test/java/shelf/load/RegisterRace.java--></figure>
+    </div>
+    <div class="pair">
+<pre class="out">round 1: 201×1  409×9
+round 2: 201×1  409×9
+round 3: 201×1  409×9</pre>
+<pre class="out">round 1: 201×1  409×9
+round 2: 201×1  409×9
+round 3: 201×1  409×9</pre>
+    </div>
+    <p>The contract test is the third added case in the <code>StoreContract</code> listings above. It passed on both stores. The Java <code>Api</code> helper used by the Java tools:</p>
+    <figure class="java"><figcaption>JAVA · test/load/Api.java</figcaption>
+<!--CODE:l46/cap_java/app/src/test/java/shelf/load/Api.java--></figure>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Thread safety" data-answer="1">
+  <p class="q">In v1, 20 members borrow one book at once. Why did most of them get 500 instead of 409?</p>
+  <div class="opts"><button>The router dropped the extra requests</button><button>All checks passed before any insert</button><button>SQLite ran out of open connections</button><button>The JSON body was read twice</button></div>
+  <p class="why">Each request checked <code>openForBook</code> while the book was still free, then tried to insert. The partial unique index refused every insert after the first, and nothing mapped that exception to 409, so the router's catch-all made it a 500.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Thread safety" data-answer="3">
+  <p class="q">Why did step A (catching the constraint violation) not fix Race 2?</p>
+  <div class="opts"><button>Race 2 only happens in Java</button><button>The catch block sat too low</button><button>SQLite ignores the member's open loans</button><button>No constraint expresses the per-member limit</button></div>
+  <p class="why">The database refuses only what its schema says. "At most one open loan per book" is an index; "at most three open loans per member" is a rule in code. Without an atomic check-and-insert, nothing stops the eleventh loan.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Thread safety" data-answer="0">
+  <p class="q">What makes step B's <code>tryLend</code> atomic?</p>
+  <div class="opts"><button>BEGIN IMMEDIATE holds the write lock</button><button>The service method is now synchronized</button><button>The checks run before BEGIN starts</button><button>The connection pool has one connection</button></div>
+  <p class="why">The checks and the insert run inside one transaction that took SQLite's write lock at <code>BEGIN</code>. No other writer can run its checks until this one commits or rolls back.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Thread safety" data-answer="2">
+  <p class="q">The naive <code>tryLend</code> failed on SQLite but passed on the memory fake. Why?</p>
+  <div class="opts"><button>The fake has no partial index</button><button>JUnit runs the fake's tests first</button><button>The fake's method holds one lock</button><button>Memory stores never run in parallel</button></div>
+  <p class="why"><code>MemoryLoanStore.tryLend</code> is <code>synchronized</code>, so its check and add can't interleave. The naive change only broke the SQLite version, and only the contract run against SQLite exposed it. Keep running the contract against the real store.</p>
+</div>
+<div class="quiz" data-id="p1-5" data-group="Part 1 · Thread safety" data-answer="1">
+  <p class="q">v1's <code>transaction</code> called <code>rollback()</code> in its catch block. When BEGIN itself failed with SQLITE_BUSY, the program reported…</p>
+  <div class="opts"><button>The original busy error</button><button>A rollback error instead</button><button>Nothing; it carried on</button><button>A pool deadlock instead</button></div>
+  <p class="why"><code>rollback()</code> threw "cannot rollback - no transaction is active", and an exception thrown in a catch block replaces the one being handled. v2 keeps the real error and adds the rollback failure with <code>addSuppressed</code> (L10).</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Add your L41 cache and L43 rate limiter, and measure the difference</h2><span class="t">~30 min</span></div>
+
+<h3>The cache is a decorator</h3>
+<p>L39's Decorator pattern pays off here: a <code>CachingBookStore</code> <em>is</em> a <code>BookStore</code>, wraps another one, and nothing else in Shelf changes. Reads go through the cache. Writes go to the real store and then invalidate (L41's cache-aside). The cache itself is L41's <code>LruCache</code>, copied in with two additions: <code>clear()</code>, and <code>getOrPut()</code> for the rate limiter below.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · cache/CachingBookStore.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/main/kotlin/shelf/cache/CachingBookStore.kt--></figure>
+  <figure class="java"><figcaption>JAVA · cache/CachingBookStore.java</figcaption>
+<!--CODE:l46/cap_java/app/src/main/java/shelf/cache/CachingBookStore.java--></figure>
+</div>
+<p>Two decisions worth questioning. First, a write drops <em>every</em> cached page and count, because a new book can shift every page after it. That's crude but correct, and with 5% writes it costs little. Second, invalidation happens after the write, so a reader can briefly see the old value. L41's TTL bounds how long (30 seconds by default here). Shelf runs as one instance; with several instances behind a load balancer (L42), each would have its own cache, and a write on one wouldn't clear the others. That's when people reach for a shared cache such as Redis.</p>
+
+<h3>The rate limiter is a filter</h3>
+<p>The JDK's <code>HttpServer</code> has a built-in hook for code that runs around every request on a context: "A filter used to pre- and post-process incoming requests. Pre-processing occurs before the application's exchange handler is invoked, and post-processing occurs after the exchange handler returns" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/jdk.httpserver/com/sun/net/httpserver/Filter.html"><code>Filter</code> docs</a>). A filter may "Terminate the chain of invocation, by not calling Filter.Chain.doFilter(HttpExchange)", in which case it "must use the HttpExchange to send back an appropriate response". That's exactly a rate limiter: a 429 never reaches the router. The bucket is L43's, unchanged.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · http/RateLimit.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/main/kotlin/shelf/http/RateLimit.kt--></figure>
+  <figure class="java"><figcaption>JAVA · http/RateLimitFilter.java (TokenBucket.java is L43's)</figcaption>
+<!--CODE:l46/cap_java/app/src/main/java/shelf/http/RateLimitFilter.java--></figure>
+</div>
+<p>Look closely at the buckets map. A plain <code>ConcurrentHashMap&lt;String, TokenBucket&gt;</code> would get one entry per client id <em>forever</em>, and since the client picks its own <code>X-Client-Id</code>, an attacker could fill your heap with made-up ids: L24's unbounded-cache leak. An LRU with a cap and a TTL bounds it. (A real deployment would use an authenticated identity, not a header anyone can set.) <code>Router</code>'s private <code>send</code> moved to a shared top-level function, so the filter can answer with the same Problem Details format as the handlers.</p>
+
+<h3>Wiring it: the composition root and <code>Config</code></h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · App.kt (v2)</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/main/kotlin/shelf/App.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Shelf.java (v2)</figcaption>
+<!--CODE:l46/cap_java/app/src/main/java/shelf/Shelf.java--></figure>
+</div>
+<p>Three details. Filters run in the order they're added, so the access log (Part 3) is outermost and sees even the requests the limiter refuses. <code>decorateBooks</code> is a seam for tests and load tools: they wrap the real store to count or slow down its calls, without touching any production class (L38). And v1's constructor still exists, so all 33 of L45's tests run unchanged against v2.</p>
+
+<h3>Measure it, honestly</h3>
+<p>A load test only means something if you can say what it measured. This one:</p>
+<ul>
+  <li>Runs the <em>same v2 build</em> twice: once with pool, cache and limiter switched off by <code>Config</code> ("before"), once with the defaults ("after"). That's not quite v1, but it changes one thing at a time.</li>
+  <li>Sends 16 polite clients with a 20 ms pause between requests: 85% <code>GET /books/{id}</code>, picked Zipf-style so a few books are popular (L41), 10% list pages, and 5% <code>PUT</code>. On top of that, one greedy client sends 1,000 GETs with no pause at all.</li>
+  <li>Wraps the real store in a <code>SlowBookStore</code> that adds 2 ms to every read and counts reads. Localhost SQLite answers in microseconds, which would make any cache look pointless; a real database across a network takes milliseconds (L41's latency table). The delay is <em>injected</em>, and the table says so.</li>
+  <li>Uses fixed seeds, so the same requests go out every run. (Kotlin's <code>Random(seed)</code> and Java's <code>java.util.Random(seed)</code> produce different sequences, so the two languages send the same mix, not the same requests.)</li>
+</ul>
+<details class="solution"><summary>The load test: LoadTest.kt / LoadTest.java</summary>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · test/load/LoadTest.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/test/kotlin/shelf/load/LoadTest.kt--></figure>
+    <figure class="java"><figcaption>JAVA · test/load/LoadTest.java and SlowBookStore.java</figcaption>
+<!--CODE:l46/cap_java/app/src/test/java/shelf/load/LoadTest.java-->
+<!--CODE:l46/cap_java/app/src/test/java/shelf/load/SlowBookStore.java--></figure>
+  </div>
+</details>
+<div class="pair">
+<pre class="out">16 paced clients x 200 requests (85% GET /books/{id}, 10% lists, 5% PUT) + 1 greedy client x 1000 GETs
+Every database read costs an extra 2 ms. Latency percentiles are for the 16 paced clients.
+                                          p50    p95    p99   req/s DB reads   hit%   429s   5xx
+before (no pool, no cache, no limit)      3.5    6.6    7.6     796     4343      -      0     0
+after (pool 8, cache, limit 50/s)         0.6    6.0    7.0     804      682     87    887     0
+(ms; on my machine, on localhost)</pre>
+<pre class="out">16 paced clients x 200 requests (85% GET /books/{id}, 10% lists, 5% PUT) + 1 greedy client x 1000 GETs
+Every database read costs an extra 2 ms. Latency percentiles are for the 16 paced clients.
+                                          p50    p95    p99   req/s DB reads   hit%   429s   5xx
+before (no pool, no cache, no limit)      3.5    6.7    8.3     792     4353      -      0     0
+after (pool 8, cache, limit 50/s)         0.5    6.3    7.0     794      698     88    886     0
+(ms; on my machine, on localhost)</pre>
+</div>
+<p>The Kotlin run as a dashboard. The bars compare the two runs; the chart shows each run over time, in half-second buckets. Pick a metric:</p>
+<div class="loadviz" data-src="lv-shelf"></div>
+<script type="application/json" id="lv-shelf">{"summary": [{"label": "p50 (ms)", "before": 3.5, "after": 0.6}, {"label": "p95 (ms)", "before": 6.6, "after": 6}, {"label": "p99 (ms)", "before": 7.6, "after": 7}, {"label": "requests/s", "before": 796, "after": 804}, {"label": "DB reads", "before": 4343, "after": 682}, {"label": "429s", "before": 0, "after": 887}], "runs": [{"name": "before", "series": [{"t": 0.0, "n": 392, "p95": 86.4, "r429": 0, "err": 0}, {"t": 0.5, "n": 499, "p95": 6.5, "r429": 0, "err": 0}, {"t": 1.0, "n": 502, "p95": 5.9, "r429": 0, "err": 0}, {"t": 1.5, "n": 494, "p95": 6.3, "r429": 0, "err": 0}, {"t": 2.0, "n": 505, "p95": 6.1, "r429": 0, "err": 0}, {"t": 2.5, "n": 503, "p95": 5.9, "r429": 0, "err": 0}, {"t": 3.0, "n": 381, "p95": 6.5, "r429": 0, "err": 0}, {"t": 3.5, "n": 256, "p95": 6.9, "r429": 0, "err": 0}, {"t": 4.0, "n": 272, "p95": 7.1, "r429": 0, "err": 0}, {"t": 4.5, "n": 272, "p95": 6.3, "r429": 0, "err": 0}, {"t": 5.0, "n": 124, "p95": 4.8, "r429": 0, "err": 0}]}, {"name": "after", "series": [{"t": 0.0, "n": 1354, "p95": 6.5, "r429": 887, "err": 0}, {"t": 0.5, "n": 288, "p95": 3.6, "r429": 0, "err": 0}, {"t": 1.0, "n": 319, "p95": 4.2, "r429": 0, "err": 0}, {"t": 1.5, "n": 288, "p95": 5.7, "r429": 0, "err": 0}, {"t": 2.0, "n": 304, "p95": 3.6, "r429": 0, "err": 0}, {"t": 2.5, "n": 303, "p95": 6.0, "r429": 0, "err": 0}, {"t": 3.0, "n": 304, "p95": 5.9, "r429": 0, "err": 0}, {"t": 3.5, "n": 319, "p95": 6.4, "r429": 0, "err": 0}, {"t": 4.0, "n": 305, "p95": 4.0, "r429": 0, "err": 0}, {"t": 4.5, "n": 304, "p95": 4.9, "r429": 0, "err": 0}, {"t": 5.0, "n": 112, "p95": 3.4, "r429": 0, "err": 0}]}], "notes": {"n": "In the after run, the greedy client's 1,000 requests all finish in the first half-second: the limiter answers most of them at once with 429. In the before run, the same 1,000 requests compete for the database for about 3 seconds, which is why its traffic runs higher early on. After that, the 16 paced clients set the pace in both.", "p95": "The before run went first, on a cold JVM, so its first half-second is slow while the JIT warms up. After that, the tail of both runs sits around 4 to 7 ms: misses and refetched list pages.", "r429": "All of the after run's 429s land in the first half-second: the greedy client spends its 100-token burst plus a few refills, and everything else it sends is refused. The paced clients, at about 40 requests a second, never hit their 50-a-second limit."}}</script>
+<p><b>What the numbers show.</b></p>
+<ul>
+  <li><b>The median request got about 6× faster</b> (3.5 → 0.6 ms), and the database did <b>about 6× less work</b> (about 4,350 → under 700 reads). 87–88% of book lookups were served from memory.</li>
+  <li><b>The tail barely moved.</b> p95 is ~6 ms in both runs. The slowest requests are the ones the cache can't help: misses, and list pages refetched after a <code>PUT</code> cleared them. L41 found the same: a cache improves the typical request, not the worst one.</li>
+  <li><b>Throughput didn't change, and that's expected.</b> The polite clients pause between requests, so they set the pace, not the server. A server that keeps up shows the same requests per second either way. To measure capacity you'd remove the pauses and raise the load until latency climbs.</li>
+  <li><b>The limiter refused 886–887 of the greedy client's 1,000 requests</b>, all within the first half-second, and none of the polite clients' (40 requests per second is under their 50-per-second limit). In the "before" run, those 1,000 requests competed for the database with everyone else for about 3 seconds; the traffic chart shows both.</li>
+</ul>
+<p><b>What they don't show.</b> This is one machine, one run, localhost, and an injected delay; the shape is trustworthy, the exact milliseconds are not. The two runs share one JVM and "before" goes first, so its first half-second ran on a cold JIT (its p95 there was 86 ms): a fairer harness would warm up first, or alternate the order, as JMH does (L24). It says nothing about a cold cache after a restart, many server instances, or a database that slows down under load. And a load test only finds the problems its workload exercises. Exercise 2 changes one number and finds a bug.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li>In tests, <code>class SpyBookStore(inner: BookStore) : BookStore by inner</code> overrides one method and forwards the other five. Java's <code>SpyBookStore</code> and <code>SlowBookStore</code> forward all six by hand (L15's class delegation).</li>
+    <li>One generic <code>load(key, cache, fetch)</code> serves <code>find</code>, <code>list</code> and <code>count</code>, with <code>!!</code> where a list can't be null. Java does the same with <code>Supplier&lt;V&gt;</code>, plus an <code>Optional</code> wrapped and unwrapped around <code>find</code>.</li>
+    <li><code>context.filters += AccessLogFilter(…)</code> uses Kotlin's <code>+=</code> on a mutable list; Java writes <code>context.getFilters().add(…)</code>.</li>
+    <li><code>config.copy(port = 0)</code> comes free with a data class. Java's <code>Config</code> record needs hand-written "withers" like <code>withPort(0)</code> (L7).</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise 2: make the database slower</div>
+  <ol>
+    <li>The load test reads <code>LOAD_DB_DELAY_MS</code> from the environment. Before running anything, predict the table for 20 ms instead of 2 ms: which numbers grow, and roughly by how much?</li>
+    <li>Run <code>LOAD_DB_DELAY_MS=20 ./gradlew -q runMain -Pmain=shelf.load.LoadTestKt</code>. This is what my <em>first</em> <code>CachingBookStore</code> printed:
+<pre class="err">16 paced clients x 200 requests (85% GET /books/{id}, 10% lists, 5% PUT) + 1 greedy client x 1000 GETs
+Every database read costs an extra 20 ms. Latency percentiles are for the 16 paced clients.
+                                          p50    p95    p99   req/s DB reads   hit%   429s   5xx
+before (no pool, no cache, no limit)     29.8   56.4   61.8     150     4343      -      0     0
+after (pool 8, cache, limit 50/s)         0.7   95.9  153.4     480      697     88    830     0
+(ms; on my machine, on localhost)</pre></li>
+    <li>The "after" run has a <em>worse</em> p95 and p99 than "before" (96 and 153 ms against 56 and 62). Find the cause. Hint: here are my first <code>list</code> and <code>count</code>, and L41's <code>getOrPut</code>:
+<pre><code class="language-kotlin">override fun list(limit: Int, offset: Int, author: String?): List&lt;Book&gt; =
+    pages.getOrPut("$limit/$offset/$author") { store.list(limit, offset, author) }
+
+override fun count(author: String?): Int = counts.getOrPut("$author") { store.count(author) }</code></pre>
+<pre><code class="language-kotlin">/** get, or create-and-put under the same lock, so two threads can't both create one (L27). */
+fun getOrPut(key: K, create: () -&gt; V): V = lock.withLock { get(key) ?: create().also { put(key, it) } }</code></pre>
+    </li>
+    <li>Fix it and re-run at 20 ms. Then re-run at 2 ms, to check you didn't make the normal case worse.</li>
+  </ol>
+  <details class="solution"><summary>Reference answer</summary>
+    <p><b>The prediction.</b> "Before" should slow down about 10× everywhere, since every request makes at least one database read. "After" should keep its median, because most requests never reach the database. Both parts held: p50 stayed at 0.7 ms.</p>
+    <p><b>The bug.</b> <code>getOrPut</code> runs <code>create()</code> <em>while holding the cache's lock</em>. For the rate limiter, <code>create()</code> builds a token bucket in nanoseconds, so that's fine. For list pages, it's a 20 ms database read. Every other list request, including those for pages already in the cache, waits for the lock behind it. After each <code>PUT</code> clears the pages, the first few list requests queue up single-file. That's L27's rule: never hold a lock during I/O. At 2 ms the queue was short enough to hide.</p>
+    <p><b>The fix.</b> Load outside the lock, coalescing concurrent misses per key with the same in-flight map that <code>find</code> already used. That's the generic <code>load</code> function in the <code>CachingBookStore</code> listings above. After the fix, at 20 ms (Kotlin, then Java):</p>
+    <div class="pair">
+<pre class="out">16 paced clients x 200 requests (85% GET /books/{id}, 10% lists, 5% PUT) + 1 greedy client x 1000 GETs
+Every database read costs an extra 20 ms. Latency percentiles are for the 16 paced clients.
+                                          p50    p95    p99   req/s DB reads   hit%   429s   5xx
+before (no pool, no cache, no limit)     30.1   57.3   61.8     150     4343      -      0     0
+after (pool 8, cache, limit 50/s)         0.7   30.8   58.0     594      650     88    828     0
+(ms; on my machine, on localhost)</pre>
+<pre class="out">16 paced clients x 200 requests (85% GET /books/{id}, 10% lists, 5% PUT) + 1 greedy client x 1000 GETs
+Every database read costs an extra 20 ms. Latency percentiles are for the 16 paced clients.
+                                          p50    p95    p99   req/s DB reads   hit%   429s   5xx
+before (no pool, no cache, no limit)     30.1   57.5   62.0     149     4353      -      0     0
+after (pool 8, cache, limit 50/s)         0.6   30.8   58.9     603      673     88    841     0
+(ms; on my machine, on localhost)</pre>
+    </div>
+    <p>p95 fell from 96 to 31 ms and p99 from 153 to 58 ms: now better than "before", as it should be. Throughput rose too (480 → about 600 requests/s), because the greedy client was no longer stuck behind the lock. The 2 ms table earlier on this page is the post-fix run; it's slightly better than my pre-fix 2 ms run, too.</p>
+    <p>Look again at the first table: the bug was there all along. At 2 ms, though, the "after" run still beat "before" at p50 and roughly tied at p95, so it looked fine. Measuring only the case you expect can't show you this; push one variable until something gives.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Cache and rate limit" data-answer="2">
+  <p class="q">Why does <code>CachingBookStore</code> implement <code>BookStore</code>?</p>
+  <div class="opts"><button>Kotlin requires decorators to implement interfaces</button><button>So SQLite can call it back</button><button>So that nothing else needs changing</button><button>So the cache writes to disk</button></div>
+  <p class="why">A decorator has the same interface as what it wraps, so <code>BookService</code> can't tell a cached store from an uncached one. The composition root decides, from <code>Config</code> (L39).</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Cache and rate limit" data-answer="0">
+  <p class="q">A rate-limited request never reaches <code>Router.handle</code>. What stops it?</p>
+  <div class="opts"><button>The filter doesn't call chain.doFilter</button><button>The router checks shared flags</button><button>HttpServer drops the socket early</button><button>The handler returns null early</button></div>
+  <p class="why">A <code>Filter</code> continues the chain only if it calls <code>chain.doFilter(exchange)</code>. If it doesn't, the docs say it "must use the HttpExchange to send back an appropriate response". Here that's a 429 with <code>Retry-After</code>.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Cache and rate limit" data-answer="3">
+  <p class="q">Why are the rate limiter's buckets kept in a bounded LRU and not a plain map?</p>
+  <div class="opts"><button>LRU lookups are faster than hashing</button><button>Token buckets expire after one second</button><button>A plain map isn't thread-safe enough</button><button>Client-chosen ids could grow it forever</button></div>
+  <p class="why">One bucket per client id, and the client sends its own <code>X-Client-Id</code>. Without a bound, made-up ids would grow the map until the heap runs out: L24's leak. A capped LRU with a TTL forgets idle clients.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Cache and rate limit" data-answer="1">
+  <p class="q">With the cache on, why did p95 hardly change at 2 ms?</p>
+  <div class="opts"><button>The cache was far too small</button><button>The slowest requests were still misses</button><button>The rate limiter delayed paced clients</button><button>The pool had too few connections</button></div>
+  <p class="why">p95 is the slow tail, and the slowest requests are the ones that still go to the database: first reads, and list pages refetched after a write. A cache moves the median far more than the tail.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Structured logging, metrics, config, shutdown</h2><span class="t">~30 min</span></div>
+
+<h3>One JSON line per request, and the golden signals</h3>
+<p>A second filter, added first so it's outermost, does four jobs for every request. It takes the caller's <code>X-Request-Id</code> or makes one. It joins the caller's W3C trace (L43) or starts one. It times the request and records it in <code>Metrics</code>. And it writes one JSON log line, even for requests the limiter refused. <code>Metrics</code> keeps L43's four golden signals: traffic and errors (a counter per status code), latency (a histogram) and saturation (requests in flight, plus idle pool connections).</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · http/Observability.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/main/kotlin/shelf/http/Observability.kt--></figure>
+  <figure class="java"><figcaption>JAVA · http/AccessLogFilter.java and Metrics.java</figcaption>
+<!--CODE:l46/cap_java/app/src/main/java/shelf/http/AccessLogFilter.java-->
+<!--CODE:l46/cap_java/app/src/main/java/shelf/http/Metrics.java--></figure>
+</div>
+<p>The router's 500 handler now logs JSON too, carrying the same request id. That's the point of request ids: one id ties the error to the access line, and to the client's bug report. <code>/health</code> now runs a real <code>SELECT 1</code> and answers 503 if it fails, which is what a load balancer's health check needs (L42). <code>/metrics</code> renders the counters as plain text in the shape of Prometheus' format.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · http/Routes.kt (added)</figcaption>
+<pre><code class="language-kotlin">// Operations endpoints: for load balancers (L42) and monitoring (L43), not for users.
+fun Router.opsRoutes(dbUp: () -&gt; Boolean, metricsText: () -&gt; String) {
+    get("/health") {
+        val up = dbUp()
+        ok(Health(if (up) "UP" else "DOWN", if (up) "UP" else "DOWN"), if (up) 200 else 503)
+    }
+    get("/metrics") { Response(200, metricsText(), "text/plain; version=0.0.4") }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · http/Routes.java (added)</figcaption>
+<pre><code class="language-java">// Operations endpoints: for load balancers (L42) and monitoring (L43), not for users.
+public static void ops(Router r, BooleanSupplier dbUp, Supplier&lt;String&gt; metricsText) {
+    r.get("/health", req -&gt; {
+        boolean up = dbUp.getAsBoolean();
+        return Json.ok(new Health(up ? "UP" : "DOWN", up ? "UP" : "DOWN"), up ? 200 : 503, Map.of());
+    });
+    r.get("/metrics", req -&gt; new Response(200, metricsText.get(), "text/plain; version=0.0.4", Map.of()));
+}</code></pre></figure>
+</div>
+
+<h3>Configuration from the environment</h3>
+<p>"The twelve-factor app stores config in environment variables … Env vars are easy to change between deploys without changing any code; unlike config files, there is little chance of them being checked into the code repo accidentally" (<a href="https://12factor.net/config">The Twelve-Factor App: Config</a>). That last part is L33's rule about secrets. Shelf has no secrets yet, but a database password would come in the same way. Every setting has a default, and 0 switches a feature off, which is how the load test made its "before" run.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Config.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/main/kotlin/shelf/Config.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Config.java</figcaption>
+<!--CODE:l46/cap_java/app/src/main/java/shelf/Config.java--></figure>
+</div>
+
+<h3>Run it like production</h3>
+<p>Install the distribution (L25), start it with environment variables, use it, then stop it with <code>kill</code>, which sends SIGTERM, the same signal a container platform sends. The script is <code>prod_session.sh</code>; this is its Kotlin run, with a rate limit of 5 to make the 429s easy to see. (The Java server printed the same lines, apart from random ids, timestamps and its process id.)</p>
+<pre class="term">$ curl -s localhost:18046/health
+{"status":"UP","db":"UP"}
+$ curl -s -H "X-Client-Id: ada" -d '{"title":"Dune","author":"Frank Herbert","year":1965}' localhost:18046/books
+{"id":1,"title":"Dune","author":"Frank Herbert","year":1965}
+$ curl -si -H "X-Client-Id: ada" -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" localhost:18046/books/1
+HTTP/1.1 200 OK
+Traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-cbfa80e5c7b6c3a4-01
+Content-type: application/json
+X-request-id: 304301bfb1089833
+Content-length: 60
+
+{"id":1,"title":"Dune","author":"Frank Herbert","year":1965}
+
+$ for i in 1 2 3 4 5; do curl -s -o /dev/null -w "%{http_code} " -H "X-Client-Id: ada" localhost:18046/books/1; done
+200 200 200 429 429 
+$ curl -si -H "X-Client-Id: ada" localhost:18046/books/1
+HTTP/1.1 429 
+Traceparent: 00-ded13a13af950a4bc21926402ec45880-86d4db41563d616e-01
+Retry-after: 1
+Content-type: application/problem+json
+X-request-id: 017f204a96f538db
+Content-length: 108
+
+{"type":"about:blank","title":"Too Many Requests","status":429,"detail":"Rate limit exceeded; retry in 1 s"}
+
+$ curl -s localhost:18046/metrics
+# TYPE shelf_requests_total counter
+shelf_requests_total{code="200"} 6
+shelf_requests_total{code="201"} 1
+shelf_requests_total{code="429"} 3
+# TYPE shelf_request_ms histogram
+shelf_request_ms_bucket{le="1"} 7
+shelf_request_ms_bucket{le="2"} 8
+shelf_request_ms_bucket{le="5"} 8
+shelf_request_ms_bucket{le="10"} 9
+shelf_request_ms_bucket{le="25"} 10
+shelf_request_ms_bucket{le="50"} 10
+shelf_request_ms_bucket{le="100"} 10
+shelf_request_ms_bucket{le="250"} 10
+shelf_request_ms_bucket{le="500"} 10
+shelf_request_ms_bucket{le="1000"} 10
+shelf_request_ms_bucket{le="+Inf"} 10
+shelf_request_ms_sum 33
+shelf_request_ms_count 10
+shelf_in_flight 1
+shelf_db_idle_connections 8
+shelf_cache_hit_ratio 0.75
+$ kill 52675   # SIGTERM, like Ctrl-C or a container stop</pre>
+<p>And the server's own output, which in production would go to a log collector:</p>
+<pre class="term">{"level":"INFO","msg":"listening","port":18046,"db":"/var/folders/3_/g5dwb35x4xl1lpd8717mpprw0000gn/T/tmp.ZEh9KRzv1I/shelf.db","pool":8,"cache":1000,"rateBurst":5.0}
+{"ts":"2026-10-28T03:38:47.944435Z","level":"INFO","requestId":"518c764e447c0cf1","traceId":"0378dbfd6d2c335cee2db17b11bb8af6","method":"GET","path":"/health","status":200,"ms":25,"client":"127.0.0.1"}
+{"ts":"2026-10-28T03:38:47.952345Z","level":"INFO","requestId":"20ce7ac7437d6e3c","traceId":"126c5607712781f42eb479e1fba119c5","method":"GET","path":"/health","status":200,"ms":0,"client":"127.0.0.1"}
+{"ts":"2026-10-28T03:38:47.965654Z","level":"INFO","requestId":"074f2af173540dea","traceId":"8592fb1e0fdc06ab7682d242fc266f5e","method":"POST","path":"/books","status":201,"ms":6,"client":"ada"}
+{"ts":"2026-10-28T03:38:47.974884Z","level":"INFO","requestId":"304301bfb1089833","traceId":"4bf92f3577b34da6a3ce929d0e0e4736","method":"GET","path":"/books/1","status":200,"ms":2,"client":"ada"}
+{"ts":"2026-10-28T03:38:47.982485Z","level":"INFO","requestId":"31753039fad27cc2","traceId":"86987f79b181907c8d24e4b5dd87f295","method":"GET","path":"/books/1","status":200,"ms":0,"client":"ada"}
+{"ts":"2026-10-28T03:38:47.988923Z","level":"INFO","requestId":"5022af025c89e3ab","traceId":"aac3a3d2fae9e5da9bdfb736a34469ec","method":"GET","path":"/books/1","status":200,"ms":0,"client":"ada"}
+{"ts":"2026-10-28T03:38:47.994568Z","level":"INFO","requestId":"dd39459352503154","traceId":"2d99a52f5519feecb0d50f9c1905c7f5","method":"GET","path":"/books/1","status":200,"ms":0,"client":"ada"}
+{"ts":"2026-10-28T03:38:48.001069Z","level":"INFO","requestId":"5ba6c36bf630a6b3","traceId":"b32c817eb804e992f141e67c5cdb8fe4","method":"GET","path":"/books/1","status":429,"ms":0,"client":"ada"}
+{"ts":"2026-10-28T03:38:48.006943Z","level":"INFO","requestId":"7e2977a03a6386bc","traceId":"4ac761df6ea9392a666a627c4293b05e","method":"GET","path":"/books/1","status":429,"ms":0,"client":"ada"}
+{"ts":"2026-10-28T03:38:48.013785Z","level":"INFO","requestId":"017f204a96f538db","traceId":"ded13a13af950a4bc21926402ec45880","method":"GET","path":"/books/1","status":429,"ms":0,"client":"ada"}
+{"ts":"2026-10-28T03:38:48.021493Z","level":"INFO","requestId":"0c8a3b5d3348d7f2","traceId":"7a176a2c0cb52d9b1cc7341524c5002e","method":"GET","path":"/metrics","status":200,"ms":1,"client":"127.0.0.1"}
+{"level":"INFO","msg":"shutting down","drainSeconds":5}
+{"level":"INFO","msg":"stopped"}
+(port 18046 free)</pre>
+<p><b>Read it.</b></p>
+<ul>
+  <li><b>The access lines</b> carry everything you'd search by: the request id, the trace id, method, path, status, duration and client. The request with a <code>traceparent</code> kept the caller's trace id <code>4bf92f35…</code> and got a new span id; the others started new traces.</li>
+  <li><b>The 4th and 5th requests</b> in the loop were refused, exactly as the warm-up predicted for a bucket of 5. The full <code>429</code> answer has <code>Retry-After: 1</code> and a Problem Details body. The status line reads <code>HTTP/1.1 429 </code> with an empty reason phrase: the JDK has no phrase for 429, as L44 found, and RFC 9112 tells clients to ignore reason phrases anyway.</li>
+  <li><b>Metrics:</b> <code>shelf_in_flight 1</code> is the <code>/metrics</code> request itself, which is still running while it renders. The cache hit ratio is 0.75, from four reads of book 1: one miss, then three hits.</li>
+  <li><b>Shutdown:</b> the hook logged "shutting down" and "stopped", and the port was free afterwards.</li>
+</ul>
+
+<h3>Graceful shutdown</h3>
+<p>v1's <code>close()</code> called <code>server.stop(0)</code>. The docs say what the number means: <code>stop</code> closes the listening socket, and "will then block until all current exchange handlers have completed or else when approximately delay seconds have elapsed (whichever happens sooner). Then, all open TCP connections are closed" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/jdk.httpserver/com/sun/net/httpserver/HttpServer.html#stop(int)"><code>HttpServer.stop</code></a>). With 0, "whichever happens sooner" is immediately. Here are three slow requests in flight (each read takes 0.8 s) when <code>close()</code> is called, with v1's <code>stop(0)</code> and then v2's <code>stop(5)</code>:</p>
+<details class="solution"><summary>The demo: ShutdownDemo.kt / ShutdownDemo.java</summary>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · test/load/ShutdownDemo.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/test/kotlin/shelf/load/ShutdownDemo.kt--></figure>
+    <figure class="java"><figcaption>JAVA · test/load/ShutdownDemo.java</figcaption>
+<!--CODE:l46/cap_java/app/src/test/java/shelf/load/ShutdownDemo.java--></figure>
+  </div>
+</details>
+<div class="pair">
+<pre class="out">drainSeconds = 0
+ 292 ms  close() called with 3 requests in flight
+ 298 ms  request 3 FAILED: ConnectException
+ 298 ms  request 2 FAILED: ConnectException
+ 298 ms  request 1 FAILED: ConnectException
+ 955 ms  close() returned
+ 956 ms  new request after close: ConnectException
+drainSeconds = 5
+ 212 ms  close() called with 3 requests in flight
+ 813 ms  close() returned
+ 822 ms  request 3 finished: 200 {"id":1,"title":"Dune","author":"Frank Herbert","year":1965}
+ 822 ms  request 2 finished: 200 {"id":1,"title":"Dune","author":"Frank Herbert","year":1965}
+ 822 ms  request 1 finished: 200 {"id":1,"title":"Dune","author":"Frank Herbert","year":1965}
+ 824 ms  new request after close: ConnectException</pre>
+<pre class="out">drainSeconds = 0
+ 296 ms  close() called with 3 requests in flight
+ 301 ms  request 1 FAILED: ConnectException
+ 301 ms  request 2 FAILED: ConnectException
+ 301 ms  request 3 FAILED: ConnectException
+1014 ms  close() returned
+1016 ms  new request after close: ConnectException
+drainSeconds = 5
+ 211 ms  close() called with 3 requests in flight
+ 816 ms  close() returned
+ 825 ms  request 1 finished: 200 {"id":1,"title":"Dune","author":"Frank Herbert","year":1965}
+ 825 ms  request 2 finished: 200 {"id":1,"title":"Dune","author":"Frank Herbert","year":1965}
+ 824 ms  request 3 finished: 200 {"id":1,"title":"Dune","author":"Frank Herbert","year":1965}
+ 826 ms  new request after close: ConnectException</pre>
+</div>
+<p>With <code>stop(0)</code>, all three clients lost their connection, even though the handlers carried on working until the executor closed (that's why <code>close()</code> still took about 0.7 s). With <code>stop(5)</code>, all three got their answer, <code>close()</code> returned as soon as they finished rather than after 5 seconds, and a new request was refused. In production, deploys and autoscaling stop servers constantly; without draining, every deploy fails some requests.</p>
+
+<h3>Tests for all of it</h3>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · test/ProductionTest.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/test/kotlin/shelf/ProductionTest.kt--></figure>
+  <figure class="java"><figcaption>JAVA · test/ProductionTest.java</figcaption>
+<!--CODE:l46/cap_java/app/src/test/java/shelf/ProductionTest.java--></figure>
+</div>
+<p>Two habits from earlier lessons are doing the heavy lifting. A <code>MutableClock</code> (L38) makes the rate-limit test instant and exact: no <code>sleep(1000)</code> waiting for a refill. And the log sink is just a function, so a test can collect lines into a list and assert on them. The one test that does sleep, for shutdown, only waits 100 ms to be sure its request is in flight.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>log: (String) -&gt; Unit = ::println</code> is a function-typed parameter with a default; tests pass <code>logs::add</code>. Java uses <code>Consumer&lt;String&gt;</code> and passes <code>System.out::println</code> explicitly (L14).</li>
+    <li><code>jsonLine("ts" to clock.instant(), …)</code> takes pairs built with <code>to</code>, in order. Java builds a <code>LinkedHashMap</code> line by line. Using <code>Map.of</code> would scramble the key order, since its iteration order is unspecified; I started that way in <code>App.java</code> and changed it.</li>
+    <li><code>Config.fromEnv</code> uses local functions (<code>fun int(name, default)</code>) and <code>?.let</code>; Java uses a static helper and <code>containsKey</code> ternaries.</li>
+    <li><code>try { chain.doFilter(exchange) } finally { … }</code> is the same in both. The access line is written even if a filter or handler throws.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise 3: answer a question from the logs</div>
+  <p>Before the Exercise 1 fix, a run of <code>RegisterRace</code> wrote 50 log lines (<code>shelf.log</code>). Using only <code>grep</code>, <code>sort</code>, <code>uniq</code> and <code>jq</code>, answer:</p>
+  <ol>
+    <li>How many requests failed with 500, and what was the split of status codes?</li>
+    <li>Take one failing request id. What happened to that request? Show every line it produced.</li>
+    <li>Are all the 500s caused by the same error?</li>
+  </ol>
+  <details class="solution"><summary>Reference session</summary>
+<pre class="term">$ grep -c '"status":500' shelf.log
+20
+$ grep -o '"status":[0-9]*' shelf.log | sort | uniq -c
+   3 "status":201
+   7 "status":409
+  20 "status":500
+$ grep 05d566c8d782dc56 shelf.log
+{"level":"ERROR","requestId":"05d566c8d782dc56","method":"POST","path":"/members","error":"org.sqlite.SQLiteException: [SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: members.email)"}
+{"ts":"2026-10-28T03:33:49.386176Z","level":"ERROR","requestId":"05d566c8d782dc56","traceId":"ea5c1027897216e1cff59851941b4d3d","method":"POST","path":"/members","status":500,"ms":44,"client":"127.0.0.1"}
+$ jq -r 'select(.error) | .error' shelf.log | sort | uniq -c
+  20 org.sqlite.SQLiteException: [SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed (UNIQUE constraint failed: members.email)</pre>
+    <p>20 of 30 requests failed. Every one of the 20 errors is the same <code>UNIQUE constraint failed: members.email</code>, so one bug explains them all. Request <code>05d566c8d782dc56</code> produced two lines: the router's ERROR line, with the exception, and the access line, with status 500 and its trace id. That's why the filter sets the request id <em>before</em> calling the router: so the router can find it. With printf-style logs, step 3 would be a fragile regex; with one JSON object per line, <code>jq</code> just selects a field. (Unstructured lines, like the demo's own <code>round 1: …</code> output, are why I kept only JSON lines in <code>shelf.log</code>.)</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · Operations" data-answer="3">
+  <p class="q">Why is the access-log filter added before the rate limiter?</p>
+  <div class="opts"><button>Filters always run in reverse order</button><button>The limiter needs the request id</button><button>Logging must always happen after routing</button><button>So refused requests get logged too</button></div>
+  <p class="why">Filters run in the order added, so the first one wraps everything after it. Outermost, the access log times and records every request, 429s included, which is exactly the traffic you want to see during an attack.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · Operations" data-answer="0">
+  <p class="q">What does <code>server.stop(5)</code> do with three requests still running?</p>
+  <div class="opts"><button>Waits for them, five seconds max</button><button>Cancels them and returns at once</button><button>Always waits the full five seconds</button><button>Finishes them, then accepts new ones</button></div>
+  <p class="why">The docs: it closes the listening socket, then blocks "until all current exchange handlers have completed or else when approximately delay seconds have elapsed (whichever happens sooner)". The demo returned after about 0.6 s, as soon as the three finished.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · Operations" data-answer="2">
+  <p class="q">Why read the port and database path from environment variables?</p>
+  <div class="opts"><button>The OS encrypts every environment variable</button><button>JVMs read them faster than files</button><button>Deploys change them without changing code</button><button>Gradle cannot package any configuration files</button></div>
+  <p class="why">Twelve-Factor: "Env vars are easy to change between deploys without changing any code", and they're unlikely to be committed by accident. The same build runs on your laptop and on a server with different settings.</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · Operations" data-answer="1">
+  <p class="q">In the session, <code>/metrics</code> showed <code>shelf_in_flight 1</code>. Which request was that?</p>
+  <div class="opts"><button>The book cached earlier on</button><button>The metrics request being rendered</button><button>A request stuck waiting there</button><button>The health check on startup</button></div>
+  <p class="why">The filter increments the gauge before calling the handler and decrements it in <code>finally</code>. The <code>/metrics</code> handler renders while its own request is still in flight, so it counts itself.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise · Capstone, part 2</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>Shelf v2</h2><span class="t">~20 min here, plus your own sittings</span></div>
+
+<p>Turn your Shelf v1 into v2, in both languages, by hand. Keep every L45 test green at every step: they're your safety net (L37). Build it in this order:</p>
+<div class="task">
+  <ol>
+    <li><b>Break it first.</b> Write <code>RaceDemo</code> and the <code>runMain</code> task, and run it against <em>your</em> v1. Save the output: it's your "before".</li>
+    <li><b>Make lending atomic.</b> Add <code>tryLend</code> and <code>TryLend</code>, change <code>lend</code>, and add the two contract tests. Prove the concurrency test can fail with a naive version, then make it pass.</li>
+    <li><b>Find and fix the register race</b> (Exercise 1), with <code>tryAdd</code> and its contract test.</li>
+    <li><b>Fix <code>Db</code>.</b> Add the rollback fix, the busy timeout and the optional pool. Run the busy and pool measurements yourself.</li>
+    <li><b>Add the cache.</b> <code>CachingBookStore</code>, with loads outside the lock, plus the cache test in <code>ProductionTest</code>.</li>
+    <li><b>Add the rate limiter.</b> <code>RateLimitFilter</code> and the fake-clock test.</li>
+    <li><b>Add telemetry.</b> The access-log filter, <code>Metrics</code>, <code>/metrics</code>, <code>/health</code> with a database check, and JSON error lines from the router, plus the logging test.</li>
+    <li><b>Add <code>Config</code>, the new composition root and graceful shutdown</b>, plus the shutdown test.</li>
+    <li><b>Measure.</b> Write the load test, and run it at 2 ms and 20 ms. Write three sentences about what your numbers do and don't show.</li>
+    <li><b>Run it like production.</b> <code>installDist</code>, environment variables, <code>curl</code>, then <code>kill</code>.</li>
+  </ol>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: Shelf v2 (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: Shelf v2 (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-tests" data-label="Final: concurrency, contract and production tests"><span class="who">TESTS</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+
+  <details class="solution"><summary>Reference: the remaining v2 files</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · cache/LruCache.kt (L41's, plus clear and getOrPut)</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/main/kotlin/shelf/cache/LruCache.kt--></figure>
+      <figure class="java"><figcaption>JAVA · cache/LruCache.java (L41's, plus clear and getOrPut)</figcaption>
+<!--CODE:l46/cap_java/app/src/main/java/shelf/cache/LruCache.java--></figure>
+    </div>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · http/Router.kt (v2)</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/main/kotlin/shelf/http/Router.kt--></figure>
+      <figure class="java"><figcaption>JAVA · http/Router.java (v2)</figcaption>
+<!--CODE:l46/cap_java/app/src/main/java/shelf/http/Router.java--></figure>
+    </div>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · store/MemoryStores.kt (v2)</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/main/kotlin/shelf/store/MemoryStores.kt--></figure>
+      <figure class="java"><figcaption>JAVA · App.java and store/MemoryLoanStore.java (v2)</figcaption>
+<!--CODE:l46/cap_java/app/src/main/java/shelf/App.java-->
+<!--CODE:l46/cap_java/app/src/main/java/shelf/store/MemoryLoanStore.java--></figure>
+    </div>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · test/load/DbDemo.kt</figcaption>
+<!--CODE:l46/cap_kotlin/app/src/test/kotlin/shelf/load/DbDemo.kt--></figure>
+      <figure class="java"><figcaption>JAVA · test/load/DbDemo.java</figcaption>
+<!--CODE:l46/cap_java/app/src/test/java/shelf/load/DbDemo.java--></figure>
+    </div>
+  </details>
+
+  <details class="solution"><summary>Reference: all 44 tests green, in both languages</summary>
+    <div class="pair">
+<pre class="out">ProductionTest &gt; the cache serves repeat reads and an update invalidates it() PASSED
+ProductionTest &gt; 20 simultaneous loans of one book give one 201 and nineteen 409s, never a 500() PASSED
+ProductionTest &gt; shutdown lets an in-flight request finish, then refuses new ones() PASSED
+ProductionTest &gt; a client over its limit gets 429 with Retry-After until tokens refill() PASSED
+ProductionTest &gt; every request gets one JSON log line that joins the caller's trace, and metrics count it() PASSED
+MemoryStoreTest &gt; tryLend keeps both rules under a burst of concurrent calls() PASSED
+MemoryStoreTest &gt; tryAdd lets exactly one of ten simultaneous sign-ups with one email through() PASSED
+MemoryStoreTest &gt; tryLend refuses a book that is out and a member at the limit() PASSED
+SqliteStoreTest &gt; tryLend keeps both rules under a burst of concurrent calls() PASSED
+SqliteStoreTest &gt; tryAdd lets exactly one of ten simultaneous sign-ups with one email through() PASSED
+SqliteStoreTest &gt; tryLend refuses a book that is out and a member at the limit() PASSED
+BUILD SUCCESSFUL in 6s</pre>
+<pre class="out">ProductionTest &gt; shutdownLetsAnInFlightRequestFinishThenRefusesNewOnes() PASSED
+ProductionTest &gt; everyRequestGetsOneJsonLogLineThatJoinsTheCallersTraceAndMetricsCountIt() PASSED
+ProductionTest &gt; aClientOverItsLimitGets429WithRetryAfterUntilTokensRefill() PASSED
+ProductionTest &gt; theCacheServesRepeatReadsAndAnUpdateInvalidatesIt() PASSED
+ProductionTest &gt; twentySimultaneousLoansOfOneBookGiveOne201AndNineteen409sNeverA500() PASSED
+MemoryStoreTest &gt; tryLendRefusesABookThatIsOutAndAMemberAtTheLimit() PASSED
+MemoryStoreTest &gt; tryLendKeepsBothRulesUnderABurstOfConcurrentCalls() PASSED
+MemoryStoreTest &gt; tryAddLetsExactlyOneOfTenSimultaneousSignUpsWithOneEmailThrough() PASSED
+SqliteStoreTest &gt; tryLendRefusesABookThatIsOutAndAMemberAtTheLimit() PASSED
+SqliteStoreTest &gt; tryLendKeepsBothRulesUnderABurstOfConcurrentCalls() PASSED
+SqliteStoreTest &gt; tryAddLetsExactlyOneOfTenSimultaneousSignUpsWithOneEmailThrough() PASSED
+BUILD SUCCESSFUL in 2s</pre>
+    </div>
+    <p>That's the new tests plus the result line. The full runs list 44 tests per language as <code>PASSED</code>: L45's 33, plus 3 contract cases run on both stores (6), plus 5 production tests.</p>
+  </details>
+
+  <p><b>Read your results.</b></p>
+  <ul>
+    <li><b>Your race counts will differ</b> from mine run to run; the <em>shape</em> shouldn't. If your v1 shows no 500s, raise the burst to 50 requests. Races depend on timing, and your machine may be faster or slower.</li>
+    <li><b>Your timings will differ</b>, but the ratios should look similar: the cache moving the median far more than the tail, and the pool beating a connection per call.</li>
+    <li><b>What v2 still isn't:</b> it has no authentication (the client id is self-declared), no HTTPS (L31), one instance with a local cache and a SQLite file (L42), and no schema migrations. L47 maps each of these to what Spring Boot and its ecosystem provide, and shows which parts of today's work it does for you, and which it doesn't.</li>
+  </ul>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">Two request threads read Shelf's route list, which was filled before <code>server.start()</code>. Why do they see every route without locking? (L27)</p>
+  <div class="opts"><button>Lists are always safe to read</button><button>Thread start is a happens-before edge</button><button>Virtual threads share one CPU cache</button><button>The router copies it per request</button></div>
+  <p class="why">JLS §17.4.5: a call to <code>start()</code> on a thread happens-before any action in the started thread. Everything written before <code>server.start()</code> (and the executor's task handoff after it) is visible to the request threads, as long as nobody writes it afterwards.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">A map of rate-limit buckets keyed by a client-chosen id, never trimmed, is an example of… (L24)</p>
+  <div class="opts"><button>A deadlock waiting to happen</button><button>A classic false sharing problem</button><button>A stack overflow on startup</button><button>A memory leak despite GC</button></div>
+  <p class="why">Every entry stays reachable from the map, so the garbage collector can never free it, however stale. L24's leaks were all this shape: a long-lived collection that only grows.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">A load balancer polls <code>/health</code> and gets 503. What should it do? (L42)</p>
+  <div class="opts"><button>Stop sending that server new requests</button><button>Restart the database on that server</button><button>Retry the same request on it</button><button>Send it double traffic to test</button></div>
+  <p class="why">L42's health checks took failing backends out of rotation. Shelf's <code>/health</code> now answers 503 when its database check fails, so a load balancer can route around it.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">Why must a database password never appear in <code>Config</code>'s defaults? (L33)</p>
+  <div class="opts"><button>Kotlin forbids string constants for passwords</button><button>Environment variables cannot hold long values</button><button>Source code lives in Git history</button><button>SQLite refuses passwords set in code</button></div>
+  <p class="why">Anything in code is in every clone and every commit forever, and L33 showed old secrets turning up with <code>git log -p</code>. Secrets come from the environment (or a secrets manager) at run time; defaults are only for harmless settings.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Draw v1's lend race as two timelines. Mark the moment it went wrong, and say which of the two races the unique index stops.</li>
+    <li>Write <code>tryLend</code> from memory, and say what makes it atomic in SQLite.</li>
+    <li>Write <code>Db.transaction</code> with the rollback fix, and explain what the old version reported instead of <code>SQLITE_BUSY</code>.</li>
+    <li>Explain why holding a lock during a database read made the cache slower than no cache at 20 ms.</li>
+    <li>Write the order of Shelf's filters and why that order. What would change if you swapped them?</li>
+    <li>Describe what <code>stop(0)</code> and <code>stop(5)</code> do to three requests in flight.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  The JDK's own <a href="https://docs.oracle.com/en/java/javase/25/docs/api/jdk.httpserver/com/sun/net/httpserver/package-summary.html"><code>com.sun.net.httpserver</code></a> docs: read <a href="https://docs.oracle.com/en/java/javase/25/docs/api/jdk.httpserver/com/sun/net/httpserver/Filter.html"><code>Filter</code></a> and <a href="https://docs.oracle.com/en/java/javase/25/docs/api/jdk.httpserver/com/sun/net/httpserver/HttpServer.html"><code>HttpServer.stop</code></a>, both short and precise. Then <a href="https://12factor.net/">The Twelve-Factor App</a>: the <a href="https://12factor.net/config">Config</a>, <a href="https://12factor.net/disposability">Disposability</a> (fast startup, graceful shutdown) and <a href="https://12factor.net/logs">Logs</a> pages are one screen each, and describe exactly what you built today. For the concurrency side, re-read <a href="https://www.sqlite.org/lang_transaction.html">SQLite: Transactions</a> on DEFERRED vs IMMEDIATE, and Fielding's <a href="https://ics.uci.edu/~fielding/pubs/dissertation/rest_arch_style.htm">REST chapter</a> §5.1.3 on statelessness: it's why Shelf could run as many instances once its cache moved out.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/capstone.html">Capstone</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. "Why not just use <code>synchronized</code> on <code>lend</code>?", "how big should my pool be?", "should the cache sit in front of the service or the store?" and "my race demo shows no 500s, what now?" are exactly the right questions. Paste your race counts, your load-test table and a few of your log lines, and we'll read them together before L47 puts Shelf side by side with Spring Boot.</p>
+
+<div class="lesson-nav">
+  <a href="0045-build-the-core.html">← L45 · Build the Core</a>
+  <a href="0047-what-spring-boot-would-have-done.html">L47 · What Spring Boot Would Have Done →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/loadviz.js"></script>
+</body>
+</html>

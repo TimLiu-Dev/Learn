@@ -1,0 +1,2546 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L42 · Scaling Out</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l42">
+<main>
+
+<div class="kicker">Lesson 42 · Phase 12 System Design &amp; Caching · <a href="../reference/roadmap.html#p12">roadmap</a></div>
+<h1>Scaling Out</h1>
+<p class="subtitle">One server can only get so big. This lesson splits a service across several programs: stateless servers behind a load balancer you write yourself, a database copied to a replica and split into shards, and a queue that moves slow work out of the request.</p>
+
+<div class="lesson-meta">
+  <span><b>~110–125 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll run three copies of the books API behind a load balancer you wrote, crash one in the middle of a test, and watch traffic flow around it. Writes go to a leader database, reads to a lagging replica, and a queue hands thumbnail jobs to workers that survive a crash without doing anything twice. Every piece is a few dozen lines of Kotlin or Java, running on your laptop.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Stateless servers and load balancers</a><span class="t">35 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Replication, read replicas, sharding</a><span class="t">30 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Message queues and asynchronous work</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: scale the books API</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l42/</code>. Every output on this page is a real capture: Kotlin 2.4.20 and JDK 26 on an 18-core Apple M5 Max, <b>all on localhost</b>. Localhost hides real network latency (a round trip here is well under a millisecond), so where a delay matters the programs add one on purpose with <code>Thread.sleep</code>, and say so. Your timings, process ids and ports will differ.</p>
+
+<div class="callout">
+  <p><b>Ground rules for this phase.</b> Nothing here needs Docker, nginx, Redis, Kafka or a cloud account. Each "system" is built small and real from course pieces: JDK <code>HttpServer</code> backends (L32), SQLite files (L34–L36), a <code>BlockingQueue</code> (L27), virtual threads (L28). Every server binds to <code>127.0.0.1</code> and shuts itself down. Where production would use a real product, the lesson names it and links its docs.</p>
+</div>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L19, L30, L36 and L41</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>In cache-aside, what must a write do to the cache, and what goes wrong if it doesn't? (L41)</li>
+    <li>Sketch an accept loop that gives each TCP client its own virtual thread. (L30)</li>
+    <li>Why did L36's concurrent lenders need <code>?transaction_mode=IMMEDIATE</code>? What does that say about how many writers SQLite allows? (L36)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="1">
+  <p class="q">Thousands of requests miss the cache for one hot key at the same instant and all hit the database. What is that called? (L41)</p>
+  <div class="opts"><button>A cache eviction</button><button>A cache stampede</button><button>A write-behind flush</button><button>A negative cache</button></div>
+  <p class="why">A stampede, or thundering herd: every request sees the miss before any of them has refilled the cache. L41's fix was request coalescing, letting one caller load the value while the others wait for it. The same "many arrive at once" shape appears today with load balancers and queues.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">A hash table doubles from 16 to 32 buckets, indexing with <code>h &amp; (n - 1)</code>. Roughly how many keys change bucket? (L19)</p>
+  <div class="opts"><button>About half of them</button><button>Almost none of them</button><button>Every single key moves</button><button>Exactly one key moves</button></div>
+  <p class="why">One more bit of the hash now counts, so each key either keeps its index or moves to index + 16: about half move. Inside one process that's a quick rehash. When the "buckets" are database servers holding terabytes, moving half the data is a disaster, and Part 2 measures something worse.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="3">
+  <p class="q">Why does an L30-style server give each connection its own virtual thread? (L30)</p>
+  <div class="opts"><button>Sockets need their own thread</button><button>Virtual threads make TCP faster</button><button>The OS forbids sharing threads</button><button>Blocking one client blocks nobody</button></div>
+  <p class="why">Each connection mostly waits on the network. With a thread per connection, a slow client blocks only its own thread, and virtual threads make that cheap (<a href="https://openjdk.org/jeps/444">JEP 444</a>). The load balancer you build today serves every request on its own virtual thread for the same reason.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="2">
+  <p class="q">How many connections can write to one SQLite database at the same moment? (L36)</p>
+  <div class="opts"><button>As many as needed</button><button>One per CPU core</button><button>Exactly one at once</button><button>None without a server</button></div>
+  <p class="why">SQLite allows one writer at a time; the others wait or get <code>SQLITE_BUSY</code>, as L36's concurrent lenders showed (<a href="https://www.sqlite.org/isolation.html">SQLite: isolation</a>). Bigger databases allow more, but every database has a limit on one machine. Replication and sharding in Part 2 are how systems get past it.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Stateless servers and load balancers</h2><span class="t">~35 min</span></div>
+
+<h3>Scaling up vs scaling out</h3>
+<p>When one server can't keep up, you have two choices. <dfn>Scaling up</dfn> (vertical scaling) means a bigger machine: more cores, more memory. <dfn>Scaling out</dfn> (horizontal scaling) means more machines, each running a copy of the program, with something in front spreading the work. The System Design Primer puts the trade-off plainly: "Scaling out using commodity machines is more cost efficient and results in higher availability than scaling up a single server on more expensive hardware, called Vertical Scaling" (<a href="https://github.com/donnemartin/system-design-primer#horizontal-scaling">System Design Primer: horizontal scaling</a>).</p>
+<table class="vs">
+  <tr><th></th><th>Scale up</th><th>Scale out</th></tr>
+  <tr><td>How</td><td>a bigger machine</td><td>more machines behind a load balancer</td></tr>
+  <tr><td>Code changes</td><td>none</td><td>servers must be stateless (below)</td></tr>
+  <tr><td>Limit</td><td>the biggest machine you can buy</td><td>the shared parts: database, load balancer</td></tr>
+  <tr><td>One machine dies</td><td>everything is down</td><td>the others carry on</td></tr>
+</table>
+<p>Scaling up is simpler and often right for a long time. You measure the difference between the two near the end of this part.</p>
+
+<h3>Why servers must be stateless</h3>
+<p>The same page of the Primer lists the price of scaling out: "Servers should be stateless: they should not contain any user-related data like sessions or profile pictures", and "Sessions can be stored in a centralized data store such as a database (SQL, NoSQL) or a persistent cache (Redis, Memcached)." Here is what goes wrong otherwise. Two servers, A and B, each keep logged-in sessions in their own memory, and the load balancer happens to send your second request to B:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Sessions.kt</figcaption>
+<pre><code class="language-kotlin">import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse.BodyHandlers
+import java.security.MessageDigest
+import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+// Version 1: each server remembers sessions in its own memory.
+class StatefulServer(val name: String) {
+    private val sessions = ConcurrentHashMap&lt;String, String&gt;()    // session id -&gt; user
+    val server: HttpServer = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50)
+    init {
+        server.createContext("/login") { ex -&gt;
+            val id = UUID.randomUUID().toString().take(8)
+            sessions[id] = ex.requestURI.query.removePrefix("user=")
+            send(ex, 200, id)
+        }
+        server.createContext("/me") { ex -&gt;
+            val user = sessions[ex.requestHeaders.getFirst("Session") ?: ""]
+            if (user == null) send(ex, 401, "who are you? ($name has no such session)") else send(ex, 200, "hello $user (from $name)")
+        }
+        server.start()
+    }
+}
+
+// Version 2: the server remembers nothing; the client carries a signed token (L33's HMAC).
+class StatelessServer(val name: String, private val key: ByteArray) {
+    val server: HttpServer = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50)
+    init {
+        server.createContext("/login") { ex -&gt;
+            val user = ex.requestURI.query.removePrefix("user=")
+            send(ex, 200, "$user.${sign(user, key)}")
+        }
+        server.createContext("/me") { ex -&gt;
+            val (user, sig) = (ex.requestHeaders.getFirst("Token") ?: ".").split(".", limit = 2)
+            val valid = MessageDigest.isEqual(sig.toByteArray(), sign(user, key).toByteArray())   // constant time (L33)
+            if (valid) send(ex, 200, "hello $user (from $name)") else send(ex, 401, "bad signature")
+        }
+        server.start()
+    }
+}
+
+fun sign(user: String, key: ByteArray): String {
+    val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key, "HmacSHA256")) }
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(mac.doFinal(user.toByteArray())).take(16)
+}
+
+fun send(ex: HttpExchange, status: Int, body: String) {
+    val bytes = body.toByteArray()
+    ex.sendResponseHeaders(status, bytes.size.toLong())
+    ex.responseBody.use { it.write(bytes) }
+}
+
+val client: HttpClient = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()
+
+fun call(server: HttpServer, path: String, header: Pair&lt;String, String&gt;? = null): String {
+    val b = HttpRequest.newBuilder(URI("http://127.0.0.1:${server.address.port}$path"))
+    header?.let { b.header(it.first, it.second) }
+    val resp = client.send(b.build(), BodyHandlers.ofString())
+    return "${resp.statusCode()} ${resp.body()}"
+}
+
+fun main() {
+    println("-- stateful: sessions live in each server's memory")
+    val (a, b) = StatefulServer("A") to StatefulServer("B")
+    val session = call(a.server, "/login?user=ada").substringAfter(" ")
+    println("login    -&gt; A: session $session")
+    println("GET /me  -&gt; B: " + call(b.server, "/me", "Session" to session))   // the balancer picked B
+    println("GET /me  -&gt; A: " + call(a.server, "/me", "Session" to session))
+
+    println("-- stateless: a signed token, nothing remembered")
+    val key = "shared-secret-from-config".toByteArray()                           // same key on every server
+    val (c, d) = StatelessServer("A", key) to StatelessServer("B", key)
+    val token = call(c.server, "/login?user=ada").substringAfter(" ")
+    println("login    -&gt; A: token $token")
+    println("GET /me  -&gt; B: " + call(d.server, "/me", "Token" to token))
+    println("GET /me  -&gt; A: " + call(c.server, "/me", "Token" to token))
+    println("forged   -&gt; B: " + call(d.server, "/me", "Token" to "admin.${token.substringAfter('.')}"))
+    listOf(a.server, b.server, c.server, d.server).forEach { it.stop(0) }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Sessions.java</figcaption>
+<pre><code class="language-java">import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.security.MessageDigest;
+import java.util.Base64;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+public class Sessions {
+    // Version 1: each server remembers sessions in its own memory.
+    static HttpServer stateful(String name) throws IOException {
+        Map&lt;String, String&gt; sessions = new ConcurrentHashMap&lt;&gt;();       // session id -&gt; user
+        HttpServer s = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50);
+        s.createContext("/login", ex -&gt; {
+            String id = UUID.randomUUID().toString().substring(0, 8);
+            sessions.put(id, ex.getRequestURI().getQuery().replaceFirst("^user=", ""));
+            send(ex, 200, id);
+        });
+        s.createContext("/me", ex -&gt; {
+            String sid = ex.getRequestHeaders().getFirst("Session");
+            String user = sid == null ? null : sessions.get(sid);
+            if (user == null) send(ex, 401, "who are you? (" + name + " has no such session)");
+            else send(ex, 200, "hello " + user + " (from " + name + ")");
+        });
+        s.start();
+        return s;
+    }
+
+    // Version 2: the server remembers nothing; the client carries a signed token (L33's HMAC).
+    static HttpServer stateless(String name, byte[] key) throws IOException {
+        HttpServer s = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50);
+        s.createContext("/login", ex -&gt; {
+            String user = ex.getRequestURI().getQuery().replaceFirst("^user=", "");
+            send(ex, 200, user + "." + sign(user, key));
+        });
+        s.createContext("/me", ex -&gt; {
+            String token = ex.getRequestHeaders().getFirst("Token");
+            String[] parts = (token == null ? "." : token).split("\\.", 2);
+            boolean valid = parts.length == 2                                              // constant time (L33)
+                &amp;&amp; MessageDigest.isEqual(parts[1].getBytes(), sign(parts[0], key).getBytes());
+            if (valid) send(ex, 200, "hello " + parts[0] + " (from " + name + ")");
+            else send(ex, 401, "bad signature");
+        });
+        s.start();
+        return s;
+    }
+
+    static String sign(String user, byte[] key) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(mac.doFinal(user.getBytes())).substring(0, 16);
+        } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+
+    static void send(HttpExchange ex, int status, String body) throws IOException {
+        byte[] bytes = body.getBytes();
+        ex.sendResponseHeaders(status, bytes.length);
+        try (OutputStream out = ex.getResponseBody()) { out.write(bytes); }
+    }
+
+    static final HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+
+    static String call(HttpServer server, String path, String header, String value) throws Exception {
+        var b = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + path));
+        if (header != null) b.header(header, value);
+        var resp = client.send(b.build(), HttpResponse.BodyHandlers.ofString());
+        return resp.statusCode() + " " + resp.body();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("-- stateful: sessions live in each server's memory");
+        HttpServer a = stateful("A"), b = stateful("B");
+        String session = call(a, "/login?user=ada", null, null).split(" ", 2)[1];
+        System.out.println("login    -&gt; A: session " + session);
+        System.out.println("GET /me  -&gt; B: " + call(b, "/me", "Session", session));   // the balancer picked B
+        System.out.println("GET /me  -&gt; A: " + call(a, "/me", "Session", session));
+
+        System.out.println("-- stateless: a signed token, nothing remembered");
+        byte[] key = "shared-secret-from-config".getBytes();                          // same key on every server
+        HttpServer c = stateless("A", key), d = stateless("B", key);
+        String token = call(c, "/login?user=ada", null, null).split(" ", 2)[1];
+        System.out.println("login    -&gt; A: token " + token);
+        System.out.println("GET /me  -&gt; B: " + call(d, "/me", "Token", token));
+        System.out.println("GET /me  -&gt; A: " + call(c, "/me", "Token", token));
+        System.out.println("forged   -&gt; B: " + call(d, "/me", "Token", "admin." + token.split("\\.", 2)[1]));
+        for (HttpServer s : new HttpServer[] { a, b, c, d }) s.stop(0);
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">-- stateful: sessions live in each server's memory
+login    -&gt; A: session 13963612
+GET /me  -&gt; B: 401 who are you? (B has no such session)
+GET /me  -&gt; A: 200 hello ada (from A)
+-- stateless: a signed token, nothing remembered
+login    -&gt; A: token ada.cUwOwDHjKosyBHs2
+GET /me  -&gt; B: 200 hello ada (from B)
+GET /me  -&gt; A: 200 hello ada (from A)
+forged   -&gt; B: 401 bad signature</pre>
+<pre class="out">-- stateful: sessions live in each server's memory
+login    -&gt; A: session 09ff6ad2
+GET /me  -&gt; B: 401 who are you? (B has no such session)
+GET /me  -&gt; A: 200 hello ada (from A)
+-- stateless: a signed token, nothing remembered
+login    -&gt; A: token ada.cUwOwDHjKosyBHs2
+GET /me  -&gt; B: 200 hello ada (from B)
+GET /me  -&gt; A: 200 hello ada (from A)
+forged   -&gt; B: 401 bad signature</pre>
+</div>
+<ul>
+  <li><b>Stateful:</b> A created the session, so only A knows it. One request later you're "logged out", purely because of which server answered.</li>
+  <li><b>Stateless:</b> the server signs the user name with an HMAC (L33) and hands the token to the client. <em>Any</em> server holding the same key can check it, and none of them remembers anything. The token is identical in both languages: same key, same HMAC, same bytes. A forged token fails the signature check. The comparison uses <code>MessageDigest.isEqual</code>, the constant-time compare from L33.</li>
+  <li><b>The key is configuration, not state.</b> Every server starts with the same secret, the way they all start with the same code. What must not differ between servers is anything learned from <em>requests</em>.</li>
+</ul>
+<p>Three ways out of the stateful trap, each with a cost:</p>
+<table class="cmds">
+  <tr><th>Fix</th><th>How</th><th>Cost</th></tr>
+  <tr><td>Shared store</td><td>sessions in a database or Redis that every server reads</td><td>a network round trip per request; the store must scale too</td></tr>
+  <tr><td>Signed token</td><td>the client carries the state, signed (above; JWTs are a standard format for this)</td><td>can't easily revoke a token before it expires</td></tr>
+  <tr><td>Sticky sessions</td><td>the load balancer sends each client back to the same server</td><td>a server crash logs its users out; load can be uneven (the exercise shows another problem)</td></tr>
+</table>
+<p>The Primer lists the sticky option as a load-balancer feature: "Session persistence - Issue cookies and route a specific client's requests to same instance if the web apps do not keep track of sessions" (<a href="https://github.com/donnemartin/system-design-primer#load-balancer">System Design Primer: load balancer</a>).</p>
+
+<h3>A load balancer, by hand</h3>
+<p>"Load balancers distribute incoming client requests to computing resources such as application servers and databases. In each case, the load balancer returns the response from the computing resource to the appropriate client." The Primer adds that they are effective at "Preventing requests from going to unhealthy servers" and "Helping to eliminate a single point of failure". It lists the usual ways of choosing a server: "Random, Least loaded, Session/cookies, Round robin or weighted round robin, Layer 4, Layer 7". Step through what you're about to build (the numbers come from the real run further down):</p>
+
+<div class="scaleviz" data-src="sv-l42"></div>
+<script type="application/json" id="sv-l42">{"modes": [{"name": "Load balancer", "type": "boxes", "h": 240, "nodes": [{"id": "c", "label": "client", "x": 60, "y": 120}, {"id": "lb", "label": "LB", "x": 210, "y": 120}, {"id": "b1", "label": "b1", "x": 430, "y": 40}, {"id": "b2", "label": "b2", "x": 430, "y": 120}, {"id": "b3", "label": "b3", "x": 430, "y": 200}], "steps": [{"note": "Three backends, each its own JVM process. The load balancer's health checker asks each one for <code>/health</code> every 500 ms.", "state": {"b1": "UP", "b2": "UP", "b3": "UP"}}, {"note": "Round-robin: request 1 goes to <b>b1</b>, the next one to the next backend.", "state": {"b1": "UP", "b2": "UP", "b3": "UP"}, "arrows": [{"from": "c", "to": "lb", "label": "GET /name"}, {"from": "lb", "to": "b1", "label": "#1"}], "cls": {"b1": "hot"}}, {"note": "Round-robin: request 2 goes to <b>b2</b>, the next one to the next backend.", "state": {"b1": "UP", "b2": "UP", "b3": "UP"}, "arrows": [{"from": "c", "to": "lb", "label": "GET /name"}, {"from": "lb", "to": "b2", "label": "#2"}], "cls": {"b2": "hot"}}, {"note": "Round-robin: request 3 goes to <b>b3</b>, the next one to the next backend.", "state": {"b1": "UP", "b2": "UP", "b3": "UP"}, "arrows": [{"from": "c", "to": "lb", "label": "GET /name"}, {"from": "lb", "to": "b3", "label": "#3"}], "cls": {"b3": "hot"}}, {"note": "At 691 ms the demo kills b2 like <code>kill -9</code>. The load balancer doesn't know: its last health check said UP.", "state": {"b1": "UP", "b2": "LB thinks UP", "b3": "UP"}, "cls": {"b2": "dead"}}, {"note": "Request 22 is b2's turn. The connection is refused, so the client gets <b>502 Bad Gateway</b>.", "state": {"b1": "UP", "b2": "LB thinks UP", "b3": "UP"}, "cls": {"b2": "dead"}, "arrows": [{"from": "lb", "to": "b2", "label": "refused", "fail": true}, {"from": "lb", "to": "c", "label": "502", "fail": true}]}, {"note": "Requests 25 and 28 hit b2 again: 3 failures in the 331 ms before the next health check.", "state": {"b1": "UP", "b2": "LB thinks UP", "b3": "UP"}, "cls": {"b2": "dead"}, "arrows": [{"from": "lb", "to": "b2", "label": "#25, #28", "fail": true}]}, {"note": "At 1,022 ms the health check fails and b2 is marked <b>DOWN</b>. Round-robin now cycles over b1 and b3 only: 57 of 60 requests succeeded.", "state": {"b1": "UP", "b2": "DOWN", "b3": "UP"}, "cls": {"b2": "down"}, "arrows": [{"from": "lb", "to": "b1", "label": "#29"}, {"from": "lb", "to": "b3", "label": "#30"}]}, {"note": "Second run, with retry on: the first request that fails marks b2 DOWN on the spot (a <em>passive</em> check) and is resent to the next backend. 60 of 60 succeeded. Only safe for GET.", "state": {"b1": "UP", "b2": "DOWN", "b3": "UP"}, "cls": {"b2": "down"}, "arrows": [{"from": "lb", "to": "b2", "label": "refused", "fail": true}, {"from": "lb", "to": "b3", "label": "retry"}, {"from": "lb", "to": "c", "label": "200"}]}]}, {"name": "Replication", "type": "boxes", "h": 220, "nodes": [{"id": "w", "label": "writer", "x": 70, "y": 50}, {"id": "L", "label": "leader", "x": 300, "y": 50}, {"id": "F", "label": "follower", "x": 300, "y": 170}, {"id": "r", "label": "reader", "x": 70, "y": 170}], "steps": [{"note": "A write goes to the leader: the row and its change-log entry in one transaction. The leader is now at version 1.", "state": {"L": "v1", "F": "v0"}, "arrows": [{"from": "w", "to": "L", "label": "write Dune"}]}, {"note": "A reader asks the follower straight away. The change hasn't arrived: <b>not found</b>.", "state": {"L": "v1", "F": "v0"}, "cls": {"F": "stale"}, "arrows": [{"from": "r", "to": "F", "label": "book 1?"}, {"from": "F", "to": "r", "label": "not found", "fail": true}]}, {"note": "300 ms later the replication stream applies change 1 on the follower.", "state": {"L": "v1", "F": "v1"}, "arrows": [{"from": "L", "to": "F", "label": "change 1"}]}, {"note": "Now the follower answers <b>Dune</b>. It was right all along, just late: that's <em>eventual</em> consistency.", "state": {"L": "v1", "F": "v1"}, "arrows": [{"from": "r", "to": "F", "label": "book 1?"}, {"from": "F", "to": "r", "label": "Dune"}]}, {"note": "Read-your-writes: the writer writes Emma (version 2) and remembers the version. The follower is only at 1, so the read goes to the leader.", "state": {"L": "v2", "F": "v1"}, "cls": {"F": "stale"}, "arrows": [{"from": "w", "to": "L", "label": "need v2: read"}, {"from": "L", "to": "w", "label": "Emma"}]}, {"note": "A burst of 20 writes: the leader jumps to v22 while the follower sits at v2, 20 versions behind, for about 300 ms.", "state": {"L": "v22", "F": "v2, behind 20"}, "cls": {"F": "stale"}, "arrows": [{"from": "w", "to": "L", "label": "20 writes"}]}, {"note": "At +327 ms the follower has caught up: v22. Replication lag is a window, not a bug, and every read from a replica must live with it.", "state": {"L": "v22", "F": "v22"}, "arrows": [{"from": "L", "to": "F", "label": "changes 3-22"}]}]}, {"name": "Hash ring", "type": "ring", "nodes": ["n1", "n2", "n3", "n4", "n5"], "steps": [{"note": "Four nodes, 3 virtual nodes each: 12 coloured ticks on the ring. Each of the 16 keys belongs to the first tick clockwise from it.", "points": [{"a": 6.92, "n": "n4"}, {"a": 32.32, "n": "n2"}, {"a": 37.96, "n": "n3"}, {"a": 50.68, "n": "n1"}, {"a": 100.69, "n": "n1"}, {"a": 102.51, "n": "n1"}, {"a": 188.78, "n": "n4"}, {"a": 198.1, "n": "n4"}, {"a": 217.6, "n": "n2"}, {"a": 225.65, "n": "n3"}, {"a": 351.18, "n": "n2"}, {"a": 357.12, "n": "n3"}], "keys": [{"a": 165.86, "n": "n4", "moved": false}, {"a": 86.76, "n": "n1", "moved": false}, {"a": 173.98, "n": "n4", "moved": false}, {"a": 178.09, "n": "n4", "moved": false}, {"a": 99.03, "n": "n1", "moved": false}, {"a": 46.7, "n": "n1", "moved": false}, {"a": 57.32, "n": "n1", "moved": false}, {"a": 353.88, "n": "n3", "moved": false}, {"a": 187.88, "n": "n4", "moved": false}, {"a": 54.13, "n": "n1", "moved": false}, {"a": 271.62, "n": "n2", "moved": false}, {"a": 112.85, "n": "n4", "moved": false}, {"a": 8.08, "n": "n2", "moved": false}, {"a": 285.02, "n": "n2", "moved": false}, {"a": 308.68, "n": "n2", "moved": false}, {"a": 231.42, "n": "n2", "moved": false}]}, {"note": "Add n5 (3 more ticks). Only the keys just before an n5 tick change owner: 7 of 16, every one of them to n5. The rest stay put.", "points": [{"a": 6.92, "n": "n4"}, {"a": 32.32, "n": "n2"}, {"a": 37.96, "n": "n3"}, {"a": 50.68, "n": "n1"}, {"a": 87.36, "n": "n5"}, {"a": 100.69, "n": "n1"}, {"a": 102.51, "n": "n1"}, {"a": 188.78, "n": "n4"}, {"a": 198.1, "n": "n4"}, {"a": 217.6, "n": "n2"}, {"a": 225.65, "n": "n3"}, {"a": 308.88, "n": "n5"}, {"a": 351.18, "n": "n2"}, {"a": 357.12, "n": "n3"}, {"a": 358.29, "n": "n5"}], "keys": [{"a": 165.86, "n": "n4", "moved": false}, {"a": 86.76, "n": "n5", "moved": true}, {"a": 173.98, "n": "n4", "moved": false}, {"a": 178.09, "n": "n4", "moved": false}, {"a": 99.03, "n": "n1", "moved": false}, {"a": 46.7, "n": "n1", "moved": false}, {"a": 57.32, "n": "n5", "moved": true}, {"a": 353.88, "n": "n3", "moved": false}, {"a": 187.88, "n": "n4", "moved": false}, {"a": 54.13, "n": "n5", "moved": true}, {"a": 271.62, "n": "n5", "moved": true}, {"a": 112.85, "n": "n4", "moved": false}, {"a": 8.08, "n": "n2", "moved": false}, {"a": 285.02, "n": "n5", "moved": true}, {"a": 308.68, "n": "n5", "moved": true}, {"a": 231.42, "n": "n5", "moved": true}]}, {"note": "With only 3 ticks per node the shares are lopsided (n5 grabbed 7 of 16 here). Sharding.kt uses 100 per node: then the load evens out to 22\u201327% each, and adding a node moves about a fifth of the keys.", "points": [{"a": 6.92, "n": "n4"}, {"a": 32.32, "n": "n2"}, {"a": 37.96, "n": "n3"}, {"a": 50.68, "n": "n1"}, {"a": 87.36, "n": "n5"}, {"a": 100.69, "n": "n1"}, {"a": 102.51, "n": "n1"}, {"a": 188.78, "n": "n4"}, {"a": 198.1, "n": "n4"}, {"a": 217.6, "n": "n2"}, {"a": 225.65, "n": "n3"}, {"a": 308.88, "n": "n5"}, {"a": 351.18, "n": "n2"}, {"a": 357.12, "n": "n3"}, {"a": 358.29, "n": "n5"}], "keys": [{"a": 165.86, "n": "n4", "moved": false}, {"a": 86.76, "n": "n5", "moved": true}, {"a": 173.98, "n": "n4", "moved": false}, {"a": 178.09, "n": "n4", "moved": false}, {"a": 99.03, "n": "n1", "moved": false}, {"a": 46.7, "n": "n1", "moved": false}, {"a": 57.32, "n": "n5", "moved": true}, {"a": 353.88, "n": "n3", "moved": false}, {"a": 187.88, "n": "n4", "moved": false}, {"a": 54.13, "n": "n5", "moved": true}, {"a": 271.62, "n": "n5", "moved": true}, {"a": 112.85, "n": "n4", "moved": false}, {"a": 8.08, "n": "n2", "moved": false}, {"a": 285.02, "n": "n5", "moved": true}, {"a": 308.68, "n": "n5", "moved": true}, {"a": 231.42, "n": "n5", "moved": true}]}]}, {"name": "Queue", "type": "boxes", "h": 240, "nodes": [{"id": "p", "label": "producer", "x": 60, "y": 120}, {"id": "q", "label": "queue", "x": 220, "y": 120}, {"id": "w1", "label": "w1", "x": 430, "y": 40}, {"id": "w2", "label": "w2", "x": 430, "y": 120}, {"id": "w3", "label": "w3", "x": 430, "y": 200}], "steps": [{"note": "Six email jobs are pushed. They wait in the queue.", "state": {"q": "6 ready"}, "arrows": [{"from": "p", "to": "q", "label": "6 jobs"}]}, {"note": "Three workers take one each. A received message isn't deleted: it's <em>in flight</em> for 300 ms (the visibility timeout).", "state": {"q": "3 ready \u00b7 3 in flight", "w1": "#1", "w2": "#2", "w3": "#3"}, "arrows": [{"from": "q", "to": "w1", "label": "#1"}, {"from": "q", "to": "w2", "label": "#2"}, {"from": "q", "to": "w3", "label": "#3"}]}, {"note": "w2 sends email #2, then crashes before it can ack.", "state": {"q": "#2 in flight", "w2": "sent #2, no ack"}, "cls": {"w2": "dead"}}, {"note": "w1 and w3 send and ack the rest: #1, #3, #4, #5, #6. Five acks; #2 is still in flight.", "state": {"q": "#2 in flight", "w1": "acked 4", "w3": "acked 1", "w2": "crashed"}, "cls": {"w2": "dead"}, "arrows": [{"from": "w1", "to": "q", "label": "ack"}, {"from": "w3", "to": "q", "label": "ack"}]}, {"note": "At about 330 ms #2's visibility timeout expires. The sweeper puts it back as attempt 2.", "state": {"q": "#2 ready (attempt 2)", "w2": "crashed"}, "cls": {"w2": "dead", "q": "hot"}}, {"note": "w1 receives #2 and sends it again: <b>7 emails for 6 jobs</b>. At-least-once delivery means duplicates happen.", "state": {"q": "empty", "w1": "sent #2 again", "w2": "crashed"}, "cls": {"w2": "dead", "w1": "hot"}, "arrows": [{"from": "q", "to": "w1", "label": "#2 again"}]}, {"note": "The idempotent consumer remembers which jobs are done. On redelivery it sees the id, skips the email and just acks: 6 emails for 6 jobs.", "state": {"q": "empty", "w1": "skips #2", "w2": "crashed"}, "cls": {"w2": "dead"}, "arrows": [{"from": "q", "to": "w1", "label": "#2 again"}, {"from": "w1", "to": "q", "label": "ack, skip"}]}]}]}</script>
+
+<p>First the backend. Each one runs as its <b>own JVM process</b>, started by the demo with <code>ProcessBuilder</code> (L22). Three servers inside one JVM would be simpler, but they'd share a heap and die together; separate processes can be killed one at a time, like real machines. The price is about half a second of JVM start-up each.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Backend.kt</figcaption>
+<pre><code class="language-kotlin">import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.URI
+import java.util.concurrent.Executors
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
+
+// One backend server. Runs as its own JVM process: java -cp l42.jar BackendKt b1 200 1
+fun main(args: Array&lt;String&gt;) {
+    val name = args[0]
+    val slowMs = args.getOrElse(1) { "0" }.toLong()
+    val threads = args.getOrElse(2) { "1" }.toInt()
+    val server = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 100)
+    server.createContext("/health") { reply(it, 200, "ok") }
+    server.createContext("/name") { reply(it, 200, name) }
+    server.createContext("/slow") { Thread.sleep(slowMs); reply(it, 200, name) }
+    server.createContext("/work") { hashPassword(); reply(it, 200, name) }
+    if (threads &gt; 1) server.executor = Executors.newFixedThreadPool(threads)
+    server.start()                       // no executor: ONE thread serves every request
+    println("READY ${server.address.port}")
+}
+
+fun reply(ex: HttpExchange, status: Int, body: String) {
+    val bytes = body.toByteArray()
+    ex.sendResponseHeaders(status, bytes.size.toLong())
+    ex.responseBody.use { it.write(bytes) }
+}
+
+// CPU-bound work: one PBKDF2 hash (L33), about 5 ms
+fun hashPassword(): ByteArray {
+    val spec = PBEKeySpec("hunter2".toCharArray(), ByteArray(16), 20_000, 256)
+    return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+}
+
+class BackendProcess(val name: String, val process: Process, port: Int) {
+    val uri: URI = URI("http://127.0.0.1:$port")
+}
+
+// Starts a backend as a separate JVM, running this same jar, and waits for READY.
+fun startBackend(name: String, slowMs: Long = 0, threads: Int = 1): BackendProcess {
+    val java = ProcessHandle.current().info().command().orElse("java")
+    val process = ProcessBuilder(java, "-cp", System.getProperty("java.class.path"),
+        "BackendKt", name, slowMs.toString(), threads.toString()).redirectErrorStream(true).start()
+    val ready = process.inputReader().readLine()          // "READY 51234"
+    return BackendProcess(name, process, ready.removePrefix("READY ").toInt())
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Backend.java</figcaption>
+<pre><code class="language-java">import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.util.concurrent.Executors;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+
+// One backend server. Runs as its own JVM process: java Backend.java b1 200 1
+public class Backend {
+    public static void main(String[] args) throws IOException {
+        String name = args[0];
+        long slowMs = args.length &gt; 1 ? Long.parseLong(args[1]) : 0;
+        int threads = args.length &gt; 2 ? Integer.parseInt(args[2]) : 1;
+        HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 100);
+        server.createContext("/health", ex -&gt; reply(ex, 200, "ok"));
+        server.createContext("/name", ex -&gt; reply(ex, 200, name));
+        server.createContext("/slow", ex -&gt; {
+            try { Thread.sleep(slowMs); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            reply(ex, 200, name);
+        });
+        server.createContext("/work", ex -&gt; { hashPassword(); reply(ex, 200, name); });
+        if (threads &gt; 1) server.setExecutor(Executors.newFixedThreadPool(threads));
+        server.start();                      // no executor: ONE thread serves every request
+        System.out.println("READY " + server.getAddress().getPort());
+    }
+
+    static void reply(HttpExchange ex, int status, String body) throws IOException {
+        byte[] bytes = body.getBytes();
+        ex.sendResponseHeaders(status, bytes.length);
+        try (OutputStream out = ex.getResponseBody()) { out.write(bytes); }
+    }
+
+    // CPU-bound work: one PBKDF2 hash (L33), about 5 ms
+    static byte[] hashPassword() {
+        try {
+            var spec = new PBEKeySpec("hunter2".toCharArray(), new byte[16], 20_000, 256);
+            return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+        } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+
+    record Proc(String name, Process process, URI uri) {}
+
+    // Starts a backend as a separate JVM (java Backend.java ...) and waits for READY.
+    static Proc start(String name, long slowMs) throws IOException { return start(name, slowMs, 1); }
+
+    static Proc start(String name, long slowMs, int threads) throws IOException {
+        String java = ProcessHandle.current().info().command().orElse("java");
+        Process p = new ProcessBuilder(java, "Backend.java", name, Long.toString(slowMs), Integer.toString(threads))
+            .redirectErrorStream(true).start();
+        String ready = p.inputReader().readLine();          // "READY 51234"
+        int port = Integer.parseInt(ready.substring("READY ".length()));
+        return new Proc(name, p, URI.create("http://127.0.0.1:" + port));
+    }
+}</code></pre></figure>
+</div>
+<ul>
+  <li><b>One thread per backend, on purpose.</b> The <code>HttpServer</code> docs: "If this method is not called (before <code>start()</code>) or if it is called with a null Executor, then a default implementation is used, which uses the thread which was created by the <code>start()</code> method" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/jdk.httpserver/com/sun/net/httpserver/HttpServer.html#setExecutor(java.util.concurrent.Executor)">HttpServer.setExecutor</a>). So each backend handles one request at a time, like a one-core machine. That makes the effects of load easy to see. The optional third argument gives it a pool instead, for the scale-up comparison.</li>
+  <li><code>/slow</code> sleeps to imitate a slow backend; <code>/work</code> burns CPU with one PBKDF2 hash (L33); <code>/health</code> is what the load balancer polls.</li>
+  <li><code>startBackend</code> launches the same program again as a child process and reads its first line, <code>READY 51234</code>, to learn the port the OS picked.</li>
+</ul>
+<p>Now the load balancer. It's an <code>HttpServer</code> too, serving each request on a virtual thread and forwarding it with <code>HttpClient</code> (L31), a <dfn>reverse proxy</dfn>:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LoadBalancer.kt</figcaption>
+<pre><code class="language-kotlin">import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import java.io.IOException
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+
+class Target(val name: String, val uri: URI) {
+    @Volatile var healthy = true
+    val active = AtomicInteger()    // requests in flight right now
+    val served = AtomicInteger()    // requests answered so far
+}
+
+enum class Strategy { ROUND_ROBIN, LEAST_CONNECTIONS }
+
+// Headers that describe one connection, not the request: each hop sets its own.
+val HOP_HEADERS = setOf("connection", "content-length", "host", "transfer-encoding", "upgrade", "expect", "date")
+
+class LoadBalancer(
+    private val targets: List&lt;Target&gt;,
+    private val strategy: Strategy,
+    private val retryOnFailure: Boolean = false,
+) : AutoCloseable {
+    private val client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
+        .connectTimeout(Duration.ofMillis(300)).build()
+    private val next = AtomicInteger()
+    private val started = System.nanoTime()
+    @Volatile private var running = true
+    private val server = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 200)
+    val uri: URI get() = URI("http://127.0.0.1:${server.address.port}")
+
+    init {
+        server.executor = Executors.newVirtualThreadPerTaskExecutor()
+        server.createContext("/") { forward(it) }
+        server.start()
+        Thread.ofVirtual().start { healthLoop() }
+    }
+
+    private fun pick(skip: Target?): Target? {
+        val up = targets.filter { it.healthy &amp;&amp; it !== skip }
+        if (up.isEmpty()) return null
+        return when (strategy) {
+            Strategy.ROUND_ROBIN -&gt; up[Math.floorMod(next.getAndIncrement(), up.size)]
+            Strategy.LEAST_CONNECTIONS -&gt; up.minBy { it.active.get() }
+        }
+    }
+
+    private fun forward(ex: HttpExchange) {
+        val body = ex.requestBody.readAllBytes()            // read once, so a retry can resend it
+        var t = pick(skip = null)
+        while (t != null) {
+            t.active.incrementAndGet()
+            try {
+                val req = HttpRequest.newBuilder(t.uri.resolve(ex.requestURI)).timeout(Duration.ofSeconds(5))
+                    .method(ex.requestMethod, HttpRequest.BodyPublishers.ofByteArray(body))
+                ex.requestHeaders.forEach { (k, vs) -&gt; if (k.lowercase() !in HOP_HEADERS) vs.forEach { req.header(k, it) } }
+                val resp = client.send(req.build(), HttpResponse.BodyHandlers.ofString())
+                resp.headers().map().forEach { (k, vs) -&gt; if (k.lowercase() !in HOP_HEADERS) ex.responseHeaders[k] = vs }
+                t.served.incrementAndGet()
+                return reply(ex, resp.statusCode(), resp.body())
+            } catch (e: IOException) {
+                // Only GET is safe to send twice (L32): a retried POST could create the book twice.
+                if (!retryOnFailure || ex.requestMethod != "GET") return reply(ex, 502, "bad gateway: ${t.name}")
+                t.healthy = false                       // passive check: stop using it right away
+                log("passive: ${t.name} failed a request, marked DOWN, retrying elsewhere")
+            } finally {
+                t.active.decrementAndGet()
+            }
+            t = pick(skip = t)                          // only reached after a failure, with retry on
+        }
+        reply(ex, 503, "no healthy backend")
+    }
+
+    // Active health check: ask every backend for /health every 500 ms.
+    private fun healthLoop() {
+        while (running) {
+            for (t in targets) {
+                val ok = try {
+                    val req = HttpRequest.newBuilder(t.uri.resolve("/health")).timeout(Duration.ofMillis(300)).build()
+                    client.send(req, HttpResponse.BodyHandlers.ofString()).statusCode() == 200
+                } catch (e: IOException) { false }
+                if (ok != t.healthy) {
+                    t.healthy = ok
+                    log("health check: ${t.name} is ${if (ok) "UP" else "DOWN"}")
+                }
+            }
+            Thread.sleep(500)
+        }
+    }
+
+    fun log(msg: String) = println("  [%4d ms] %s".format((System.nanoTime() - started) / 1_000_000, msg))
+
+    override fun close() { running = false; server.stop(0) }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LoadBalancer.java</figcaption>
+<pre><code class="language-java">import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class LoadBalancer implements AutoCloseable {
+    public static final class Target {
+        final String name;
+        final URI uri;
+        volatile boolean healthy = true;
+        final AtomicInteger active = new AtomicInteger();   // requests in flight right now
+        final AtomicInteger served = new AtomicInteger();   // requests answered so far
+        Target(String name, URI uri) { this.name = name; this.uri = uri; }
+        @Override public String toString() { return name + "=" + served; }
+    }
+
+    public enum Strategy { ROUND_ROBIN, LEAST_CONNECTIONS }
+
+    // Headers that describe one connection, not the request: each hop sets its own.
+    static final Set&lt;String&gt; HOP_HEADERS =
+        Set.of("connection", "content-length", "host", "transfer-encoding", "upgrade", "expect", "date");
+
+    private final List&lt;Target&gt; targets;
+    private final Strategy strategy;
+    private final boolean retryOnFailure;
+    private final HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
+        .connectTimeout(Duration.ofMillis(300)).build();
+    private final AtomicInteger next = new AtomicInteger();
+    private final long started = System.nanoTime();
+    private volatile boolean running = true;
+    private final HttpServer server;
+
+    public LoadBalancer(List&lt;Target&gt; targets, Strategy strategy, boolean retryOnFailure) throws IOException {
+        this.targets = targets;
+        this.strategy = strategy;
+        this.retryOnFailure = retryOnFailure;
+        server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 200);
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.createContext("/", this::forward);
+        server.start();
+        Thread.ofVirtual().start(this::healthLoop);
+    }
+
+    public URI uri() { return URI.create("http://127.0.0.1:" + server.getAddress().getPort()); }
+
+    private Target pick(Target skip) {
+        List&lt;Target&gt; up = targets.stream().filter(t -&gt; t.healthy &amp;&amp; t != skip).toList();
+        if (up.isEmpty()) return null;
+        return switch (strategy) {
+            case ROUND_ROBIN -&gt; up.get(Math.floorMod(next.getAndIncrement(), up.size()));
+            case LEAST_CONNECTIONS -&gt; up.stream().min(Comparator.comparingInt(t -&gt; t.active.get())).orElseThrow();
+        };
+    }
+
+    private void forward(HttpExchange ex) throws IOException {
+        byte[] body = ex.getRequestBody().readAllBytes();   // read once, so a retry can resend it
+        Target t = pick(null);
+        while (t != null) {
+            t.active.incrementAndGet();
+            try {
+                var req = HttpRequest.newBuilder(t.uri.resolve(ex.getRequestURI())).timeout(Duration.ofSeconds(5))
+                    .method(ex.getRequestMethod(), HttpRequest.BodyPublishers.ofByteArray(body));
+                ex.getRequestHeaders().forEach((k, vs) -&gt; {
+                    if (!HOP_HEADERS.contains(k.toLowerCase())) vs.forEach(v -&gt; req.header(k, v));
+                });
+                var resp = client.send(req.build(), HttpResponse.BodyHandlers.ofString());
+                resp.headers().map().forEach((k, vs) -&gt; {
+                    if (!HOP_HEADERS.contains(k.toLowerCase())) ex.getResponseHeaders().put(k, vs);
+                });
+                t.served.incrementAndGet();
+                Backend.reply(ex, resp.statusCode(), resp.body());
+                return;
+            } catch (IOException e) {
+                // Only GET is safe to send twice (L32): a retried POST could create the book twice.
+                if (!retryOnFailure || !ex.getRequestMethod().equals("GET")) { Backend.reply(ex, 502, "bad gateway: " + t.name); return; }
+                t.healthy = false;                          // passive check: stop using it right away
+                log("passive: " + t.name + " failed a request, marked DOWN, retrying elsewhere");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } finally {
+                t.active.decrementAndGet();
+            }
+            t = pick(t);                                    // only reached after a failure, with retry on
+        }
+        Backend.reply(ex, 503, "no healthy backend");
+    }
+
+    // Active health check: ask every backend for /health every 500 ms.
+    private void healthLoop() {
+        while (running) {
+            for (Target t : targets) {
+                boolean ok;
+                try {
+                    var req = HttpRequest.newBuilder(t.uri.resolve("/health")).timeout(Duration.ofMillis(300)).build();
+                    ok = client.send(req, HttpResponse.BodyHandlers.ofString()).statusCode() == 200;
+                } catch (IOException e) {
+                    ok = false;
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (ok != t.healthy) {
+                    t.healthy = ok;
+                    log("health check: " + t.name + " is " + (ok ? "UP" : "DOWN"));
+                }
+            }
+            try { Thread.sleep(500); } catch (InterruptedException e) { return; }
+        }
+    }
+
+    public void log(String msg) {
+        System.out.printf("  [%4d ms] %s%n", (System.nanoTime() - started) / 1_000_000, msg);
+    }
+
+    @Override public void close() { running = false; server.stop(0); }
+}</code></pre></figure>
+</div>
+<ul>
+  <li><b>Round-robin</b> takes the next healthy backend in turn; <b>least-connections</b> takes the one with the fewest requests in flight right now (<code>active</code>). Both are on nginx's list: "round-robin — requests to the application servers are distributed in a round-robin fashion, least-connected — next request is assigned to the server with the least number of active connections" (<a href="https://nginx.org/en/docs/http/load_balancing.html">nginx: load balancing</a>).</li>
+  <li><b>Active health checks:</b> a virtual thread asks every backend for <code>/health</code> every 500 ms, with a 300 ms timeout, and flips <code>healthy</code> on a change.</li>
+  <li><b>Passive health checks and retry</b> (off unless asked for): when a request fails, mark that backend down immediately and try another. nginx does the same: "If the response from a particular server fails with an error, nginx will mark this server as failed, and will try to avoid selecting this server for subsequent inbound requests for a while."</li>
+  <li><b>Only GET is retried.</b> A request that failed might have reached the backend and done its work before the connection dropped. Sending a GET twice is harmless; sending a POST twice could create two books. That's L32's idempotency, and the final shows it.</li>
+  <li><b>Forwarding headers:</b> everything except the per-connection ones (<code>Host</code>, <code>Content-Length</code>, <code>Connection</code>…), which each hop sets for itself. <code>HttpClient</code> refuses to set some of them anyway.</li>
+</ul>
+<p>The demo starts three backends where b2 is ten times slower than the others, compares the two strategies with a steady stream of requests, then kills b2 in the middle of a run, twice:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LbDemo.kt</figcaption>
+<pre><code class="language-kotlin">import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse.BodyHandlers
+import java.util.concurrent.Executors
+
+val http: HttpClient = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()
+fun get(uri: URI) = http.send(HttpRequest.newBuilder(uri).build(), BodyHandlers.ofString())
+
+fun main() {
+    val procs = mutableListOf(startBackend("b1", 20), startBackend("b2", 200), startBackend("b3", 20))
+    println("3 backend processes: " + procs.joinToString { "${it.name} pid ${it.process.pid()}" })
+    try {
+        println("-- 60 requests to /slow, one every 10 ms (b2 takes 200 ms, b1 and b3 take 20 ms)")
+        for (strategy in Strategy.entries) {
+            val targets = procs.map { Target(it.name, it.uri) }
+            LoadBalancer(targets, strategy).use { lb -&gt;
+                val ms = arrivals(lb.uri.resolve("/slow"), n = 60, gapMs = 10)
+                println("  %-17s all done after %5d ms   %s".format(strategy, ms,
+                    targets.joinToString(" ") { "${it.name}=${it.served}" }))
+            }
+        }
+        println("-- kill b2 mid-run, active health checks only")
+        killMidRun(procs, retry = false)
+        procs[1] = startBackend("b2")                        // a fresh b2 for round two
+        println("-- kill b2 again, now with retry on failure")
+        killMidRun(procs, retry = true)
+    } finally {
+        procs.forEach { it.process.destroyForcibly() }
+    }
+}
+
+// Open-loop load: a new request every gapMs, whether or not earlier ones have finished.
+fun arrivals(uri: URI, n: Int, gapMs: Long): Long {
+    val t0 = System.nanoTime()
+    Executors.newVirtualThreadPerTaskExecutor().use { pool -&gt;
+        repeat(n) { pool.submit { get(uri) }; Thread.sleep(gapMs) }
+    }
+    return (System.nanoTime() - t0) / 1_000_000
+}
+
+fun killMidRun(procs: List&lt;BackendProcess&gt;, retry: Boolean) {
+    val targets = procs.map { Target(it.name, it.uri) }
+    LoadBalancer(targets, Strategy.ROUND_ROBIN, retry).use { lb -&gt;
+        var ok = 0
+        var failed = 0
+        repeat(60) { i -&gt;
+            if (i == 20) {
+                procs[1].process.destroyForcibly().waitFor()
+                lb.log("killed ${procs[1].name} (like kill -9)")
+            }
+            val resp = get(lb.uri.resolve("/name"))
+            if (resp.statusCode() == 200) ok++ else { failed++; lb.log("request $i -&gt; ${resp.statusCode()} ${resp.body()}") }
+            Thread.sleep(25)
+        }
+        println("  60 requests: $ok ok, $failed failed   " + targets.joinToString(" ") { "${it.name}=${it.served}" })
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LbDemo.java</figcaption>
+<pre><code class="language-java">import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Executors;
+
+public class LbDemo {
+    static final HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+
+    static HttpResponse&lt;String&gt; get(URI uri) throws Exception {
+        return http.send(HttpRequest.newBuilder(uri).build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    public static void main(String[] args) throws Exception {
+        List&lt;Backend.Proc&gt; procs = new ArrayList&lt;&gt;(List.of(
+            Backend.start("b1", 20), Backend.start("b2", 200), Backend.start("b3", 20)));
+        System.out.println("3 backend processes: " + procs.stream()
+            .map(p -&gt; p.name() + " pid " + p.process().pid()).toList());
+        try {
+            System.out.println("-- 60 requests to /slow, one every 10 ms (b2 takes 200 ms, b1 and b3 take 20 ms)");
+            for (var strategy : LoadBalancer.Strategy.values()) {
+                var targets = targetsOf(procs);
+                try (var lb = new LoadBalancer(targets, strategy, false)) {
+                    long ms = arrivals(lb.uri().resolve("/slow"), 60, 10);
+                    System.out.printf("  %-17s all done after %5d ms   %s%n", strategy, ms, targets);
+                }
+            }
+            System.out.println("-- kill b2 mid-run, active health checks only");
+            killMidRun(procs, false);
+            procs.set(1, Backend.start("b2", 0));               // a fresh b2 for round two
+            System.out.println("-- kill b2 again, now with retry on failure");
+            killMidRun(procs, true);
+        } finally {
+            procs.forEach(p -&gt; p.process().destroyForcibly());
+        }
+    }
+
+    static List&lt;LoadBalancer.Target&gt; targetsOf(List&lt;Backend.Proc&gt; procs) {
+        return procs.stream().map(p -&gt; new LoadBalancer.Target(p.name(), p.uri())).toList();
+    }
+
+    // Open-loop load: a new request every gapMs, whether or not earlier ones have finished.
+    static long arrivals(URI uri, int n, long gapMs) throws InterruptedException {
+        long t0 = System.nanoTime();
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i &lt; n; i++) {
+                pool.submit(() -&gt; get(uri));
+                Thread.sleep(gapMs);
+            }
+        }
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    static void killMidRun(List&lt;Backend.Proc&gt; procs, boolean retry) throws Exception {
+        var targets = targetsOf(procs);
+        try (var lb = new LoadBalancer(targets, LoadBalancer.Strategy.ROUND_ROBIN, retry)) {
+            int ok = 0, failed = 0;
+            for (int i = 0; i &lt; 60; i++) {
+                if (i == 20) {
+                    procs.get(1).process().destroyForcibly().waitFor();
+                    lb.log("killed " + procs.get(1).name() + " (like kill -9)");
+                }
+                var resp = get(lb.uri().resolve("/name"));
+                if (resp.statusCode() == 200) ok++;
+                else { failed++; lb.log("request " + i + " -&gt; " + resp.statusCode() + " " + resp.body()); }
+                Thread.sleep(25);
+            }
+            System.out.println("  60 requests: " + ok + " ok, " + failed + " failed   " + targets);
+        }
+    }
+}</code></pre></figure>
+</div>
+<p>Kotlin, built with <code>kotlinc Backend.kt LoadBalancer.kt LbDemo.kt Throughput.kt -include-runtime -d l42.jar</code> and run with <code>java -cp l42.jar LbDemoKt</code>. The Java version runs with <code>java LbDemo.java</code> from the folder holding all four <code>.java</code> files: since JDK 22 the source launcher finds the other classes by file name (<a href="https://openjdk.org/jeps/458">JEP 458</a>).</p>
+<div class="pair">
+<pre class="out">3 backend processes: b1 pid 61579, b2 pid 61580, b3 pid 61581
+-- 60 requests to /slow, one every 10 ms (b2 takes 200 ms, b1 and b3 take 20 ms)
+  [1097 ms] health check: b2 is DOWN
+  [1718 ms] health check: b2 is UP
+  [3151 ms] health check: b2 is DOWN
+  [3807 ms] health check: b2 is UP
+  ROUND_ROBIN       all done after  4218 ms   b1=20 b2=20 b3=20
+  [ 854 ms] health check: b2 is DOWN
+  LEAST_CONNECTIONS all done after  1068 ms   b1=30 b2=5 b3=25
+-- kill b2 mid-run, active health checks only
+  [ 691 ms] killed b2 (like kill -9)
+  [ 765 ms] request 22 -&gt; 502 bad gateway: b2
+  [ 857 ms] request 25 -&gt; 502 bad gateway: b2
+  [ 968 ms] request 28 -&gt; 502 bad gateway: b2
+  [1022 ms] health check: b2 is DOWN
+  60 requests: 57 ok, 3 failed   b1=25 b2=7 b3=25
+-- kill b2 again, now with retry on failure
+  [ 682 ms] killed b2 (like kill -9)
+  [ 756 ms] passive: b2 failed a request, marked DOWN, retrying elsewhere
+  60 requests: 60 ok, 0 failed   b1=27 b2=7 b3=26</pre>
+<pre class="out">3 backend processes: [b1 pid 61630, b2 pid 61631, b3 pid 61632]
+-- 60 requests to /slow, one every 10 ms (b2 takes 200 ms, b1 and b3 take 20 ms)
+  [1092 ms] health check: b2 is DOWN
+  [3369 ms] health check: b2 is UP
+  ROUND_ROBIN       all done after  4204 ms   [b1=20, b2=20, b3=20]
+  [ 821 ms] health check: b2 is DOWN
+  LEAST_CONNECTIONS all done after  1066 ms   [b1=29, b2=5, b3=26]
+-- kill b2 mid-run, active health checks only
+  [ 684 ms] killed b2 (like kill -9)
+  [ 755 ms] request 22 -&gt; 502 bad gateway: b2
+  [ 856 ms] request 25 -&gt; 502 bad gateway: b2
+  [ 965 ms] request 28 -&gt; 502 bad gateway: b2
+  [1020 ms] health check: b2 is DOWN
+  60 requests: 57 ok, 3 failed   [b1=25, b2=7, b3=25]
+-- kill b2 again, now with retry on failure
+  [ 699 ms] killed b2 (like kill -9)
+  [ 765 ms] passive: b2 failed a request, marked DOWN, retrying elsewhere
+  60 requests: 60 ok, 0 failed   [b1=27, b2=7, b3=26]</pre>
+</div>
+<ul>
+  <li><b>Least-connections finished four times sooner</b> (about 1.07 s against 4.2 s). Round-robin gave slow b2 its full third, 20 requests, and b2 serves one at a time at 200 ms each: 20 × 200 ms is 4 s. Least-connections saw b2's requests piling up and sent it only 5.</li>
+  <li><b>The health checker marked a working server DOWN.</b> b2 wasn't dead, just busy: its single thread was working through queued slow requests, so <code>/health</code> waited in line past the 300 ms timeout. Under round-robin it then flapped DOWN, UP, DOWN as the queue drained and refilled. That's a real failure mode, not a bug in the demo. An overloaded server fails its health check, the balancer pulls it out, and its load lands on the others, which may then overload in turn. L43 calls this a cascading failure. Real systems answer health checks on a separate thread or port, and require several failures in a row before pulling a server.</li>
+  <li><b>The kill:</b> b2 died at about 690 ms, and its round-robin turns failed with 502 until the next health check, about 330 ms later: 3 failures out of 60. That window is the price of active checks alone.</li>
+  <li><b>With retry on,</b> the first failure marked b2 down on the spot and the request was resent to b3: 60 of 60 succeeded.</li>
+</ul>
+
+<h3>Does it actually scale?</h3>
+<p>A CPU-bound endpoint behind the balancer, with 24 clients calling it as fast as they can for 3 seconds (after a 1-second warm-up), first with one backend, then two, then three. Last, one backend given three threads instead: scaling up.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Throughput.kt</figcaption>
+<pre><code class="language-kotlin">import java.net.URI
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+
+fun main() {
+    val procs = (1..3).map { startBackend("b$it") }
+    try {
+        for (n in 1..3) {
+            val targets = procs.take(n).map { Target(it.name, it.uri) }
+            LoadBalancer(targets, Strategy.ROUND_ROBIN).use { lb -&gt;
+                load(lb.uri.resolve("/work"), clients = 24, millis = 1000)              // warm-up
+                val perSecond = load(lb.uri.resolve("/work"), clients = 24, millis = 3000) / 3.0
+                println("%d backend(s): %4.0f hashes/s   %s".format(n, perSecond,
+                    targets.joinToString(" ") { "${it.name}=${it.served}" }))
+            }
+        }
+        val big = startBackend("big", threads = 3)          // scale UP: one server, 3 threads
+        LoadBalancer(listOf(Target(big.name, big.uri)), Strategy.ROUND_ROBIN).use { lb -&gt;
+            load(lb.uri.resolve("/work"), clients = 24, millis = 1000)
+            println("1 backend, 3 threads: %4.0f hashes/s".format(load(lb.uri.resolve("/work"), 24, 3000) / 3.0))
+        }
+        big.process.destroyForcibly()
+    } finally {
+        procs.forEach { it.process.destroyForcibly() }
+    }
+}
+
+// `clients` virtual threads call `uri` in a loop until time is up; returns how many calls succeeded.
+fun load(uri: URI, clients: Int, millis: Long): Int {
+    val done = AtomicInteger()
+    val deadline = System.nanoTime() + millis * 1_000_000
+    Executors.newVirtualThreadPerTaskExecutor().use { pool -&gt;
+        repeat(clients) {
+            pool.submit {
+                while (System.nanoTime() &lt; deadline) {
+                    if (get(uri).statusCode() == 200) done.incrementAndGet()
+                }
+            }
+        }
+    }
+    return done.get()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Throughput.java</figcaption>
+<pre><code class="language-java">import java.net.URI;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Throughput {
+    public static void main(String[] args) throws Exception {
+        List&lt;Backend.Proc&gt; procs = List.of(Backend.start("b1", 0), Backend.start("b2", 0), Backend.start("b3", 0));
+        try {
+            for (int n = 1; n &lt;= 3; n++) {
+                var targets = LbDemo.targetsOf(procs.subList(0, n));
+                try (var lb = new LoadBalancer(targets, LoadBalancer.Strategy.ROUND_ROBIN, false)) {
+                    load(lb.uri().resolve("/work"), 24, 1000);                     // warm-up
+                    double perSecond = load(lb.uri().resolve("/work"), 24, 3000) / 3.0;
+                    System.out.printf("%d backend(s): %4.0f hashes/s   %s%n", n, perSecond, targets);
+                }
+            }
+            var big = Backend.start("big", 0, 3);              // scale UP: one server, 3 threads
+            try (var lb = new LoadBalancer(LbDemo.targetsOf(List.of(big)), LoadBalancer.Strategy.ROUND_ROBIN, false)) {
+                load(lb.uri().resolve("/work"), 24, 1000);
+                System.out.printf("1 backend, 3 threads: %4.0f hashes/s%n", load(lb.uri().resolve("/work"), 24, 3000) / 3.0);
+            }
+            big.process().destroyForcibly();
+        } finally {
+            procs.forEach(p -&gt; p.process().destroyForcibly());
+        }
+    }
+
+    // `clients` virtual threads call `uri` in a loop until time is up; returns how many calls succeeded.
+    static int load(URI uri, int clients, long millis) {
+        var done = new AtomicInteger();
+        long deadline = System.nanoTime() + millis * 1_000_000;
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int c = 0; c &lt; clients; c++) {
+                pool.submit(() -&gt; {
+                    while (System.nanoTime() &lt; deadline) {
+                        if (LbDemo.get(uri).statusCode() == 200) done.incrementAndGet();
+                    }
+                    return null;
+                });
+            }
+        }
+        return done.get();
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">1 backend(s):  658 hashes/s   b1=2511
+2 backend(s): 1215 hashes/s   b1=2349 b2=2349
+3 backend(s): 1820 hashes/s   b1=2363 b2=2363 b3=2363
+1 backend, 3 threads: 1821 hashes/s</pre>
+<pre class="out">1 backend(s):  603 hashes/s   [b1=2329]
+2 backend(s): 1210 hashes/s   [b1=2359, b2=2358]
+3 backend(s): 1809 hashes/s   [b1=2352, b2=2351, b3=2351]
+1 backend, 3 threads: 1810 hashes/s</pre>
+</div>
+<ul>
+  <li><b>Near-linear:</b> each one-thread backend does about 600 hashes a second, and three do about three times that.</li>
+  <li><b>Scaling up gave the same number.</b> On one 18-core machine, three one-thread processes and one three-thread process use the same three cores, so they're equally fast. Scaling out doesn't win on speed here. It wins on what this laptop can't show: surviving a dead machine, and growing past the biggest machine you can buy.</li>
+  <li><b>The limit on one machine is the cores.</b> Past 18 backends there would be nothing left to add. The <code>served</code> counts include the warm-up second.</li>
+</ul>
+
+<h3>Layer 4, layer 7, and before the balancer</h3>
+<p>Your balancer reads each HTTP request, so it's a <dfn>layer 7</dfn> balancer (application layer, L30). The Primer: "Layer 7 load balancers terminate network traffic, reads the message, makes a load-balancing decision, then opens a connection to the selected server." A <dfn>layer 4</dfn> balancer only looks at addresses and ports: "Generally, this involves the source, destination IP addresses, and ports in the header, but not the contents of the packet." Layer 4 is cheaper; layer 7 can route on paths, headers and cookies. In production these are <a href="https://nginx.org/en/docs/http/load_balancing.html">nginx</a>, <a href="https://www.haproxy.org/">HAProxy</a> ("a free, very fast and reliable reverse-proxy offering high availability, load balancing, and proxying for TCP and HTTP-based applications"), or a cloud provider's load balancer. A single balancer is itself a single point of failure, so the Primer notes "it's common to set up multiple load balancers, either in active-passive or active-active mode."</p>
+<p>Spreading starts even earlier, in DNS (L30): <code>example.com</code> returned two A records, and clients pick one, a crude form of balancing. <dfn>Anycast</dfn> goes further: "Anycast is the name given to the practice of making a Service Address available to a routing system at Anycast Nodes in two or more discrete locations" (<a href="https://www.rfc-editor.org/rfc/rfc4786">RFC 4786</a>). The same IP address is announced from many places, and internet routing delivers each client to a nearby one.</p>
+
+<div class="callout">
+  <p><b>Bridge.</b> When you deploy a Spring Boot service, the platform (Kubernetes, a cloud load balancer) does this part, and your job is to make the service stateless and give it a health endpoint. Spring Boot's Actuator provides <code>/actuator/health</code> for exactly that. On Android, the app is the <em>client</em> of all this: it talks to one hostname and never knows how many servers are behind it.</p>
+</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>when (strategy)</code> over an enum is an expression, and <code>up.minBy { it.active.get() }</code> picks the least-loaded backend in one call. Java needs a stream with <code>Comparator.comparingInt</code> and <code>orElseThrow()</code>.</li>
+    <li><code>pick(skip = null) ?: return reply(…)</code> handles "no healthy backend" in the same line that picks one.</li>
+    <li><code>use { }</code> closes the load balancer and the executor; Java writes try-with-resources. Default arguments (<code>retryOnFailure = false</code>, <code>slowMs = 0</code>) replace Java's extra constructor or overload.</li>
+    <li>No checked exceptions: <code>Thread.sleep</code> and <code>client.send</code> need no <code>catch (InterruptedException e)</code>. The Java health loop has three catch blocks for the same logic.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: sticky routing, and why mod N bites</div>
+  <p>From a blank file, write <code>pick(client, backends)</code> that sends a client to <code>backends[hash(client) mod size]</code>, so the same client always lands on the same backend. Map ten client names over <code>b1, b2, b3</code>, then over <code>b1, b3</code> as if b2 died. For each client print whether it moved, and whether it <em>had</em> to. Predict before running: how many clients on healthy backends get moved anyway?</p>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex1.kt</figcaption>
+<pre><code class="language-kotlin">// Sticky routing: the same client always goes to the same backend.
+fun pick(client: String, backends: List&lt;String&gt;) = backends[Math.floorMod(client.hashCode(), backends.size)]
+
+fun main() {
+    val clients = listOf("ada", "bob", "cy", "dee", "eve", "fay", "gus", "hal", "ivy", "jo")
+    val before = clients.associateWith { pick(it, listOf("b1", "b2", "b3")) }
+    val after = clients.associateWith { pick(it, listOf("b1", "b3")) }          // b2 died
+    for (c in clients) {
+        val note = when {
+            before[c] == after[c] -&gt; ""
+            before[c] == "b2" -&gt; "  moved (its backend died)"
+            else -&gt; "  MOVED although its backend is fine"
+        }
+        println("%-4s %s -&gt; %s%s".format(c, before[c], after[c], note))
+    }
+    val needless = clients.count { before[it] != after[it] &amp;&amp; before[it] != "b2" }
+    println("clients that lost their session for no reason: $needless of ${clients.size}")
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex1.java</figcaption>
+<pre><code class="language-java">import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+public class Ex1 {
+    // Sticky routing: the same client always goes to the same backend.
+    static String pick(String client, List&lt;String&gt; backends) {
+        return backends.get(Math.floorMod(client.hashCode(), backends.size()));
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; clients = List.of("ada", "bob", "cy", "dee", "eve", "fay", "gus", "hal", "ivy", "jo");
+        Map&lt;String, String&gt; before = clients.stream().collect(Collectors.toMap(Function.identity(), c -&gt; pick(c, List.of("b1", "b2", "b3"))));
+        Map&lt;String, String&gt; after = clients.stream().collect(Collectors.toMap(Function.identity(), c -&gt; pick(c, List.of("b1", "b3"))));  // b2 died
+        for (String c : clients) {
+            String note = before.get(c).equals(after.get(c)) ? ""
+                : before.get(c).equals("b2") ? "  moved (its backend died)"
+                : "  MOVED although its backend is fine";
+            System.out.printf("%-4s %s -&gt; %s%s%n", c, before.get(c), after.get(c), note);
+        }
+        long needless = clients.stream()
+            .filter(c -&gt; !before.get(c).equals(after.get(c)) &amp;&amp; !before.get(c).equals("b2")).count();
+        System.out.println("clients that lost their session for no reason: " + needless + " of " + clients.size());
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">ada  b1 -&gt; b1
+bob  b2 -&gt; b3  moved (its backend died)
+cy   b2 -&gt; b1  moved (its backend died)
+dee  b3 -&gt; b1  MOVED although its backend is fine
+eve  b3 -&gt; b1  MOVED although its backend is fine
+fay  b3 -&gt; b1  MOVED although its backend is fine
+gus  b3 -&gt; b3
+hal  b1 -&gt; b3  MOVED although its backend is fine
+ivy  b3 -&gt; b1  MOVED although its backend is fine
+jo   b2 -&gt; b3  moved (its backend died)
+clients that lost their session for no reason: 5 of 10</pre>
+    <p>Java prints exactly the same: <code>String.hashCode</code> is the same function in both (L19). Three clients had to move because b2 died. But five more moved although their backend was fine, because dividing by 2 instead of 3 reshuffles almost everyone. With sticky sessions, half your users would have been logged out for no reason. Part 2 measures this at scale and fixes it.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Stateless servers and load balancers" data-answer="2">
+  <p class="q">Server A keeps sessions in a <code>HashMap</code>. The load balancer sends your next request to B. What happens?</p>
+  <div class="opts"><button>B copies the session</button><button>The request is queued</button><button>You look logged out</button><button>A forwards it automatically</button></div>
+  <p class="why">B has its own memory and has never seen your session, exactly as <code>Sessions</code> showed with a 401. Servers behind a balancer must be stateless: keep sessions in a shared store, or in a signed token the client carries.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Stateless servers and load balancers" data-answer="0">
+  <p class="q">In the demo, why did least-connections finish in about 1 s instead of 4 s?</p>
+  <div class="opts"><button>It sent fewer to b2</button><button>It skipped all health checks</button><button>It used more backend threads</button><button>It cached the slow responses</button></div>
+  <p class="why">Least-connections looks at requests in flight. b2's piled up while it slept 200 ms on each, so new requests went to b1 and b3: b2 got 5 instead of 20. Round-robin ignores load and sends b2 its full third.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Stateless servers and load balancers" data-answer="3">
+  <p class="q">A backend dies, and the balancer has active health checks but no retries. Which requests fail?</p>
+  <div class="opts"><button>Every request from then on</button><button>Only the very first one</button><button>None, TCP resends them all</button><button>Its share until health check</button></div>
+  <p class="why">Until the next health check notices, the dead backend keeps getting its round-robin turns, and each one fails. In the demo that was 3 of 60 requests in a 330 ms window. After the check marks it DOWN, nothing more goes there.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Stateless servers and load balancers" data-answer="1">
+  <p class="q">Why may the load balancer retry a failed GET but not a failed POST?</p>
+  <div class="opts"><button>POST bodies are too large</button><button>GET is idempotent, POST isn't</button><button>HTTP forbids retrying any POST</button><button>Retries only work over TCP</button></div>
+  <p class="why">The failed attempt may have reached the backend and done its work. Repeating a GET changes nothing; repeating a POST might create a second book. RFC 9110 calls GET idempotent and POST not (L32); safe retries of POST need an idempotency key, which L43 covers.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Replication, read replicas, sharding</h2><span class="t">~30 min</span></div>
+
+<p>Part 1's backends are easy to multiply because they keep nothing. The database keeps everything, so all the backends still share one. Two techniques spread a database over several machines. <b>Replication</b> keeps a full copy on each, which helps reads and survives a crash. <b>Sharding</b> gives each a slice, which helps writes and size. <em>Designing Data-Intensive Applications</em> gives each a chapter; read the replication and sharding (partitioning) chapters after this lesson.</p>
+
+<h3>Leader and follower</h3>
+<p>The Primer describes the classic set-up, using the older names master and slave: "The master serves reads and writes, replicating writes to one or more slaves, which serve only reads. Slaves can also replicate to additional slaves in a tree-like fashion. If the master goes offline, the system can continue to operate in read-only mode until a slave is promoted to a master or a new master is provisioned" (<a href="https://github.com/donnemartin/system-design-primer#master-slave-replication">System Design Primer: replication</a>). Today they're usually called <dfn>leader</dfn> and <dfn>follower</dfn>, or primary and replica. Managed databases replicate <em>asynchronously</em> by default. Amazon RDS: "When you make updates to the primary DB instance, Amazon RDS copies them asynchronously to the read replica" (<a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html">Amazon RDS: read replicas</a>).</p>
+<p>Here it is with two SQLite files. Each write goes to the leader together with a row in a <code>changes</code> table (the <dfn>replication log</dfn>), in one transaction (L36). A replicator thread copies changes to the follower in order, each one 300 ms after it was written. That's an artificial delay standing in for the network and a busy replica.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Replication.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.nio.file.Path
+import java.sql.Connection
+import java.sql.DriverManager
+
+// Leader + one follower, two SQLite files. The follower copies the leader's change log `lagMs` late.
+class ReplicatedBooks(private val dir: Path, private val lagMs: Long) : AutoCloseable {
+    private fun open(file: String): Connection =
+        DriverManager.getConnection("jdbc:sqlite:${dir.resolve(file)}?busy_timeout=3000&amp;journal_mode=WAL")
+    private val leader = open("leader.db")          // used by writers
+    private val leaderLog = open("leader.db")       // used by the replicator to read the change log
+    private val follower = open("follower.db")      // used by the replicator to apply changes
+    private val followerRead = open("follower.db")  // used by readers
+    @Volatile private var running = true
+
+    init {
+        leader.createStatement().use {
+            it.executeUpdate("CREATE TABLE books(id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+            it.executeUpdate("CREATE TABLE changes(version INTEGER PRIMARY KEY, at INTEGER, id INTEGER, title TEXT)")
+        }
+        follower.createStatement().use {
+            it.executeUpdate("CREATE TABLE books(id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+            it.executeUpdate("CREATE TABLE applied(version INTEGER)")
+            it.executeUpdate("INSERT INTO applied VALUES (0)")
+        }
+        Thread.ofVirtual().start { replicate() }
+    }
+
+    // A write goes to the leader: the row and its change-log entry in one transaction (L36).
+    data class Written(val id: Long, val version: Long)
+
+    @Synchronized fun write(title: String): Written {
+        leader.autoCommit = false
+        try {
+            val id = leader.prepareStatement("INSERT INTO books(title) VALUES (?)").use {
+                it.setString(1, title); it.executeUpdate()
+                leader.createStatement().executeQuery("SELECT last_insert_rowid()").use { rs -&gt; rs.getLong(1) }
+            }
+            leader.prepareStatement("INSERT INTO changes(at, id, title) VALUES (?, ?, ?)").use {
+                it.setLong(1, System.currentTimeMillis()); it.setLong(2, id); it.setString(3, title); it.executeUpdate()
+            }
+            val version = leader.createStatement().executeQuery("SELECT last_insert_rowid()").use { it.getLong(1) }
+            leader.commit()
+            return Written(id, version)
+        } finally {
+            leader.autoCommit = true
+        }
+    }
+
+    fun readLeader(id: Long): String? = titleOf(leader, id)
+    fun readFollower(id: Long): String? = titleOf(followerRead, id)
+    fun followerVersion(): Long = followerRead.createStatement().executeQuery("SELECT version FROM applied").use { it.getLong(1) }
+    @Synchronized fun leaderVersion(): Long =
+        leader.createStatement().executeQuery("SELECT coalesce(max(version), 0) FROM changes").use { it.getLong(1) }
+
+    private fun titleOf(c: Connection, id: Long): String? =
+        c.prepareStatement("SELECT title FROM books WHERE id = ?").use {
+            it.setLong(1, id)
+            it.executeQuery().use { rs -&gt; if (rs.next()) rs.getString(1) else null }
+        }
+
+    // The replication stream: apply every change, in order, once it is `lagMs` old.
+    private fun replicate() {
+        while (running) {
+            val from = followerVersion()
+            leaderLog.prepareStatement("SELECT version, at, id, title FROM changes WHERE version &gt; ? ORDER BY version").use { st -&gt;
+                st.setLong(1, from)
+                st.executeQuery().use { rs -&gt;
+                    while (rs.next()) {
+                        val wait = rs.getLong("at") + lagMs - System.currentTimeMillis()
+                        if (wait &gt; 0) Thread.sleep(wait)                   // the artificial network delay
+                        follower.autoCommit = false
+                        follower.prepareStatement("INSERT OR REPLACE INTO books(id, title) VALUES (?, ?)").use {
+                            it.setLong(1, rs.getLong("id")); it.setString(2, rs.getString("title")); it.executeUpdate()
+                        }
+                        follower.prepareStatement("UPDATE applied SET version = ?").use { it.setLong(1, rs.getLong("version")); it.executeUpdate() }
+                        follower.commit()
+                        follower.autoCommit = true
+                    }
+                }
+            }
+            Thread.sleep(10)
+        }
+    }
+
+    override fun close() { running = false; Thread.sleep(50); listOf(leader, leaderLog, follower, followerRead).forEach { it.close() } }
+}
+
+fun main() {
+    val dir = Files.createTempDirectory("l42")
+    ReplicatedBooks(dir, lagMs = 300).use { db -&gt;
+        println("-- read from the follower right after a write")
+        val v1 = db.write("Dune").version
+        println("write 'Dune'           -&gt; leader version $v1")
+        println("read book 1, follower  -&gt; ${db.readFollower(1) ?: "not found"}   (follower at version ${db.followerVersion()})")
+        Thread.sleep(400)
+        println("400 ms later, follower -&gt; ${db.readFollower(1)}   (follower at version ${db.followerVersion()})")
+
+        println("-- read-your-writes: remember your write's version, read where it is visible")
+        val mine = db.write("Emma").version
+        fun readMine(id: Long, minVersion: Long): String {
+            val fv = db.followerVersion()
+            return if (fv &gt;= minVersion) "${db.readFollower(id)} from follower (at $fv)"
+                   else "${db.readLeader(id)} from leader (follower only at $fv, need $minVersion)"
+        }
+        println("write 'Emma' -&gt; version $mine; read now -&gt; ${readMine(2, mine)}")
+        Thread.sleep(400)
+        println("400 ms later           -&gt; ${readMine(2, mine)}")
+
+        println("-- lag under a burst of 20 writes")
+        repeat(20) { db.write("book $it") }
+        val t0 = System.currentTimeMillis()
+        while (true) {
+            val lv = db.leaderVersion()
+            val fv = db.followerVersion()
+            println("  +%3d ms  leader v%d  follower v%d  behind by %d".format(System.currentTimeMillis() - t0, lv, fv, lv - fv))
+            if (fv == lv) break
+            Thread.sleep(100)
+        }
+    }
+    dir.toFile().deleteRecursively()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Replication.java</figcaption>
+<pre><code class="language-java">import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+
+// Leader + one follower, two SQLite files. The follower copies the leader's change log `lagMs` late.
+public class Replication {
+    static class ReplicatedBooks implements AutoCloseable {
+        private final Path dir;
+        private final long lagMs;
+        private final Connection leader, leaderLog, follower, followerRead;
+        private volatile boolean running = true;
+
+        ReplicatedBooks(Path dir, long lagMs) throws SQLException {
+            this.dir = dir;
+            this.lagMs = lagMs;
+            leader = open("leader.db");         // used by writers
+            leaderLog = open("leader.db");      // used by the replicator to read the change log
+            follower = open("follower.db");     // used by the replicator to apply changes
+            followerRead = open("follower.db"); // used by readers
+            try (Statement st = leader.createStatement()) {
+                st.executeUpdate("CREATE TABLE books(id INTEGER PRIMARY KEY, title TEXT NOT NULL)");
+                st.executeUpdate("CREATE TABLE changes(version INTEGER PRIMARY KEY, at INTEGER, id INTEGER, title TEXT)");
+            }
+            try (Statement st = follower.createStatement()) {
+                st.executeUpdate("CREATE TABLE books(id INTEGER PRIMARY KEY, title TEXT NOT NULL)");
+                st.executeUpdate("CREATE TABLE applied(version INTEGER)");
+                st.executeUpdate("INSERT INTO applied VALUES (0)");
+            }
+            Thread.ofVirtual().start(this::replicate);
+        }
+
+        private Connection open(String file) throws SQLException {
+            return DriverManager.getConnection("jdbc:sqlite:" + dir.resolve(file) + "?busy_timeout=3000&amp;journal_mode=WAL");
+        }
+
+        // A write goes to the leader: the row and its change-log entry in one transaction (L36).
+        record Written(long id, long version) {}
+
+        synchronized Written write(String title) throws SQLException {
+            leader.setAutoCommit(false);
+            try {
+                long id;
+                try (var st = leader.prepareStatement("INSERT INTO books(title) VALUES (?)")) {
+                    st.setString(1, title);
+                    st.executeUpdate();
+                    id = lastRowId(leader);
+                }
+                try (var st = leader.prepareStatement("INSERT INTO changes(at, id, title) VALUES (?, ?, ?)")) {
+                    st.setLong(1, System.currentTimeMillis()); st.setLong(2, id); st.setString(3, title);
+                    st.executeUpdate();
+                }
+                long version = lastRowId(leader);
+                leader.commit();
+                return new Written(id, version);
+            } finally {
+                leader.setAutoCommit(true);
+            }
+        }
+
+        String readLeader(long id) throws SQLException { return titleOf(leader, id); }
+        String readFollower(long id) throws SQLException { return titleOf(followerRead, id); }
+        long followerVersion() throws SQLException { return single(followerRead, "SELECT version FROM applied"); }
+        synchronized long leaderVersion() throws SQLException { return single(leader, "SELECT coalesce(max(version), 0) FROM changes"); }
+
+        private static long lastRowId(Connection c) throws SQLException { return single(c, "SELECT last_insert_rowid()"); }
+
+        private static long single(Connection c, String sql) throws SQLException {
+            try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) { return rs.getLong(1); }
+        }
+
+        private static String titleOf(Connection c, long id) throws SQLException {
+            try (var st = c.prepareStatement("SELECT title FROM books WHERE id = ?")) {
+                st.setLong(1, id);
+                try (ResultSet rs = st.executeQuery()) { return rs.next() ? rs.getString(1) : null; }
+            }
+        }
+
+        // The replication stream: apply every change, in order, once it is `lagMs` old.
+        private void replicate() {
+            try {
+                while (running) {
+                    try (var st = leaderLog.prepareStatement("SELECT version, at, id, title FROM changes WHERE version &gt; ? ORDER BY version")) {
+                        st.setLong(1, followerVersion());
+                        try (ResultSet rs = st.executeQuery()) {
+                            while (rs.next()) {
+                                long wait = rs.getLong("at") + lagMs - System.currentTimeMillis();
+                                if (wait &gt; 0) Thread.sleep(wait);               // the artificial network delay
+                                follower.setAutoCommit(false);
+                                try (var ins = follower.prepareStatement("INSERT OR REPLACE INTO books(id, title) VALUES (?, ?)");
+                                     var upd = follower.prepareStatement("UPDATE applied SET version = ?")) {
+                                    ins.setLong(1, rs.getLong("id")); ins.setString(2, rs.getString("title")); ins.executeUpdate();
+                                    upd.setLong(1, rs.getLong("version")); upd.executeUpdate();
+                                }
+                                follower.commit();
+                                follower.setAutoCommit(true);
+                            }
+                        }
+                    }
+                    Thread.sleep(10);
+                }
+            } catch (SQLException | InterruptedException e) {
+                if (running) e.printStackTrace();
+            }
+        }
+
+        @Override public void close() throws Exception {
+            running = false;
+            Thread.sleep(50);
+            for (Connection c : new Connection[] { leader, leaderLog, follower, followerRead }) c.close();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path dir = Files.createTempDirectory("l42");
+        try (var db = new ReplicatedBooks(dir, 300)) {
+            System.out.println("-- read from the follower right after a write");
+            long v1 = db.write("Dune").version();
+            System.out.println("write 'Dune'           -&gt; leader version " + v1);
+            String now = db.readFollower(1);
+            System.out.println("read book 1, follower  -&gt; " + (now == null ? "not found" : now) + "   (follower at version " + db.followerVersion() + ")");
+            Thread.sleep(400);
+            System.out.println("400 ms later, follower -&gt; " + db.readFollower(1) + "   (follower at version " + db.followerVersion() + ")");
+
+            System.out.println("-- read-your-writes: remember your write's version, read where it is visible");
+            long mine = db.write("Emma").version();
+            System.out.println("write 'Emma' -&gt; version " + mine + "; read now -&gt; " + readMine(db, 2, mine));
+            Thread.sleep(400);
+            System.out.println("400 ms later           -&gt; " + readMine(db, 2, mine));
+
+            System.out.println("-- lag under a burst of 20 writes");
+            for (int i = 0; i &lt; 20; i++) db.write("book " + i);
+            long t0 = System.currentTimeMillis();
+            while (true) {
+                long lv = db.leaderVersion(), fv = db.followerVersion();
+                System.out.printf("  +%3d ms  leader v%d  follower v%d  behind by %d%n", System.currentTimeMillis() - t0, lv, fv, lv - fv);
+                if (fv == lv) break;
+                Thread.sleep(100);
+            }
+        }
+        try (var files = Files.walk(dir)) {
+            files.sorted(java.util.Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete());
+        }
+    }
+
+    static String readMine(ReplicatedBooks db, long id, long minVersion) throws SQLException {
+        long fv = db.followerVersion();
+        return fv &gt;= minVersion ? db.readFollower(id) + " from follower (at " + fv + ")"
+                                : db.readLeader(id) + " from leader (follower only at " + fv + ", need " + minVersion + ")";
+    }
+}</code></pre></figure>
+</div>
+<p>Run with sqlite-jdbc on the classpath, as in L36. Java: <code>java --enable-native-access=ALL-UNNAMED -cp sqlite-jdbc-3.53.4.0.jar Replication.java</code>.</p>
+<div class="pair">
+<pre class="out">-- read from the follower right after a write
+write 'Dune'           -&gt; leader version 1
+read book 1, follower  -&gt; not found   (follower at version 0)
+400 ms later, follower -&gt; Dune   (follower at version 1)
+-- read-your-writes: remember your write's version, read where it is visible
+write 'Emma' -&gt; version 2; read now -&gt; Emma from leader (follower only at 1, need 2)
+400 ms later           -&gt; Emma from follower (at 2)
+-- lag under a burst of 20 writes
+  +  0 ms  leader v22  follower v2  behind by 20
+  +109 ms  leader v22  follower v2  behind by 20
+  +219 ms  leader v22  follower v2  behind by 20
+  +327 ms  leader v22  follower v22  behind by 0</pre>
+<pre class="out">-- read from the follower right after a write
+write 'Dune'           -&gt; leader version 1
+read book 1, follower  -&gt; not found   (follower at version 0)
+400 ms later, follower -&gt; Dune   (follower at version 1)
+-- read-your-writes: remember your write's version, read where it is visible
+write 'Emma' -&gt; version 2; read now -&gt; Emma from leader (follower only at 1, need 2)
+400 ms later           -&gt; Emma from follower (at 2)
+-- lag under a burst of 20 writes
+  +  0 ms  leader v22  follower v2  behind by 20
+  +111 ms  leader v22  follower v2  behind by 20
+  +220 ms  leader v22  follower v2  behind by 20
+  +327 ms  leader v22  follower v22  behind by 0</pre>
+</div>
+<ul>
+  <li><b>Read right after a write:</b> the follower hasn't heard about Dune yet and answers "not found". 400 ms later it has. Nothing is broken: the follower is <em>eventually</em> consistent. Step through it in the <b>Replication</b> tab of the diagram above.</li>
+  <li><b>Read-your-writes:</b> the writer remembers the version its write produced and asks for "at least version 2". The follower is only at 1, so the read goes to the leader. Once the follower catches up, reads go back to it. Other users don't get this guarantee unless they carry a version too; the final shows what they see.</li>
+  <li><b>Lag under load:</b> after a burst of 20 writes the follower sat 20 versions behind for about 300 ms. The Primer warns that "The more read slaves, the more you have to replicate, which leads to greater replication lag."</li>
+  <li><b>Four connections, on purpose:</b> a JDBC connection isn't meant for several threads at once, so writers, readers and the replicator each get their own. WAL mode lets a reader read while the replicator writes (<a href="https://www.sqlite.org/wal.html">SQLite: WAL</a>).</li>
+</ul>
+<p><b>Synchronous vs asynchronous.</b> This replicator is asynchronous: the leader commits and answers without waiting for the follower. That's fast, but the Primer lists the risk: "There is a potential for loss of data if the master fails before any newly written data can be replicated to other nodes." A <em>synchronous</em> replica makes the leader wait until the follower has the change too: no loss, but every write is as slow as the slowest replica, and a dead replica blocks writes. Many systems compromise with one synchronous follower and the rest asynchronous. <b>Failover</b>, promoting a follower when the leader dies, is the hard part: deciding the leader really is dead and not just slow (Part 1's health-check false alarm again), and making sure the old leader can't come back and accept writes. "Additional logic is needed to promote a slave to a master," says the Primer. Real databases do this with consensus, which L43 introduces.</p>
+
+<h3>Sharding: splitting the data</h3>
+<p>Replicas copy everything, so every replica still receives every write. To spread <em>writes</em>, split the data. The Primer: "Sharding distributes data across different databases such that each database can only manage a subset of the data. Taking a users database as an example, as the number of users increases, more shards are added to the cluster" (<a href="https://github.com/donnemartin/system-design-primer#sharding">System Design Primer: sharding</a>). Two ways to choose a key's shard:</p>
+<ul>
+  <li><b>By range:</b> users A–F on shard 1, G–M on shard 2, and so on. Range queries stay on one shard, but popular ranges get hot: every new order today lands on the "today" shard.</li>
+  <li><b>By hash:</b> <code>hash(key) mod N</code>. Load spreads evenly, but neighbouring keys scatter, and changing N is painful. That pain is measurable:</li>
+</ul>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Sharding.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.ByteBuffer
+import java.security.MessageDigest
+import java.util.TreeMap
+
+// A well-mixed 64-bit hash of a string: the first 8 bytes of its MD5 digest.
+fun hash64(s: String): Long = ByteBuffer.wrap(MessageDigest.getInstance("MD5").digest(s.toByteArray())).long
+
+fun modShard(key: String, n: Int) = "n${Math.floorMod(hash64(key), n) + 1}"
+
+// Consistent hashing: nodes and keys share one ring of 64-bit positions.
+class Ring(private val vnodes: Int) {
+    private val ring = TreeMap&lt;Long, String&gt;()                        // ring position -&gt; node
+    fun add(node: String) = repeat(vnodes) { ring[hash64("$node#$it")] = node }
+    fun remove(node: String) = repeat(vnodes) { ring.remove(hash64("$node#$it")) }
+    // Walk clockwise from the key's position to the first node position (wrap around at the end).
+    fun nodeFor(key: String): String = (ring.ceilingEntry(hash64(key)) ?: ring.firstEntry()).value
+}
+
+fun main() {
+    val keys = (0 until 100_000).map { "user:$it" }
+
+    val moved = keys.count { modShard(it, 4) != modShard(it, 5) }
+    println("hash mod N, 4 -&gt; 5 nodes: %,d of %,d keys move (%.0f%%)".format(moved, keys.size, 100.0 * moved / keys.size))
+
+    for (vnodes in listOf(1, 100)) {
+        val ring = Ring(vnodes)
+        listOf("n1", "n2", "n3", "n4").forEach(ring::add)
+        val before = keys.associateWith(ring::nodeFor)
+        val load = before.values.groupingBy { it }.eachCount().toSortedMap()
+        ring.add("n5")
+        val after = keys.associateWith(ring::nodeFor)
+        val changed = keys.filter { before[it] != after[it] }
+        println("ring, %3d vnode(s) per node: load %s".format(vnodes, load))
+        println("   add n5: %,d keys move (%.0f%%), all of them to n5: %s".format(
+            changed.size, 100.0 * changed.size / keys.size, changed.all { after[it] == "n5" }))
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Sharding.java</figcaption>
+<pre><code class="language-java">import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+public class Sharding {
+    // A well-mixed 64-bit hash of a string: the first 8 bytes of its MD5 digest.
+    static long hash64(String s) {
+        try {
+            byte[] d = MessageDigest.getInstance("MD5").digest(s.getBytes(StandardCharsets.UTF_8));
+            return ByteBuffer.wrap(d).getLong();
+        } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+
+    static String modShard(String key, int n) { return "n" + (Math.floorMod(hash64(key), n) + 1); }
+
+    // Consistent hashing: nodes and keys share one ring of 64-bit positions.
+    static class Ring {
+        private final int vnodes;
+        private final TreeMap&lt;Long, String&gt; ring = new TreeMap&lt;&gt;();     // ring position -&gt; node
+        Ring(int vnodes) { this.vnodes = vnodes; }
+        void add(String node) { for (int i = 0; i &lt; vnodes; i++) ring.put(hash64(node + "#" + i), node); }
+        void remove(String node) { for (int i = 0; i &lt; vnodes; i++) ring.remove(hash64(node + "#" + i)); }
+        // Walk clockwise from the key's position to the first node position (wrap around at the end).
+        String nodeFor(String key) {
+            var e = ring.ceilingEntry(hash64(key));
+            return (e != null ? e : ring.firstEntry()).getValue();
+        }
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; keys = IntStream.range(0, 100_000).mapToObj(i -&gt; "user:" + i).toList();
+
+        long moved = keys.stream().filter(k -&gt; !modShard(k, 4).equals(modShard(k, 5))).count();
+        System.out.printf("hash mod N, 4 -&gt; 5 nodes: %,d of %,d keys move (%.0f%%)%n", moved, keys.size(), 100.0 * moved / keys.size());
+
+        for (int vnodes : new int[] { 1, 100 }) {
+            Ring ring = new Ring(vnodes);
+            List.of("n1", "n2", "n3", "n4").forEach(ring::add);
+            Map&lt;String, String&gt; before = keys.stream().collect(Collectors.toMap(Function.identity(), ring::nodeFor));
+            var load = new TreeMap&lt;&gt;(before.values().stream().collect(Collectors.groupingBy(n -&gt; n, Collectors.counting())));
+            ring.add("n5");
+            Map&lt;String, String&gt; after = keys.stream().collect(Collectors.toMap(Function.identity(), ring::nodeFor));
+            List&lt;String&gt; changed = keys.stream().filter(k -&gt; !before.get(k).equals(after.get(k))).toList();
+            System.out.printf("ring, %3d vnode(s) per node: load %s%n", vnodes, load);
+            System.out.printf("   add n5: %,d keys move (%.0f%%), all of them to n5: %s%n",
+                changed.size(), 100.0 * changed.size() / keys.size(), changed.stream().allMatch(k -&gt; after.get(k).equals("n5")));
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">hash mod N, 4 -&gt; 5 nodes: 80,147 of 100,000 keys move (80%)
+ring,   1 vnode(s) per node: load {n1=17431, n2=32435, n3=8682, n4=41452}
+   add n5: 25,475 keys move (25%), all of them to n5: true
+ring, 100 vnode(s) per node: load {n1=22391, n2=24129, n3=26412, n4=27068}
+   add n5: 22,091 keys move (22%), all of them to n5: true</pre>
+<pre class="out">hash mod N, 4 -&gt; 5 nodes: 80,147 of 100,000 keys move (80%)
+ring,   1 vnode(s) per node: load {n1=17431, n2=32435, n3=8682, n4=41452}
+   add n5: 25,475 keys move (25%), all of them to n5: true
+ring, 100 vnode(s) per node: load {n1=22391, n2=24129, n3=26412, n4=27068}
+   add n5: 22,091 keys move (22%), all of them to n5: true</pre>
+</div>
+<ul>
+  <li><b>mod N moved 80% of the keys</b> when one node was added. A key stays put only if its hash gives the same remainder for 4 and 5, which happens about one time in five. Real shards hold real data, so 80% means copying almost the whole database across the network.</li>
+  <li><b>Consistent hashing</b> puts nodes and keys on the same ring of 64-bit positions, and each key belongs to the first node position clockwise from it. That's a <code>TreeMap.ceilingEntry</code> lookup (L20), wrapping round to <code>firstEntry</code> at the end. Adding n5 only takes over the stretches just before its own positions, so <b>every moved key moved to n5</b>, and none moved between old nodes. The idea comes from Karger and colleagues' 1997 paper "Consistent hashing and random trees". The Primer recommends it: "A sharding function based on consistent hashing can reduce the amount of transferred data."</li>
+  <li><b>Virtual nodes even out the load.</b> With one position per node the slices are luck: n4 owned 41% and n3 only 9%. With 100 positions per node every node gets 22–27%, and adding a fifth moves 22%, close to the ideal fifth. Step through a small ring in the <b>Hash ring</b> tab above.</li>
+  <li><b>Hash quality matters:</b> <code>String.hashCode</code> is fine for <code>mod</code> but clusters similar strings, so the ring uses the first 8 bytes of MD5. Here MD5 is a mixing function, not security (L33).</li>
+</ul>
+<p><b>What sharding costs.</b> The Primer's list: "Data distribution can become lopsided in a shard. For example, a set of power users on a shard could result in increased load to that shard compared to others", "Rebalancing adds additional complexity", and "Joining data from multiple shards is more complex." A single celebrity's account is a <dfn>hot key</dfn> that no hash function can spread, because all of its traffic has one key. A query across shards ("top 10 books by loans") must ask every shard and merge the answers. A transaction that touches two shards loses the simple single-database guarantees of L36 and needs a distributed commit protocol, which is slow and rare. So you choose the shard key to keep each user's or each tenant's data together.</p>
+
+<div class="callout">
+  <p><b>Bridge.</b> Managed databases such as Amazon RDS create read replicas with a click; your code decides which reads may go to them, which is today's read-your-writes problem. On Android, Room is a single local SQLite database (<a href="https://developer.android.com/training/data-storage/room">"an abstraction layer over SQLite"</a>), with no replication at all. The phone's copy plus the server's copy <em>is</em> a replication problem, which offline-first sync has to solve.</p>
+</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>keys.associateWith(ring::nodeFor)</code> builds the key-to-node map in one call; Java needs <code>Collectors.toMap(Function.identity(), ring::nodeFor)</code>.</li>
+    <li><code>groupingBy { it }.eachCount().toSortedMap()</code> is a sorted histogram. Java writes <code>new TreeMap&lt;&gt;(…groupingBy(n -&gt; n, Collectors.counting()))</code>.</li>
+    <li><code>data class Written(val id: Long, val version: Long)</code> returns two values with names; Java's record does the same since JDK 16 (L7).</li>
+    <li><code>(ring.ceilingEntry(h) ?: ring.firstEntry()).value</code> is the whole wrap-around in one expression; Java needs a temporary and a null check.</li>
+    <li>But Kotlin is stricter about nulls, and it shows in the exercise.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a node dies for good</div>
+  <p>From a blank file, reuse your <code>Ring</code>: put n1–n4 on it with 100 virtual nodes, record every key's owner, then <code>remove("n3")</code>. Count the keys that moved, check they were all n3's, and print where they went. Compare with <code>mod 4</code> going to <code>mod 3</code>. Predict first: should n3's keys all land on one node?</p>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex2.kt</figcaption>
+<pre><code class="language-kotlin">// Uses Ring and modShard from Sharding.kt: kotlinc Sharding.kt Ex2.kt ...
+fun main() {
+    val keys = (0 until 100_000).map { "user:$it" }
+    val ring = Ring(100)
+    listOf("n1", "n2", "n3", "n4").forEach(ring::add)
+    val before = keys.associateWith(ring::nodeFor)
+    ring.remove("n3")                                            // n3 crashed for good
+    val after = keys.associateWith(ring::nodeFor)
+    val changed = keys.filter { before[it] != after[it] }
+    println("ring: n3 removed, %,d keys move; all were on n3: %s".format(changed.size, changed.all { before[it] == "n3" }))
+    println("      where n3's keys went: " + changed.groupingBy { after.getValue(it) }.eachCount().toSortedMap())
+    val modMoved = keys.count { modShard(it, 4) != modShard(it, 3) }
+    println("mod N, 4 -&gt; 3 nodes: %,d keys move".format(modMoved))
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex2.java</figcaption>
+<pre><code class="language-java">import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+// Uses Sharding.Ring and Sharding.modShard: run with `java Ex2.java` next to Sharding.java
+public class Ex2 {
+    public static void main(String[] args) {
+        List&lt;String&gt; keys = IntStream.range(0, 100_000).mapToObj(i -&gt; "user:" + i).toList();
+        var ring = new Sharding.Ring(100);
+        List.of("n1", "n2", "n3", "n4").forEach(ring::add);
+        Map&lt;String, String&gt; before = keys.stream().collect(Collectors.toMap(Function.identity(), ring::nodeFor));
+        ring.remove("n3");                                       // n3 crashed for good
+        Map&lt;String, String&gt; after = keys.stream().collect(Collectors.toMap(Function.identity(), ring::nodeFor));
+        List&lt;String&gt; changed = keys.stream().filter(k -&gt; !before.get(k).equals(after.get(k))).toList();
+        System.out.printf("ring: n3 removed, %,d keys move; all were on n3: %s%n",
+            changed.size(), changed.stream().allMatch(k -&gt; before.get(k).equals("n3")));
+        System.out.println("      where n3's keys went: " + new TreeMap&lt;&gt;(changed.stream()
+            .collect(Collectors.groupingBy(after::get, Collectors.counting()))));
+        long modMoved = keys.stream().filter(k -&gt; !Sharding.modShard(k, 4).equals(Sharding.modShard(k, 3))).count();
+        System.out.printf("mod N, 4 -&gt; 3 nodes: %,d keys move%n", modMoved);
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">ring: n3 removed, 26,412 keys move; all were on n3: true
+      where n3's keys went: {n1=11468, n2=7955, n4=6989}
+mod N, 4 -&gt; 3 nodes: 74,977 keys move</pre>
+    <p>Java prints the same. Only n3's 26,412 keys moved, and they spread over all three survivors, because n3's 100 positions were scattered around the ring. Each neighbour inherits a little, so no single node doubles its load. <code>mod 3</code> would have moved three quarters of everything.</p>
+    <p>A Kotlin trap on the way: my first version grouped by <code>after[it]</code>. A map lookup returns <code>String?</code>, and a nullable key isn't <code>Comparable</code>, so <code>toSortedMap()</code> without a comparator doesn't apply. The error message is confusing:</p>
+<pre class="err">Ex2Bad.kt:4:58: error: no value passed for parameter 'comparator'.
+    println(changed.groupingBy { after[it] }.eachCount().toSortedMap())   // after[it] is String?
+                                                         ^^^^^^^^^^^</pre>
+    <p>(from <code>err/Ex2Bad.kt</code>). <code>after.getValue(it)</code> returns a plain <code>String</code> and throws if the key is missing, which is the honest choice here. Java compiles the equivalent and would only fail at runtime if a null ever appeared.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Replication and sharding" data-answer="1">
+  <p class="q">You write to the leader, then immediately read the same row from an asynchronous replica. What might you see?</p>
+  <div class="opts"><button>A database error message</button><button>The old value, briefly</button><button>Someone else's newer value</button><button>A corrupted half row</button></div>
+  <p class="why">The replica applies changes after a delay, so for a moment it answers with what it had before, or "not found" for a new row, as <code>Replication</code> showed. Read-your-writes fixes it for the writer: carry the version and read the leader until the replica has it.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Replication and sharding" data-answer="3">
+  <p class="q">Sharding with <code>hash mod N</code>, going from 4 to 5 nodes. Roughly what fraction of keys moved?</p>
+  <div class="opts"><button>About one fifth</button><button>About one half</button><button>None of them</button><button>About four fifths</button></div>
+  <p class="why">80,147 of 100,000 in the real run. A key keeps its shard only when its remainder is the same for 4 and 5, about one key in five. That's why plain mod N is a bad sharding function for a cluster that grows.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Replication and sharding" data-answer="0">
+  <p class="q">With consistent hashing, adding node n5 moves keys only…</p>
+  <div class="opts"><button>Onto the new node</button><button>Off the new node</button><button>Between the old nodes</button><button>To random other nodes</button></div>
+  <p class="why">n5's positions take over the stretch of ring just before each of them, so the only keys that change owner are the ones n5 now owns. The run checked it: "all of them to n5: true".</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Replication and sharding" data-answer="2">
+  <p class="q">Why give each node 100 virtual positions on the ring instead of 1?</p>
+  <div class="opts"><button>Lookups become much faster</button><button>Keys never move again</button><button>Load spreads more evenly</button><button>It removes hot keys</button></div>
+  <p class="why">One random position per node gives random slice sizes: 9% to 41% in the run. A hundred small slices per node average out to 22–27% each. Lookups are a little slower (a bigger TreeMap), keys still move, and one hot key is still one hot key.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Message queues and asynchronous work</h2><span class="t">~25 min</span></div>
+
+<p>Some work doesn't belong in the request at all: resizing an image, sending a welcome email, recomputing a report. The user shouldn't wait for it, and a burst of it shouldn't take the web servers down. The Primer's workflow: "An application publishes a job to the queue, then notifies the user of job status. A worker picks up the job from the queue, processes it, then signals the job is complete. The user is not blocked and the job is processed in the background" (<a href="https://github.com/donnemartin/system-design-primer#message-queues">System Design Primer: message queues</a>). A queue also smooths load spikes: jobs wait instead of overwhelming anyone, and workers can be added without touching the producers.</p>
+
+<h3>A queue that survives crashes</h3>
+<p>The hard part is a worker dying halfway through a job. If the queue deleted each message when handing it out, that job would be lost. So real queues hand it out and keep it: "When you receive a message from an Amazon SQS queue, it remains in the queue but becomes temporarily invisible to other consumers… If you don't delete it before the timeout expires, the message becomes visible again in the queue and can be retrieved by another consumer" (<a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">Amazon SQS: visibility timeout</a>). RabbitMQ does the same when the consumer's connection drops: "any delivery (message) that was not acked is automatically requeued" (<a href="https://www.rabbitmq.com/docs/confirms">RabbitMQ: consumer acknowledgements</a>). Here's that design in about forty lines:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · JobQueue.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+
+data class Message(val id: Long, val body: String, val attempts: Int = 0)
+
+// An at-least-once queue: a message stays "in flight" until acked, and comes back if it isn't.
+class JobQueue(capacity: Int, private val visibilityMs: Long, private val maxAttempts: Int) : AutoCloseable {
+    private val ready = LinkedBlockingQueue&lt;Message&gt;(capacity)
+    private val inFlight = ConcurrentHashMap&lt;Long, Pair&lt;Message, Long&gt;&gt;()   // id -&gt; (message, deadline)
+    val deadLetters = CopyOnWriteArrayList&lt;Message&gt;()
+    private val ids = AtomicLong()
+    @Volatile private var running = true
+
+    init { Thread.ofVirtual().start { sweep() } }
+
+    fun push(body: String) = ready.put(Message(ids.incrementAndGet(), body))           // blocks while full
+    fun offer(body: String): Boolean = ready.offer(Message(ids.incrementAndGet(), body)) // false while full
+
+    fun receive(timeoutMs: Long): Message? {
+        val m = ready.poll(timeoutMs, TimeUnit.MILLISECONDS) ?: return null
+        val delivery = m.copy(attempts = m.attempts + 1)
+        inFlight[m.id] = delivery to System.currentTimeMillis() + visibilityMs
+        return delivery
+    }
+
+    fun ack(id: Long): Boolean = inFlight.remove(id) != null
+
+    // Every 20 ms: anything in flight past its deadline goes back to the queue, or to the dead letters.
+    private fun sweep() {
+        while (running) {
+            val now = System.currentTimeMillis()
+            for ((id, entry) in inFlight) {
+                if (entry.second &lt;= now &amp;&amp; inFlight.remove(id, entry)) {
+                    val m = entry.first
+                    if (m.attempts &gt;= maxAttempts) deadLetters += m else ready.put(m)
+                }
+            }
+            Thread.sleep(20)
+        }
+    }
+
+    override fun close() { running = false }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · JobQueue.java</figcaption>
+<pre><code class="language-java">import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+// An at-least-once queue: a message stays "in flight" until acked, and comes back if it isn't.
+public class JobQueue implements AutoCloseable {
+    public record Message(long id, String body, int attempts) {}
+    private record InFlight(Message message, long deadline) {}
+
+    private final LinkedBlockingQueue&lt;Message&gt; ready;
+    private final Map&lt;Long, InFlight&gt; inFlight = new ConcurrentHashMap&lt;&gt;();
+    final List&lt;Message&gt; deadLetters = new CopyOnWriteArrayList&lt;&gt;();
+    private final AtomicLong ids = new AtomicLong();
+    private final long visibilityMs;
+    private final int maxAttempts;
+    private volatile boolean running = true;
+
+    public JobQueue(int capacity, long visibilityMs, int maxAttempts) {
+        this.ready = new LinkedBlockingQueue&lt;&gt;(capacity);
+        this.visibilityMs = visibilityMs;
+        this.maxAttempts = maxAttempts;
+        Thread.ofVirtual().start(this::sweep);
+    }
+
+    public void push(String body) throws InterruptedException {             // blocks while full
+        ready.put(new Message(ids.incrementAndGet(), body, 0));
+    }
+
+    public boolean offer(String body) {                                      // false while full
+        return ready.offer(new Message(ids.incrementAndGet(), body, 0));
+    }
+
+    public Message receive(long timeoutMs) throws InterruptedException {
+        Message m = ready.poll(timeoutMs, TimeUnit.MILLISECONDS);
+        if (m == null) return null;
+        Message delivery = new Message(m.id(), m.body(), m.attempts() + 1);
+        inFlight.put(m.id(), new InFlight(delivery, System.currentTimeMillis() + visibilityMs));
+        return delivery;
+    }
+
+    public boolean ack(long id) { return inFlight.remove(id) != null; }
+
+    // Every 20 ms: anything in flight past its deadline goes back to the queue, or to the dead letters.
+    private void sweep() {
+        try {
+            while (running) {
+                long now = System.currentTimeMillis();
+                for (var e : inFlight.entrySet()) {
+                    if (e.getValue().deadline() &lt;= now &amp;&amp; inFlight.remove(e.getKey(), e.getValue())) {
+                        Message m = e.getValue().message();
+                        if (m.attempts() &gt;= maxAttempts) deadLetters.add(m); else ready.put(m);
+                    }
+                }
+                Thread.sleep(20);
+            }
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    @Override public void close() { running = false; }
+}</code></pre></figure>
+</div>
+<ul>
+  <li><b>Three places a message can be:</b> <code>ready</code> (waiting), <code>inFlight</code> (handed out, with a deadline), or <code>deadLetters</code> (given up on).</li>
+  <li><code>receive</code> moves a message to in-flight and counts the attempt; <code>ack</code> removes it for good. A sweeper thread puts expired in-flight messages back, or into the dead letters after <code>maxAttempts</code>.</li>
+  <li><code>inFlight.remove(id, entry)</code> removes only if the entry is still the one the sweeper saw, so a late ack and the sweeper can't both win (L27's compare-and-set idea).</li>
+  <li><b>Bounded:</b> <code>LinkedBlockingQueue(capacity)</code> makes <code>push</code> block and <code>offer</code> refuse when full.</li>
+</ul>
+<p>Four scenarios: a worker that crashes after doing the work but before acking, the same crash with an idempotent worker, a message that can never succeed, and a producer faster than its consumer:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · QueueDemo.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+
+val t0 = System.currentTimeMillis()
+private val printLock = Any()
+fun log(msg: String) = synchronized(printLock) { println("  [%4d ms] %s".format(System.currentTimeMillis() - t0, msg)) }
+
+fun main() {
+    println("-- at-least-once: worker w2 crashes after sending an email, before acking it")
+    emails(idempotent = false)
+    println("-- the same crash, with an idempotent consumer")
+    emails(idempotent = true)
+    println("-- a poison message")
+    poison()
+    println("-- backpressure: a queue of 5, a producer faster than its consumer")
+    backpressure()
+}
+
+fun emails(idempotent: Boolean) {
+    JobQueue(capacity = 100, visibilityMs = 300, maxAttempts = 3).use { q -&gt;
+        repeat(6) { q.push("welcome email for user ${it + 1}") }
+        val sent = CopyOnWriteArrayList&lt;Long&gt;()                 // the outside world: emails really sent
+        val done = ConcurrentHashMap.newKeySet&lt;Long&gt;()          // stands in for a processed_ids table
+        val crashed = AtomicBoolean(false)
+        val workers = (1..3).map { w -&gt;
+            Thread.ofVirtual().start {
+                while (true) {
+                    val m = q.receive(500) ?: break
+                    if (idempotent &amp;&amp; m.id in done) { log("w$w skips #${m.id}: already done"); q.ack(m.id); continue }
+                    sent += m.id
+                    log("w$w sends #${m.id} (attempt ${m.attempts})")
+                    if (idempotent) done += m.id
+                    if (w == 2 &amp;&amp; crashed.compareAndSet(false, true)) { log("w2 CRASHES before acking #${m.id}"); break }
+                    q.ack(m.id)
+                }
+            }
+        }
+        workers.forEach { it.join() }
+        println("  6 jobs -&gt; ${sent.size} emails sent, duplicates: ${sent.groupingBy { it }.eachCount().filterValues { it &gt; 1 }.keys}")
+    }
+}
+
+fun poison() {
+    JobQueue(capacity = 100, visibilityMs = 100, maxAttempts = 3).use { q -&gt;
+        listOf("ok 1", "BAD", "ok 2").forEach(q::push)
+        while (true) {
+            val m = q.receive(400) ?: break
+            try {
+                require(m.body != "BAD") { "cannot parse '${m.body}'" }
+                log("#${m.id} '${m.body}' done")
+                q.ack(m.id)
+            } catch (e: IllegalArgumentException) {
+                log("#${m.id} attempt ${m.attempts} failed: ${e.message}")        // no ack: it will come back
+            }
+        }
+        println("  dead letters: ${q.deadLetters}")
+    }
+}
+
+fun backpressure() {
+    JobQueue(capacity = 5, visibilityMs = 1000, maxAttempts = 3).use { q -&gt;
+        val consumer = Thread.ofVirtual().start {
+            while (true) { val m = q.receive(300) ?: break; Thread.sleep(50); q.ack(m.id) }
+        }
+        val start = System.currentTimeMillis()
+        repeat(20) { q.push("job $it") }                         // blocks whenever 5 are waiting
+        println("  push(): 20 jobs queued after ${System.currentTimeMillis() - start} ms (the producer was slowed down)")
+        val rejected = (1..20).count { !q.offer("extra $it") }   // never blocks; says no instead
+        println("  offer(): $rejected of 20 extra jobs rejected straight away")
+        consumer.join()
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · QueueDemo.java</figcaption>
+<pre><code class="language-java">import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+public class QueueDemo {
+    static final long t0 = System.currentTimeMillis();
+
+    static synchronized void log(String msg) {
+        System.out.printf("  [%4d ms] %s%n", System.currentTimeMillis() - t0, msg);
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("-- at-least-once: worker w2 crashes after sending an email, before acking it");
+        emails(false);
+        System.out.println("-- the same crash, with an idempotent consumer");
+        emails(true);
+        System.out.println("-- a poison message");
+        poison();
+        System.out.println("-- backpressure: a queue of 5, a producer faster than its consumer");
+        backpressure();
+    }
+
+    static void emails(boolean idempotent) throws Exception {
+        try (var q = new JobQueue(100, 300, 3)) {
+            for (int i = 1; i &lt;= 6; i++) q.push("welcome email for user " + i);
+            List&lt;Long&gt; sent = new CopyOnWriteArrayList&lt;&gt;();               // the outside world: emails really sent
+            Set&lt;Long&gt; done = ConcurrentHashMap.newKeySet();               // stands in for a processed_ids table
+            var crashed = new AtomicBoolean(false);
+            List&lt;Thread&gt; workers = IntStream.rangeClosed(1, 3).mapToObj(w -&gt; Thread.ofVirtual().start(() -&gt; {
+                try {
+                    while (true) {
+                        var m = q.receive(500);
+                        if (m == null) break;
+                        if (idempotent &amp;&amp; done.contains(m.id())) { log("w" + w + " skips #" + m.id() + ": already done"); q.ack(m.id()); continue; }
+                        sent.add(m.id());
+                        log("w" + w + " sends #" + m.id() + " (attempt " + m.attempts() + ")");
+                        if (idempotent) done.add(m.id());
+                        if (w == 2 &amp;&amp; crashed.compareAndSet(false, true)) { log("w2 CRASHES before acking #" + m.id()); break; }
+                        q.ack(m.id());
+                    }
+                } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            })).toList();
+            for (Thread t : workers) t.join();
+            Map&lt;Long, Long&gt; counts = sent.stream().collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
+            List&lt;Long&gt; dupes = counts.entrySet().stream().filter(e -&gt; e.getValue() &gt; 1).map(Map.Entry::getKey).toList();
+            System.out.println("  6 jobs -&gt; " + sent.size() + " emails sent, duplicates: " + dupes);
+        }
+    }
+
+    static void poison() throws Exception {
+        try (var q = new JobQueue(100, 100, 3)) {
+            for (String body : List.of("ok 1", "BAD", "ok 2")) q.push(body);
+            while (true) {
+                var m = q.receive(400);
+                if (m == null) break;
+                if (m.body().equals("BAD")) {
+                    log("#" + m.id() + " attempt " + m.attempts() + " failed: cannot parse '" + m.body() + "'");  // no ack
+                } else {
+                    log("#" + m.id() + " '" + m.body() + "' done");
+                    q.ack(m.id());
+                }
+            }
+            System.out.println("  dead letters: " + q.deadLetters);
+        }
+    }
+
+    static void backpressure() throws Exception {
+        try (var q = new JobQueue(5, 1000, 3)) {
+            Thread consumer = Thread.ofVirtual().start(() -&gt; {
+                try {
+                    while (true) { var m = q.receive(300); if (m == null) break; Thread.sleep(50); q.ack(m.id()); }
+                } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            });
+            long start = System.currentTimeMillis();
+            for (int i = 0; i &lt; 20; i++) q.push("job " + i);                // blocks whenever 5 are waiting
+            System.out.println("  push(): 20 jobs queued after " + (System.currentTimeMillis() - start) + " ms (the producer was slowed down)");
+            long rejected = IntStream.rangeClosed(1, 20).filter(i -&gt; !q.offer("extra " + i)).count();  // never blocks
+            System.out.println("  offer(): " + rejected + " of 20 extra jobs rejected straight away");
+            consumer.join();
+        }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">-- at-least-once: worker w2 crashes after sending an email, before acking it
+  [  11 ms] w1 sends #1 (attempt 1)
+  [  17 ms] w1 sends #4 (attempt 1)
+  [  17 ms] w1 sends #5 (attempt 1)
+  [  17 ms] w1 sends #6 (attempt 1)
+  [  17 ms] w2 sends #2 (attempt 1)
+  [  17 ms] w3 sends #3 (attempt 1)
+  [  17 ms] w2 CRASHES before acking #2
+  [ 333 ms] w1 sends #2 (attempt 2)
+  6 jobs -&gt; 7 emails sent, duplicates: [2]
+-- the same crash, with an idempotent consumer
+  [ 841 ms] w1 sends #1 (attempt 1)
+  [ 841 ms] w2 sends #3 (attempt 1)
+  [ 841 ms] w2 CRASHES before acking #3
+  [ 841 ms] w1 sends #4 (attempt 1)
+  [ 841 ms] w1 sends #5 (attempt 1)
+  [ 841 ms] w1 sends #6 (attempt 1)
+  [ 841 ms] w3 sends #2 (attempt 1)
+  [1153 ms] w1 skips #3: already done
+  6 jobs -&gt; 6 emails sent, duplicates: []
+-- a poison message
+  [1663 ms] #1 'ok 1' done
+  [1663 ms] #2 attempt 1 failed: cannot parse 'BAD'
+  [1663 ms] #3 'ok 2' done
+  [1780 ms] #2 attempt 2 failed: cannot parse 'BAD'
+  [1894 ms] #2 attempt 3 failed: cannot parse 'BAD'
+  dead letters: [Message(id=2, body=BAD, attempts=3)]
+-- backpressure: a queue of 5, a producer faster than its consumer
+  push(): 20 jobs queued after 751 ms (the producer was slowed down)
+  offer(): 20 of 20 extra jobs rejected straight away</pre>
+<pre class="out">-- at-least-once: worker w2 crashes after sending an email, before acking it
+  [  35 ms] w1 sends #1 (attempt 1)
+  [  38 ms] w1 sends #4 (attempt 1)
+  [  38 ms] w1 sends #5 (attempt 1)
+  [  38 ms] w1 sends #6 (attempt 1)
+  [  38 ms] w3 sends #3 (attempt 1)
+  [  38 ms] w2 sends #2 (attempt 1)
+  [  39 ms] w2 CRASHES before acking #2
+  [ 336 ms] w1 sends #2 (attempt 2)
+  6 jobs -&gt; 7 emails sent, duplicates: [2]
+-- the same crash, with an idempotent consumer
+  [ 842 ms] w1 sends #1 (attempt 1)
+  [ 842 ms] w1 sends #4 (attempt 1)
+  [ 842 ms] w1 sends #5 (attempt 1)
+  [ 843 ms] w1 sends #6 (attempt 1)
+  [ 843 ms] w2 sends #2 (attempt 1)
+  [ 843 ms] w2 CRASHES before acking #2
+  [ 843 ms] w3 sends #3 (attempt 1)
+  [1161 ms] w1 skips #2: already done
+  6 jobs -&gt; 6 emails sent, duplicates: []
+-- a poison message
+  [1671 ms] #1 'ok 1' done
+  [1672 ms] #2 attempt 1 failed: cannot parse 'BAD'
+  [1672 ms] #3 'ok 2' done
+  [1777 ms] #2 attempt 2 failed: cannot parse 'BAD'
+  [1885 ms] #2 attempt 3 failed: cannot parse 'BAD'
+  dead letters: [Message[id=2, body=BAD, attempts=3]]
+-- backpressure: a queue of 5, a producer faster than its consumer
+  push(): 20 jobs queued after 755 ms (the producer was slowed down)
+  offer(): 20 of 20 extra jobs rejected straight away</pre>
+</div>
+<p>Which worker gets which job differs between the two runs (and between your runs): three threads race for messages. The outcomes are the same every time.</p>
+<ul>
+  <li><b>At-least-once delivery means duplicates.</b> A worker crashed between sending email #2 and acking it. After the 300 ms visibility timeout #2 came back and another worker sent it again: 7 emails for 6 jobs. The queue can't tell "crashed before the work" from "crashed after", so it errs on the side of not losing jobs. SQS says it directly: "Design your applications to be idempotent (they should not be affected adversely when processing the same message more than once)" (<a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues-at-least-once-delivery.html">Amazon SQS: at-least-once delivery</a>).</li>
+  <li><b>The idempotent consumer</b> records each job id it finishes and skips ids it has seen: 6 emails for 6 jobs, one redelivery skipped. Here the record is an in-memory set; in production it's a <code>processed_ids</code> table with a unique key (L35). There's still a gap between "email sent" and "id recorded": a crash exactly there would duplicate the email. You close it by writing the effect and the id in <em>one transaction</em> when the effect is a database write (L36), or by passing an idempotency key to the downstream service so it can de-duplicate (L32).</li>
+  <li><b>Poison messages go to the dead letters.</b> "BAD" failed on every attempt. After 3 tries it moved to the dead-letter list instead of looping forever, and the good messages weren't held up. SQS: "The <code>maxReceiveCount</code> is the number of times a consumer can receive a message from a source queue before it is moved to a dead-letter queue" (<a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html">Amazon SQS: dead-letter queues</a>). Someone looks at the dead letters later.</li>
+  <li><b>Backpressure:</b> with room for 5, <code>push</code> blocked whenever the queue was full, so pushing 20 jobs took about 750 ms, the consumer's pace (15 waits × 50 ms). <code>offer</code> refused all 20 extras straight away. The Primer explains why bounded queues are better: "Back pressure can help by limiting the queue size, thereby maintaining a high throughput rate and good response times for jobs already in the queue." It's L28's bounded executor queue again, at system scale.</li>
+</ul>
+
+<h3>Delivery guarantees, ordering, and logs</h3>
+<table class="vs">
+  <tr><th>Guarantee</th><th>How</th><th>Failure looks like</th></tr>
+  <tr><td>At-most-once</td><td>ack (delete) <em>before</em> doing the work</td><td>a crash loses the job</td></tr>
+  <tr><td>At-least-once</td><td>ack <em>after</em> doing the work (today's queue)</td><td>a crash repeats the job</td></tr>
+  <tr><td>"Exactly-once"</td><td>at-least-once + an idempotent consumer</td><td>repeats happen, but have no extra effect</td></tr>
+</table>
+<p>"Exactly-once" delivery over an unreliable network isn't possible in general; what systems offer is exactly-once <em>effect</em>, built from the bottom two rows.</p>
+<p><b>Ordering.</b> With several workers, jobs finish in whatever order the workers manage, not the order they were pushed. In the run above, w1 sent #4–#6 before #2's retry. Often that's fine. When it isn't, say all updates to one user must apply in order, real systems keep order <em>per key</em> rather than globally. Kafka: "Events with the same event key (e.g., a customer or vehicle ID) are written to the same partition, and Kafka guarantees that any consumer of a given topic-partition will always read that partition's events in exactly the same order as they were written" (<a href="https://kafka.apache.org/intro/">Apache Kafka: introduction</a>). That's sharding again, applied to a queue.</p>
+<p><b>Queues vs logs.</b> SQS and RabbitMQ are <em>queues</em>: a message is deleted once acked, and each one goes to one consumer. Kafka is a <em>log</em>: messages are kept for days, and each consumer group remembers its own position, so several independent consumers can read the same stream, and a new one can replay history. DDIA's stream-processing chapter compares the two in depth.</p>
+
+<div class="callout">
+  <p><b>Bridge.</b> On Android, WorkManager is the phone's job queue: it "is intended for work that is required to run reliably even if the user navigates off a screen, the app exits, or the device restarts" (<a href="https://developer.android.com/develop/background-work/background-tasks/persistent">Android: WorkManager</a>), and it retries with backoff, like today's queue. In Spring, <code>@Async</code> runs a method "in a task that has been submitted to a TaskExecutor" (<a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html">Spring: @Async</a>), which is an in-process queue that loses jobs on a crash. Spring Kafka's <code>@KafkaListener</code> and the SQS integrations are the durable kind.</p>
+</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>data class Message</code> plus <code>m.copy(attempts = m.attempts + 1)</code> makes "the same message, one more attempt" one expression. Java's record has no <code>copy</code>, so you call the constructor with every field again.</li>
+    <li><code>ready.poll(…) ?: return null</code> and <code>q.receive(500) ?: break</code> put the empty case on the same line.</li>
+    <li>Destructuring <code>for ((id, entry) in inFlight)</code> reads a map entry by its two parts; Java writes <code>e.getKey()</code> and <code>e.getValue()</code>.</li>
+    <li>No checked <code>InterruptedException</code>: Java's worker lambdas each need a <code>try</code> just to call <code>receive</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a queue broker over TCP</div>
+  <p>Producers and workers are normally separate programs, often on separate machines. From a blank file, put your <code>JobQueue</code> behind L30's line protocol: <code>PUSH &lt;body&gt;</code> → <code>OK</code>; <code>POP</code> → <code>MSG &lt;id&gt; &lt;attempt&gt; &lt;body&gt;</code> or <code>EMPTY</code>; <code>ACK &lt;id&gt;</code> → <code>OK</code> or <code>UNKNOWN</code>. Use a 2-second visibility timeout. Drive it with <code>nc</code>: push two jobs, pop both without acking (two "workers" that die), wait, and pop again.</p>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · QueueServer.kt</figcaption>
+<pre><code class="language-kotlin">import java.net.InetAddress
+import java.net.ServerSocket
+
+// A tiny queue broker over TCP (L30's line protocol), using JobQueue.kt.
+//   PUSH &lt;body&gt;  -&gt; OK
+//   POP          -&gt; MSG &lt;id&gt; &lt;attempt&gt; &lt;body&gt;   or EMPTY
+//   ACK &lt;id&gt;     -&gt; OK   or UNKNOWN
+fun main(args: Array&lt;String&gt;) {
+    val q = JobQueue(capacity = 1000, visibilityMs = 2000, maxAttempts = 5)
+    val server = ServerSocket(args[0].toInt(), 50, InetAddress.getLoopbackAddress())
+    println("queue broker on 127.0.0.1:${server.localPort}")
+    while (true) {
+        val socket = server.accept()
+        Thread.ofVirtual().start {
+            socket.use { s -&gt;
+                val out = s.getOutputStream().bufferedWriter()
+                s.getInputStream().bufferedReader().lineSequence().forEach { line -&gt;
+                    val parts = line.split(" ", limit = 2)
+                    val reply = when (parts[0]) {
+                        "PUSH" -&gt; { q.push(parts.getOrElse(1) { "" }); "OK" }
+                        "POP" -&gt; q.receive(0)?.let { "MSG ${it.id} ${it.attempts} ${it.body}" } ?: "EMPTY"
+                        "ACK" -&gt; if (q.ack(parts[1].toLong())) "OK" else "UNKNOWN"
+                        else -&gt; "ERR unknown command"
+                    }
+                    out.write(reply + "\n"); out.flush()
+                }
+            }
+        }
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · QueueServer.java</figcaption>
+<pre><code class="language-java">import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+// A tiny queue broker over TCP (L30's line protocol), using JobQueue.java.
+//   PUSH &lt;body&gt;  -&gt; OK
+//   POP          -&gt; MSG &lt;id&gt; &lt;attempt&gt; &lt;body&gt;   or EMPTY
+//   ACK &lt;id&gt;     -&gt; OK   or UNKNOWN
+public class QueueServer {
+    public static void main(String[] args) throws IOException {
+        var q = new JobQueue(1000, 2000, 5);
+        var server = new ServerSocket(Integer.parseInt(args[0]), 50, InetAddress.getLoopbackAddress());
+        System.out.println("queue broker on 127.0.0.1:" + server.getLocalPort());
+        while (true) {
+            Socket socket = server.accept();
+            Thread.ofVirtual().start(() -&gt; serve(socket, q));
+        }
+    }
+
+    static void serve(Socket socket, JobQueue q) {
+        try (socket;
+             var in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+             var out = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()))) {
+            String line;
+            while ((line = in.readLine()) != null) {
+                String[] parts = line.split(" ", 2);
+                String reply = switch (parts[0]) {
+                    case "PUSH" -&gt; { q.push(parts.length &gt; 1 ? parts[1] : ""); yield "OK"; }
+                    case "POP" -&gt; {
+                        var m = q.receive(0);
+                        yield m == null ? "EMPTY" : "MSG " + m.id() + " " + m.attempts() + " " + m.body();
+                    }
+                    case "ACK" -&gt; q.ack(Long.parseLong(parts[1])) ? "OK" : "UNKNOWN";
+                    default -&gt; "ERR unknown command";
+                };
+                out.write(reply + "\n");
+                out.flush();
+            }
+        } catch (IOException | InterruptedException e) {
+            // client went away
+        }
+    }
+}</code></pre></figure>
+    </div>
+<pre class="term"><span class="p">$ </span>java QueueServer.java 18142 &amp;
+queue broker on 127.0.0.1:18142
+<span class="p">$ </span>printf 'PUSH resize cover 7\nPUSH resize cover 8\n' | nc 127.0.0.1 18142
+OK
+OK
+<span class="p">$ </span>printf 'POP\n' | nc 127.0.0.1 18142       <span class="c"># worker A takes #1, then dies without ACK</span>
+MSG 1 1 resize cover 7
+<span class="p">$ </span>printf 'POP\n' | nc 127.0.0.1 18142       <span class="c"># worker B takes #2, and also never acks</span>
+MSG 2 1 resize cover 8
+<span class="p">$ </span>sleep 2.5; printf 'POP\nACK 1\nACK 1\nPOP\n' | nc 127.0.0.1 18142
+MSG 1 2 resize cover 7
+OK
+UNKNOWN
+MSG 2 2 resize cover 8</pre>
+    <p>The Kotlin broker printed the same session on port 18143. After the 2-second timeout both jobs came back as attempt 2: the broker can't know the workers died, it only knows they never acked. The second <code>ACK 1</code> answers <code>UNKNOWN</code> because the message is already gone. (On macOS, <code>nc</code> hangs up as soon as its input ends; with a slow reply, add <code>; sleep 1</code> inside a subshell so the answer has time to arrive.) A real broker also writes messages to disk, so a broker restart doesn't lose them. This one keeps them in memory only.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · Queues and async work" data-answer="2">
+  <p class="q">A worker finishes a job but crashes before acking it. With a visibility timeout, what happens?</p>
+  <div class="opts"><button>The message is lost</button><button>The queue stops working</button><button>It is delivered again</button><button>The producer resends it</button></div>
+  <p class="why">The message stays in flight until its deadline, then the queue makes it visible again and another worker gets it. That's at-least-once delivery: no job lost, but the job ran twice, which is why consumers must be idempotent.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · Queues and async work" data-answer="1">
+  <p class="q">What makes a consumer idempotent?</p>
+  <div class="opts"><button>It acknowledges every message instantly</button><button>Processing twice equals processing once</button><button>It runs on one thread</button><button>It never crashes while working</button></div>
+  <p class="why">Idempotent means a repeat has no extra effect, like the demo's "skips #2: already done". Acking instantly would make delivery at-most-once and lose jobs on a crash; and no consumer can promise never to crash.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · Queues and async work" data-answer="3">
+  <p class="q">A message fails every single time it is processed. What should the queue eventually do?</p>
+  <div class="opts"><button>Retry it forever quietly</button><button>Delete it without trace</button><button>Stop all the workers</button><button>Move it to dead-letters</button></div>
+  <p class="why">After <code>maxAttempts</code> it goes to the dead-letter queue, where someone can inspect and fix it, while the healthy messages keep flowing. Retrying forever wastes workers; deleting it hides a bug.</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · Queues and async work" data-answer="0">
+  <p class="q">The bounded queue is full. What does <code>push()</code> in <code>JobQueue</code> do?</p>
+  <div class="opts"><button>Blocks until there's room</button><button>Drops the oldest job</button><button>Grows the queue unbounded</button><button>Throws away the job</button></div>
+  <p class="why"><code>LinkedBlockingQueue.put</code> waits for space, so a fast producer is slowed to the consumers' pace: 20 pushes took about 750 ms. That's backpressure. <code>offer</code> is the non-blocking choice that says no instead.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>Scale the books API</h2><span class="t">~25 min</span></div>
+
+<p>Put all three parts together in one program, from a blank file, Kotlin first and then Java. Reuse your <code>LoadBalancer</code>, <code>ReplicatedBooks</code> and <code>JobQueue</code>; write the backend and the test script fresh.</p>
+<div class="task">
+  <ol>
+    <li><b>Three stateless books backends</b> (an L32-style API, smaller). <code>GET /login?user=ada</code> returns an HMAC-signed token. <code>POST /books</code> needs the token, writes the title to the leader and answers <code>201</code> with the new id and an <code>X-Version</code> header. <code>GET /books/{id}</code> reads from the replica, unless the request's <code>X-Min-Version</code> is newer than the replica, in which case it reads the leader. Each backend keeps nothing in its own fields except its dependencies.</li>
+    <li><b>Behind your round-robin load balancer</b> with health checks and retry on. Don't forget a <code>/health</code> endpoint.</li>
+    <li><b>Writes to a leader SQLite database, reads from a follower</b> that lags 300 ms.</li>
+    <li><b>Every new book queues a "thumbnail" job</b> for 2 idempotent workers. Make worker 1 crash once, after making a thumbnail but before acking it.</li>
+    <li><b>A scripted run:</b> log in, then 20 times: create a book, read it back as the writer (sending the version), and read it as another client (no version). Crash b2 before book 10. Print per-backend request counts, errors the client saw, how many of the writer's reads went to the leader, how many of the other client's reads got 404, and the thumbnail jobs, duplicates included. Clean up every server.</li>
+  </ol>
+<pre class="out">  [  75 ms] worker 1 made 'thumbnail 1', then CRASHED before ack
+  [ 701 ms] b2 crashed
+  [ 710 ms] POST Book 10 -&gt; 502 bad gateway: b2
+  [ 716 ms] passive: b2 failed a request, marked DOWN, retrying elsewhere
+per-backend requests: b1=24 b2=10 b3=24
+errors seen by the client: 1
+own reads routed to the leader (replica behind): 19 of 20
+other client's reads that got 404 (replica behind): 19 of 20
+thumbnail jobs: 19 distinct, made 19 times, duplicates skipped: 1</pre>
+  <p>Java: the same, apart from the timings:</p>
+<pre class="out">  [ 103 ms] worker 1 made 'thumbnail 1', then CRASHED before ack
+  [ 719 ms] b2 crashed
+  [ 727 ms] POST Book 10 -&gt; 502 bad gateway: b2
+  [ 732 ms] passive: b2 failed a request, marked DOWN, retrying elsewhere
+per-backend requests: b1=24 b2=10 b3=24
+errors seen by the client: 1
+own reads routed to the leader (replica behind): 19 of 20
+other client's reads that got 404 (replica behind): 19 of 20
+thumbnail jobs: 19 distinct, made 19 times, duplicates skipped: 1</pre>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: scale the books API (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: scale the books API (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-sys" data-label="Final: explaining every number in the output"><span class="who">SYSTEMS</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · ScaleBooks.kt</figcaption>
+<pre><code class="language-kotlin">import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse.BodyHandlers
+import java.nio.file.Files
+import java.security.MessageDigest
+import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+// Build with: kotlinc Backend.kt LoadBalancer.kt JobQueue.kt Replication.kt ScaleBooks.kt (+ sqlite-jdbc)
+
+fun signToken(user: String, key: ByteArray): String {
+    val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key, "HmacSHA256")) }
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(mac.doFinal(user.toByteArray())).take(16)
+}
+
+// A stateless books backend: everything it knows lives in the database, the queue or the token.
+class BooksBackend(val name: String, private val db: ReplicatedBooks, private val jobs: JobQueue, private val key: ByteArray) {
+    val server: HttpServer = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 100)
+    val uri: URI get() = URI("http://127.0.0.1:${server.address.port}")
+
+    init {
+        server.executor = Executors.newVirtualThreadPerTaskExecutor()
+        server.createContext("/health") { reply(it, 200, "ok") }      // without this, the LB marks us DOWN
+        server.createContext("/login") { ex -&gt;
+            val user = ex.requestURI.query.removePrefix("user=")
+            reply(ex, 200, "$user.${signToken(user, key)}")
+        }
+        server.createContext("/books") { ex -&gt; if (ex.requestMethod == "POST") create(ex) else read(ex) }
+        server.start()
+    }
+
+    private fun user(ex: HttpExchange): String? {
+        val (user, sig) = (ex.requestHeaders.getFirst("Token") ?: ".").split(".", limit = 2)
+        return user.takeIf { MessageDigest.isEqual(sig.toByteArray(), signToken(user, key).toByteArray()) }
+    }
+
+    private fun create(ex: HttpExchange) {
+        user(ex) ?: return reply(ex, 401, "bad token")
+        val written = db.write(ex.requestBody.readAllBytes().decodeToString())   // to the leader
+        jobs.push("thumbnail ${written.id}")                                     // slow work: later
+        ex.responseHeaders.add("X-Version", written.version.toString())
+        reply(ex, 201, written.id.toString())
+    }
+
+    private fun read(ex: HttpExchange) {
+        val id = ex.requestURI.path.substringAfterLast('/').toLong()
+        val needed = ex.requestHeaders.getFirst("X-Min-Version")?.toLong() ?: 0
+        val fromReplica = db.followerVersion() &gt;= needed                          // read-your-writes
+        val title = if (fromReplica) db.readFollower(id) else db.readLeader(id)
+        ex.responseHeaders.add("X-Served-By", "$name/${if (fromReplica) "replica" else "leader"}")
+        if (title == null) reply(ex, 404, "no book $id") else reply(ex, 200, title)
+    }
+}
+
+fun main() {
+    val dir = Files.createTempDirectory("l42final")
+    val key = "shared-secret-from-config".toByteArray()
+    val db = ReplicatedBooks(dir, lagMs = 300)
+    val jobs = JobQueue(capacity = 100, visibilityMs = 300, maxAttempts = 3)
+    val backends = (1..3).map { BooksBackend("b$it", db, jobs, key) }
+    val targets = backends.map { Target(it.name, it.uri) }
+    val lb = LoadBalancer(targets, Strategy.ROUND_ROBIN, retryOnFailure = true)
+
+    // Two thumbnail workers. Idempotent: a job whose thumbnail exists is acked and skipped.
+    val thumbnails = ConcurrentHashMap.newKeySet&lt;String&gt;()
+    val made = AtomicInteger()
+    val skipped = AtomicInteger()
+    val crashOnce = AtomicBoolean(true)
+    val workers = (1..2).map { w -&gt;
+        Thread.ofVirtual().start {
+            while (true) {
+                val m = jobs.receive(800) ?: break
+                if (m.body in thumbnails) { skipped.incrementAndGet(); jobs.ack(m.id); continue }
+                Thread.sleep(30)                                   // "resize the cover image"
+                thumbnails += m.body
+                made.incrementAndGet()
+                if (w == 1 &amp;&amp; crashOnce.getAndSet(false)) { lb.log("worker 1 made '${m.body}', then CRASHED before ack"); continue }
+                jobs.ack(m.id)
+            }
+        }
+    }
+
+    val client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()
+    fun send(b: HttpRequest.Builder) = client.send(b.build(), BodyHandlers.ofString())
+    val token = send(HttpRequest.newBuilder(lb.uri.resolve("/login?user=ada"))).body()
+
+    var errors = 0
+    var leaderReads = 0
+    var staleReads = 0
+    repeat(20) { i -&gt;
+        if (i == 10) { backends[1].server.stop(0); lb.log("b2 crashed") }
+        val post = send(HttpRequest.newBuilder(lb.uri.resolve("/books")).header("Token", token)
+            .POST(HttpRequest.BodyPublishers.ofString("Book $i")))
+        if (post.statusCode() != 201) { errors++; lb.log("POST Book $i -&gt; ${post.statusCode()} ${post.body()}"); return@repeat }
+        val id = post.body()
+        val version = post.headers().firstValue("X-Version").orElseThrow()
+        // the writer reads its own write: it sends the version it saw
+        val mine = send(HttpRequest.newBuilder(lb.uri.resolve("/books/$id")).header("X-Min-Version", version))
+        if (mine.statusCode() != 200) errors++
+        if (mine.headers().firstValue("X-Served-By").orElse("").endsWith("leader")) leaderReads++
+        // someone else reads the same book straight away, without a version
+        val other = send(HttpRequest.newBuilder(lb.uri.resolve("/books/$id")))
+        if (other.statusCode() == 404) staleReads++
+        Thread.sleep(50)
+    }
+    workers.forEach { it.join() }
+
+    println("per-backend requests: " + targets.joinToString(" ") { "${it.name}=${it.served}" })
+    println("errors seen by the client: $errors")
+    println("own reads routed to the leader (replica behind): $leaderReads of 20")
+    println("other client's reads that got 404 (replica behind): $staleReads of 20")
+    println("thumbnail jobs: ${thumbnails.size} distinct, made ${made.get()} times, duplicates skipped: ${skipped.get()}")
+
+    lb.close(); jobs.close(); db.close()
+    backends.forEach { it.server.stop(0) }
+    dir.toFile().deleteRecursively()
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · ScaleBooks.java</figcaption>
+<pre><code class="language-java">import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.sql.SQLException;
+import java.util.Base64;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+// Run with: java -cp sqlite-jdbc.jar ScaleBooks.java  (next to LoadBalancer.java, JobQueue.java,
+// Replication.java and Backend.java: the source launcher finds those classes by file name)
+public class ScaleBooks {
+    static String signToken(String user, byte[] key) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(mac.doFinal(user.getBytes())).substring(0, 16);
+        } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+
+    // A stateless books backend: everything it knows lives in the database, the queue or the token.
+    static class BooksBackend {
+        final String name;
+        final HttpServer server;
+        private final Replication.ReplicatedBooks db;
+        private final JobQueue jobs;
+        private final byte[] key;
+
+        BooksBackend(String name, Replication.ReplicatedBooks db, JobQueue jobs, byte[] key) throws IOException {
+            this.name = name; this.db = db; this.jobs = jobs; this.key = key;
+            server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 100);
+            server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+            server.createContext("/health", ex -&gt; Backend.reply(ex, 200, "ok"));   // without this, the LB marks us DOWN
+            server.createContext("/login", ex -&gt; {
+                String user = ex.getRequestURI().getQuery().replaceFirst("^user=", "");
+                Backend.reply(ex, 200, user + "." + signToken(user, key));
+            });
+            server.createContext("/books", ex -&gt; {
+                try {
+                    if (ex.getRequestMethod().equals("POST")) create(ex); else read(ex);
+                } catch (SQLException | InterruptedException e) {
+                    Backend.reply(ex, 500, "server error");
+                }
+            });
+            server.start();
+        }
+
+        URI uri() { return URI.create("http://127.0.0.1:" + server.getAddress().getPort()); }
+
+        private String user(HttpExchange ex) {
+            String token = ex.getRequestHeaders().getFirst("Token");
+            String[] parts = (token == null ? "." : token).split("\\.", 2);
+            boolean ok = parts.length == 2 &amp;&amp; MessageDigest.isEqual(parts[1].getBytes(), signToken(parts[0], key).getBytes());
+            return ok ? parts[0] : null;
+        }
+
+        private void create(HttpExchange ex) throws IOException, SQLException, InterruptedException {
+            if (user(ex) == null) { Backend.reply(ex, 401, "bad token"); return; }
+            var written = db.write(new String(ex.getRequestBody().readAllBytes()));   // to the leader
+            jobs.push("thumbnail " + written.id());                                   // slow work: later
+            ex.getResponseHeaders().add("X-Version", Long.toString(written.version()));
+            Backend.reply(ex, 201, Long.toString(written.id()));
+        }
+
+        private void read(HttpExchange ex) throws IOException, SQLException {
+            String path = ex.getRequestURI().getPath();
+            long id = Long.parseLong(path.substring(path.lastIndexOf('/') + 1));
+            String header = ex.getRequestHeaders().getFirst("X-Min-Version");
+            long needed = header == null ? 0 : Long.parseLong(header);
+            boolean fromReplica = db.followerVersion() &gt;= needed;                       // read-your-writes
+            String title = fromReplica ? db.readFollower(id) : db.readLeader(id);
+            ex.getResponseHeaders().add("X-Served-By", name + "/" + (fromReplica ? "replica" : "leader"));
+            if (title == null) Backend.reply(ex, 404, "no book " + id); else Backend.reply(ex, 200, title);
+        }
+    }
+
+    static final HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+
+    static HttpResponse&lt;String&gt; send(HttpRequest.Builder b) throws Exception {
+        return client.send(b.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path dir = Files.createTempDirectory("l42final");
+        byte[] key = "shared-secret-from-config".getBytes();
+        var db = new Replication.ReplicatedBooks(dir, 300);
+        var jobs = new JobQueue(100, 300, 3);
+        List&lt;BooksBackend&gt; backends = List.of(new BooksBackend("b1", db, jobs, key),
+            new BooksBackend("b2", db, jobs, key), new BooksBackend("b3", db, jobs, key));
+        List&lt;LoadBalancer.Target&gt; targets = backends.stream().map(b -&gt; new LoadBalancer.Target(b.name, b.uri())).toList();
+        var lb = new LoadBalancer(targets, LoadBalancer.Strategy.ROUND_ROBIN, true);
+
+        // Two thumbnail workers. Idempotent: a job whose thumbnail exists is acked and skipped.
+        Set&lt;String&gt; thumbnails = ConcurrentHashMap.newKeySet();
+        var made = new AtomicInteger();
+        var skipped = new AtomicInteger();
+        var crashOnce = new AtomicBoolean(true);
+        List&lt;Thread&gt; workers = IntStream.rangeClosed(1, 2).mapToObj(w -&gt; Thread.ofVirtual().start(() -&gt; {
+            try {
+                while (true) {
+                    var m = jobs.receive(800);
+                    if (m == null) break;
+                    if (thumbnails.contains(m.body())) { skipped.incrementAndGet(); jobs.ack(m.id()); continue; }
+                    Thread.sleep(30);                                  // "resize the cover image"
+                    thumbnails.add(m.body());
+                    made.incrementAndGet();
+                    if (w == 1 &amp;&amp; crashOnce.getAndSet(false)) { lb.log("worker 1 made '" + m.body() + "', then CRASHED before ack"); continue; }
+                    jobs.ack(m.id());
+                }
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        })).toList();
+
+        String token = send(HttpRequest.newBuilder(lb.uri().resolve("/login?user=ada"))).body();
+        int errors = 0, leaderReads = 0, staleReads = 0;
+        for (int i = 0; i &lt; 20; i++) {
+            if (i == 10) { backends.get(1).server.stop(0); lb.log("b2 crashed"); }
+            var post = send(HttpRequest.newBuilder(lb.uri().resolve("/books")).header("Token", token)
+                .POST(HttpRequest.BodyPublishers.ofString("Book " + i)));
+            if (post.statusCode() != 201) { errors++; lb.log("POST Book " + i + " -&gt; " + post.statusCode() + " " + post.body()); continue; }
+            String id = post.body();
+            String version = post.headers().firstValue("X-Version").orElseThrow();
+            // the writer reads its own write: it sends the version it saw
+            var mine = send(HttpRequest.newBuilder(lb.uri().resolve("/books/" + id)).header("X-Min-Version", version));
+            if (mine.statusCode() != 200) errors++;
+            if (mine.headers().firstValue("X-Served-By").orElse("").endsWith("leader")) leaderReads++;
+            // someone else reads the same book straight away, without a version
+            var other = send(HttpRequest.newBuilder(lb.uri().resolve("/books/" + id)));
+            if (other.statusCode() == 404) staleReads++;
+            Thread.sleep(50);
+        }
+        for (Thread t : workers) t.join();
+
+        System.out.println("per-backend requests: " + targets.stream().map(Object::toString).collect(Collectors.joining(" ")));
+        System.out.println("errors seen by the client: " + errors);
+        System.out.println("own reads routed to the leader (replica behind): " + leaderReads + " of 20");
+        System.out.println("other client's reads that got 404 (replica behind): " + staleReads + " of 20");
+        System.out.println("thumbnail jobs: " + thumbnails.size() + " distinct, made " + made.get() + " times, duplicates skipped: " + skipped.get());
+
+        lb.close(); jobs.close(); db.close();
+        backends.forEach(b -&gt; b.server.stop(0));
+        try (var files = Files.walk(dir)) { files.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+    </div>
+    <ul>
+      <li><b>Why the backends live in one JVM here:</b> one file, one process, and clean-up is a few <code>stop(0)</code> calls. They still share nothing but the database, the queue and the key. Part 1 already showed real separate processes, and <code>server.stop(0)</code> closes the port, so the balancer sees exactly what a crash looks like: connection refused.</li>
+      <li><b>One error, on purpose.</b> The first request to dead b2 was a POST, and POSTs aren't retried: the backend might have created the book before dying. The next request, a GET, failed over to another backend and marked b2 down, and everything after that avoided b2. Making POST safe to retry needs an idempotency key (L43).</li>
+      <li><b>The writer never saw stale data:</b> 19 of its 19 reads went to the leader, because the replica was always behind the version it had just written. <b>The other client did:</b> 19 of 19 reads got 404, because the replica lags 300 ms and the read came a few milliseconds after the write. Same database, different guarantee, depending only on what the reader knew.</li>
+      <li><b>Thumbnails: 19 jobs, 19 made, 1 duplicate skipped.</b> Worker 1's crash left one job unacked; it came back, and the idempotency check skipped it instead of resizing twice.</li>
+      <li><b>The forgotten <code>/health</code>:</b> my first version had none. The health checker got 404 from all three backends and marked them all DOWN in the first 30 ms, so every request answered 503 "no healthy backend". A health endpoint is part of a service's contract with its load balancer.</li>
+    </ul>
+  </details>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">The stateless servers compare token signatures with <code>MessageDigest.isEqual</code>, not <code>equals</code>. Why? (L33)</p>
+  <div class="opts"><button>isEqual is much faster</button><button>It takes constant time</button><button>equals ignores the case</button><button>Strings cannot be compared</button></div>
+  <p class="why"><code>equals</code> stops at the first different character, so an attacker can measure how long a guess took and learn the signature byte by byte. <code>MessageDigest.isEqual</code> takes the same time either way (L33).</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">Which <code>TreeMap</code> call finds the owner of a key's ring position <code>h</code>? (L20)</p>
+  <div class="opts"><button><code>firstKey()</code></button><button><code>floorKey(h)</code></button><button><code>get(h)</code></button><button><code>ceilingEntry(h)</code></button></div>
+  <p class="why">"Clockwise to the first node position" is the smallest key ≥ h: <code>ceilingEntry</code>, falling back to <code>firstEntry()</code> to wrap round. A balanced tree makes it O(log n) (L20). <code>get(h)</code> would almost never find an exact match.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">Which executor rejection policy also pushes back on a producer that is too fast? (L28)</p>
+  <div class="opts"><button><code>CallerRunsPolicy</code></button><button><code>AbortPolicy</code></button><button><code>DiscardPolicy</code></button><button><code>DiscardOldestPolicy</code></button></div>
+  <p class="why">With <code>CallerRunsPolicy</code> a full pool makes the submitting thread run the task itself, so it can't submit more until it's done: backpressure, like <code>push()</code> blocking. <code>AbortPolicy</code> throws, more like <code>offer()</code> returning false; the discard policies silently lose work.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">Several workers record finished job ids in one set at the same time. Which set is safe? (L27)</p>
+  <div class="opts"><button><code>HashSet()</code></button><button><code>TreeSet()</code></button><button><code>ConcurrentHashMap.newKeySet()</code></button><button><code>LinkedHashSet()</code></button></div>
+  <p class="why">Only the concurrent set is built for writers on several threads; the others can lose entries or corrupt themselves (L26–L27). Today's queue and final use <code>ConcurrentHashMap.newKeySet()</code> for exactly this.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Scale up vs scale out: one advantage of each, and the one rule servers must follow before you can scale out.</li>
+    <li>Three places session state can live when servers are stateless, with one cost each.</li>
+    <li>Round-robin vs least-connections: when do they give different results? What did the slow backend do to the health checker?</li>
+    <li>Draw a leader, a follower and a reader. Where can the reader see stale data, and how does read-your-writes avoid it?</li>
+    <li>Why does <code>hash mod N</code> move about 80% of keys going from 4 to 5 nodes, and how does a ring with virtual nodes do better?</li>
+    <li>From a blank file: a queue with receive, ack and a visibility timeout. Then explain at-least-once, idempotent consumers and dead letters in one sentence each.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  <a href="https://github.com/donnemartin/system-design-primer">The System Design Primer</a>, free on GitHub: read the sections <a href="https://github.com/donnemartin/system-design-primer#load-balancer">Load balancer</a> (including layer 4 and layer 7, and horizontal scaling), <a href="https://github.com/donnemartin/system-design-primer#master-slave-replication">Replication</a>, <a href="https://github.com/donnemartin/system-design-primer#sharding">Sharding</a> and <a href="https://github.com/donnemartin/system-design-primer#asynchronism">Asynchronism</a> (message queues and back pressure). It's community-written and interview-flavoured, so for depth read <a href="https://martin.kleppmann.com/2026/03/24/designing-data-intensive-applications-2e.html"><em>Designing Data-Intensive Applications</em>, 2nd ed.</a>, the chapters on replication and on sharding (partitioning), which are the best explanation of replication lag, failover and rebalancing in print. For queue semantics, the SQS pages on <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">visibility timeout</a> and <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html">dead-letter queues</a> are short and precise.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/system-design.html">System Design</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "why did the health check fail when the server was only busy?", "how does a real database pick a new leader?", "where do I put session state in a Spring Boot app?" or "when is a queue overkill?" are exactly the right kind. Paste your final in for a review, and try explaining each number in its output before you do.</p>
+
+<div class="lesson-nav">
+  <a href="0041-latency-and-caching.html">← L41 · Latency &amp; Caching</a>
+  <a href="0043-trade-offs-and-resilience.html">L43 · Trade-offs &amp; Resilience →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/scaleviz.js"></script>
+</body>
+</html>

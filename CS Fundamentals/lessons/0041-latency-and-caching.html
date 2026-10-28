@@ -1,0 +1,3154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L41 · Latency &amp; Caching</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l41">
+<main>
+
+<div class="kicker">Lesson 41 · Phase 12 System Design &amp; Caching · <a href="../reference/roadmap.html#p12">roadmap</a></div>
+<h1>Latency &amp; Caching</h1>
+<p class="subtitle">Phase 11 shaped code inside one program. Phase 12 shapes systems made of many programs, and the first thing that changes is time: a database is a thousand times further away than a <code>HashMap</code>. This lesson puts real numbers on that, shows why the average hides the slow requests that users notice, and then builds the most common fix, a cache, including the three ways caches go wrong: stale data, stampedes and races.</p>
+
+<div class="lesson-meta">
+  <span><b>~110–125 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll put a thread-safe LRU cache you wrote yourself in front of a slow SQLite-backed HTTP endpoint. Fifty simultaneous requests for a cold book will cause exactly one database query, a <code>PUT</code> will invalidate the stale copy, and a load test will show the median latency dropping from about 27 ms to 0.5 ms. You'll also see why the 95th percentile barely moved.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Latency numbers worth memorising</a><span class="t">25 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Cache patterns, and why invalidation is hard</a><span class="t">35 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · A thread-safe LRU cache from scratch</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: a cached book service</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l41/</code>. Every output on this page was captured from real runs on my machine (an 18-core Apple M5 Max) with Kotlin 2.4.20, JDK 26 and sqlite-jdbc 3.53.4.0. Your numbers will differ; the <em>ratios</em> are what matter. Everything runs on <code>127.0.0.1</code>, which hides real network latency: where the point needs a slow network or a slow database, the code sleeps on purpose and says so. Programs that use SQLite run as <code>java --enable-native-access=ALL-UNNAMED -cp sqlite-jdbc-3.53.4.0.jar File.java</code>. For Kotlin, compile with <code>kotlinc -cp sqlite-jdbc-3.53.4.0.jar File.kt -include-runtime -d f.jar</code>, then run <code>java --enable-native-access=ALL-UNNAMED -cp f.jar:sqlite-jdbc-3.53.4.0.jar FileKt</code> (L36).</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L19, L22, L27, L31 and L40</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Put these in order, fastest first: a disk seek, an L1 cache hit, a main-memory read, a network round trip across an ocean. Roughly how many times slower is each step? (L22)</li>
+    <li>What do <code>Cache-Control: max-age=60</code> and an <code>ETag</code> each let a client skip? (L31)</li>
+    <li>Write the three lines that turn a <code>LinkedHashMap</code> into an LRU cache with a capacity of 3. (L19)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="2">
+  <p class="q">In L40's AI-written diff, the books endpoint cached its result under the key <code>"books"</code>. What went wrong? (L40)</p>
+  <div class="opts"><button>The cache grew without any limit</button><button>The first request was always slow</button><button>Every page returned the first page</button><button>The server crashed under heavy load</button></div>
+  <p class="why">The key ignored <code>page</code> and <code>size</code>, so every request after the first got the first answer. A cache key must include everything the answer depends on. Exercise 2 today builds a proper key.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">A response has <code>Cache-Control: max-age=2</code> and an <code>ETag</code>. Three seconds later the client wants it again. What happens? (L31)</p>
+  <div class="opts"><button>It revalidates and may get 304</button><button>It serves the copy without asking</button><button>It throws the copy away forever</button><button>It waits for a server push</button></div>
+  <p class="why">After 2 seconds the copy is stale, so the client sends <code>If-None-Match</code> with the ETag. If nothing changed, the server answers <code>304 Not Modified</code> with no body. TTL plus revalidation is today's whole topic, at the HTTP layer.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="3">
+  <p class="q">With <code>accessOrder = true</code>, which entry does <code>LinkedHashMap</code>'s <code>removeEldestEntry</code> see as "eldest"? (L19)</p>
+  <div class="opts"><button>The most recently inserted entry</button><button>The entry with lowest key</button><button>The most recently read entry</button><button>The least recently accessed entry</button></div>
+  <p class="why">Access order moves an entry to the end on every <code>get</code>, so the eldest is the least recently used: an LRU cache in three lines. Part 3 builds the same thing from a hash map and a linked list, and makes it thread-safe.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="1">
+  <p class="q">Eight threads call Kotlin's <code>getOrPut</code> on one <code>ConcurrentHashMap</code> for the same missing key. How many times can the lambda run? (L27)</p>
+  <div class="opts"><button>Exactly one time</button><button>More than once</button><button>Never at all</button><button>It won't compile</button></div>
+  <p class="why"><code>getOrPut</code> is check-then-act: several threads can miss at the same moment and each run the lambda. In L27 it ran 8 times. Today you'll meet the same bug at system scale, under its own name: a cache stampede.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Latency numbers worth memorising</h2><span class="t">~25 min</span></div>
+
+<p>In L22 you climbed the memory hierarchy inside one machine. Systems add rungs further down: another machine in the same building, then another continent. The System Design Primer's appendix reproduces the classic table, originally from Jeff Dean and Peter Norvig (<a href="https://github.com/donnemartin/system-design-primer#appendix">System Design Primer: Latency numbers every programmer should know</a>; Norvig's version is in <a href="https://norvig.com/21-days.html#answers">Teach Yourself Programming in Ten Years</a>). The numbers are approximate and dated: hardware has moved on, but the <em>gaps</em> between rungs have not.</p>
+<table class="cmds">
+  <tr><th>Operation</th><th>Approx. time</th><th>Compared with</th></tr>
+  <tr><td>L1 cache reference</td><td>0.5 ns</td><td></td></tr>
+  <tr><td>Main memory reference</td><td>100 ns</td><td>200× L1</td></tr>
+  <tr><td>Send 1 KB over a 1 Gbps network</td><td>10 µs</td><td></td></tr>
+  <tr><td>Read 4 KB randomly from SSD</td><td>150 µs</td><td></td></tr>
+  <tr><td>Read 1 MB sequentially from memory</td><td>250 µs</td><td></td></tr>
+  <tr><td>Round trip within the same datacenter</td><td>500 µs</td><td></td></tr>
+  <tr><td>Read 1 MB sequentially from SSD</td><td>1 ms</td><td>4× memory</td></tr>
+  <tr><td>Read 1 MB sequentially over 1 Gbps</td><td>10 ms</td><td>40× memory</td></tr>
+  <tr><td>Send a packet California → Netherlands → California</td><td>150 ms</td><td></td></tr>
+</table>
+<p>Memorise four rules of thumb, all approximate: <b>memory ≈ 100 ns</b>, <b>SSD read ≈ 100 µs</b>, <b>a round trip inside one datacenter ≈ 0.5 ms</b>, <b>a round trip across a continent or ocean ≈ 150 ms</b>. The primer's own summary line puts it in requests: "2,000 round trips per second within a data center" but only "6-7 world-wide round trips per second". That last fact is why a server in one region feels slow on the other side of the world, no matter how fast its code is.</p>
+
+<h3>Measure what you can</h3>
+<p>Here are four of those rungs measured on this machine: a <code>HashMap</code> lookup, an indexed SQLite query (L35), an HTTP round trip to an <code>HttpServer</code> on <code>127.0.0.1</code> (L32), and the same method call cold (first ever call) and warm (after the JIT has compiled it, L23).</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Latency.kt</figcaption>
+<pre><code class="language-kotlin">import com.sun.net.httpserver.HttpServer
+import java.net.InetSocketAddress
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.nio.file.Files
+import java.sql.DriverManager
+import java.sql.PreparedStatement
+import java.util.concurrent.Executors
+import kotlin.random.Random
+
+// Measure four latencies on this machine: a HashMap get, an indexed SQLite
+// lookup, a localhost HTTP round trip, and a cold vs warm function call.
+fun main() {
+    // 1. HashMap get: 100,000 entries, 10 million random lookups
+    val rnd = Random(41)
+    val map = HashMap&lt;Int, String&gt;()
+    for (i in 0 until 100_000) map[i] = "book-$i"
+    val keys = IntArray(10_000_000) { rnd.nextInt(100_000) }
+    var sink = 0L
+    for (k in keys) sink += map.getValue(k).length          // warm-up pass
+    var t = System.nanoTime()
+    for (k in keys) sink += map.getValue(k).length
+    val mapNs = (System.nanoTime() - t) / keys.size.toDouble()
+
+    // 2. SQLite: 100,000 rows, lookup by an indexed column
+    val db = Files.createTempFile("l41-latency", ".db")
+    val sqlUs = DriverManager.getConnection("jdbc:sqlite:$db").use { c -&gt;
+        c.createStatement().use { s -&gt;
+            s.execute("CREATE TABLE books(id INTEGER PRIMARY KEY, isbn TEXT, title TEXT)")
+            s.execute("CREATE INDEX books_isbn ON books(isbn)")
+        }
+        c.autoCommit = false
+        c.prepareStatement("INSERT INTO books(isbn, title) VALUES (?, ?)").use { ins -&gt;
+            for (i in 0 until 100_000) {
+                ins.setString(1, "978${1_000_000 + i}"); ins.setString(2, "Title $i"); ins.addBatch()
+            }
+            ins.executeBatch()
+        }
+        c.commit()
+        c.prepareStatement("SELECT title FROM books WHERE isbn = ?").use { q -&gt;
+            repeat(2_000) { sink += lookup(q, rnd) }            // warm-up
+            t = System.nanoTime()
+            repeat(20_000) { sink += lookup(q, rnd) }
+            (System.nanoTime() - t) / 20_000.0 / 1_000
+        }
+    }
+    Files.delete(db)
+
+    // 3. HTTP round trip to a server on 127.0.0.1
+    val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    server.createContext("/ping") { ex -&gt;
+        val body = "ok".toByteArray()
+        ex.sendResponseHeaders(200, body.size.toLong())
+        ex.responseBody.use { it.write(body) }
+    }
+    server.executor = Executors.newVirtualThreadPerTaskExecutor()
+    server.start()
+    val client = HttpClient.newHttpClient()
+    val req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:${server.address.port}/ping")).build()
+    repeat(500) { client.send(req, HttpResponse.BodyHandlers.ofString()) }   // warm-up
+    t = System.nanoTime()
+    repeat(5_000) { sink += client.send(req, HttpResponse.BodyHandlers.ofString()).body().length }
+    val httpUs = (System.nanoTime() - t) / 5_000.0 / 1_000
+    server.stop(0)
+
+    // 4. Cold vs warm: the first call loads and links classes; later calls are JIT-compiled
+    t = System.nanoTime()
+    sink += "%08.3f|%s".format(3.14159, listOf(1, 2)).length
+    val coldUs = (System.nanoTime() - t) / 1_000.0
+    repeat(100_000) { sink += "%08.3f|%s".format(3.14159, listOf(1, 2)).length }
+    t = System.nanoTime()
+    repeat(10_000) { sink += "%08.3f|%s".format(3.14159, listOf(1, 2)).length }
+    val warmUs = (System.nanoTime() - t) / 10_000.0 / 1_000
+
+    println("HashMap get            %10.1f ns".format(mapNs))
+    println("SQLite indexed lookup  %10.1f µs".format(sqlUs))
+    println("HTTP round trip (lo0)  %10.1f µs".format(httpUs))
+    println("String.format, cold    %10.1f µs".format(coldUs))
+    println("String.format, warm    %10.1f µs".format(warmUs))
+    println("(sink ${sink % 10})")
+}
+
+fun lookup(q: PreparedStatement, rnd: Random): Int {
+    q.setString(1, "978${1_000_000 + rnd.nextInt(100_000)}")
+    return q.executeQuery().use { rs -&gt; if (rs.next()) rs.getString(1).length else 0 }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Latency.java</figcaption>
+<pre><code class="language-java">import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.file.*;
+import java.sql.*;
+import java.util.*;
+import java.util.concurrent.Executors;
+
+// Measure four latencies on this machine: a HashMap get, an indexed SQLite
+// lookup, a localhost HTTP round trip, and a cold vs warm method call.
+public class Latency {
+    public static void main(String[] args) throws Exception {
+        // 1. HashMap get: 100,000 entries, 10 million random lookups
+        var rnd = new Random(41);
+        var map = new HashMap&lt;Integer, String&gt;();
+        for (int i = 0; i &lt; 100_000; i++) map.put(i, "book-" + i);
+        int[] keys = new int[10_000_000];
+        for (int i = 0; i &lt; keys.length; i++) keys[i] = rnd.nextInt(100_000);
+        long sink = 0;
+        for (int k : keys) sink += map.get(k).length();          // warm-up pass
+        long t = System.nanoTime();
+        for (int k : keys) sink += map.get(k).length();
+        double mapNs = (System.nanoTime() - t) / (double) keys.length;
+
+        // 2. SQLite: 100,000 rows, lookup by an indexed column
+        Path db = Files.createTempFile("l41-latency", ".db");
+        double sqlUs;
+        try (var c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
+            try (var s = c.createStatement()) {
+                s.execute("CREATE TABLE books(id INTEGER PRIMARY KEY, isbn TEXT, title TEXT)");
+                s.execute("CREATE INDEX books_isbn ON books(isbn)");
+            }
+            c.setAutoCommit(false);
+            try (var ins = c.prepareStatement("INSERT INTO books(isbn, title) VALUES (?, ?)")) {
+                for (int i = 0; i &lt; 100_000; i++) {
+                    ins.setString(1, "978" + (1_000_000 + i)); ins.setString(2, "Title " + i); ins.addBatch();
+                }
+                ins.executeBatch();
+            }
+            c.commit();
+            try (var q = c.prepareStatement("SELECT title FROM books WHERE isbn = ?")) {
+                for (int i = 0; i &lt; 2_000; i++) sink += lookup(q, rnd);    // warm-up
+                t = System.nanoTime();
+                for (int i = 0; i &lt; 20_000; i++) sink += lookup(q, rnd);
+                sqlUs = (System.nanoTime() - t) / 20_000.0 / 1_000;
+            }
+        }
+        Files.delete(db);
+
+        // 3. HTTP round trip to a server on 127.0.0.1
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/ping", ex -&gt; {
+            byte[] body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            try (var out = ex.getResponseBody()) { out.write(body); }
+        });
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.start();
+        var client = HttpClient.newHttpClient();
+        var req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/ping")).build();
+        for (int i = 0; i &lt; 500; i++) client.send(req, HttpResponse.BodyHandlers.ofString());   // warm-up
+        t = System.nanoTime();
+        for (int i = 0; i &lt; 5_000; i++) sink += client.send(req, HttpResponse.BodyHandlers.ofString()).body().length();
+        double httpUs = (System.nanoTime() - t) / 5_000.0 / 1_000;
+        server.stop(0);
+
+        // 4. Cold vs warm: the first call loads and links classes; later calls are JIT-compiled
+        t = System.nanoTime();
+        sink += String.format("%08.3f|%s", 3.14159, List.of(1, 2)).length();
+        double coldUs = (System.nanoTime() - t) / 1_000.0;
+        for (int i = 0; i &lt; 100_000; i++) sink += String.format("%08.3f|%s", 3.14159, List.of(1, 2)).length();
+        t = System.nanoTime();
+        for (int i = 0; i &lt; 10_000; i++) sink += String.format("%08.3f|%s", 3.14159, List.of(1, 2)).length();
+        double warmUs = (System.nanoTime() - t) / 10_000.0 / 1_000;
+
+        System.out.printf("HashMap get            %10.1f ns%n", mapNs);
+        System.out.printf("SQLite indexed lookup  %10.1f µs%n", sqlUs);
+        System.out.printf("HTTP round trip (lo0)  %10.1f µs%n", httpUs);
+        System.out.printf("String.format, cold    %10.1f µs%n", coldUs);
+        System.out.printf("String.format, warm    %10.1f µs%n", warmUs);
+        System.out.println("(sink " + (sink % 10) + ")");
+    }
+
+    static int lookup(PreparedStatement q, Random rnd) throws SQLException {
+        q.setString(1, "978" + (1_000_000 + rnd.nextInt(100_000)));
+        try (var rs = q.executeQuery()) { return rs.next() ? rs.getString(1).length() : 0; }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">HashMap get                   4.5 ns
+SQLite indexed lookup         1.9 µs
+HTTP round trip (lo0)       109.3 µs
+String.format, cold        7001.7 µs
+String.format, warm           0.2 µs
+(sink 6)</pre>
+<pre class="out">HashMap get                   4.6 ns
+SQLite indexed lookup         2.0 µs
+HTTP round trip (lo0)       112.5 µs
+String.format, cold         299.7 µs
+String.format, warm           0.2 µs
+(sink 1)</pre>
+</div>
+<p>On my machine, on localhost. Read the ratios:</p>
+<ul>
+  <li><b>HashMap ≈ 5 ns.</b> Faster than the 100 ns memory figure because 100,000 small entries mostly fit in the CPU caches (L22).</li>
+  <li><b>SQLite ≈ 2 µs: about 400× a map lookup.</b> And this is the friendliest possible database: an in-process library reading a file the OS already holds in memory (the page cache). A database server adds a network round trip on top.</li>
+  <li><b>HTTP round trip ≈ 110 µs, on loopback.</b> No network card, no cable: this is pure kernel and JVM overhead (L22's system calls). Real machines in one datacenter add about 0.5 ms more; across an ocean, 150 ms more.</li>
+  <li><b>Cold vs warm: over 1,000×.</b> The first call loads and links classes; later calls run JIT-compiled code (L23). The cold number swings wildly between runs and languages (0.3 ms in Java, 7 ms in Kotlin here), which is why benchmarks warm up first (L24).</li>
+</ul>
+<p>The <code>sink</code> line exists only so the JIT can't delete the loops as dead code (L23).</p>
+
+<h3>Percentiles: why the average lies</h3>
+<p>A service that's usually fast and occasionally slow is the normal case: a garbage collection, a cold cache, a lock, a retry. The average blends those together into a number no request actually took. Systems people describe latency with <b>percentiles</b> instead: p50 (the median, half of requests are faster), p95, p99 and so on. To find them, sort the measurements and index into the sorted array (L18). Here is a local service where exactly one request in 50 sleeps:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Tail.kt</figcaption>
+<pre><code class="language-kotlin">import com.sun.net.httpserver.HttpServer
+import java.net.InetSocketAddress
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.ceil
+import kotlin.math.pow
+import kotlin.random.Random
+
+// A local service where 2% of requests are slow. Measure 10,000 requests,
+// then look at the distribution instead of the average.
+fun main() {
+    val count = AtomicInteger()
+    val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    server.createContext("/book") { ex -&gt;
+        if (count.incrementAndGet() % 50 == 7) Thread.sleep(20)   // exactly 1 request in 50
+        val body = "Dune".toByteArray()
+        ex.sendResponseHeaders(200, body.size.toLong())
+        ex.responseBody.use { it.write(body) }
+    }
+    server.executor = Executors.newVirtualThreadPerTaskExecutor()
+    server.start()
+
+    val client = HttpClient.newHttpClient()
+    val req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:${server.address.port}/book")).build()
+    repeat(500) { client.send(req, HttpResponse.BodyHandlers.discarding()) }   // warm-up
+    count.set(0)
+
+    val ms = DoubleArray(10_000) {
+        val t = System.nanoTime()
+        client.send(req, HttpResponse.BodyHandlers.discarding())
+        (System.nanoTime() - t) / 1e6
+    }
+    server.stop(0)
+
+    val sorted = ms.sortedArray()                               // L18: sort, then index
+    println("requests %d, slow %.0f%%".format(ms.size, 100.0 * ms.count { it &gt; 10 } / ms.size))
+    println("mean   %6.2f ms".format(ms.average()))
+    for (p in listOf(50.0, 95.0, 99.0, 99.9)) {
+        val label = if (p % 1 == 0.0) p.toInt().toString() else p.toString()
+        println("p%-5s %6.2f ms".format(label, pct(sorted, p)))
+    }
+    println("max    %6.2f ms".format(sorted.last()))
+
+    // Fan-out: a page calls 10 services, each with this distribution.
+    val p99 = pct(sorted, 99.0)
+    val rnd = Random(41)
+    val pages = 100_000
+    val hit = (1..pages).count { (1..10).any { ms[rnd.nextInt(ms.size)] &gt; p99 } }
+    println("pages with a call slower than p99: computed %.1f%%, simulated %.1f%%"
+        .format(100 * (1 - 0.99.pow(10)), 100.0 * hit / pages))
+}
+
+// Nearest-rank percentile: the value at position ceil(p/100 * n) in sorted order
+fun pct(sorted: DoubleArray, p: Double): Double {
+    val rank = ceil(p / 100 * sorted.size).toInt()
+    return sorted[maxOf(0, rank - 1)]
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Tail.java</figcaption>
+<pre><code class="language-java">import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.*;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+// A local service where 2% of requests are slow. Measure 10,000 requests,
+// then look at the distribution instead of the average.
+public class Tail {
+    public static void main(String[] args) throws Exception {
+        var count = new AtomicInteger();
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/book", ex -&gt; {
+            if (count.incrementAndGet() % 50 == 7) {           // exactly 1 request in 50
+                try { Thread.sleep(20); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            byte[] body = "Dune".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            try (var out = ex.getResponseBody()) { out.write(body); }
+        });
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.start();
+
+        var client = HttpClient.newHttpClient();
+        var req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/book")).build();
+        for (int i = 0; i &lt; 500; i++) client.send(req, HttpResponse.BodyHandlers.discarding());  // warm-up
+        count.set(0);
+
+        double[] ms = new double[10_000];
+        for (int i = 0; i &lt; ms.length; i++) {
+            long t = System.nanoTime();
+            client.send(req, HttpResponse.BodyHandlers.discarding());
+            ms[i] = (System.nanoTime() - t) / 1e6;
+        }
+        server.stop(0);
+
+        double[] sorted = ms.clone();
+        Arrays.sort(sorted);                                    // L18: sort, then index
+        double mean = Arrays.stream(ms).average().orElseThrow();
+        System.out.printf("requests %d, slow %.0f%%%n", ms.length, 100.0 * Arrays.stream(ms).filter(x -&gt; x &gt; 10).count() / ms.length);
+        System.out.printf("mean   %6.2f ms%n", mean);
+        for (double p : new double[] {50, 95, 99, 99.9}) System.out.printf("p%-5s %6.2f ms%n", fmt(p), pct(sorted, p));
+        System.out.printf("max    %6.2f ms%n", sorted[sorted.length - 1]);
+
+        // Fan-out: a page calls 10 services, each with this distribution.
+        double p99 = pct(sorted, 99);
+        var rnd = new Random(41);
+        int pages = 100_000, hit = 0;
+        for (int p = 0; p &lt; pages; p++) {
+            boolean anySlow = false;
+            for (int call = 0; call &lt; 10; call++) if (ms[rnd.nextInt(ms.length)] &gt; p99) anySlow = true;
+            if (anySlow) hit++;
+        }
+        System.out.printf("pages with a call slower than p99: computed %.1f%%, simulated %.1f%%%n",
+                100 * (1 - Math.pow(0.99, 10)), 100.0 * hit / pages);
+    }
+
+    // Nearest-rank percentile: the value at position ceil(p/100 * n) in sorted order
+    static double pct(double[] sorted, double p) {
+        int rank = (int) Math.ceil(p / 100 * sorted.length);
+        return sorted[Math.max(0, rank - 1)];
+    }
+
+    static String fmt(double p) { return p == Math.rint(p) ? String.valueOf((int) p) : String.valueOf(p); }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">requests 10000, slow 2%
+mean     0.70 ms
+p50      0.13 ms
+p95      0.24 ms
+p99     30.20 ms
+p99.9   30.39 ms
+max     32.38 ms
+pages with a call slower than p99: computed 9.6%, simulated 9.6%</pre>
+<pre class="out">requests 10000, slow 2%
+mean     0.70 ms
+p50      0.14 ms
+p95      0.24 ms
+p99     30.18 ms
+p99.9   30.37 ms
+max     32.96 ms
+pages with a call slower than p99: computed 9.6%, simulated 9.6%</pre>
+</div>
+<p>Three lessons in eight lines:</p>
+<ol>
+  <li><b>The mean describes nobody.</b> 0.70 ms is five times the typical request (0.13 ms) and 40 times faster than the slow ones (30 ms). No single request took 0.70 ms.</li>
+  <li><b>p95 is fine, p99 is terrible.</b> With 2% slow requests, the 95th percentile is still in the fast group and the 99th is in the slow group. Which percentile you watch decides which problem you can see.</li>
+  <li><b>Timers lie a little too.</b> The code asks for <code>sleep(20)</code>, yet slow requests took about 30 ms in both languages. The OS doesn't wake a sleeping thread at the exact millisecond. Always measure; never assume.</li>
+</ol>
+<p><b>Fan-out makes the tail everyone's problem.</b> A real page often calls several services in parallel and must wait for the slowest. If each call is slower than its p99 one time in 100, a page that makes 10 calls hits at least one slow call with probability 1 − 0.99<sup>10</sup> ≈ 9.6%. The simulation above drew 100,000 pages of 10 calls from the measured latencies and got the same 9.6%. Jeffrey Dean and Luiz André Barroso wrote the classic paper on this, <a href="https://research.google/pubs/the-tail-at-scale/"><em>The Tail at Scale</em></a> (<em>Communications of the ACM</em>, 2013). Their abstract says "Temporary high latency episodes which are unimportant in moderate size systems may come to dominate overall service performance at large scale."</p>
+<p class="callout"><b>Why this matters for caching.</b> A cache makes most requests fast, but every miss is still slow. You'll see this in the final: the cache drops the median from about 27 ms to 0.5 ms, while p95 and p99 stay near 30 ms because they're made of misses. Always report a cache's effect as percentiles, not just "average latency halved".</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>DoubleArray(n) { … }</code> fills an array of measurements in one expression. Java needs a loop writing into <code>new double[n]</code>.</li>
+    <li><code>sortedArray()</code>, <code>average()</code> and <code>count { it &gt; 10 }</code> are built in. Java goes through <code>Arrays.sort</code> and <code>Arrays.stream(...)</code>.</li>
+    <li><code>(1..pages).count { (1..10).any { … } }</code> states the fan-out simulation directly. Java needs two loops and a flag.</li>
+    <li><code>use { }</code> closes the response stream; Java uses try-with-resources (L10).</li>
+    <li>The latency itself is language-neutral: both run on the same JVM, so the numbers match.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: measure a tail, then hedge it</div>
+  <ol>
+    <li>From a blank file, write <code>call()</code>: it sleeps 1 ms, except that 5% of calls (chosen at random) sleep 50 ms. Time 1,000 calls and print p50, p95 and p99.</li>
+    <li>Now add <b>hedging</b>, one of the tail-tolerance techniques Dean and Barroso describe: start the call; if it hasn't answered within 5 ms, start a second copy and return whichever finishes first. Use <code>CompletableFuture.supplyAsync</code> on a virtual-thread executor, <code>get(5, MILLISECONDS)</code> and <code>CompletableFuture.anyOf</code> (L28).</li>
+    <li>Compare the percentiles, and count how many extra calls hedging cost.</li>
+  </ol>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex1.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
+
+// Exercise 1: a service where 5% of calls take 50 ms. Measure its percentiles,
+// then add hedging: if no answer after 5 ms, send a second copy and take whichever wins.
+val calls = AtomicInteger()
+
+fun call(): String {
+    calls.incrementAndGet()
+    val slow = ThreadLocalRandom.current().nextInt(100) &lt; 5
+    Thread.sleep(if (slow) 50 else 1)
+    return "ok"
+}
+
+fun hedged(pool: ExecutorService): String {
+    val first = CompletableFuture.supplyAsync(::call, pool)
+    return try {
+        first.get(5, TimeUnit.MILLISECONDS)
+    } catch (slowSoFar: TimeoutException) {
+        val second = CompletableFuture.supplyAsync(::call, pool)
+        CompletableFuture.anyOf(first, second).join() as String     // first answer wins
+    }
+}
+
+fun main() {
+    Executors.newVirtualThreadPerTaskExecutor().use { pool -&gt;
+        measure("plain") { pool.submit(::call).get() }
+        measure("hedged") { hedged(pool) }
+    }
+}
+
+fun measure(name: String, request: () -&gt; String) {
+    calls.set(0)
+    val ms = DoubleArray(1_000) {
+        val t = System.nanoTime()
+        request()
+        (System.nanoTime() - t) / 1e6
+    }.sortedArray()
+    println("%-7s p50 %5.1f ms  p95 %5.1f ms  p99 %5.1f ms  (%d calls for 1000 requests)"
+        .format(name, ms[499], ms[949], ms[989], calls.get()))
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex1.java</figcaption>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+// Exercise 1: a service where 5% of calls take 50 ms. Measure its percentiles,
+// then add hedging: if no answer after 5 ms, send a second copy and take whichever wins.
+public class Ex1 {
+    static final AtomicInteger calls = new AtomicInteger();
+
+    static String call() {
+        calls.incrementAndGet();
+        boolean slow = ThreadLocalRandom.current().nextInt(100) &lt; 5;
+        try { Thread.sleep(slow ? 50 : 1); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return "ok";
+    }
+
+    static String hedged(ExecutorService pool) throws Exception {
+        var first = CompletableFuture.supplyAsync(Ex1::call, pool);
+        try {
+            return first.get(5, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException slowSoFar) {
+            var second = CompletableFuture.supplyAsync(Ex1::call, pool);
+            return (String) CompletableFuture.anyOf(first, second).join();   // first answer wins
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            measure("plain", () -&gt; pool.submit(Ex1::call).get());
+            measure("hedged", () -&gt; hedged(pool));
+        }
+    }
+
+    static void measure(String name, Callable&lt;String&gt; request) throws Exception {
+        calls.set(0);
+        double[] ms = new double[1_000];
+        for (int i = 0; i &lt; ms.length; i++) {
+            long t = System.nanoTime();
+            request.call();
+            ms[i] = (System.nanoTime() - t) / 1e6;
+        }
+        Arrays.sort(ms);
+        System.out.printf("%-7s p50 %5.1f ms  p95 %5.1f ms  p99 %5.1f ms  (%d calls for 1000 requests)%n",
+                name, ms[499], ms[949], ms[989], calls.get());
+    }
+}</code></pre></figure>
+    </div>
+<div class="pair">
+<pre class="out">plain   p50   1.5 ms  p95   1.7 ms  p99  60.1 ms  (1000 calls for 1000 requests)
+hedged  p50   1.6 ms  p95   7.1 ms  p99   9.1 ms  (1055 calls for 1000 requests)</pre>
+<pre class="out">plain   p50   1.6 ms  p95   1.7 ms  p99  59.5 ms  (1000 calls for 1000 requests)
+hedged  p50   1.6 ms  p95   1.6 ms  p99   9.1 ms  (1039 calls for 1000 requests)</pre>
+</div>
+    <p>p99 fell from about 60 ms to 9 ms for 4–6% extra calls. The second copy only wins when the first was unlucky, and with 5% slow calls both copies are unlucky only about 0.25% of the time. The cost is real load on the service, so hedging fits read-only, idempotent requests (L32). The randomness isn't seeded, so your counts will vary a little from run to run.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Latency numbers" data-answer="1">
+  <p class="q">Roughly how long does a network round trip inside one datacenter take?</p>
+  <div class="opts"><button><code>0.5 ns</code></button><button><code>0.5 ms</code></button><button><code>50 ms</code></button><button><code>150 ms</code></button></div>
+  <p class="why">About 500 µs = 0.5 ms (the primer's table): 5,000 main-memory reads. 150 ms is the cross-ocean round trip.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Latency numbers" data-answer="3">
+  <p class="q">In <code>Tail</code>, 2% of requests are slow. Why is p95 fast but p99 slow?</p>
+  <div class="opts"><button>The mean is low</button><button>The JIT warmed late</button><button>Sorting changed the data</button><button>Only 2% are slow</button></div>
+  <p class="why">The slowest 2% occupy ranks 9,801–10,000 of the sorted 10,000. p95 is rank 9,500, still fast; p99 is rank 9,900, inside the slow group.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Latency numbers" data-answer="0">
+  <p class="q">A page waits for 10 parallel calls, each slower than its p99 1% of the time. About how often is the page slow?</p>
+  <div class="opts"><button>About 10%</button><button>About 1%</button><button>About 0.1%</button><button>About 50%</button></div>
+  <p class="why">1 − 0.99<sup>10</sup> ≈ 9.6%, and the simulation agreed. Fan-out turns a rare per-call event into a common per-page one (<em>The Tail at Scale</em>).</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Latency numbers" data-answer="2">
+  <p class="q">Why is the SQLite lookup here much faster than querying a database server would be?</p>
+  <div class="opts"><button>SQLite skips the index for lookups</button><button>JDBC caches every single query result</button><button>No network round trip is involved</button><button>The JIT compiles the SQL itself</button></div>
+  <p class="why">SQLite is a library inside your process, reading a file the OS has cached. A database server is another process, usually on another machine: add at least a datacenter round trip (~0.5 ms) to every query.</p>
+</div>
+<div class="quiz" data-id="p1-5" data-group="Part 1 · Latency numbers" data-answer="1">
+  <p class="q">Why does a benchmark run warm-up iterations before it starts timing?</p>
+  <div class="opts"><button>To fill the CPU with heat</button><button>To time the JIT-compiled code instead</button><button>To make the averages look smaller</button><button>To let the garbage collector rest</button></div>
+  <p class="why">The first calls include class loading and interpretation; the cold <code>String.format</code> was over 1,000× slower than the warm one. Steady-state numbers come after the JIT has compiled the hot code (L23, L24).</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Cache patterns, and why invalidation is hard</h2><span class="t">~35 min</span></div>
+
+<p>A cache keeps a copy of data somewhere faster and closer than its source of truth. The System Design Primer puts the motivation plainly: "Caching improves page load times and can reduce the load on your servers and databases" (<a href="https://github.com/donnemartin/system-design-primer#cache">System Design Primer: Cache</a>). You have already met caches at almost every level of this course:</p>
+<table class="cmds">
+  <tr><th>Where</th><th>Example</th><th>Lesson</th></tr>
+  <tr><td>CPU</td><td>L1/L2/L3 caches in front of RAM</td><td>L22</td></tr>
+  <tr><td>Operating system</td><td>the page cache: recently read file pages kept in RAM (why SQLite above was fast)</td><td>L22</td></tr>
+  <tr><td>Inside your process</td><td>a <code>HashMap</code> or LRU cache in the JVM heap: today's Part 3</td><td>L19</td></tr>
+  <tr><td>Shared cache server</td><td><a href="https://memcached.org/">Memcached</a> ("a high-performance, distributed memory object caching system"), <a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis</a>: one cache many app servers share</td><td>L42</td></tr>
+  <tr><td>CDN</td><td>copies of static files in data centres near users</td><td>L31</td></tr>
+  <tr><td>Browser</td><td>the HTTP cache, driven by <code>Cache-Control</code> and <code>ETag</code></td><td>L31</td></tr>
+</table>
+<p>An in-process cache is fastest (no network) but each server has its own copy, and it vanishes on restart. A shared cache like Redis is one network hop away but consistent across servers. We can't run Redis here (and won't install it), so everything below is an in-process cache; the <em>patterns</em> are the same whichever kind you use.</p>
+
+<h3>Five ways to keep a cache and a database in step</h3>
+<p>The demo puts one tiny cache with a time-to-live (TTL) in front of a SQLite table that takes an extra 5 ms per query (an injected sleep, standing in for a database server). Each numbered section is one pattern.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · CachePatterns.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.nio.file.Path
+import java.sql.Connection
+import java.sql.DriverManager
+import java.util.concurrent.ConcurrentHashMap
+
+// Cache-aside, read-through, write-through, negative caching and TTL staleness,
+// all in front of the same slow SQLite table.
+
+// The "database": a SQLite file, 5 ms extra per query so the cache matters
+class BookDb(file: Path) : AutoCloseable {
+    private val c: Connection = DriverManager.getConnection("jdbc:sqlite:$file")
+    var queries = 0
+    init {
+        c.createStatement().use { s -&gt;
+            s.execute("CREATE TABLE IF NOT EXISTS books(id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+            s.execute("INSERT OR REPLACE INTO books VALUES (1,'Dune'),(2,'Emma'),(3,'Ulysses'),(4,'Beloved')")
+        }
+    }
+    @Synchronized fun find(id: Int): String? {
+        queries++
+        Thread.sleep(5)
+        return c.prepareStatement("SELECT title FROM books WHERE id = ?").use { q -&gt;
+            q.setInt(1, id)
+            q.executeQuery().use { rs -&gt; if (rs.next()) rs.getString(1) else null }
+        }
+    }
+    @Synchronized fun save(id: Int, title: String) {
+        c.prepareStatement("INSERT OR REPLACE INTO books VALUES (?, ?)").use { u -&gt;
+            u.setInt(1, id); u.setString(2, title); u.executeUpdate()
+        }
+    }
+    override fun close() = c.close()
+}
+
+// A tiny TTL cache. `value == null` inside an Entry means "known missing".
+class Entry(val value: String?, val expiresAt: Long)
+class TtlCache(ttlMillis: Long) {
+    private val map = ConcurrentHashMap&lt;Int, Entry&gt;()
+    private val ttlNanos = ttlMillis * 1_000_000
+    var hits = 0; var misses = 0
+    fun get(id: Int): Entry? {
+        val e = map[id]
+        if (e != null &amp;&amp; e.expiresAt &gt; System.nanoTime()) { hits++; return e }
+        misses++; return null
+    }
+    fun put(id: Int, v: String?) { map[id] = Entry(v, System.nanoTime() + ttlNanos) }
+    fun invalidate(id: Int) { map.remove(id) }
+}
+
+// Read-through: the cache itself knows how to load. Callers never see the DB.
+class ReadThrough(val cache: TtlCache, private val loader: (Int) -&gt; String?) {
+    fun get(id: Int): String? {
+        val e = cache.get(id)
+        if (e != null) return e.value        // a hit, even when the cached answer is "missing"
+        return loader(id).also { cache.put(id, it) }
+    }
+}
+
+val READS = intArrayOf(1, 2, 1, 1, 3, 2, 1, 4, 1, 2)
+
+fun main() {
+    val file = Files.createTempFile("l41-patterns", ".db")
+    BookDb(file).use { db -&gt;
+        // 0. No cache: every read goes to the database
+        var t = System.nanoTime()
+        for (id in READS) db.find(id)
+        println("%-15s reads %d, db reads %d, %d ms".format("no cache", READS.size, db.queries, (System.nanoTime() - t) / 1_000_000))
+
+        // 1. Cache-aside: the application checks the cache, then the DB, then fills the cache
+        db.queries = 0
+        val cache = TtlCache(60_000)
+        t = System.nanoTime()
+        for (id in READS) {
+            if (cache.get(id) == null) cache.put(id, db.find(id))
+        }
+        report("cache-aside", t, cache, db)
+        // ...and on a write: update the DB, then invalidate (not update) the cached copy
+        db.save(2, "Emma (2nd ed.)")
+        cache.invalidate(2)
+        val after = cache.get(2)?.value ?: db.find(2)
+        println("  after write + invalidate, id 2 = $after")
+
+        // 2. Read-through: same counts, but the loading logic moved into the cache
+        db.queries = 0
+        val rt = ReadThrough(TtlCache(60_000), db::find)
+        t = System.nanoTime()
+        for (id in READS) rt.get(id)
+        report("read-through", t, rt.cache, db)
+
+        // 3. Write-through: every write goes to the DB and the cache together
+        db.queries = 0
+        val wt = TtlCache(60_000)
+        db.save(5, "Middlemarch"); wt.put(5, "Middlemarch")
+        println("write-through   read after write: ${wt.get(5)?.value}, db reads ${db.queries}")
+
+        // 4. Negative caching: remember "not found" too
+        db.queries = 0
+        repeat(5) { db.find(99) }
+        println("no negative cache: 5 lookups of id 99 -&gt; ${db.queries} db reads")
+        db.queries = 0
+        val neg = ReadThrough(TtlCache(60_000), db::find)
+        repeat(5) { neg.get(99) }
+        println("negative cache:    5 lookups of id 99 -&gt; ${db.queries} db read")
+        db.save(99, "Persuasion")                           // the book arrives...
+        println("  after insert, cache still says: ${neg.get(99) ?: "not found"}")
+
+        // 5. TTL staleness: someone updates the DB behind the cache's back
+        val ttl = ReadThrough(TtlCache(300), db::find)
+        ttl.get(3)
+        val changed = System.nanoTime()
+        db.save(3, "Ulysses (annotated)")
+        var seen: String?
+        do { Thread.sleep(50); seen = ttl.get(3) } while (seen == "Ulysses")
+        println("TTL 300 ms: stale for ${(System.nanoTime() - changed) / 1_000_000} ms, then saw '$seen'")
+    }
+    Files.delete(file)
+}
+
+fun report(name: String, start: Long, c: TtlCache, db: BookDb) =
+    println("%-15s reads %d, hits %d, misses %d, db reads %d, %d ms"
+        .format(name, READS.size, c.hits, c.misses, db.queries, (System.nanoTime() - start) / 1_000_000))</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · CachePatterns.java</figcaption>
+<pre><code class="language-java">import java.nio.file.*;
+import java.sql.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
+
+// Cache-aside, read-through, write-through, negative caching and TTL staleness,
+// all in front of the same slow SQLite table.
+public class CachePatterns {
+    // The "database": a SQLite file, 5 ms extra per query so the cache matters
+    static class BookDb implements AutoCloseable {
+        final Connection c;
+        int queries = 0;
+        BookDb(Path file) throws SQLException {
+            c = DriverManager.getConnection("jdbc:sqlite:" + file);
+            try (var s = c.createStatement()) {
+                s.execute("CREATE TABLE IF NOT EXISTS books(id INTEGER PRIMARY KEY, title TEXT NOT NULL)");
+                s.execute("INSERT OR REPLACE INTO books VALUES (1,'Dune'),(2,'Emma'),(3,'Ulysses'),(4,'Beloved')");
+            }
+        }
+        synchronized Optional&lt;String&gt; find(int id) {
+            queries++;
+            sleep(5);
+            try (var q = c.prepareStatement("SELECT title FROM books WHERE id = ?")) {
+                q.setInt(1, id);
+                try (var rs = q.executeQuery()) { return rs.next() ? Optional.of(rs.getString(1)) : Optional.empty(); }
+            } catch (SQLException e) { throw new IllegalStateException(e); }
+        }
+        synchronized void save(int id, String title) {
+            try (var u = c.prepareStatement("INSERT OR REPLACE INTO books VALUES (?, ?)")) {
+                u.setInt(1, id); u.setString(2, title); u.executeUpdate();
+            } catch (SQLException e) { throw new IllegalStateException(e); }
+        }
+        public void close() throws SQLException { c.close(); }
+    }
+
+    // A tiny TTL cache: value plus an expiry time. Optional.empty() = "known missing".
+    record Entry(Optional&lt;String&gt; value, long expiresAt) {}
+    static class TtlCache {
+        final Map&lt;Integer, Entry&gt; map = new ConcurrentHashMap&lt;&gt;();
+        final long ttlNanos;
+        int hits = 0, misses = 0;
+        TtlCache(long ttlMillis) { ttlNanos = ttlMillis * 1_000_000; }
+        Entry get(int id) {
+            Entry e = map.get(id);
+            if (e != null &amp;&amp; e.expiresAt() &gt; System.nanoTime()) { hits++; return e; }
+            misses++; return null;
+        }
+        void put(int id, Optional&lt;String&gt; v) { map.put(id, new Entry(v, System.nanoTime() + ttlNanos)); }
+        void invalidate(int id) { map.remove(id); }
+    }
+
+    // Read-through: the cache itself knows how to load. Callers never see the DB.
+    static class ReadThrough {
+        final TtlCache cache; final Function&lt;Integer, Optional&lt;String&gt;&gt; loader;
+        ReadThrough(TtlCache cache, Function&lt;Integer, Optional&lt;String&gt;&gt; loader) { this.cache = cache; this.loader = loader; }
+        Optional&lt;String&gt; get(int id) {
+            Entry e = cache.get(id);
+            if (e != null) return e.value();
+            Optional&lt;String&gt; v = loader.apply(id);
+            cache.put(id, v);
+            return v;
+        }
+    }
+
+    static final int[] READS = {1, 2, 1, 1, 3, 2, 1, 4, 1, 2};
+
+    public static void main(String[] args) throws Exception {
+        Path file = Files.createTempFile("l41-patterns", ".db");
+        try (var db = new BookDb(file)) {
+            // 0. No cache: every read goes to the database
+            long t = System.nanoTime();
+            for (int id : READS) db.find(id);
+            System.out.printf("%-15s reads %d, db reads %d, %d ms%n", "no cache", READS.length, db.queries, (System.nanoTime() - t) / 1_000_000);
+
+            // 1. Cache-aside: the application checks the cache, then the DB, then fills the cache
+            db.queries = 0;
+            var cache = new TtlCache(60_000);
+            t = System.nanoTime();
+            for (int id : READS) {
+                Entry e = cache.get(id);
+                if (e == null) { Optional&lt;String&gt; v = db.find(id); cache.put(id, v); }
+            }
+            report("cache-aside", t, cache, db);
+            // ...and on a write: update the DB, then invalidate (not update) the cached copy
+            db.save(2, "Emma (2nd ed.)");
+            cache.invalidate(2);
+            Entry e2 = cache.get(2);
+            String after = e2 != null ? e2.value().orElseThrow() : db.find(2).orElseThrow();
+            System.out.println("  after write + invalidate, id 2 = " + after);
+
+            // 2. Read-through: same counts, but the loading logic moved into the cache
+            db.queries = 0;
+            var rt = new ReadThrough(new TtlCache(60_000), db::find);
+            t = System.nanoTime();
+            for (int id : READS) rt.get(id);
+            report("read-through", t, rt.cache, db);
+
+            // 3. Write-through: every write goes to the DB and the cache together
+            db.queries = 0;
+            var wt = new TtlCache(60_000);
+            db.save(5, "Middlemarch"); wt.put(5, Optional.of("Middlemarch"));
+            Entry e5 = wt.get(5);
+            System.out.printf("write-through   read after write: %s, db reads %d%n", e5.value().orElseThrow(), db.queries);
+
+            // 4. Negative caching: remember "not found" too
+            db.queries = 0;
+            for (int i = 0; i &lt; 5; i++) db.find(99);
+            System.out.printf("no negative cache: 5 lookups of id 99 -&gt; %d db reads%n", db.queries);
+            db.queries = 0;
+            var neg = new ReadThrough(new TtlCache(60_000), db::find);
+            for (int i = 0; i &lt; 5; i++) neg.get(99);
+            System.out.printf("negative cache:    5 lookups of id 99 -&gt; %d db read%n", db.queries);
+            db.save(99, "Persuasion");                          // the book arrives...
+            System.out.println("  after insert, cache still says: " + neg.get(99).orElse("not found"));
+
+            // 5. TTL staleness: someone updates the DB behind the cache's back
+            var ttl = new ReadThrough(new TtlCache(300), db::find);
+            ttl.get(3);
+            long changed = System.nanoTime();
+            db.save(3, "Ulysses (annotated)");
+            String seen;
+            do { sleep(50); seen = ttl.get(3).orElseThrow(); }
+            while (seen.equals("Ulysses"));
+            System.out.printf("TTL 300 ms: stale for %d ms, then saw '%s'%n", (System.nanoTime() - changed) / 1_000_000, seen);
+        }
+        Files.delete(file);
+    }
+
+    static void report(String name, long start, TtlCache c, BookDb db) {
+        System.out.printf("%-15s reads %d, hits %d, misses %d, db reads %d, %d ms%n",
+                name, READS.length, c.hits, c.misses, db.queries, (System.nanoTime() - start) / 1_000_000);
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">no cache        reads 10, db reads 10, 76 ms
+cache-aside     reads 10, hits 6, misses 4, db reads 4, 30 ms
+  after write + invalidate, id 2 = Emma (2nd ed.)
+read-through    reads 10, hits 6, misses 4, db reads 4, 30 ms
+write-through   read after write: Middlemarch, db reads 0
+no negative cache: 5 lookups of id 99 -> 5 db reads
+negative cache:    5 lookups of id 99 -> 1 db read
+  after insert, cache still says: not found
+TTL 300 ms: stale for 346 ms, then saw 'Ulysses (annotated)'</pre>
+<pre class="out">no cache        reads 10, db reads 10, 73 ms
+cache-aside     reads 10, hits 6, misses 4, db reads 4, 30 ms
+  after write + invalidate, id 2 = Emma (2nd ed.)
+read-through    reads 10, hits 6, misses 4, db reads 4, 28 ms
+write-through   read after write: Middlemarch, db reads 0
+no negative cache: 5 lookups of id 99 -> 5 db reads
+negative cache:    5 lookups of id 99 -> 1 db read
+  after insert, cache still says: not found
+TTL 300 ms: stale for 345 ms, then saw 'Ulysses (annotated)'</pre>
+</div>
+<p>The same ten reads (four distinct books) went from ten database queries to four. Here is what each pattern means:</p>
+<ul>
+  <li><b>Cache-aside</b> (also called lazy loading). In the primer's words, "The application is responsible for reading and writing from storage. The cache does not interact with storage directly." On a read: check the cache; on a miss, load from the database and put it in the cache. On a write: update the database, then <em>invalidate</em> (delete) the cached copy, so the next read loads the fresh value. Deleting rather than updating is deliberate: you never risk writing a value computed from stale data. Memcached "is generally used in this manner".</li>
+  <li><b>Read-through.</b> The same reads, but the loading logic lives <em>inside</em> the cache. The application asks only the cache, which calls a loader on a miss. It's the decorator idea from L39: <code>ReadThrough</code> wraps the database's <code>find</code>. Caffeine, the standard Java cache library, calls this a <code>LoadingCache</code>: "a Cache built with an attached CacheLoader" (<a href="https://github.com/ben-manes/caffeine/wiki/Population">Caffeine wiki: Population</a>).</li>
+  <li><b>Write-through.</b> Every write goes to the database and the cache together, so a read right after a write is a hit, and "Data in the cache is not stale". The cost: every write pays for both, and much written data may never be read.</li>
+  <li><b>Write-behind</b> (write-back). Writes go to the cache immediately and reach the database later, in batches. Writes are fast; the risk is in the next demo.</li>
+  <li><b>Refresh-ahead.</b> The cache reloads popular entries <em>before</em> they expire, so readers never wait for a miss. Caffeine's version: "The old value (if any) is still returned while the key is being refreshed" (<a href="https://github.com/ben-manes/caffeine/wiki/Refresh">Caffeine wiki: Refresh</a>). The primer's warning: if you predict the wrong keys, you load data nobody asks for.</li>
+</ul>
+<p>Look again at <code>ReadThrough.get</code> in Kotlin. It checks the <em>entry</em>, not the value, because a cached "not found" is stored as <code>null</code>. The tempting one-liner <code>cache.get(id)?.value ?: load(id)</code> would treat a cached <code>null</code> as a miss and reload every time: the same trap as <code>getOrPut</code> with null values in L39.</p>
+
+<h3>Negative caching</h3>
+<p>Looking up a book that doesn't exist hits the database every time, which is exactly what an attacker or a broken client does in a loop. <b>Negative caching</b> remembers "not found" too: 5 lookups, 1 query. The risk is in the next output line: when the book is added, the cache keeps saying "not found" until the entry expires. Give negative entries a short TTL, or invalidate them on insert.</p>
+
+<h3>TTL: how long you're willing to be wrong</h3>
+<p>The last line is the important one. Someone updated the database without telling the cache (another service, an admin, a script), and the cache served the old title for 345 ms: the 300 ms TTL plus up to 50 ms of polling. A TTL is a promise about staleness: "I might be wrong, but never for longer than this". Pick it per kind of data: a book's title can be stale for minutes; a bank balance can't be cached this way at all.</p>
+
+<h3>Write-behind: what a crash costs</h3>
+<p>Write-behind is the fastest way to write and the easiest way to lose data. The primer lists it as the first disadvantage: "There could be data loss if the cache goes down prior to its contents hitting the data store." This program sells stock through a write-behind cache that flushes every 500 ms, then cuts the power with <code>Runtime.halt</code>, which stops the JVM without running shutdown hooks:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · WriteBehind.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.nio.file.Path
+import java.sql.DriverManager
+import java.util.TreeMap
+import java.util.concurrent.BlockingQueue
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+
+// Write-behind: writes land in the cache at once and reach the database later,
+// in batches. Run "write" (which crashes on purpose), then "check".
+val DB: Path = Path.of(System.getProperty("java.io.tmpdir"), "l41-writebehind.db")
+
+fun main(args: Array&lt;String&gt;) {
+    if (args[0] == "check") { check(); return }
+    Files.deleteIfExists(DB)
+    DriverManager.getConnection("jdbc:sqlite:$DB").use { c -&gt;
+        c.createStatement().use { s -&gt;
+            s.execute("CREATE TABLE stock(sku TEXT PRIMARY KEY, qty INTEGER NOT NULL)")
+            s.execute("INSERT INTO stock VALUES ('dune', 10), ('emma', 10), ('ulysses', 10)")
+        }
+    }
+    val cache = ConcurrentHashMap(mapOf("dune" to 10, "emma" to 10, "ulysses" to 10))
+    val dirty = LinkedBlockingQueue&lt;String&gt;()               // keys waiting to be written
+
+    // The flusher: every 500 ms, write all dirty keys to the database in one transaction
+    val flusher = Executors.newSingleThreadScheduledExecutor()
+    flusher.scheduleAtFixedRate({
+        val batch = mutableListOf&lt;String&gt;()
+        dirty.drainTo(batch)
+        if (batch.isNotEmpty()) {
+            DriverManager.getConnection("jdbc:sqlite:$DB").use { c -&gt;
+                c.prepareStatement("UPDATE stock SET qty = ? WHERE sku = ?").use { u -&gt;
+                    c.autoCommit = false
+                    for (sku in batch.toSet()) { u.setInt(1, cache.getValue(sku)); u.setString(2, sku); u.executeUpdate() }
+                    c.commit()
+                }
+            }
+            println("  flushed ${batch.size} writes")
+        }
+    }, 500, 500, TimeUnit.MILLISECONDS)
+
+    // Writes are instant: cache first, database "later"
+    sell(cache, dirty, "dune", 3); sell(cache, dirty, "emma", 1)
+    Thread.sleep(700)                                       // one flush happens
+    sell(cache, dirty, "dune", 2); sell(cache, dirty, "ulysses", 4); sell(cache, dirty, "emma", 5)
+    println("cache says: ${TreeMap(cache)}, queued: ${dirty.size}")
+    println("power cut!")
+    Runtime.getRuntime().halt(1)                            // no shutdown hooks, no final flush
+}
+
+fun sell(cache: MutableMap&lt;String, Int&gt;, dirty: BlockingQueue&lt;String&gt;, sku: String, n: Int) {
+    cache.merge(sku, -n, Int::plus)
+    dirty.add(sku)
+}
+
+fun check() {
+    val rows = TreeMap&lt;String, Int&gt;()
+    DriverManager.getConnection("jdbc:sqlite:$DB").use { c -&gt;
+        c.createStatement().executeQuery("SELECT sku, qty FROM stock").use { rs -&gt;
+            while (rs.next()) rows[rs.getString(1)] = rs.getInt(2)
+        }
+    }
+    println("database says: $rows")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · WriteBehind.java</figcaption>
+<pre><code class="language-java">import java.nio.file.*;
+import java.sql.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+// Write-behind: writes land in the cache at once and reach the database later,
+// in batches. Run "write" (which crashes on purpose), then "check".
+public class WriteBehind {
+    static final Path DB = Path.of(System.getProperty("java.io.tmpdir"), "l41-writebehind.db");
+
+    public static void main(String[] args) throws Exception {
+        if (args[0].equals("check")) { check(); return; }
+        Files.deleteIfExists(DB);
+        try (var c = DriverManager.getConnection("jdbc:sqlite:" + DB); var s = c.createStatement()) {
+            s.execute("CREATE TABLE stock(sku TEXT PRIMARY KEY, qty INTEGER NOT NULL)");
+            s.execute("INSERT INTO stock VALUES ('dune', 10), ('emma', 10), ('ulysses', 10)");
+        }
+        var cache = new ConcurrentHashMap&lt;String, Integer&gt;(Map.of("dune", 10, "emma", 10, "ulysses", 10));
+        var dirty = new LinkedBlockingQueue&lt;String&gt;();       // keys waiting to be written
+
+        // The flusher: every 500 ms, write all dirty keys to the database in one transaction
+        var flusher = Executors.newSingleThreadScheduledExecutor();
+        flusher.scheduleAtFixedRate(() -&gt; {
+            var batch = new ArrayList&lt;String&gt;();
+            dirty.drainTo(batch);
+            if (batch.isEmpty()) return;
+            try (var c = DriverManager.getConnection("jdbc:sqlite:" + DB);
+                 var u = c.prepareStatement("UPDATE stock SET qty = ? WHERE sku = ?")) {
+                c.setAutoCommit(false);
+                for (String sku : new LinkedHashSet&lt;&gt;(batch)) { u.setInt(1, cache.get(sku)); u.setString(2, sku); u.executeUpdate(); }
+                c.commit();
+                System.out.println("  flushed " + batch.size() + " writes");
+            } catch (SQLException e) { throw new IllegalStateException(e); }
+        }, 500, 500, TimeUnit.MILLISECONDS);
+
+        // Writes are instant: cache first, database "later"
+        sell(cache, dirty, "dune", 3); sell(cache, dirty, "emma", 1);
+        Thread.sleep(700);                                      // one flush happens
+        sell(cache, dirty, "dune", 2); sell(cache, dirty, "ulysses", 4); sell(cache, dirty, "emma", 5);
+        System.out.println("cache says: " + new TreeMap&lt;&gt;(cache) + ", queued: " + dirty.size());
+        System.out.println("power cut!");
+        Runtime.getRuntime().halt(1);                           // no shutdown hooks, no final flush
+    }
+
+    static void sell(Map&lt;String, Integer&gt; cache, BlockingQueue&lt;String&gt; dirty, String sku, int n) {
+        cache.merge(sku, -n, Integer::sum);
+        dirty.add(sku);
+    }
+
+    static void check() throws SQLException {
+        var rows = new TreeMap&lt;String, Integer&gt;();
+        try (var c = DriverManager.getConnection("jdbc:sqlite:" + DB);
+             var rs = c.createStatement().executeQuery("SELECT sku, qty FROM stock")) {
+            while (rs.next()) rows.put(rs.getString(1), rs.getInt(2));
+        }
+        System.out.println("database says: " + rows);
+    }
+}</code></pre></figure>
+</div>
+<pre class="term"><span class="p">$ </span>java --enable-native-access=ALL-UNNAMED -cp sqlite-jdbc-3.53.4.0.jar WriteBehind.java write
+  flushed 2 writes
+cache says: {dune=5, emma=4, ulysses=6}, queued: 3
+power cut!
+<span class="p">$ </span>echo $?
+1
+<span class="p">$ </span>java --enable-native-access=ALL-UNNAMED -cp sqlite-jdbc-3.53.4.0.jar WriteBehind.java check
+database says: {dune=7, emma=9, ulysses=10}</pre>
+<p>The Kotlin version prints the same lines. Five sales were acknowledged; the database has only the first two. Three sales are gone, and nothing anywhere records that they happened. Real write-behind systems reduce the risk with a durable queue (L42) or a replicated cache, but they never make it zero. Use write-behind only for data you can afford to lose or rebuild, such as view counters.</p>
+
+<h3>The race inside cache-aside</h3>
+<p>Cache-aside has a classic race, and it involves the "invalidate on write" rule itself. It needs this exact interleaving:</p>
+<ol>
+  <li>A reader misses and reads the <em>old</em> value from the database.</li>
+  <li>Before the reader puts it in the cache, a writer updates the database and invalidates the cache (which is empty anyway).</li>
+  <li>The reader now puts the old value into the cache. It stays there until it expires.</li>
+</ol>
+<p>Races are rare and timing-dependent (L26), so the demo forces this exact order with two latches:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Race.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+
+// The classic cache-aside race, forced into one exact interleaving with latches (L26):
+// reader misses, reads the old value, the writer updates + invalidates, then the
+// reader puts the OLD value into the cache. Then a fix: versioned values.
+data class Row(val title: String, val version: Long)
+
+fun main() {
+    println("plain cache-aside:  cache = ${run(versioned = false)}   database = Emma (2nd ed.)")
+    println("versioned cache:    cache = ${run(versioned = true)}   database = Emma (2nd ed.)")
+}
+
+// keep whichever row is newer: an old read can never overwrite a newer one
+val newer = { old: Row, nu: Row -&gt; if (nu.version &gt; old.version) nu else old }
+
+fun run(versioned: Boolean): String {
+    val db = ConcurrentHashMap(mapOf(2 to Row("Emma", 1)))
+    val cache = ConcurrentHashMap&lt;Int, Row&gt;()
+    val readerHasOldValue = CountDownLatch(1)
+    val writerDone = CountDownLatch(1)
+
+    val reader = Thread.ofVirtual().start {
+        val fromDb = db.getValue(2)                     // cache miss, so read the database: v1
+        readerHasOldValue.countDown()
+        writerDone.await()                              // ...the reader gets descheduled here...
+        if (versioned) cache.merge(2, fromDb, newer)
+        else cache[2] = fromDb                          // writes v1 back into the cache: stale!
+    }
+    val writer = Thread.ofVirtual().start {
+        readerHasOldValue.await()
+        val updated = Row("Emma (2nd ed.)", 2)
+        db[2] = updated                                 // update the database...
+        if (versioned) cache.merge(2, updated, newer)
+        else cache.remove(2)                            // ...then invalidate the cache
+        writerDone.countDown()
+    }
+    reader.join(); writer.join()
+    return cache.getValue(2).title
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Race.java</figcaption>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+
+// The classic cache-aside race, forced into one exact interleaving with latches (L26):
+// reader misses, reads the old value, the writer updates + invalidates, then the
+// reader puts the OLD value into the cache. Then a fix: versioned values.
+public class Race {
+    record Row(String title, long version) {}
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("plain cache-aside:  cache = " + run(false) + "   database = Emma (2nd ed.)");
+        System.out.println("versioned cache:    cache = " + run(true) + "   database = Emma (2nd ed.)");
+    }
+
+    static String run(boolean versioned) throws Exception {
+        var db = new ConcurrentHashMap&lt;Integer, Row&gt;(Map.of(2, new Row("Emma", 1)));
+        var cache = new ConcurrentHashMap&lt;Integer, Row&gt;();
+        var readerHasOldValue = new CountDownLatch(1);
+        var writerDone = new CountDownLatch(1);
+
+        Thread reader = Thread.ofVirtual().start(() -&gt; {
+            Row fromDb = db.get(2);                     // cache miss, so read the database: v1
+            readerHasOldValue.countDown();
+            await(writerDone);                          // ...the reader gets descheduled here...
+            if (versioned) {
+                // keep whichever row is newer: an old read can never overwrite a newer one
+                cache.merge(2, fromDb, (old, nu) -&gt; nu.version() &gt; old.version() ? nu : old);
+            } else {
+                cache.put(2, fromDb);                   // writes v1 back into the cache: stale!
+            }
+        });
+        Thread writer = Thread.ofVirtual().start(() -&gt; {
+            await(readerHasOldValue);
+            Row updated = new Row("Emma (2nd ed.)", 2);
+            db.put(2, updated);                         // update the database...
+            if (versioned) cache.merge(2, updated, (old, nu) -&gt; nu.version() &gt; old.version() ? nu : old);
+            else cache.remove(2);                       // ...then invalidate the cache
+            writerDone.countDown();
+        });
+        reader.join(); writer.join();
+        return cache.get(2).title();
+    }
+
+    static void await(CountDownLatch l) {
+        try { l.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">plain cache-aside:  cache = Emma   database = Emma (2nd ed.)
+versioned cache:    cache = Emma (2nd ed.)   database = Emma (2nd ed.)</pre>
+<p>Both languages print exactly this. Without the fix, the cache holds the old title with nothing to correct it but the TTL. The fix gives every row a <b>version number</b> that increases on each write; the writer puts the new versioned row into the cache, and <code>merge</code> keeps whichever row is newer, atomically (L27). The reader's late write of version 1 loses to version 2, whatever the order. Other real fixes: keep a short TTL so the damage is bounded, or use "leases", as described in Facebook's paper <em>Scaling Memcache at Facebook</em> (<a href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala">Nishtala et al., NSDI 2013</a>).</p>
+
+<h3>Stampede: everyone misses at once</h3>
+<p>A popular key expires, and 50 requests arrive in the same millisecond. All 50 miss, and all 50 query the database for the same row: a <b>cache stampede</b>, or thundering herd. It's L27's check-then-act bug at system scale, and it hits right when the database is busiest. The fix is <b>request coalescing</b>: the first miss starts the load; everyone else waits for that same load.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Stampede.kt (needs kotlinx-coroutines-core on the classpath)</figcaption>
+<pre><code class="language-kotlin">import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+// A hot key expires and 50 requests arrive at once. Plain cache-aside sends all
+// 50 to the database; request coalescing sends one and lets the other 49 wait for it.
+val dbQueries = AtomicInteger()
+
+fun slowDbFind(id: Int): String {                   // the database: 50 ms per query (blocking, like JDBC)
+    dbQueries.incrementAndGet()
+    Thread.sleep(50)
+    return "Dune"
+}
+
+val cache = ConcurrentHashMap&lt;Int, String&gt;()
+
+// Plain cache-aside: check, miss, load, put
+suspend fun getPlain(id: Int): String =
+    cache[id] ?: withContext(Dispatchers.IO) { slowDbFind(id) }.also { cache[id] = it }
+
+// Coalescing: the first miss starts one async load; everyone else awaits the same Deferred
+val inFlight = HashMap&lt;Int, Deferred&lt;String&gt;&gt;()
+val inFlightLock = Mutex()
+val loaderScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+suspend fun getCoalesced(id: Int): String {
+    cache[id]?.let { return it }
+    val load = inFlightLock.withLock {
+        inFlight.getOrPut(id) {                         // safe here: the Mutex makes it atomic
+            loaderScope.async { slowDbFind(id).also { cache[id] = it } }
+        }
+    }
+    try {
+        return load.await()                             // a failed load throws here for every waiter
+    } finally {
+        inFlightLock.withLock { if (inFlight[id] === load) inFlight.remove(id) }
+    }
+}
+
+fun main() = runBlocking {
+    burst("plain") { getPlain(1) }
+    cache.clear()                                       // the hot key expires again
+    burst("coalesced") { getCoalesced(1) }
+    loaderScope.cancel()
+}
+
+suspend fun burst(name: String, request: suspend () -&gt; String) = coroutineScope {
+    dbQueries.set(0)
+    val gate = CompletableDeferred&lt;Unit&gt;()
+    val jobs = List(50) { async(Dispatchers.Default) { gate.await(); request() } }
+    val t = System.nanoTime()
+    gate.complete(Unit)                                 // release all 50 at once
+    jobs.awaitAll()
+    println("%-10s 50 requests -&gt; %2d database queries, %d ms"
+        .format(name, dbQueries.get(), (System.nanoTime() - t) / 1_000_000))
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Stampede.java</figcaption>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+// A hot key expires and 50 requests arrive at once. Plain cache-aside sends all
+// 50 to the database; request coalescing sends one and lets the other 49 wait for it.
+public class Stampede {
+    static final AtomicInteger dbQueries = new AtomicInteger();
+
+    static String slowDbFind(int id) {               // the database: 50 ms per query
+        dbQueries.incrementAndGet();
+        try { Thread.sleep(50); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return "Dune";
+    }
+
+    // Plain cache-aside: check, miss, load, put
+    static final Map&lt;Integer, String&gt; cache = new ConcurrentHashMap&lt;&gt;();
+    static String getPlain(int id) {
+        String v = cache.get(id);
+        if (v == null) { v = slowDbFind(id); cache.put(id, v); }
+        return v;
+    }
+
+    // Coalescing: the first miss creates a future; everyone else waits on the same one
+    static final Map&lt;Integer, CompletableFuture&lt;String&gt;&gt; inFlight = new ConcurrentHashMap&lt;&gt;();
+    static String getCoalesced(int id) {
+        String v = cache.get(id);
+        if (v != null) return v;
+        var mine = new CompletableFuture&lt;String&gt;();
+        var running = inFlight.putIfAbsent(id, mine);  // atomic: exactly one caller wins
+        if (running != null) return running.join();    // someone is already loading: wait
+        try {
+            String loaded = slowDbFind(id);
+            cache.put(id, loaded);
+            mine.complete(loaded);
+            return loaded;
+        } catch (RuntimeException e) {
+            mine.completeExceptionally(e);              // waiters see the failure too
+            throw e;
+        } finally {
+            inFlight.remove(id, mine);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        burst("plain", () -&gt; getPlain(1));
+        cache.clear();                                  // the hot key expires again
+        burst("coalesced", () -&gt; getCoalesced(1));
+    }
+
+    static void burst(String name, Callable&lt;String&gt; request) throws Exception {
+        dbQueries.set(0);
+        var gate = new CountDownLatch(1);
+        long t;
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            var results = new ArrayList&lt;Future&lt;String&gt;&gt;();
+            for (int i = 0; i &lt; 50; i++) results.add(pool.submit(() -&gt; { gate.await(); return request.call(); }));
+            t = System.nanoTime();
+            gate.countDown();                           // release all 50 at once
+            for (var f : results) f.get();
+        }
+        System.out.printf("%-10s 50 requests -&gt; %2d database queries, %d ms%n",
+                name, dbQueries.get(), (System.nanoTime() - t) / 1_000_000);
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">plain      50 requests -> 50 database queries, 64 ms
+coalesced  50 requests ->  1 database queries, 58 ms</pre>
+<pre class="out">plain      50 requests -> 50 database queries, 58 ms
+coalesced  50 requests ->  1 database queries, 55 ms</pre>
+</div>
+<p>I ran each version several times: always 50 queries without coalescing and exactly 1 with it. The wall time looks the same only because this fake database never gets overloaded; a real one serving 50 identical queries slows down for every other user too.</p>
+<ul>
+  <li><b>Java</b> keeps a <code>ConcurrentHashMap&lt;Integer, CompletableFuture&lt;String&gt;&gt;</code> of loads in progress. <code>putIfAbsent</code> is atomic, so exactly one caller gets <code>null</code> back and does the load; the others <code>join()</code> the winner's future (L28). Why not <code>computeIfAbsent(id, k -&gt; slowDbFind(k))</code>? Its docs warn: "Some attempted update operations on this map by other threads may be blocked while computation is in progress, so the computation should be short and simple" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html#computeIfAbsent(K,java.util.function.Function)">API docs</a>). A 50 ms database call is neither, so the map holds a future, which is created instantly.</li>
+  <li><b>Kotlin</b> uses coroutines (L29): a <code>Mutex</code> guards a plain map of <code>Deferred</code> loads. Here <code>getOrPut</code> is safe, because the mutex makes the whole check-then-act atomic. The docs describe <code>Mutex</code> as "Mutual exclusion for coroutines" whose lock "happens-before every subsequent successful lock" (<a href="https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.sync/-mutex/">Mutex API docs</a>), just like <code>synchronized</code>.</li>
+  <li><b>Both</b> remove the in-flight entry when the load finishes, success or failure, and pass a failure on to every waiter, so one bad load doesn't wedge the key forever.</li>
+</ul>
+
+<h3>Which entry to throw away</h3>
+<p>A cache is smaller than the data behind it, so when it's full something must go. The three classic eviction policies are <b>LRU</b> (least recently used), <b>LFU</b> (least frequently used) and <b>FIFO</b> (oldest inserted). Real traffic is skewed: a few books get most of the requests. The simulation below uses a Zipf-like distribution, where the <em>r</em>-th most popular key is requested in proportion to 1/<em>r</em>, with a fixed seed:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Eviction.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.Random
+
+// LRU vs LFU vs FIFO on a skewed (Zipf-like) workload: a few keys are very popular.
+// Capacity 100, 1,000 keys, 200,000 requests, fixed seed.
+typealias Policy = (Int) -&gt; Boolean                   // true = hit
+
+fun lru(cap: Int): Policy {                           // L19: access-order LinkedHashMap
+    val m = object : LinkedHashMap&lt;Int, Boolean&gt;(16, 0.75f, true) {
+        override fun removeEldestEntry(e: MutableMap.MutableEntry&lt;Int, Boolean&gt;?) = size &gt; cap
+    }
+    return { k -&gt; if (m[k] != null) true else { m[k] = true; false } }
+}
+
+fun fifo(cap: Int): Policy {                          // insertion order: oldest goes first
+    val m = object : LinkedHashMap&lt;Int, Boolean&gt;() {
+        override fun removeEldestEntry(e: MutableMap.MutableEntry&lt;Int, Boolean&gt;?) = size &gt; cap
+    }
+    return { k -&gt; if (k in m) true else { m[k] = true; false } }
+}
+
+fun lfu(cap: Int): Policy {                           // evict the cached key used least often
+    val count = HashMap&lt;Int, Int&gt;()
+    return { k -&gt;
+        if (k in count) { count.merge(k, 1, Int::plus); true }
+        else {
+            if (count.size == cap) count.remove(count.minBy { it.value }.key)
+            count[k] = 1
+            false
+        }
+    }
+}
+
+fun main() {
+    val keys = 1_000; val cap = 100; val requests = 200_000
+    val cdf = DoubleArray(keys)                       // Zipf: P(rank r) is proportional to 1/r
+    var total = 0.0
+    for (r in 1..keys) { total += 1.0 / r; cdf[r - 1] = total }
+
+    for (scans in listOf(false, true)) {
+        println(if (scans) "Zipf + a one-off scan of 500 cold keys every 1,000 requests" else "Zipf only")
+        for ((name, make) in listOf("LRU" to ::lru, "LFU" to ::lfu, "FIFO" to ::fifo)) {
+            val p = make(cap)
+            val rnd = Random(41)
+            var hits = 0
+            for (i in 0 until requests) {
+                if (scans &amp;&amp; i % 1_000 == 0)
+                    for (cold in 0 until 500) p(10_000 + i * 500 + cold)       // never seen again
+                val idx = cdf.binarySearch(rnd.nextDouble() * total)
+                val key = if (idx &gt;= 0) idx else -idx - 1
+                if (p(key)) hits++
+            }
+            println("  %-4s hit rate %.1f%%".format(name, 100.0 * hits / requests))
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Eviction.java</figcaption>
+<pre><code class="language-java">import java.util.*;
+
+// LRU vs LFU vs FIFO on a skewed (Zipf-like) workload: a few keys are very popular.
+// Capacity 100, 1,000 keys, 200,000 requests, fixed seed.
+public class Eviction {
+    interface Policy { boolean access(int key); }        // true = hit
+
+    static Policy lru(int cap) {                          // L19: access-order LinkedHashMap
+        var m = new LinkedHashMap&lt;Integer, Boolean&gt;(16, 0.75f, true) {
+            protected boolean removeEldestEntry(Map.Entry&lt;Integer, Boolean&gt; e) { return size() &gt; cap; }
+        };
+        return k -&gt; { if (m.get(k) != null) return true; m.put(k, true); return false; };
+    }
+    static Policy fifo(int cap) {                         // insertion order: oldest goes first
+        var m = new LinkedHashMap&lt;Integer, Boolean&gt;() {
+            protected boolean removeEldestEntry(Map.Entry&lt;Integer, Boolean&gt; e) { return size() &gt; cap; }
+        };
+        return k -&gt; { if (m.containsKey(k)) return true; m.put(k, true); return false; };
+    }
+    static Policy lfu(int cap) {                          // evict the cached key used least often
+        var count = new HashMap&lt;Integer, Integer&gt;();
+        return k -&gt; {
+            if (count.containsKey(k)) { count.merge(k, 1, Integer::sum); return true; }
+            if (count.size() == cap) {
+                int victim = Collections.min(count.entrySet(), Map.Entry.comparingByValue()).getKey();
+                count.remove(victim);
+            }
+            count.put(k, 1);
+            return false;
+        };
+    }
+
+    public static void main(String[] args) {
+        int keys = 1_000, cap = 100, requests = 200_000;
+        double[] cdf = new double[keys];                  // Zipf: P(rank r) is proportional to 1/r
+        double total = 0;
+        for (int r = 1; r &lt;= keys; r++) { total += 1.0 / r; cdf[r - 1] = total; }
+
+        for (boolean scans : new boolean[] {false, true}) {
+            System.out.println(scans ? "Zipf + a one-off scan of 500 cold keys every 1,000 requests" : "Zipf only");
+            for (String name : List.of("LRU", "LFU", "FIFO")) {
+                Policy p = switch (name) { case "LRU" -&gt; lru(cap); case "LFU" -&gt; lfu(cap); default -&gt; fifo(cap); };
+                var rnd = new Random(41);
+                int hits = 0, gets = 0;
+                for (int i = 0; i &lt; requests; i++) {
+                    if (scans &amp;&amp; i % 1_000 == 0)
+                        for (int cold = 0; cold &lt; 500; cold++) p.access(10_000 + i * 500 + cold);   // never seen again
+                    int idx = Arrays.binarySearch(cdf, rnd.nextDouble() * total);
+                    int key = idx &gt;= 0 ? idx : -idx - 1;
+                    gets++;
+                    if (p.access(key)) hits++;
+                }
+                System.out.printf("  %-4s hit rate %.1f%%%n", name, 100.0 * hits / gets);
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">Zipf only
+  LRU  hit rate 57.7%
+  LFU  hit rate 56.3%
+  FIFO hit rate 52.2%
+Zipf + a one-off scan of 500 cold keys every 1,000 requests
+  LRU  hit rate 55.4%
+  LFU  hit rate 60.1%
+  FIFO hit rate 50.7%</pre>
+<p>Both languages print identical numbers (same seed, same <code>java.util.Random</code>). With a cache holding 10% of the keys, all three policies serve over half the requests, which is the power of skew. FIFO is worst: it evicts popular keys just because they're old. LRU wins on plain skewed traffic. But add occasional <b>scans</b> (a report or a crawler touching hundreds of keys once each) and LRU loses: every scanned key becomes "most recently used" and pushes hot keys out. LFU ignores one-off keys, so it wins there. Plain LFU has its own weakness, visible in the first result: a new key starts with a count of 1, so it's the first evicted even if it's about to become popular.</p>
+<p>Production caches combine both ideas. Caffeine "uses the Window TinyLfu policy due to its high hit rate and low memory footprint": a small LRU window in front of a frequency-based main area (<a href="https://github.com/ben-manes/caffeine/wiki/Efficiency">Caffeine wiki: Efficiency</a>). Redis's LRU is approximate on purpose: it "samples a small number of keys at random and then evicts the ones with the longest time since last access" (<a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis docs: Key eviction</a>).</p>
+
+<p>Step through the four patterns below. The counts in each tab come from the runs above.</p>
+<div class="cacheflow" data-src="cf-patterns"></div>
+<script type="application/json" id="cf-patterns">{
+ "lanes": ["Client", "App", "Cache", "Database"],
+ "tabs": [
+  {"name": "cache-aside",
+   "initial": {"db": {"1": "Dune", "2": "Emma", "3": "Ulysses", "4": "Beloved"}, "counts": {"hits": 0, "misses": 0, "db reads": 0}},
+   "steps": [
+    {"from": 0, "to": 1, "text": "GET book 1", "kind": "req", "note": "A request reaches the application."},
+    {"from": 1, "to": 2, "text": "get 1 → miss", "kind": "miss", "counts": {"hits": 0, "misses": 1, "db reads": 0}, "note": "Cache-aside: the app asks the cache first. It's empty, so this is a miss."},
+    {"from": 1, "to": 3, "text": "SELECT … id = 1", "kind": "req", "counts": {"hits": 0, "misses": 1, "db reads": 1}, "note": "The <em>application</em> loads from the database. The cache never talks to the database itself."},
+    {"from": 3, "to": 1, "text": "Dune", "kind": "res", "note": "About 7 ms here (5 ms of injected delay plus the query)."},
+    {"from": 1, "to": 2, "text": "put 1 = Dune", "kind": "write", "cache": {"1": "Dune"}, "note": "Then it puts the value in the cache for next time."},
+    {"from": 1, "to": 0, "text": "Dune", "kind": "res", "note": "And answers the client."},
+    {"from": 0, "to": 1, "text": "GET book 1", "kind": "req", "note": "The same book again."},
+    {"from": 1, "to": 2, "text": "get 1 → hit", "kind": "hit", "counts": {"hits": 1, "misses": 1, "db reads": 1}, "note": "A hit: no database query. Over the demo's 10 reads this happened 6 times."},
+    {"from": 0, "to": 1, "text": "PUT book 2", "kind": "req", "note": "Now a write."},
+    {"from": 1, "to": 3, "text": "UPDATE 2 = Emma (2nd ed.)", "kind": "write", "db": {"1": "Dune", "2": "Emma (2nd ed.)", "3": "Ulysses", "4": "Beloved"}, "note": "Write the source of truth first..."},
+    {"from": 1, "to": 2, "text": "invalidate 2", "kind": "write", "note": "...then <em>delete</em> the cached copy, so the next read of book 2 misses and loads the new title. The demo printed <code>after write + invalidate, id 2 = Emma (2nd ed.)</code>."}
+   ]},
+  {"name": "write-behind",
+   "initial": {"cache": {"dune": 10, "emma": 10, "ulysses": 10}, "db": {"dune": 10, "emma": 10, "ulysses": 10}, "counts": {"queued": 0}},
+   "steps": [
+    {"from": 0, "to": 1, "text": "sell 3 × dune, 1 × emma", "kind": "req", "note": "Two sales arrive."},
+    {"from": 1, "to": 2, "text": "dune = 7, emma = 9", "kind": "write", "cache": {"dune": 7, "emma": 9, "ulysses": 10}, "counts": {"queued": 2}, "note": "Write-behind: the cache is updated at once and the keys are queued. The client gets its answer immediately."},
+    {"from": 2, "to": 3, "text": "flush 2 writes", "kind": "async", "db": {"dune": 7, "emma": 9, "ulysses": 10}, "counts": {"queued": 0}, "note": "Every 500 ms the flusher writes the queued keys in one transaction. Real run: <code>flushed 2 writes</code>."},
+    {"from": 0, "to": 1, "text": "sell 2 dune, 4 ulysses, 5 emma", "kind": "req", "note": "Three more sales."},
+    {"from": 1, "to": 2, "text": "dune = 5, ulysses = 6, emma = 4", "kind": "write", "cache": {"dune": 5, "emma": 4, "ulysses": 6}, "counts": {"queued": 3}, "note": "Acknowledged to the client, queued for the next flush."},
+    {"from": 2, "to": 3, "text": "power cut! (never flushed)", "kind": "lost", "note": "<code>Runtime.halt(1)</code>: the 3 queued writes never reach the database. Real run afterwards: <code>database says: {dune=7, emma=9, ulysses=10}</code>. With <b>write-through</b>, the app would have waited for each database write before answering, so nothing acknowledged could be lost."}
+   ]},
+  {"name": "TTL + stale read",
+   "initial": {"db": {"3": "Ulysses"}, "counts": {"ms since update": "–"}},
+   "steps": [
+    {"from": 1, "to": 3, "text": "load 3 (miss)", "kind": "miss", "cache": {"3": "Ulysses (TTL 300 ms)"}, "note": "A read loads book 3 and caches it for 300 ms."},
+    {"from": 0, "to": 3, "text": "admin: UPDATE 3", "kind": "write", "db": {"3": "Ulysses (annotated)"}, "counts": {"ms since update": 0}, "note": "Someone updates the database directly. Nobody tells the cache."},
+    {"from": 1, "to": 2, "text": "get 3 → Ulysses", "kind": "hit", "counts": {"ms since update": 50}, "note": "A hit, and a stale one: the cache still has the old title."},
+    {"from": 1, "to": 2, "text": "get 3 → Ulysses", "kind": "hit", "counts": {"ms since update": 300}, "note": "Still stale. The cache has no way of knowing."},
+    {"from": 1, "to": 2, "text": "get 3 → expired", "kind": "miss", "counts": {"ms since update": 345}, "note": "The entry's TTL has run out, so this read misses..."},
+    {"from": 1, "to": 3, "text": "reload 3", "kind": "req", "cache": {"3": "Ulysses (annotated)"}, "note": "...and loads the new title. Real run: <code>stale for 345 ms</code> with a 300 ms TTL; the extra is the 50 ms polling step. The TTL is the most you'll ever be wrong by."}
+   ]},
+  {"name": "stampede",
+   "initial": {"cache": {"1": "Dune (expired)"}, "db": {"1": "Dune"}, "counts": {"plain: db queries": 0, "coalesced: db queries": 0}},
+   "steps": [
+    {"from": 0, "to": 1, "text": "50 × GET book 1", "kind": "burst", "note": "A hot key has just expired, and 50 requests arrive at once."},
+    {"from": 1, "to": 2, "text": "50 × get 1 → miss", "kind": "miss", "note": "All 50 check the cache before any of them has reloaded it."},
+    {"from": 1, "to": 3, "text": "50 × SELECT … id = 1", "kind": "burst", "counts": {"plain: db queries": 50, "coalesced: db queries": 0}, "note": "Plain cache-aside: all 50 go to the database for the same row. Real run: <code>50 database queries</code>."},
+    {"from": 1, "to": 2, "text": "coalesced: 1 loads, 49 wait", "kind": "hit", "note": "Same burst with coalescing: the first miss puts a future in a map of in-flight loads; the other 49 find it and wait on it."},
+    {"from": 1, "to": 3, "text": "1 × SELECT … id = 1", "kind": "req", "counts": {"plain: db queries": 50, "coalesced: db queries": 1}, "note": "One query. Real run: <code>1 database queries</code>."},
+    {"from": 3, "to": 1, "text": "Dune → all 50", "kind": "res", "cache": {"1": "Dune"}, "note": "When it completes, the value goes into the cache and every waiter gets it."}
+   ]}
+ ]
+}</script>
+
+<p class="callout"><b>"There are only two hard things in Computer Science: cache invalidation and naming things."</b> Phil Karlton's line, via <a href="https://martinfowler.com/bliki/TwoHardThings.html">Martin Fowler's bliki</a>. You've now seen why the first one is hard: stale reads after an update, a race that writes old data back, and negative entries that outlive the truth. A cache trades correctness for speed, so decide explicitly how stale each kind of data may be.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>String?</code> says "maybe missing" in the type, so a cached "not found" is just <code>null</code>. Java's version wraps values in <code>Optional</code>. The flip side: you must check the <em>entry</em>, not the value, or a cached <code>null</code> looks like a miss.</li>
+    <li><code>@Synchronized</code> on a method replaces Java's <code>synchronized</code> keyword (L26).</li>
+    <li>Coroutines let the coalescing version use a non-blocking <code>Mutex</code> and <code>Deferred</code>. Java's version blocks virtual threads on <code>CompletableFuture.join()</code>, which is cheap since L28.</li>
+    <li><code>merge(key, value, newer)</code> passes a lambda stored in a <code>val</code>; Java writes the same lambda inline twice.</li>
+    <li>The patterns themselves are language-neutral: Memcached and Redis don't care what language the client is written in.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a cache key that includes the query</div>
+  <ol>
+    <li>From a blank file, reproduce L40's bug: a <code>search(query)</code> that caches results under the fixed key <code>"books"</code>. Run it for <code>page=2&amp;size=3</code> and then <code>page=3&amp;size=3</code>, and show that page 3 gets page 2's books.</li>
+    <li>Write <code>canonicalKey(path, query)</code>: parse the parameters, lowercase the names, sort them, and join them back. Requests with the same parameters in any order must share one cache entry; different values must never share.</li>
+    <li>Count the database calls for the four requests <code>page=2&amp;size=3</code>, <code>size=3&amp;page=2</code>, <code>Page=2&amp;SIZE=3</code> and <code>page=3&amp;size=3</code>.</li>
+  </ol>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex2.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.TreeMap
+
+// Exercise 2: the L40 bug (a cache key that ignores the query), then a canonical key:
+// the same parameters in any order share one entry; different values never do.
+var dbCalls = 0
+
+fun searchDb(page: Int, size: Int): List&lt;String&gt; {          // the slow query
+    dbCalls++
+    return List(size) { i -&gt; "Book ${(page - 1) * size + i + 1}" }
+}
+
+fun parse(query: String): Map&lt;String, String&gt; =
+    query.split("&amp;").associateTo(TreeMap()) { pair -&gt;        // sorted by name
+        val kv = pair.split("=", limit = 2)
+        kv[0].trim().lowercase() to (kv.getOrNull(1)?.trim() ?: "")
+    }
+
+fun canonicalKey(path: String, query: String) =
+    path + "?" + parse(query).entries.joinToString("&amp;") { (k, v) -&gt; "$k=$v" }
+
+val cache = HashMap&lt;String, List&lt;String&gt;&gt;()
+
+fun search(query: String, buggy: Boolean): List&lt;String&gt; {
+    val key = if (buggy) "books" else canonicalKey("/books", query)
+    return cache.getOrPut(key) {
+        val p = parse(query)
+        searchDb(p.getValue("page").toInt(), p.getValue("size").toInt())
+    }
+}
+
+fun main() {
+    val requests = listOf("page=2&amp;size=3", "size=3&amp;page=2", "Page=2&amp;SIZE=3", "page=3&amp;size=3")
+    for (buggy in listOf(true, false)) {
+        cache.clear(); dbCalls = 0
+        println(if (buggy) "key = \"books\" (the L40 bug)" else "key = canonical path + sorted params")
+        for (q in requests) println("  %-15s -&gt; %s".format(q, search(q, buggy)))
+        println("  db calls: $dbCalls, keys: ${cache.keys}")
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex2.java</figcaption>
+<pre><code class="language-java">import java.util.*;
+import java.util.stream.Collectors;
+
+// Exercise 2: the L40 bug (a cache key that ignores the query), then a canonical key:
+// the same parameters in any order share one entry; different values never do.
+public class Ex2 {
+    static int dbCalls = 0;
+
+    static List&lt;String&gt; searchDb(int page, int size) {          // the slow query
+        dbCalls++;
+        var titles = new ArrayList&lt;String&gt;();
+        for (int i = 0; i &lt; size; i++) titles.add("Book " + ((page - 1) * size + i + 1));
+        return titles;
+    }
+
+    static Map&lt;String, String&gt; parse(String query) {
+        var params = new TreeMap&lt;String, String&gt;();            // sorted by name
+        for (String pair : query.split("&amp;")) {
+            String[] kv = pair.split("=", 2);
+            params.put(kv[0].trim().toLowerCase(), kv.length &gt; 1 ? kv[1].trim() : "");
+        }
+        return params;
+    }
+
+    static String canonicalKey(String path, String query) {
+        return path + "?" + parse(query).entrySet().stream()
+                .map(e -&gt; e.getKey() + "=" + e.getValue()).collect(Collectors.joining("&amp;"));
+    }
+
+    static final Map&lt;String, List&lt;String&gt;&gt; cache = new HashMap&lt;&gt;();
+
+    static List&lt;String&gt; search(String query, boolean buggy) {
+        String key = buggy ? "books" : canonicalKey("/books", query);
+        return cache.computeIfAbsent(key, k -&gt; {
+            var p = parse(query);
+            return searchDb(Integer.parseInt(p.get("page")), Integer.parseInt(p.get("size")));
+        });
+    }
+
+    public static void main(String[] args) {
+        String[] requests = {"page=2&amp;size=3", "size=3&amp;page=2", "Page=2&amp;SIZE=3", "page=3&amp;size=3"};
+        for (boolean buggy : new boolean[] {true, false}) {
+            cache.clear(); dbCalls = 0;
+            System.out.println(buggy ? "key = \"books\" (the L40 bug)" : "key = canonical path + sorted params");
+            for (String q : requests) System.out.printf("  %-15s -&gt; %s%n", q, search(q, buggy));
+            System.out.println("  db calls: " + dbCalls + ", keys: " + cache.keySet());
+        }
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">key = "books" (the L40 bug)
+  page=2&amp;size=3   -&gt; [Book 4, Book 5, Book 6]
+  size=3&amp;page=2   -&gt; [Book 4, Book 5, Book 6]
+  Page=2&amp;SIZE=3   -&gt; [Book 4, Book 5, Book 6]
+  page=3&amp;size=3   -&gt; [Book 4, Book 5, Book 6]
+  db calls: 1, keys: [books]
+key = canonical path + sorted params
+  page=2&amp;size=3   -&gt; [Book 4, Book 5, Book 6]
+  size=3&amp;page=2   -&gt; [Book 4, Book 5, Book 6]
+  Page=2&amp;SIZE=3   -&gt; [Book 4, Book 5, Book 6]
+  page=3&amp;size=3   -&gt; [Book 7, Book 8, Book 9]
+  db calls: 2, keys: [/books?page=2&amp;size=3, /books?page=3&amp;size=3]</pre>
+    <p>Both print this. The buggy key "saves" a database call by returning a wrong answer, the worst kind of cache bug because nothing crashes. The canonical key gets 2 queries for 4 requests and every answer is right. Whether names should be case-insensitive is a decision for your API (L32); whatever you choose, the cache key must follow the same rule as the code that reads the parameters.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Cache patterns" data-answer="2">
+  <p class="q">In cache-aside, what should a write do with the cached copy of the row it changed?</p>
+  <div class="opts"><button>Update it before writing the database</button><button>Leave it alone until the TTL</button><button>Delete it after writing the database</button><button>Copy it into a second cache</button></div>
+  <p class="why">Write the source of truth, then invalidate. The next read misses and loads the fresh row. Updating the cache instead risks storing a value computed from stale data.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Cache patterns" data-answer="0">
+  <p class="q">Which pattern lost three acknowledged sales when the process halted?</p>
+  <div class="opts"><button>Write-behind</button><button>Write-through</button><button>Cache-aside</button><button>Read-through</button></div>
+  <p class="why">Write-behind acknowledges writes once they're in the cache and flushes later. Anything still queued at a crash is gone: the database still said <code>dune=7</code> after five sales.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Cache patterns" data-answer="3">
+  <p class="q">With a 300 ms TTL, an update made directly in the database is visible through the cache after at most...</p>
+  <div class="opts"><button>Gives 0 ms</button><button>Gives 50 ms</button><button>Gives 5 ms</button><button>Gives 300 ms</button></div>
+  <p class="why">The cached entry lives at most 300 ms, so 300 ms is the worst-case staleness. The run showed 345 ms only because it polled every 50 ms.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Cache patterns" data-answer="1">
+  <p class="q">Why does coalescing put a <code>CompletableFuture</code> in the map instead of calling <code>computeIfAbsent(id, k -&gt; slowDbFind(k))</code>?</p>
+  <div class="opts"><button>Futures use less memory than strings</button><button>Long work in computeIfAbsent blocks updates</button><button>computeIfAbsent cannot return any value here</button><button>Maps cannot store a String value</button></div>
+  <p class="why">The docs say the computation "should be short and simple" because other updates to the map may block meanwhile. Creating a future is instant; the slow query runs outside the map.</p>
+</div>
+<div class="quiz" data-id="p2-5" data-group="Part 2 · Cache patterns" data-answer="2">
+  <p class="q">Why did LFU beat LRU once scans of one-off keys were added?</p>
+  <div class="opts"><button>LFU uses a bigger cache</button><button>LRU forgets every key twice</button><button>Scanned keys never gain frequency</button><button>The random seed was changed</button></div>
+  <p class="why">Each scanned key becomes LRU's most recently used entry and pushes hot keys out. LFU ranks by count, and a key seen once can't displace a key seen hundreds of times.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>A thread-safe LRU cache from scratch</h2><span class="t">~25 min</span></div>
+
+<p>In L19 an LRU cache took three lines of <code>LinkedHashMap</code>. Now build what's inside it, because the structure is a classic interview question and because you need to own it to add TTLs and thread safety:</p>
+<ul>
+  <li>A <b><code>HashMap&lt;K, Node&gt;</code></b> finds a key's node in O(1) (L19).</li>
+  <li>A <b>doubly linked list</b> of those nodes keeps them in recency order: most recently used next to the <code>head</code> sentinel, least recently used next to the <code>tail</code> sentinel. Moving a node to the front and dropping the last node are both O(1) pointer swaps (L17). The two sentinels mean no step ever has to special-case an empty list.</li>
+  <li>Each node also stores <b>when it expires</b>. The time comes from an injected <code>Clock</code> (L38), so tests can move time forward instantly.</li>
+  <li>One <b><code>ReentrantLock</code></b> guards the map and the list together, because every <code>get</code> <em>writes</em> (it moves a node). There's no such thing as a read-only LRU lookup (L26).</li>
+</ul>
+<p>Set the project up as in L11 (<code>gradle init</code>), with <code>org.xerial:sqlite-jdbc:3.53.4.0</code> added for the final. Write the tests first if you can.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LruCache.kt</figcaption>
+<pre><code class="language-kotlin">package cache
+
+import java.time.Clock
+import java.time.Duration
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+/**
+ * A fixed-capacity LRU cache with a time-to-live per entry.
+ * HashMap (L19) for O(1) lookup + doubly linked list (L17) for O(1) "move to front"
+ * and "drop the oldest". One lock guards both, so every method is thread-safe.
+ */
+class LruCache&lt;K : Any, V : Any&gt;(
+    private val capacity: Int,
+    private val ttl: Duration,
+    private val clock: Clock = Clock.systemUTC(),
+) {
+    private class Node&lt;K, V&gt;(val key: K?, var value: V?, var expiresAt: Long) {
+        var prev: Node&lt;K, V&gt;? = null
+        var next: Node&lt;K, V&gt;? = null
+    }
+
+    private val map = HashMap&lt;K, Node&lt;K, V&gt;&gt;()
+    private val head = Node&lt;K, V&gt;(null, null, 0)      // sentinel: most recently used side
+    private val tail = Node&lt;K, V&gt;(null, null, 0)      // sentinel: least recently used side
+    private val lock = ReentrantLock()
+    private var hits = 0L
+    private var misses = 0L
+    private var evictions = 0L
+
+    init {
+        require(capacity &gt; 0) { "capacity must be positive" }
+        head.next = tail
+        tail.prev = head
+    }
+
+    fun get(key: K): V? = lock.withLock {
+        val node = map[key]
+        if (node == null || node.expiresAt &lt;= clock.millis()) {
+            if (node != null) { unlink(node); map.remove(key) }     // expired: drop it now
+            misses++
+            return null
+        }
+        hits++
+        unlink(node)
+        addFront(node)                                             // now the most recently used
+        node.value
+    }
+
+    fun put(key: K, value: V) {
+        lock.withLock {
+            val expiresAt = clock.millis() + ttl.toMillis()
+            val existing = map[key]
+            if (existing != null) {
+                existing.value = value
+                existing.expiresAt = expiresAt
+                unlink(existing)
+                addFront(existing)
+                return
+            }
+            if (map.size == capacity) {                            // full: evict the LRU entry
+                val oldest = tail.prev!!
+                unlink(oldest)
+                map.remove(oldest.key!!)
+                evictions++
+            }
+            val node = Node(key, value, expiresAt)
+            map[key] = node
+            addFront(node)
+        }
+    }
+
+    fun remove(key: K) {
+        lock.withLock { map.remove(key)?.let { unlink(it) } }
+    }
+
+    val size: Int get() = lock.withLock { map.size }
+
+    fun stats(): Stats = lock.withLock { Stats(hits, misses, evictions) }
+
+    /** Keys from most to least recently used. */
+    fun keys(): List&lt;K&gt; = lock.withLock {
+        generateSequence(head.next) { it.next }.takeWhile { it !== tail }.map { it.key!! }.toList()
+    }
+
+    private fun unlink(n: Node&lt;K, V&gt;) {
+        n.prev!!.next = n.next
+        n.next!!.prev = n.prev
+    }
+
+    private fun addFront(n: Node&lt;K, V&gt;) {
+        n.next = head.next
+        n.prev = head
+        head.next!!.prev = n
+        head.next = n
+    }
+}
+
+data class Stats(val hits: Long, val misses: Long, val evictions: Long) {
+    val hitRate: Double get() = if (hits + misses == 0L) 0.0 else hits.toDouble() / (hits + misses)
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LruCache.java (+ Stats.java)</figcaption>
+<pre><code class="language-java">package cache;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * A fixed-capacity LRU cache with a time-to-live per entry.
+ * HashMap (L19) for O(1) lookup + doubly linked list (L17) for O(1) "move to front"
+ * and "drop the oldest". One lock guards both, so every method is thread-safe.
+ */
+public final class LruCache&lt;K, V&gt; {
+    private static final class Node&lt;K, V&gt; {
+        final K key;
+        V value;
+        long expiresAt;
+        Node&lt;K, V&gt; prev, next;
+        Node(K key, V value, long expiresAt) { this.key = key; this.value = value; this.expiresAt = expiresAt; }
+    }
+
+    private final int capacity;
+    private final long ttlMillis;
+    private final Clock clock;
+    private final Map&lt;K, Node&lt;K, V&gt;&gt; map = new HashMap&lt;&gt;();
+    private final Node&lt;K, V&gt; head = new Node&lt;&gt;(null, null, 0);   // sentinel: most recently used side
+    private final Node&lt;K, V&gt; tail = new Node&lt;&gt;(null, null, 0);   // sentinel: least recently used side
+    private final ReentrantLock lock = new ReentrantLock();
+    private long hits, misses, evictions;
+
+    public LruCache(int capacity, Duration ttl) { this(capacity, ttl, Clock.systemUTC()); }
+
+    public LruCache(int capacity, Duration ttl, Clock clock) {
+        if (capacity &lt;= 0) throw new IllegalArgumentException("capacity must be positive");
+        this.capacity = capacity;
+        this.ttlMillis = ttl.toMillis();
+        this.clock = clock;
+        head.next = tail;
+        tail.prev = head;
+    }
+
+    public V get(K key) {
+        lock.lock();
+        try {
+            Node&lt;K, V&gt; node = map.get(key);
+            if (node == null || node.expiresAt &lt;= clock.millis()) {
+                if (node != null) { unlink(node); map.remove(key); }   // expired: drop it now
+                misses++;
+                return null;
+            }
+            hits++;
+            unlink(node);
+            addFront(node);                                            // now the most recently used
+            return node.value;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void put(K key, V value) {
+        lock.lock();
+        try {
+            long expiresAt = clock.millis() + ttlMillis;
+            Node&lt;K, V&gt; existing = map.get(key);
+            if (existing != null) {
+                existing.value = value;
+                existing.expiresAt = expiresAt;
+                unlink(existing);
+                addFront(existing);
+                return;
+            }
+            if (map.size() == capacity) {                              // full: evict the LRU entry
+                Node&lt;K, V&gt; oldest = tail.prev;
+                unlink(oldest);
+                map.remove(oldest.key);
+                evictions++;
+            }
+            Node&lt;K, V&gt; node = new Node&lt;&gt;(key, value, expiresAt);
+            map.put(key, node);
+            addFront(node);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void remove(K key) {
+        lock.lock();
+        try {
+            Node&lt;K, V&gt; node = map.remove(key);
+            if (node != null) unlink(node);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public int size() {
+        lock.lock();
+        try { return map.size(); } finally { lock.unlock(); }
+    }
+
+    public Stats stats() {
+        lock.lock();
+        try { return new Stats(hits, misses, evictions); } finally { lock.unlock(); }
+    }
+
+    /** Keys from most to least recently used. */
+    public List&lt;K&gt; keys() {
+        lock.lock();
+        try {
+            var keys = new ArrayList&lt;K&gt;();
+            for (Node&lt;K, V&gt; n = head.next; n != tail; n = n.next) keys.add(n.key);
+            return keys;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void unlink(Node&lt;K, V&gt; n) {
+        n.prev.next = n.next;
+        n.next.prev = n.prev;
+    }
+
+    private void addFront(Node&lt;K, V&gt; n) {
+        n.next = head.next;
+        n.prev = head;
+        head.next.prev = n;
+        head.next = n;
+    }
+}</code></pre>
+<pre><code class="language-java">package cache;
+
+public record Stats(long hits, long misses, long evictions) {
+    public double hitRate() { return hits + misses == 0 ? 0 : (double) hits / (hits + misses); }
+}</code></pre></figure>
+</div>
+<p>Two details worth copying. An expired entry is removed the moment a read finds it, so it doesn't sit in the cache taking a slot. And <code>put</code> on an existing key updates in place instead of evicting someone to make room for a key that's already there.</p>
+
+<h3>The tests</h3>
+<p>Six tests per language: eviction order, recency on <code>get</code>, update without eviction, TTL with a fake clock, the stats counters, and 8 threads hammering the cache with 100,000 random operations each.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LruCacheTest.kt</figcaption>
+<pre><code class="language-kotlin">package cache
+
+import java.time.Clock
+import java.time.Duration
+import java.time.Instant
+import java.time.ZoneId
+import java.time.ZoneOffset
+import java.util.Random
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+/** A clock the test moves by hand (L38: inject time). */
+class FakeClock(private var now: Instant = Instant.parse("2026-10-26T12:00:00Z")) : Clock() {
+    override fun getZone(): ZoneId = ZoneOffset.UTC
+    override fun withZone(zone: ZoneId?): Clock = this
+    override fun instant(): Instant = now
+    fun advance(d: Duration) { now = now.plus(d) }
+}
+
+class LruCacheTest {
+    private val clock = FakeClock()
+    private fun cache(cap: Int = 3) = LruCache&lt;String, Int&gt;(cap, Duration.ofSeconds(10), clock)
+
+    @Test fun `evicts the least recently used entry when full`() {
+        val c = cache()
+        c.put("a", 1); c.put("b", 2); c.put("c", 3)
+        c.put("d", 4)                                   // "a" is the oldest
+        assertNull(c.get("a"))
+        assertEquals(listOf("d", "c", "b"), c.keys())
+    }
+
+    @Test fun `get makes an entry recently used`() {
+        val c = cache()
+        c.put("a", 1); c.put("b", 2); c.put("c", 3)
+        c.get("a")                                      // now "b" is the oldest
+        c.put("d", 4)
+        assertNull(c.get("b"))
+        assertEquals(1, c.get("a"))
+    }
+
+    @Test fun `put on an existing key updates without evicting`() {
+        val c = cache()
+        c.put("a", 1); c.put("b", 2); c.put("c", 3)
+        c.put("a", 10)
+        assertEquals(3, c.size)
+        assertEquals(10, c.get("a"))
+        assertEquals(0, c.stats().evictions)
+    }
+
+    @Test fun `entries expire after the ttl`() {
+        val c = cache()
+        c.put("a", 1)
+        clock.advance(Duration.ofSeconds(9))
+        assertEquals(1, c.get("a"))
+        clock.advance(Duration.ofSeconds(1))            // exactly 10 s: expired
+        assertNull(c.get("a"))
+        assertEquals(0, c.size)                         // an expired entry is dropped on read
+    }
+
+    @Test fun `stats count hits misses and evictions`() {
+        val c = cache(cap = 1)
+        c.put("a", 1); c.get("a"); c.get("x"); c.put("b", 2)
+        assertEquals(Stats(hits = 1, misses = 1, evictions = 1), c.stats())
+    }
+
+    @Test fun `stays within capacity under 8 threads`() {
+        val c = LruCache&lt;Int, Int&gt;(100, Duration.ofHours(1))
+        val pool = Executors.newFixedThreadPool(8)
+        val gate = CountDownLatch(1)
+        val errors = java.util.concurrent.ConcurrentLinkedQueue&lt;Throwable&gt;()
+        repeat(8) { t -&gt;
+            pool.submit {
+                gate.await()
+                val rnd = Random(41L + t)
+                try {
+                    repeat(100_000) {
+                        val k = rnd.nextInt(1_000)
+                        if (rnd.nextBoolean()) c.put(k, k) else c.get(k)?.let { v -&gt; check(v == k) }
+                    }
+                } catch (e: Throwable) { errors += e }
+            }
+        }
+        gate.countDown()
+        pool.shutdown()
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS))
+        assertTrue(errors.isEmpty(), "errors: $errors")
+        assertEquals(100, c.size)
+        assertEquals(100, c.keys().toSet().size)        // list and map agree: no lost or duplicate nodes
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LruCacheTest.java</figcaption>
+<pre><code class="language-java">package cache;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.time.*;
+import java.util.List;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.*;
+import org.junit.jupiter.api.Test;
+
+class LruCacheTest {
+    /** A clock the test moves by hand (L38: inject time). */
+    static final class FakeClock extends Clock {
+        private Instant now = Instant.parse("2026-10-26T12:00:00Z");
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId zone) { return this; }
+        @Override public Instant instant() { return now; }
+        void advance(Duration d) { now = now.plus(d); }
+    }
+
+    private final FakeClock clock = new FakeClock();
+    private LruCache&lt;String, Integer&gt; cache(int cap) { return new LruCache&lt;&gt;(cap, Duration.ofSeconds(10), clock); }
+
+    @Test void evictsTheLeastRecentlyUsedEntryWhenFull() {
+        var c = cache(3);
+        c.put("a", 1); c.put("b", 2); c.put("c", 3);
+        c.put("d", 4);                                   // "a" is the oldest
+        assertNull(c.get("a"));
+        assertEquals(List.of("d", "c", "b"), c.keys());
+    }
+
+    @Test void getMakesAnEntryRecentlyUsed() {
+        var c = cache(3);
+        c.put("a", 1); c.put("b", 2); c.put("c", 3);
+        c.get("a");                                      // now "b" is the oldest
+        c.put("d", 4);
+        assertNull(c.get("b"));
+        assertEquals(1, c.get("a"));
+    }
+
+    @Test void putOnAnExistingKeyUpdatesWithoutEvicting() {
+        var c = cache(3);
+        c.put("a", 1); c.put("b", 2); c.put("c", 3);
+        c.put("a", 10);
+        assertEquals(3, c.size());
+        assertEquals(10, c.get("a"));
+        assertEquals(0, c.stats().evictions());
+    }
+
+    @Test void entriesExpireAfterTheTtl() {
+        var c = cache(3);
+        c.put("a", 1);
+        clock.advance(Duration.ofSeconds(9));
+        assertEquals(1, c.get("a"));
+        clock.advance(Duration.ofSeconds(1));            // exactly 10 s: expired
+        assertNull(c.get("a"));
+        assertEquals(0, c.size());                       // an expired entry is dropped on read
+    }
+
+    @Test void statsCountHitsMissesAndEvictions() {
+        var c = cache(1);
+        c.put("a", 1); c.get("a"); c.get("x"); c.put("b", 2);
+        assertEquals(new Stats(1, 1, 1), c.stats());
+    }
+
+    @Test void staysWithinCapacityUnder8Threads() throws Exception {
+        var c = new LruCache&lt;Integer, Integer&gt;(100, Duration.ofHours(1));
+        var pool = Executors.newFixedThreadPool(8);
+        var gate = new CountDownLatch(1);
+        var errors = new ConcurrentLinkedQueue&lt;Throwable&gt;();
+        for (int t = 0; t &lt; 8; t++) {
+            final long seed = 41 + t;
+            pool.submit(() -&gt; {
+                try {
+                    gate.await();
+                    var rnd = new Random(seed);
+                    for (int i = 0; i &lt; 100_000; i++) {
+                        int k = rnd.nextInt(1_000);
+                        if (rnd.nextBoolean()) c.put(k, k);
+                        else { Integer v = c.get(k); if (v != null &amp;&amp; v != k) throw new IllegalStateException("wrong value"); }
+                    }
+                } catch (Throwable e) { errors.add(e); }
+            });
+        }
+        gate.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+        assertTrue(errors.isEmpty(), "errors: " + errors);
+        assertEquals(100, c.size());
+        assertEquals(100, Set.copyOf(c.keys()).size());   // list and map agree: no lost or duplicate nodes
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">LruCacheTest &gt; stats count hits misses and evictions() PASSED
+LruCacheTest &gt; get makes an entry recently used() PASSED
+LruCacheTest &gt; entries expire after the ttl() PASSED
+LruCacheTest &gt; stays within capacity under 8 threads() PASSED
+LruCacheTest &gt; evicts the least recently used entry when full() PASSED
+LruCacheTest &gt; put on an existing key updates without evicting() PASSED</pre>
+<pre class="out">LruCacheTest &gt; getMakesAnEntryRecentlyUsed() PASSED
+LruCacheTest &gt; putOnAnExistingKeyUpdatesWithoutEvicting() PASSED
+LruCacheTest &gt; staysWithinCapacityUnder8Threads() PASSED
+LruCacheTest &gt; statsCountHitsMissesAndEvictions() PASSED
+LruCacheTest &gt; evictsTheLeastRecentlyUsedEntryWhenFull() PASSED
+LruCacheTest &gt; entriesExpireAfterTheTtl() PASSED</pre>
+</div>
+<p>The concurrency test checks <em>invariants</em> rather than exact results, since the interleaving changes every run: no exceptions, every value read matches its key, the size equals the capacity, and the list holds exactly as many distinct keys as the map. <b>Does it catch a real bug?</b> I removed the lock from <code>get</code> only (it became <code>run {</code> instead of <code>lock.withLock {</code>) and ran the Kotlin tests twice:</p>
+<pre class="err">LruCacheTest &gt; stays within capacity under 8 threads() FAILED
+    org.opentest4j.AssertionFailedError: errors: [java.lang.NullPointerException, java.lang.NullPointerException, java.lang.NullPointerException, java.lang.NullPointerException, java.lang.NullPointerException, java.lang.NullPointerException, java.lang.NullPointerException, java.lang.NullPointerException]
+
+LruCacheTest &gt; stays within capacity under 8 threads() FAILED
+    org.opentest4j.AssertionFailedError: expected: &lt;100&gt; but was: &lt;1000&gt;</pre>
+<p>Two runs, two different symptoms of one bug. In the first, threads moved the same node at the same time and corrupted the pointers, so later reads hit <code>null</code> links. In the second, the list was damaged so badly that eviction stopped working, and a cache with a capacity of 100 held 1,000 entries: a memory leak in production (L24). The other five tests still passed, because they're single-threaded. Put the lock back and all six pass again.</p>
+
+<h3>One lock, many threads</h3>
+<p>Correct isn't the same as fast. The benchmark runs 80% reads and 20% writes over 2,000 keys against a 1,000-entry cache, first on 1 thread, then on 8, comparing your cache with L19's <code>LinkedHashMap</code> wrapped in <code>Collections.synchronizedMap</code>, which "Returns a synchronized (thread-safe) map backed by the specified map" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/Collections.html#synchronizedMap(java.util.Map)">API docs</a>). It's the <code>bench</code> mode of the final's <code>App</code> (code below): <code>./gradlew run --args=bench</code>.</p>
+<div class="pair">
+<pre class="out">LruCache (ReentrantLock)    1 thread :    9 ms for 400,000 ops
+synchronized LinkedHashMap  1 thread :    9 ms for 400,000 ops
+LruCache (ReentrantLock)    8 threads:  244 ms for 3,200,000 ops
+synchronized LinkedHashMap  8 threads:  258 ms for 3,200,000 ops
+LruCache: size 1000, Stats(hits=5755695, misses=5758457, evictions=1441437)</pre>
+<pre class="out">LruCache (ReentrantLock)    1 thread :    8 ms for 400,000 ops
+synchronized LinkedHashMap  1 thread :    7 ms for 400,000 ops
+LruCache (ReentrantLock)    8 threads:  209 ms for 3,200,000 ops
+synchronized LinkedHashMap  8 threads:  207 ms for 3,200,000 ops
+LruCache: size 1000, Stats[hits=5755711, misses=5758441, evictions=1441627]</pre>
+</div>
+<p>On my machine; best of 4 runs, so treat the numbers as rough (a JMH benchmark, L24, would be rigorous). Your hand-written cache keeps pace with the JDK's, which is good. The surprise is the 8-thread line: 8 times the work took about 26 times as long. Adding threads made total throughput <em>worse</em>, because one lock lets one thread in at a time and the rest queue up and hand the lock around (L26). That's why production caches don't use one lock:</p>
+<ul>
+  <li><b>Striping</b> splits the cache into, say, 16 segments by key hash, each with its own lock and its own LRU list, so threads touching different segments don't wait for each other. The price: eviction is only "least recently used within a segment".</li>
+  <li><b>Caffeine</b> goes further: reads record their access in a buffer and the reordering happens later, in batches, so a <code>get</code> almost never waits for a lock. Its wiki describes it as "a high performance Java caching library providing a near optimal hit rate" (<a href="https://github.com/ben-manes/caffeine/wiki">Caffeine wiki</a>). In real code, use Caffeine; write your own only to learn, as here.</li>
+</ul>
+<p class="callout"><b>Bridge.</b> Spring's cache abstraction lets you put <code>@Cacheable</code> on a method: "the Spring Framework provides support for transparently adding caching to an existing Spring application" (<a href="https://docs.spring.io/spring-framework/reference/integration/cache.html">Spring docs: Cache Abstraction</a>), with Caffeine or Redis as the store behind it. That's the read-through decorator from Part 2, generated for you. On Android, image loaders keep exactly this two-level structure: Coil's <code>ImageLoader</code> "keeps a memory cache of recently decoded Bitmaps as well as a disk cache for any images loaded from the Internet" (<a href="https://coil-kt.github.io/coil/image_loaders/">Coil docs</a>), and Glide "checks multiple layers of caches before starting a new request for an image" (<a href="https://bumptech.github.io/glide/doc/caching.html">Glide docs: Caching</a>).</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>lock.withLock { }</code> is <code>lock()</code> + <code>try</code>/<code>finally unlock()</code> in one inline call. Java writes the try/finally by hand in every method, and forgetting <code>unlock()</code> on one path is a deadlock waiting to happen (L27).</li>
+    <li>Because <code>withLock</code> is <code>inline</code>, <code>return null</code> inside it returns from <code>get</code> itself (L14's non-local return).</li>
+    <li><code>K : Any</code> forbids <code>null</code> keys at compile time. Java's <code>HashMap</code> accepts a <code>null</code> key, and the cache would quietly cache it.</li>
+    <li><code>data class Stats</code> gives <code>equals</code>, so a test compares all three counters in one <code>assertEquals</code>. Java's <code>record</code> does the same.</li>
+    <li>Test names in backticks read as sentences in the Gradle report.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: <code>peek</code> and an eviction listener</div>
+  <ol>
+    <li>From a blank file, write a small LRU from a map and a linked list with sentinels (no TTL or lock needed this time).</li>
+    <li>Add <code>peek(key)</code>, which returns the value <em>without</em> changing recency. It's useful for monitoring and debugging, where looking must not change behaviour.</li>
+    <li>Add an <code>onEvict</code> callback the cache calls with the evicted key and value: real caches use this to log, to write a dirty entry back, or to close a resource.</li>
+    <li>With capacity 2: put <code>dune</code>, put <code>emma</code>, <code>peek(dune)</code>, put <code>ulysses</code>. Which one is evicted? Then <code>get(emma)</code> and put <code>beloved</code>.</li>
+  </ol>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex3.kt</figcaption>
+<pre><code class="language-kotlin">// Exercise 3: two features real caches have. peek() reads without changing recency,
+// and onEvict tells you which entry was pushed out (to log it, or to close a resource).
+class Lru&lt;K : Any, V : Any&gt;(private val capacity: Int, private val onEvict: (K, V) -&gt; Unit) {
+    private inner class Node(val key: K?, var value: V?) {
+        var prev: Node? = null
+        var next: Node? = null
+    }
+    private val map = HashMap&lt;K, Node&gt;()
+    private val head = Node(null, null)
+    private val tail = Node(null, null)
+
+    init { head.next = tail; tail.prev = head }
+
+    fun get(key: K): V? {
+        val n = map[key] ?: return null
+        unlink(n); addFront(n)
+        return n.value
+    }
+
+    fun peek(key: K): V? = map[key]?.value                  // same lookup, no move to front
+
+    fun put(key: K, value: V) {
+        map[key]?.let { n -&gt; n.value = value; unlink(n); addFront(n); return }
+        if (map.size == capacity) {
+            val oldest = tail.prev!!
+            unlink(oldest); map.remove(oldest.key!!)
+            onEvict(oldest.key, oldest.value!!)             // tell the owner
+        }
+        val n = Node(key, value)
+        map[key] = n; addFront(n)
+    }
+
+    fun keys(): List&lt;K&gt; = generateSequence(head.next) { it.next }.takeWhile { it !== tail }.map { it.key!! }.toList()
+
+    private fun unlink(n: Node) { n.prev!!.next = n.next; n.next!!.prev = n.prev }
+    private fun addFront(n: Node) { n.next = head.next; n.prev = head; head.next!!.prev = n; head.next = n }
+}
+
+fun main() {
+    val cache = Lru&lt;String, String&gt;(2) { k, v -&gt; println("  evicted $k=$v") }
+    cache.put("dune", "Herbert"); cache.put("emma", "Austen")
+    println("peek(dune) = ${cache.peek("dune")}, order ${cache.keys()}")
+    cache.put("ulysses", "Joyce")                           // dune is still the oldest
+    println("order ${cache.keys()}")
+    cache.get("emma")
+    cache.put("beloved", "Morrison")                        // ulysses is now the oldest
+    println("order ${cache.keys()}")
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · Ex3.java</figcaption>
+<pre><code class="language-java">import java.util.*;
+import java.util.function.BiConsumer;
+
+// Exercise 3: two features real caches have. peek() reads without changing recency,
+// and onEvict tells you which entry was pushed out (to log it, or to close a resource).
+public class Ex3 {
+    static final class Lru&lt;K, V&gt; {
+        private final class Node { K key; V value; Node prev, next; }
+        private final int capacity;
+        private final BiConsumer&lt;K, V&gt; onEvict;
+        private final Map&lt;K, Node&gt; map = new HashMap&lt;&gt;();
+        private final Node head = new Node(), tail = new Node();
+
+        Lru(int capacity, BiConsumer&lt;K, V&gt; onEvict) {
+            this.capacity = capacity; this.onEvict = onEvict;
+            head.next = tail; tail.prev = head;
+        }
+
+        V get(K key) {
+            Node n = map.get(key);
+            if (n == null) return null;
+            unlink(n); addFront(n);
+            return n.value;
+        }
+
+        V peek(K key) {                                   // same lookup, no move to front
+            Node n = map.get(key);
+            return n == null ? null : n.value;
+        }
+
+        void put(K key, V value) {
+            Node n = map.get(key);
+            if (n != null) { n.value = value; unlink(n); addFront(n); return; }
+            if (map.size() == capacity) {
+                Node oldest = tail.prev;
+                unlink(oldest); map.remove(oldest.key);
+                onEvict.accept(oldest.key, oldest.value);  // tell the owner
+            }
+            n = new Node(); n.key = key; n.value = value;
+            map.put(key, n); addFront(n);
+        }
+
+        List&lt;K&gt; keys() {
+            var keys = new ArrayList&lt;K&gt;();
+            for (Node n = head.next; n != tail; n = n.next) keys.add(n.key);
+            return keys;
+        }
+
+        private void unlink(Node n) { n.prev.next = n.next; n.next.prev = n.prev; }
+        private void addFront(Node n) { n.next = head.next; n.prev = head; head.next.prev = n; head.next = n; }
+    }
+
+    public static void main(String[] args) {
+        var cache = new Lru&lt;String, String&gt;(2, (k, v) -&gt; System.out.println("  evicted " + k + "=" + v));
+        cache.put("dune", "Herbert"); cache.put("emma", "Austen");
+        System.out.println("peek(dune) = " + cache.peek("dune") + ", order " + cache.keys());
+        cache.put("ulysses", "Joyce");                     // dune is still the oldest
+        System.out.println("order " + cache.keys());
+        cache.get("emma");
+        cache.put("beloved", "Morrison");                  // ulysses is now the oldest
+        System.out.println("order " + cache.keys());
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">peek(dune) = Herbert, order [emma, dune]
+  evicted dune=Herbert
+order [ulysses, emma]
+  evicted ulysses=Joyce
+order [beloved, emma]</pre>
+    <p>Both print this. <code>peek</code> left <code>dune</code> at the back, so it was evicted; a <code>get</code> would have saved it and evicted <code>emma</code> instead. The Kotlin node is an <code>inner class</code> so it can use the cache's <code>K</code> and <code>V</code>; Java's non-static nested class does the same.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · LRU from scratch" data-answer="0">
+  <p class="q">Why does an LRU cache need a linked list as well as a hash map?</p>
+  <div class="opts"><button>To reorder entries in O(1)</button><button>To find keys in O(1)</button><button>To store values without boxing</button><button>To sort the keys alphabetically</button></div>
+  <p class="why">The map finds a node; the list keeps recency order. Moving a node to the front and removing the tail are constant-time pointer changes, which an array or tree can't match.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · LRU from scratch" data-answer="3">
+  <p class="q">Why must <code>get</code> take the lock, even though it only "reads"?</p>
+  <div class="opts"><button>The map rehashes on every read</button><button>The clock object is not thread-safe</button><button>Every read allocates a new node</button><button>It moves the node to front</button></div>
+  <p class="why">A hit moves the node to the front: four pointer writes. Without the lock, two threads did that at once and the list broke, giving NullPointerExceptions and a cache 10× over capacity.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · LRU from scratch" data-answer="1">
+  <p class="q">How does the TTL test check expiry without sleeping for 10 seconds?</p>
+  <div class="opts"><button>It shortens the TTL to zero</button><button>It advances an injected fake clock</button><button>It calls the garbage collector first</button><button>It runs the test in parallel</button></div>
+  <p class="why">The cache reads time from a <code>Clock</code> passed in (L38). The test passes a <code>FakeClock</code> and moves it forward 9 s, then 1 s more, instantly.</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · LRU from scratch" data-answer="2">
+  <p class="q">With one lock, 8 threads did 8× the work in about 26× the time. Why?</p>
+  <div class="opts"><button>Eight threads use eight times the memory</button><button>The JIT stopped compiling the hot loop</button><button>Only one thread can hold the lock</button><button>The cache evicted every entry each time</button></div>
+  <p class="why">Every operation queues for the same lock, and handing it between cores costs extra. That's why real caches stripe their locks or, like Caffeine, buffer reads and reorder later.</p>
+</div>
+<div class="quiz" data-id="p3-5" data-group="Part 3 · LRU from scratch" data-answer="0">
+  <p class="q">Capacity 2: put <code>a</code>, put <code>b</code>, <code>peek(a)</code>, put <code>c</code>. Which key is evicted?</p>
+  <div class="opts"><button><code>a</code></button><button><code>b</code></button><button><code>c</code></button><button><code>none</code></button></div>
+  <p class="why"><code>peek</code> doesn't change recency, so <code>a</code> is still the least recently used. A <code>get(a)</code> would have saved it and evicted <code>b</code>.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>A cached book service</h2><span class="t">~25 min</span></div>
+
+<p>From blank files, in the same Gradle project as your <code>LruCache</code>, put your cache in front of a slow SQLite-backed HTTP service, and measure the difference.</p>
+<div class="task">
+  <ol>
+    <li><b>The source of truth.</b> A <code>BookCatalog</code> interface with <code>find(id)</code> (returning a book or nothing) and <code>save(book)</code>. A <code>SqliteCatalog</code> implementation seeded with 200 books (<code>"Book 1"</code> … <code>"Book 200"</code>) that sleeps 20 ms on every read, standing in for a remote database, and counts its queries.</li>
+    <li><b>Cache-aside with coalescing.</b> A <code>CachedCatalog</code> that is also a <code>BookCatalog</code> (L38/L39: a decorator behind the same interface). Reads check your <code>LruCache</code> (capacity 50, TTL 60 s) first; concurrent misses for the same id share one load; <code>save</code> writes the database and then invalidates.</li>
+    <li><b>The endpoint.</b> An <code>HttpServer</code> on <code>127.0.0.1</code> with a virtual-thread executor (L28, L32): <code>GET /books/{id}</code> (200 with JSON, or 404), <code>PUT /books/{id}</code> with the new title as the body (204), and <code>GET /stats</code> (hits, misses, evictions, coalesced, database queries).</li>
+    <li><b>The load test.</b> Start one server on the plain catalog and one on the cached catalog. Send each the same 2,000 requests from 16 concurrent clients, with book ids drawn from a Zipf-like distribution (fixed seeds). Print p50, p95 and p99, the database query count and the hit rate.</li>
+  </ol>
+  <p>Expected run (Kotlin; Java's numbers are within a few percent, and yours will differ):</p>
+<pre class="out">GET /books/1 -&gt; 200 {"id":1,"title":"Book 1"}
+GET /books/1 -&gt; 200 {"id":1,"title":"Book 1"}
+PUT /books/1 -&gt; 204
+GET /books/1 -&gt; 200 {"id":1,"title":"Dune"}
+GET /books/999 -&gt; 404 {"error":"no book 999"}
+GET /stats -&gt; 200 {"hits":1,"misses":3,"evictions":0,"coalesced":0,"dbQueries":3}
+50 concurrent GET /books/7 -&gt; 1 database query, coalesced 49
+
+without cache 2000 requests in 3451 ms: p50 28.2 ms, p95 32.0 ms, p99 33.0 ms
+  2000 database queries
+with cache    2000 requests in 1370 ms: p50 0.5 ms, p95 29.5 ms, p99 30.7 ms
+  650 database queries, hit rate 64.2%, 602 evictions</pre>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: cached book service (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: cached book service (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-tests" data-label="Final: cache tests (LRU, TTL, concurrency, coalescing)"><span class="who">TESTS</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+  <details class="solution"><summary>Reference solutions: Kotlin</summary>
+    <p>The generated <code>app/build.gradle.kts</code> gets <code>implementation("org.xerial:sqlite-jdbc:3.53.4.0")</code> in place of Guava, and <code>jvmArgs("--enable-native-access=ALL-UNNAMED")</code> in the <code>test</code> and <code>run</code> tasks so JDK 26 doesn't warn about SQLite's native code.</p>
+    <figure class="kotlin"><figcaption>KOTLIN · Catalog.kt · source of truth + cache-aside with coalescing</figcaption>
+<pre><code class="language-kotlin">package cache
+
+import java.nio.file.Path
+import java.sql.DriverManager
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+
+data class Book(val id: Int, val title: String)
+
+interface BookCatalog {
+    fun find(id: Int): Book?
+    fun save(book: Book)
+}
+
+/** The slow source of truth: SQLite, plus an injected delay per read. */
+class SqliteCatalog(private val file: Path, private val delayMillis: Long) : BookCatalog {
+    val queries = AtomicLong()
+
+    // One connection per call keeps the example simple; a real app uses a pool (L36).
+    private fun &lt;T&gt; withDb(block: (java.sql.Connection) -&gt; T): T =
+        DriverManager.getConnection("jdbc:sqlite:$file").use(block)
+
+    fun seed(count: Int) = withDb { c -&gt;
+        c.createStatement().use { it.execute("CREATE TABLE IF NOT EXISTS books(id INTEGER PRIMARY KEY, title TEXT NOT NULL)") }
+        c.autoCommit = false
+        c.prepareStatement("INSERT OR REPLACE INTO books VALUES (?, ?)").use { ins -&gt;
+            for (id in 1..count) { ins.setInt(1, id); ins.setString(2, "Book $id"); ins.addBatch() }
+            ins.executeBatch()
+        }
+        c.commit()
+    }
+
+    override fun find(id: Int): Book? {
+        queries.incrementAndGet()
+        Thread.sleep(delayMillis)
+        return withDb { c -&gt;
+            c.prepareStatement("SELECT title FROM books WHERE id = ?").use { q -&gt;
+                q.setInt(1, id)
+                q.executeQuery().use { rs -&gt; if (rs.next()) Book(id, rs.getString(1)) else null }
+            }
+        }
+    }
+
+    override fun save(book: Book) = withDb { c -&gt;
+        c.prepareStatement("INSERT OR REPLACE INTO books VALUES (?, ?)").use { u -&gt;
+            u.setInt(1, book.id); u.setString(2, book.title); u.executeUpdate()
+        }
+        Unit
+    }
+}
+
+/** Cache-aside in front of any catalog, with request coalescing for concurrent misses. */
+class CachedCatalog(private val db: BookCatalog, private val cache: LruCache&lt;Int, Book&gt;) : BookCatalog {
+    private val inFlight = ConcurrentHashMap&lt;Int, CompletableFuture&lt;Book?&gt;&gt;()
+    val coalesced = AtomicLong()
+
+    override fun find(id: Int): Book? {
+        cache.get(id)?.let { return it }
+        val mine = CompletableFuture&lt;Book?&gt;()
+        val running = inFlight.putIfAbsent(id, mine)
+        if (running != null) {                           // someone is already loading this id
+            coalesced.incrementAndGet()
+            return running.join()
+        }
+        try {
+            val book = db.find(id)
+            if (book != null) cache.put(id, book)
+            mine.complete(book)
+            return book
+        } catch (e: Exception) {
+            mine.completeExceptionally(e)
+            throw e
+        } finally {
+            inFlight.remove(id, mine)
+        }
+    }
+
+    override fun save(book: Book) {
+        db.save(book)                                    // write the source of truth first...
+        cache.remove(book.id)                            // ...then invalidate the cached copy
+    }
+
+    fun stats() = cache.stats()
+}</code></pre></figure>
+    <figure class="kotlin"><figcaption>KOTLIN · Server.kt</figcaption>
+<pre><code class="language-kotlin">package cache
+
+import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import java.net.InetSocketAddress
+import java.util.concurrent.Executors
+
+/** GET /books/{id}, PUT /books/{id} (body = new title), GET /stats. */
+fun startServer(catalog: BookCatalog, stats: () -&gt; String): HttpServer {
+    val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    server.createContext("/books/") { ex -&gt;
+        val id = ex.requestURI.path.removePrefix("/books/").toIntOrNull()
+        when {
+            id == null -&gt; send(ex, 400, """{"error":"bad id"}""")
+            ex.requestMethod == "GET" -&gt; {
+                val book = catalog.find(id)
+                if (book == null) send(ex, 404, """{"error":"no book $id"}""")
+                else send(ex, 200, """{"id":${book.id},"title":"${json(book.title)}"}""")
+            }
+            ex.requestMethod == "PUT" -&gt; {
+                val title = ex.requestBody.readAllBytes().decodeToString().trim()
+                catalog.save(Book(id, title))
+                send(ex, 204, null)
+            }
+            else -&gt; send(ex, 405, """{"error":"use GET or PUT"}""")
+        }
+    }
+    server.createContext("/stats") { ex -&gt; send(ex, 200, stats()) }
+    server.executor = Executors.newVirtualThreadPerTaskExecutor()       // L28
+    server.start()
+    return server
+}
+
+private fun send(ex: HttpExchange, status: Int, body: String?) {
+    if (body == null) { ex.sendResponseHeaders(status, -1); ex.close(); return }
+    val bytes = body.toByteArray()
+    ex.responseHeaders.add("Content-Type", "application/json")
+    ex.sendResponseHeaders(status, bytes.size.toLong())
+    ex.responseBody.use { it.write(bytes) }
+}
+
+private fun json(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")</code></pre></figure>
+    <figure class="kotlin"><figcaption>KOTLIN · App.kt · demo, load test, and Part 3's bench</figcaption>
+<pre><code class="language-kotlin">package cache
+
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.nio.file.Files
+import java.time.Duration
+import java.util.Collections
+import java.util.Random
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import kotlin.math.ceil
+
+fun main(args: Array&lt;String&gt;) {
+    if (args.firstOrNull() == "bench") bench() else finalDemo()
+}
+
+// ── Final: the same SQLite catalog served with and without the cache ─────────────
+fun finalDemo() {
+    val file = Files.createTempFile("l41-final", ".db")
+    SqliteCatalog(file, 0).seed(200)
+
+    val plainDb = SqliteCatalog(file, delayMillis = 20)
+    val plainServer = startServer(plainDb) { """{"dbQueries":${plainDb.queries.get()}}""" }
+
+    val cachedDb = SqliteCatalog(file, delayMillis = 20)
+    val cached = CachedCatalog(cachedDb, LruCache(capacity = 50, ttl = Duration.ofSeconds(60)))
+    val cachedServer = startServer(cached) {
+        val s = cached.stats()
+        """{"hits":${s.hits},"misses":${s.misses},"evictions":${s.evictions},""" +
+            """"coalesced":${cached.coalesced.get()},"dbQueries":${cachedDb.queries.get()}}"""
+    }
+    val client = HttpClient.newHttpClient()
+    val base = "http://127.0.0.1:${cachedServer.address.port}"
+
+    fun call(method: String, path: String, body: String? = null): String {
+        val req = HttpRequest.newBuilder(URI.create(base + path))
+            .method(method, if (body == null) HttpRequest.BodyPublishers.noBody() else HttpRequest.BodyPublishers.ofString(body))
+            .build()
+        val res = client.send(req, HttpResponse.BodyHandlers.ofString())
+        return "$method $path -&gt; ${res.statusCode()} ${res.body()}".trim()
+    }
+
+    println(call("GET", "/books/1"))
+    println(call("GET", "/books/1"))
+    println(call("PUT", "/books/1", "Dune"))
+    println(call("GET", "/books/1"))
+    println(call("GET", "/books/999"))
+    println(call("GET", "/stats"))
+
+    // 50 concurrent requests for a cold key: coalescing sends one query to the database
+    val before = cachedDb.queries.get()
+    val gate = CountDownLatch(1)
+    Executors.newVirtualThreadPerTaskExecutor().use { pool -&gt;
+        repeat(50) { pool.submit { gate.await(); call("GET", "/books/7") } }
+        gate.countDown()
+    }
+    println("50 concurrent GET /books/7 -&gt; ${cachedDb.queries.get() - before} database query, coalesced ${cached.coalesced.get()}")
+
+    println()
+    loadTest("without cache", plainServer.address.port, client)
+    println("  ${plainDb.queries.get()} database queries")
+    val q0 = cachedDb.queries.get()
+    val s0 = cached.stats()
+    loadTest("with cache", cachedServer.address.port, client)
+    val s1 = cached.stats()
+    val hits = s1.hits - s0.hits; val misses = s1.misses - s0.misses
+    println("  ${cachedDb.queries.get() - q0} database queries, hit rate %.1f%%, %d evictions"
+        .format(100.0 * hits / (hits + misses), s1.evictions - s0.evictions))
+
+    plainServer.stop(0); cachedServer.stop(0)
+    Files.delete(file)
+}
+
+/** 16 clients x 125 requests, ids drawn from a Zipf-like distribution over 200 books. */
+fun loadTest(name: String, port: Int, client: HttpClient) {
+    val cdf = DoubleArray(200)
+    var total = 0.0
+    for (r in 1..200) { total += 1.0 / r; cdf[r - 1] = total }
+    val latencies = Collections.synchronizedList(ArrayList&lt;Double&gt;())
+    val t = System.nanoTime()
+    Executors.newVirtualThreadPerTaskExecutor().use { pool -&gt;
+        for (c in 0 until 16) pool.submit {
+            val rnd = Random(41L + c)
+            repeat(125) {
+                val idx = cdf.binarySearch(rnd.nextDouble() * total)
+                val id = (if (idx &gt;= 0) idx else -idx - 1) + 1
+                val req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/books/$id")).build()
+                val start = System.nanoTime()
+                client.send(req, HttpResponse.BodyHandlers.discarding())
+                latencies += (System.nanoTime() - start) / 1e6
+            }
+        }
+    }
+    val wall = (System.nanoTime() - t) / 1_000_000
+    val sorted = latencies.sorted()
+    fun p(x: Double) = sorted[maxOf(0, ceil(x / 100 * sorted.size).toInt() - 1)]
+    println("%-13s %d requests in %d ms: p50 %.1f ms, p95 %.1f ms, p99 %.1f ms"
+        .format(name, sorted.size, wall, p(50.0), p(95.0), p(99.0)))
+}
+
+// ── Part 3: my LruCache vs a synchronized LinkedHashMap under contention ─────────
+fun bench() {
+    val cap = 1_000
+    val mine = LruCache&lt;Int, Int&gt;(cap, Duration.ofHours(1))
+    val jdk = Collections.synchronizedMap(object : LinkedHashMap&lt;Int, Int&gt;(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry&lt;Int, Int&gt;?) = size &gt; cap
+    })
+    val impls = listOf&lt;Pair&lt;String, (Int, Boolean) -&gt; Unit&gt;&gt;(
+        "LruCache (ReentrantLock)" to { k, read -&gt; if (read) mine.get(k) else mine.put(k, k) },
+        "synchronized LinkedHashMap" to { k, read -&gt; if (read) jdk[k] else jdk[k] = k },
+    )
+    for (threads in listOf(1, 8)) {
+        for ((name, op) in impls) {
+            val best = (1..4).minOf { run(threads, op) }      // first runs warm up the JIT
+            println("%-27s %d thread%s: %4d ms for %,d ops".format(name, threads, if (threads == 1) " " else "s", best, threads * 400_000))
+        }
+    }
+    println("LruCache: size ${mine.size}, ${mine.stats()}")
+}
+
+private fun run(threads: Int, op: (Int, Boolean) -&gt; Unit): Long {
+    val gate = CountDownLatch(1)
+    val pool = Executors.newFixedThreadPool(threads)
+    val done = CountDownLatch(threads)
+    for (t in 0 until threads) pool.submit {
+        val rnd = Random(41L + t)
+        gate.await()
+        repeat(400_000) { op(rnd.nextInt(2_000), rnd.nextInt(10) &lt; 8) }   // 80% reads, 20% writes
+        done.countDown()
+    }
+    val start = System.nanoTime()
+    gate.countDown()
+    done.await()
+    pool.shutdown()
+    return (System.nanoTime() - start) / 1_000_000
+}</code></pre></figure>
+    <figure class="kotlin"><figcaption>KOTLIN · CachedCatalogTest.kt</figcaption>
+<pre><code class="language-kotlin">package cache
+
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+/** A fake slow catalog (L38): counts reads, takes 50 ms each. */
+class SlowFakeCatalog : BookCatalog {
+    val books = ConcurrentHashMap(mapOf(1 to Book(1, "Dune"), 2 to Book(2, "Emma")))
+    val reads = AtomicInteger()
+    override fun find(id: Int): Book? { reads.incrementAndGet(); Thread.sleep(50); return books[id] }
+    override fun save(book: Book) { books[book.id] = book }
+}
+
+class CachedCatalogTest {
+    private val db = SlowFakeCatalog()
+    private val catalog = CachedCatalog(db, LruCache(10, Duration.ofMinutes(1)))
+
+    @Test fun `second read is served from the cache`() {
+        catalog.find(1); catalog.find(1)
+        assertEquals(1, db.reads.get())
+    }
+
+    @Test fun `concurrent misses for one key hit the database once`() {
+        val gate = CountDownLatch(1)
+        Executors.newVirtualThreadPerTaskExecutor().use { pool -&gt;
+            repeat(50) { pool.submit { gate.await(); catalog.find(2) } }
+            gate.countDown()
+        }
+        assertEquals(1, db.reads.get())
+    }
+
+    @Test fun `save invalidates so the next read sees the new value`() {
+        catalog.find(1)
+        catalog.save(Book(1, "Dune Messiah"))
+        assertEquals("Dune Messiah", catalog.find(1)?.title)
+        assertEquals(2, db.reads.get())
+    }
+
+    @Test fun `missing books are not cached`() {
+        repeat(3) { catalog.find(99) }
+        assertEquals(3, db.reads.get())
+    }
+}</code></pre></figure>
+<pre class="out">CachedCatalogTest &gt; missing books are not cached() PASSED
+CachedCatalogTest &gt; second read is served from the cache() PASSED
+CachedCatalogTest &gt; concurrent misses for one key hit the database once() PASSED
+CachedCatalogTest &gt; save invalidates so the next read sees the new value() PASSED
+LruCacheTest &gt; stats count hits misses and evictions() PASSED
+LruCacheTest &gt; get makes an entry recently used() PASSED
+LruCacheTest &gt; entries expire after the ttl() PASSED
+LruCacheTest &gt; stays within capacity under 8 threads() PASSED
+LruCacheTest &gt; evicts the least recently used entry when full() PASSED
+LruCacheTest &gt; put on an existing key updates without evicting() PASSED
+BUILD SUCCESSFUL in 1s</pre>
+  </details>
+  <details class="solution"><summary>Reference solutions: Java</summary>
+    <figure class="java"><figcaption>JAVA · Catalog.java · source of truth + cache-aside with coalescing</figcaption>
+<pre><code class="language-java">package cache;
+
+import java.nio.file.Path;
+import java.sql.*;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+// The catalog types live together in one file to keep the final short to read.
+final class Catalog {
+    private Catalog() {}
+
+    record Book(int id, String title) {}
+
+    interface BookCatalog {
+        Book find(int id);                               // null when there's no such book
+        void save(Book book);
+    }
+
+    /** The slow source of truth: SQLite, plus an injected delay per read. */
+    static final class SqliteCatalog implements BookCatalog {
+        private final Path file;
+        private final long delayMillis;
+        final AtomicLong queries = new AtomicLong();
+
+        SqliteCatalog(Path file, long delayMillis) { this.file = file; this.delayMillis = delayMillis; }
+
+        // One connection per call keeps the example simple; a real app uses a pool (L36).
+        private Connection open() throws SQLException { return DriverManager.getConnection("jdbc:sqlite:" + file); }
+
+        void seed(int count) throws SQLException {
+            try (var c = open()) {
+                try (var s = c.createStatement()) { s.execute("CREATE TABLE IF NOT EXISTS books(id INTEGER PRIMARY KEY, title TEXT NOT NULL)"); }
+                c.setAutoCommit(false);
+                try (var ins = c.prepareStatement("INSERT OR REPLACE INTO books VALUES (?, ?)")) {
+                    for (int id = 1; id &lt;= count; id++) { ins.setInt(1, id); ins.setString(2, "Book " + id); ins.addBatch(); }
+                    ins.executeBatch();
+                }
+                c.commit();
+            }
+        }
+
+        @Override public Book find(int id) {
+            queries.incrementAndGet();
+            try {
+                Thread.sleep(delayMillis);
+                try (var c = open(); var q = c.prepareStatement("SELECT title FROM books WHERE id = ?")) {
+                    q.setInt(1, id);
+                    try (var rs = q.executeQuery()) { return rs.next() ? new Book(id, rs.getString(1)) : null; }
+                }
+            } catch (SQLException | InterruptedException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        @Override public void save(Book book) {
+            try (var c = open(); var u = c.prepareStatement("INSERT OR REPLACE INTO books VALUES (?, ?)")) {
+                u.setInt(1, book.id()); u.setString(2, book.title()); u.executeUpdate();
+            } catch (SQLException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+    }
+
+    /** Cache-aside in front of any catalog, with request coalescing for concurrent misses. */
+    static final class CachedCatalog implements BookCatalog {
+        private final BookCatalog db;
+        private final LruCache&lt;Integer, Book&gt; cache;
+        private final Map&lt;Integer, CompletableFuture&lt;Book&gt;&gt; inFlight = new ConcurrentHashMap&lt;&gt;();
+        final AtomicLong coalesced = new AtomicLong();
+
+        CachedCatalog(BookCatalog db, LruCache&lt;Integer, Book&gt; cache) { this.db = db; this.cache = cache; }
+
+        @Override public Book find(int id) {
+            Book cached = cache.get(id);
+            if (cached != null) return cached;
+            var mine = new CompletableFuture&lt;Book&gt;();
+            var running = inFlight.putIfAbsent(id, mine);
+            if (running != null) {                       // someone is already loading this id
+                coalesced.incrementAndGet();
+                return running.join();
+            }
+            try {
+                Book book = db.find(id);
+                if (book != null) cache.put(id, book);
+                mine.complete(book);
+                return book;
+            } catch (RuntimeException e) {
+                mine.completeExceptionally(e);
+                throw e;
+            } finally {
+                inFlight.remove(id, mine);
+            }
+        }
+
+        @Override public void save(Book book) {
+            db.save(book);                               // write the source of truth first...
+            cache.remove(book.id());                     // ...then invalidate the cached copy
+        }
+
+        Stats stats() { return cache.stats(); }
+    }
+}</code></pre></figure>
+    <figure class="java"><figcaption>JAVA · Server.java</figcaption>
+<pre><code class="language-java">package cache;
+
+import cache.Catalog.Book;
+import cache.Catalog.BookCatalog;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.Executors;
+import java.util.function.Supplier;
+
+/** GET /books/{id}, PUT /books/{id} (body = new title), GET /stats. */
+final class Server {
+    private Server() {}
+
+    static HttpServer start(BookCatalog catalog, Supplier&lt;String&gt; stats) throws IOException {
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/books/", ex -&gt; {
+            Integer id = parseId(ex.getRequestURI().getPath().substring("/books/".length()));
+            if (id == null) { send(ex, 400, "{\"error\":\"bad id\"}"); return; }
+            switch (ex.getRequestMethod()) {
+                case "GET" -&gt; {
+                    Book book = catalog.find(id);
+                    if (book == null) send(ex, 404, "{\"error\":\"no book " + id + "\"}");
+                    else send(ex, 200, "{\"id\":" + book.id() + ",\"title\":\"" + json(book.title()) + "\"}");
+                }
+                case "PUT" -&gt; {
+                    String title = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8).trim();
+                    catalog.save(new Book(id, title));
+                    send(ex, 204, null);
+                }
+                default -&gt; send(ex, 405, "{\"error\":\"use GET or PUT\"}");
+            }
+        });
+        server.createContext("/stats", ex -&gt; send(ex, 200, stats.get()));
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());      // L28
+        server.start();
+        return server;
+    }
+
+    private static Integer parseId(String s) {
+        try { return Integer.parseInt(s); } catch (NumberFormatException e) { return null; }
+    }
+
+    private static void send(HttpExchange ex, int status, String body) throws IOException {
+        if (body == null) { ex.sendResponseHeaders(status, -1); ex.close(); return; }
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().add("Content-Type", "application/json");
+        ex.sendResponseHeaders(status, bytes.length);
+        try (var out = ex.getResponseBody()) { out.write(bytes); }
+    }
+
+    private static String json(String s) { return s.replace("\\", "\\\\").replace("\"", "\\\""); }
+}</code></pre></figure>
+    <figure class="java"><figcaption>JAVA · App.java · demo, load test, and Part 3's bench</figcaption>
+<pre><code class="language-java">package cache;
+
+import cache.Catalog.CachedCatalog;
+import cache.Catalog.SqliteCatalog;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.file.Files;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.BiConsumer;
+
+public class App {
+    public static void main(String[] args) throws Exception {
+        if (args.length &gt; 0 &amp;&amp; args[0].equals("bench")) bench(); else finalDemo();
+    }
+
+    // ── Final: the same SQLite catalog served with and without the cache ─────────
+    static void finalDemo() throws Exception {
+        var file = Files.createTempFile("l41-final", ".db");
+        new SqliteCatalog(file, 0).seed(200);
+
+        var plainDb = new SqliteCatalog(file, 20);
+        var plainServer = Server.start(plainDb, () -&gt; "{\"dbQueries\":" + plainDb.queries.get() + "}");
+
+        var cachedDb = new SqliteCatalog(file, 20);
+        var cached = new CachedCatalog(cachedDb, new LruCache&lt;&gt;(50, Duration.ofSeconds(60)));
+        var cachedServer = Server.start(cached, () -&gt; {
+            Stats s = cached.stats();
+            return "{\"hits\":" + s.hits() + ",\"misses\":" + s.misses() + ",\"evictions\":" + s.evictions()
+                    + ",\"coalesced\":" + cached.coalesced.get() + ",\"dbQueries\":" + cachedDb.queries.get() + "}";
+        });
+        var client = HttpClient.newHttpClient();
+        String base = "http://127.0.0.1:" + cachedServer.getAddress().getPort();
+
+        Callers call = (method, path, body) -&gt; {
+            var req = HttpRequest.newBuilder(URI.create(base + path))
+                    .method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+            var res = client.send(req, HttpResponse.BodyHandlers.ofString());
+            return (method + " " + path + " -&gt; " + res.statusCode() + " " + res.body()).trim();
+        };
+
+        System.out.println(call.call("GET", "/books/1", null));
+        System.out.println(call.call("GET", "/books/1", null));
+        System.out.println(call.call("PUT", "/books/1", "Dune"));
+        System.out.println(call.call("GET", "/books/1", null));
+        System.out.println(call.call("GET", "/books/999", null));
+        System.out.println(call.call("GET", "/stats", null));
+
+        // 50 concurrent requests for a cold key: coalescing sends one query to the database
+        long before = cachedDb.queries.get();
+        var gate = new CountDownLatch(1);
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i &lt; 50; i++) pool.submit(() -&gt; { gate.await(); return call.call("GET", "/books/7", null); });
+            gate.countDown();
+        }
+        System.out.println("50 concurrent GET /books/7 -&gt; " + (cachedDb.queries.get() - before)
+                + " database query, coalesced " + cached.coalesced.get());
+
+        System.out.println();
+        loadTest("without cache", plainServer.getAddress().getPort(), client);
+        System.out.println("  " + plainDb.queries.get() + " database queries");
+        long q0 = cachedDb.queries.get();
+        Stats s0 = cached.stats();
+        loadTest("with cache", cachedServer.getAddress().getPort(), client);
+        Stats s1 = cached.stats();
+        long hits = s1.hits() - s0.hits(), misses = s1.misses() - s0.misses();
+        System.out.printf("  %d database queries, hit rate %.1f%%, %d evictions%n",
+                cachedDb.queries.get() - q0, 100.0 * hits / (hits + misses), s1.evictions() - s0.evictions());
+
+        plainServer.stop(0);
+        cachedServer.stop(0);
+        Files.delete(file);
+    }
+
+    interface Callers { String call(String method, String path, String body) throws Exception; }
+
+    /** 16 clients x 125 requests, ids drawn from a Zipf-like distribution over 200 books. */
+    static void loadTest(String name, int port, HttpClient client) throws Exception {
+        double[] cdf = new double[200];
+        double total = 0;
+        for (int r = 1; r &lt;= 200; r++) { total += 1.0 / r; cdf[r - 1] = total; }
+        final double sum = total;
+        var latencies = Collections.synchronizedList(new ArrayList&lt;Double&gt;());
+        long t = System.nanoTime();
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int c = 0; c &lt; 16; c++) {
+                final long seed = 41 + c;
+                pool.submit(() -&gt; {
+                    var rnd = new Random(seed);
+                    for (int i = 0; i &lt; 125; i++) {
+                        int idx = Arrays.binarySearch(cdf, rnd.nextDouble() * sum);
+                        int id = (idx &gt;= 0 ? idx : -idx - 1) + 1;
+                        var req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/books/" + id)).build();
+                        long start = System.nanoTime();
+                        client.send(req, HttpResponse.BodyHandlers.discarding());
+                        latencies.add((System.nanoTime() - start) / 1e6);
+                    }
+                    return null;
+                });
+            }
+        }
+        long wall = (System.nanoTime() - t) / 1_000_000;
+        var sorted = new ArrayList&lt;&gt;(latencies);
+        Collections.sort(sorted);
+        System.out.printf("%-13s %d requests in %d ms: p50 %.1f ms, p95 %.1f ms, p99 %.1f ms%n",
+                name, sorted.size(), wall, pct(sorted, 50), pct(sorted, 95), pct(sorted, 99));
+    }
+
+    static double pct(List&lt;Double&gt; sorted, double p) {
+        return sorted.get(Math.max(0, (int) Math.ceil(p / 100 * sorted.size()) - 1));
+    }
+
+    // ── Part 3: my LruCache vs a synchronized LinkedHashMap under contention ─────
+    static void bench() throws Exception {
+        int cap = 1_000;
+        var mine = new LruCache&lt;Integer, Integer&gt;(cap, Duration.ofHours(1));
+        Map&lt;Integer, Integer&gt; jdk = Collections.synchronizedMap(new LinkedHashMap&lt;&gt;(16, 0.75f, true) {
+            @Override protected boolean removeEldestEntry(Map.Entry&lt;Integer, Integer&gt; eldest) { return size() &gt; cap; }
+        });
+        var impls = new LinkedHashMap&lt;String, BiConsumer&lt;Integer, Boolean&gt;&gt;();
+        impls.put("LruCache (ReentrantLock)", (k, read) -&gt; { if (read) mine.get(k); else mine.put(k, k); });
+        impls.put("synchronized LinkedHashMap", (k, read) -&gt; { if (read) jdk.get(k); else jdk.put(k, k); });
+        for (int threads : new int[] {1, 8}) {
+            for (var e : impls.entrySet()) {
+                long best = Long.MAX_VALUE;
+                for (int round = 0; round &lt; 4; round++) best = Math.min(best, run(threads, e.getValue()));   // first runs warm up the JIT
+                System.out.printf("%-27s %d thread%s: %4d ms for %,d ops%n", e.getKey(), threads, threads == 1 ? " " : "s", best, threads * 400_000);
+            }
+        }
+        System.out.println("LruCache: size " + mine.size() + ", " + mine.stats());
+    }
+
+    static long run(int threads, BiConsumer&lt;Integer, Boolean&gt; op) throws Exception {
+        var gate = new CountDownLatch(1);
+        var done = new CountDownLatch(threads);
+        var pool = Executors.newFixedThreadPool(threads);
+        for (int t = 0; t &lt; threads; t++) {
+            final long seed = 41 + t;
+            pool.submit(() -&gt; {
+                var rnd = new Random(seed);
+                gate.await();
+                for (int i = 0; i &lt; 400_000; i++) op.accept(rnd.nextInt(2_000), rnd.nextInt(10) &lt; 8);   // 80% reads, 20% writes
+                done.countDown();
+                return null;
+            });
+        }
+        long start = System.nanoTime();
+        gate.countDown();
+        done.await();
+        pool.shutdown();
+        return (System.nanoTime() - start) / 1_000_000;
+    }
+}</code></pre></figure>
+    <figure class="java"><figcaption>JAVA · CachedCatalogTest.java</figcaption>
+<pre><code class="language-java">package cache;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import cache.Catalog.Book;
+import cache.Catalog.BookCatalog;
+import cache.Catalog.CachedCatalog;
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.Test;
+
+class CachedCatalogTest {
+    /** A fake slow catalog (L38): counts reads, takes 50 ms each. */
+    static final class SlowFakeCatalog implements BookCatalog {
+        final Map&lt;Integer, Book&gt; books = new ConcurrentHashMap&lt;&gt;(Map.of(1, new Book(1, "Dune"), 2, new Book(2, "Emma")));
+        final AtomicInteger reads = new AtomicInteger();
+        @Override public Book find(int id) {
+            reads.incrementAndGet();
+            try { Thread.sleep(50); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return books.get(id);
+        }
+        @Override public void save(Book book) { books.put(book.id(), book); }
+    }
+
+    private final SlowFakeCatalog db = new SlowFakeCatalog();
+    private final CachedCatalog catalog = new CachedCatalog(db, new LruCache&lt;&gt;(10, Duration.ofMinutes(1)));
+
+    @Test void secondReadIsServedFromTheCache() {
+        catalog.find(1); catalog.find(1);
+        assertEquals(1, db.reads.get());
+    }
+
+    @Test void concurrentMissesForOneKeyHitTheDatabaseOnce() {
+        var gate = new CountDownLatch(1);
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i &lt; 50; i++) pool.submit(() -&gt; { gate.await(); return catalog.find(2); });
+            gate.countDown();
+        }
+        assertEquals(1, db.reads.get());
+    }
+
+    @Test void saveInvalidatesSoTheNextReadSeesTheNewValue() {
+        catalog.find(1);
+        catalog.save(new Book(1, "Dune Messiah"));
+        assertEquals("Dune Messiah", catalog.find(1).title());
+        assertEquals(2, db.reads.get());
+    }
+
+    @Test void missingBooksAreNotCached() {
+        for (int i = 0; i &lt; 3; i++) catalog.find(99);
+        assertEquals(3, db.reads.get());
+    }
+}</code></pre></figure>
+<pre class="out">CachedCatalogTest &gt; missingBooksAreNotCached() PASSED
+CachedCatalogTest &gt; secondReadIsServedFromTheCache() PASSED
+CachedCatalogTest &gt; concurrentMissesForOneKeyHitTheDatabaseOnce() PASSED
+CachedCatalogTest &gt; saveInvalidatesSoTheNextReadSeesTheNewValue() PASSED
+LruCacheTest &gt; getMakesAnEntryRecentlyUsed() PASSED
+LruCacheTest &gt; putOnAnExistingKeyUpdatesWithoutEvicting() PASSED
+LruCacheTest &gt; staysWithinCapacityUnder8Threads() PASSED
+LruCacheTest &gt; statsCountHitsMissesAndEvictions() PASSED
+LruCacheTest &gt; evictsTheLeastRecentlyUsedEntryWhenFull() PASSED
+LruCacheTest &gt; entriesExpireAfterTheTtl() PASSED
+BUILD SUCCESSFUL in 5s</pre>
+<pre class="out">GET /books/1 -&gt; 200 {"id":1,"title":"Book 1"}
+GET /books/1 -&gt; 200 {"id":1,"title":"Book 1"}
+PUT /books/1 -&gt; 204
+GET /books/1 -&gt; 200 {"id":1,"title":"Dune"}
+GET /books/999 -&gt; 404 {"error":"no book 999"}
+GET /stats -&gt; 200 {"hits":1,"misses":3,"evictions":0,"coalesced":0,"dbQueries":3}
+50 concurrent GET /books/7 -&gt; 1 database query, coalesced 49
+
+without cache 2000 requests in 3318 ms: p50 26.4 ms, p95 31.3 ms, p99 32.6 ms
+  2000 database queries
+with cache    2000 requests in 1442 ms: p50 0.5 ms, p95 30.3 ms, p99 31.0 ms
+  661 database queries, hit rate 63.0%, 613 evictions</pre>
+  </details>
+  <p><b>Read your results.</b></p>
+  <ul>
+    <li><b>The first six lines</b> walk through cache-aside: miss, hit, a <code>PUT</code> that invalidates, a fresh read, a 404 that isn't cached, and the counters to prove it.</li>
+    <li><b>Coalescing.</b> 50 simultaneous requests for a cold book became 1 database query; 49 requests waited for it.</li>
+    <li><b>The load test.</b> The cache answered about 64% of requests from memory and cut database queries by two-thirds. The median fell from about 27 ms to 0.5 ms and the whole run took less than half as long. But p95 and p99 hardly moved: with a 36% miss rate, the slowest 5% of requests are all misses, and a miss costs exactly what it did without the cache. Part 1's lesson again: a cache improves the typical case; the tail is decided by your misses. Raise the capacity, or warm the cache for popular books, and watch p95 move.</li>
+    <li><b>What's still missing for production:</b> the race from Part 2 (a reader can re-cache an old title just after a <code>PUT</code>; the 60 s TTL bounds it), a shared cache so several servers agree (L42), and metrics you can graph rather than a <code>/stats</code> printout (L43).</li>
+  </ul>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">An LRU cache needs a doubly linked list. Why doubly linked, not singly? (L17)</p>
+  <div class="opts"><button>To walk the whole list backwards</button><button>To unlink any node in O(1)</button><button>To halve the memory it uses</button><button>To keep all the keys sorted</button></div>
+  <p class="why">Removing a node from the middle needs its predecessor. With a <code>prev</code> pointer you have it immediately; a singly linked list would have to walk from the head, which is O(n).</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">Your cache uses <code>Book</code> objects as keys. What must <code>Book</code> provide for lookups to work? (L7, L19)</p>
+  <div class="opts"><button>A public constructor with no arguments</button><button>A toString that prints every field</button><button>A compareTo method for sorting keys</button><button>Consistent equals and hashCode method pair</button></div>
+  <p class="why">Hash lookups use <code>hashCode</code> to find the bucket and <code>equals</code> to find the key. A data class or record generates both, which is why ids and records make good cache keys.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">Which executor did the final's <code>HttpServer</code> use so that thousands of blocked requests stay cheap? (L28)</p>
+  <div class="opts"><button><code>newVirtualThreadPerTaskExecutor()</code></button><button><code>newSingleThreadExecutor()</code></button><button><code>newFixedThreadPool(1)</code></button><button><code>ForkJoinPool.commonPool()</code></button></div>
+  <p class="why">A virtual thread per request: waiting on the 20 ms database or on a coalesced future parks the virtual thread and frees its carrier. A single thread would serve one request at a time.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">A <code>PUT</code> writes the book in a transaction, then invalidates the cache. When must the invalidation happen? (L36)</p>
+  <div class="opts"><button>Before the transaction begins</button><button>Halfway through the transaction</button><button>After the transaction commits</button><button>When the TTL expires</button></div>
+  <p class="why">Invalidate too early and a concurrent read can reload the old, still-committed row into the cache. Invalidate after commit, so the next miss can only see the new value.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Write the four latency rules of thumb from memory: memory, SSD, same-datacenter round trip, cross-ocean round trip.</li>
+    <li>Given 10 latencies, compute p50 and p90 by hand. Then explain in one sentence why the mean can describe no request at all.</li>
+    <li>Draw cache-aside's read path and write path. Which comes first on a write, the database or the cache, and is the cache updated or deleted?</li>
+    <li>Name the data-loss risk of write-behind, and one kind of data where it's acceptable.</li>
+    <li>Explain a cache stampede, and sketch request coalescing with a map of futures.</li>
+    <li>From memory, write <code>get</code> and <code>put</code> for an LRU cache built from a map and a doubly linked list with sentinels.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  The <a href="https://github.com/donnemartin/system-design-primer#cache">System Design Primer's Cache section</a>, including "When to update the cache" (cache-aside, write-through, write-behind, refresh-ahead) and each pattern's disadvantages, plus its <a href="https://github.com/donnemartin/system-design-primer#appendix">latency numbers appendix</a>. Then Dean and Barroso's <a href="https://research.google/pubs/the-tail-at-scale/"><em>The Tail at Scale</em></a> for why percentiles and fan-out matter. For how a production Java cache really works, browse the <a href="https://github.com/ben-manes/caffeine/wiki">Caffeine wiki</a>, especially Population, Eviction and Efficiency. <em>Designing Data-Intensive Applications</em> (2nd ed.) is the deep follow-up for the consistency questions caching raises; you'll lean on it through L42–L44.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/system-design.html">System Design</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. "Should this data be cached at all?", "what TTL would you pick here?", "is cache-aside or write-through better for my case?" and "why is my p99 so bad?" are exactly the right questions. Paste your final's load-test output in and we'll read it together.</p>
+
+<div class="lesson-nav">
+  <a href="0040-code-review-and-team-git.html">← L40 · Code Review &amp; Team Git</a>
+  <a href="0042-scaling-out.html">L42 · Scaling Out →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/cacheflow.js"></script>
+</body>
+</html>

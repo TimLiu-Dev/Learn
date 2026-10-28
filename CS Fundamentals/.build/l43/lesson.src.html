@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L43 · Trade-offs &amp; Resilience</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l43">
+<main>
+
+<div class="kicker">Lesson 43 · Phase 12 System Design &amp; Caching · <a href="../reference/roadmap.html#p12">roadmap</a></div>
+<h1>Trade-offs &amp; Resilience</h1>
+<p class="subtitle">Once a system is several programs talking over a network, parts of it will be slow, broken or unreachable while the rest keeps running. This lesson is about living with that: what "consistent" can mean when the network splits, how timeouts, retries, circuit breakers and rate limits stop one failure from spreading, and how logs, metrics and traces tell you what actually happened.</p>
+
+<div class="lesson-meta">
+  <span><b>~105–120 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll put a <em>resilient gateway</em> in front of a deliberately flaky pricing service: per-client rate limiting with <code>429</code>, 300 ms timeouts, jittered retries, a circuit breaker, a stale-price fallback, golden-signal metrics and a trace that shows exactly where the time went. Then you'll watch it ride out a two-second outage without returning a single error.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Consistency and the CAP theorem, in plain terms</a><span class="t">25 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Timeouts, retries, circuit breakers; a rate limiter</a><span class="t">35 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Observability: logs, metrics, traces</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: a resilient gateway</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l43/</code>. Every output on this page comes from a real run: JDK 26.0.1 and Kotlin 2.4.20 on an Apple M5 Max, with every server bound to <code>127.0.0.1</code>. <b>Localhost hides real network latency</b>: a call between two programs on one machine takes well under a millisecond, while a call across a datacenter or a continent takes far longer (L41). Where a delay matters to the point, I add it on purpose with <code>Thread.sleep</code> and say so. Timings and random IDs will differ on your machine; compare shapes, not exact numbers.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L28, L31, L41 and L42</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>A leader database copies every write to a follower about 500 ms later. A user saves their profile, refreshes, and the page reads from the follower. What do they see, and what is that guarantee called when it works? (L42)</li>
+    <li>A message queue delivers <em>at least once</em>. Why must the consumer be idempotent, and how could "charge the card" be made idempotent? (L42, L32)</li>
+    <li>A page calls 50 backends in parallel and waits for all of them. Each backend is slow 1% of the time. Roughly how often is the <em>page</em> slow? (L41)</li>
+    <li>Write the Java line that gives a <code>CompletableFuture</code> a 300 ms deadline. Which status code says "you sent too many requests"? (L28, L31)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="2">
+  <p class="q">A user writes to the leader, then immediately reads from a lagging replica and doesn't see the write. Which guarantee was missing? (L42)</p>
+  <div class="opts"><button>Referential integrity</button><button>Atomic durability</button><button>Read-your-writes consistency</button><button>Strict serialisability</button></div>
+  <p class="why">Read-your-writes means a user always sees their own earlier writes. Replication lag breaks it unless you read your own data from the leader, or wait for the replica to catch up. Part 1 places it among the other consistency models.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">A queue delivers each message <em>at least once</em>, so sometimes twice. What must the consumer be? (L42)</p>
+  <div class="opts"><button>Idempotent</button><button>Stateless</button><button>Synchronous</button><button>Encrypted</button></div>
+  <p class="why">Processing the same message twice must have the same effect as processing it once. The same idea decides which requests are safe to <em>retry</em> in Part 2.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="3">
+  <p class="q">Why watch p99 latency rather than the average for a page that fans out to 50 backends? (L41)</p>
+  <div class="opts"><button>The average is always exactly zero</button><button>Percentiles are cheaper to compute exactly</button><button>Backends report only their p99 numbers</button><button>One slow backend slows the page</button></div>
+  <p class="why">If each backend is slow 1% of the time, the chance that at least one of 50 is slow is 1 − 0.99<sup>50</sup> ≈ 39%. Tail latency becomes the typical page latency. Part 3 measures percentiles with histograms.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="1">
+  <p class="q">Which status code tells a client that it is being rate limited? (L31)</p>
+  <div class="opts"><button><code>503</code></button><button><code>429</code></button><button><code>504</code></button><button><code>409</code></button></div>
+  <p class="why"><code>429 Too Many Requests</code> comes from RFC 6585, not the core HTTP spec. Part 2 sends it with a <code>Retry-After</code> header.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Consistency and the CAP theorem, in plain terms</h2><span class="t">~25 min</span></div>
+
+<p>In L42 you copied data to replicas so you could survive a dead machine and spread reads. Copies raise a question that one database never had to answer: <em>when a copy is behind, what may a reader see?</em> A <dfn>consistency model</dfn> is the answer, a promise about which values reads can return. Three you'll meet constantly, from strongest to weakest:</p>
+<table class="vs">
+  <tr><th>Model</th><th>Plain-words promise</th><th>Example</th></tr>
+  <tr><td><b>Strong</b> (linearizable)</td><td>The system behaves as if there were one copy. Once a write finishes, every later read, anywhere, sees it.</td><td>A bank balance; "is this username taken?"</td></tr>
+  <tr><td><b>Read-your-writes</b></td><td>You always see your own writes. Other people may briefly see older data.</td><td>Your own profile edits (L42)</td></tr>
+  <tr><td><b>Eventual</b></td><td>If writes stop, all copies converge on the same value eventually. Until then, reads can disagree.</td><td>A like counter; DNS records (L30)</td></tr>
+</table>
+<p>Stronger models are easier to program against and cost more: the replicas must talk to each other before answering, which adds latency and fails when they can't reach each other. <em>Designing Data-Intensive Applications</em> (2nd ed.) treats these properly in its chapter on consistency and consensus; this part gives you the working intuition.</p>
+
+<h3>CAP: what happens when the network splits</h3>
+<p>A <dfn>network partition</dfn> means some machines can't reach others: a cable, a switch, a misconfigured firewall, a cloud region that goes dark. The machines are fine; the link between them isn't. The <dfn>CAP theorem</dfn> (Brewer's conjecture, proved by Gilbert and Lynch in "Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services", 2002) says that <b>during a partition</b>, a replicated system must choose: refuse some requests to stay consistent (<b>C</b>), or answer every request and risk returning stale or conflicting data (<b>A</b>).</p>
+<p>You'll often hear CAP as "pick 2 of 3". Brewer himself rejected that framing twelve years later: "The '2 of 3' formulation was always misleading because it tended to oversimplify the tensions among properties", and "CAP prohibits only a tiny part of the design space: perfect availability and consistency in the presence of partitions, which are rare" (<a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/">Brewer, "CAP Twelve Years Later: How the 'Rules' Have Changed"</a>). Martin Kleppmann goes further and argues that labelling whole databases "CP" or "AP" is meaningless, because the theorem's definitions are narrow and real systems fit neither bucket cleanly: "please stop talking about CP and AP, because they just don’t make any sense" (<a href="https://martin.kleppmann.com/2015/05/11/please-stop-calling-databases-cp-or-ap.html">"Please stop calling databases CP or AP"</a>, 2015). The useful takeaway is narrower and more practical: <b>decide, per piece of data, what you do while replicas can't talk.</b></p>
+
+<p>Here are two replicas joined by a link you can cut. In CP mode a write must reach the other replica or it's refused. In AP mode each side accepts writes and sends them later; when the link heals, the newest timestamp wins (<dfn>last write wins</dfn>).</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Cap.kt</figcaption>
+<!--CODE:l43/Cap.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Cap.java</figcaption>
+<!--CODE:l43/Cap.java--></figure>
+</div>
+<p>Both print exactly this (checked with <code>diff</code>):</p>
+<pre class="out"><!--OUT:Cap.kt.txt--></pre>
+<p>Read it as two business decisions:</p>
+<ul>
+  <li><b>The balance chose consistency.</b> During the partition, nobody could change it: both writes were refused. That's unavailable, but nobody spent money they didn't have. When the link comes back, there's nothing to reconcile.</li>
+  <li><b>The cart chose availability.</b> Both sides kept accepting writes and the two replicas disagreed for a while. On heal, "last write wins" quietly <b>threw away the lamp</b>: the customer added it, and it vanished. LWW is simple and convergent, and it loses data whenever two writes happen concurrently. That's acceptable for some data (a "last seen" timestamp), and terrible for a cart. The exercise fixes it by keeping both versions.</li>
+</ul>
+<p class="note">Bridge: offline-first Android apps are AP systems. The phone keeps working without a network and syncs later. Android's own guide describes the same trade-off: "For mobile apps, a common approach is "last write wins."" (<a href="https://developer.android.com/topic/architecture/data-layer/offline-first">Build an offline-first app</a>). Its conflict-resolution section is worth reading after this part.</p>
+
+<h3>PACELC: the trade-off you face every day</h3>
+<p>Partitions are rare. Daniel Abadi pointed out that a replicated system faces a second trade-off <em>all the time</em> ("Consistency Tradeoffs in Modern Distributed Database System Design: CAP is Only Part of the Story", IEEE Computer, 2012). His summary is <dfn>PACELC</dfn>: if there's a <b>P</b>artition, choose <b>A</b>vailability or <b>C</b>onsistency; <b>E</b>lse, choose <b>L</b>atency or <b>C</b>onsistency. That "else" is L42's replication choice. Waiting for the follower to confirm every write (synchronous replication) keeps reads consistent and makes every write slower. Replying before the follower has the data (asynchronous replication) is fast, and that's why read-your-writes can break.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Destructuring a triple.</b> <code>val (a, b, link) = cluster("CP")</code> unpacks a <code>Triple</code> in one line. Java returns a <code>Node[]</code> and indexes it, or needs a record to carry three values.</li>
+    <li><b>Data class vs record.</b> <code>data class Versioned(…)</code> and <code>record Versioned(…)</code> both give you <code>equals</code>/<code>hashCode</code>/<code>toString</code> (L7). Kotlin reads fields as <code>v.ts</code>, Java as <code>v.ts()</code>.</li>
+    <li><b><code>lateinit var peer</code></b> says "set right after construction" without making the type nullable. Java's field just starts as <code>null</code> and nothing stops you forgetting it (L6).</li>
+    <li><b>Pairs.</b> <code>key to v</code> builds a <code>Pair</code>; Java uses <code>Map.entry(key, v)</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: keep both versions</div>
+  <p>Last write wins lost the lamp. From a blank file, build two cart replicas that never lose an item. Each write records the version it <em>replaced</em> (its parent). When a replica receives a version with the same parent as its own current version, the two writes were concurrent: neither saw the other. Instead of picking one, keep both and merge them (for a cart, the union of the items). Replay the scenario: sync <code>[book]</code>, partition, add <code>lamp</code> on A and <code>pen</code> on B, heal. Both replicas must end with all three items.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · CartMerge.kt</figcaption>
+<!--CODE:l43/ex/CartMerge.kt--></figure>
+  <figure class="java"><figcaption>JAVA · CartMerge.java</figcaption>
+<!--CODE:l43/ex/CartMerge.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:CartMerge.kt.txt--></pre>
+<pre class="out"><!--OUT:CartMerge.java.txt--></pre>
+</div>
+  <p>Nothing is lost. The only difference between the two runs is order: Kotlin's <code>cart.items + item</code> builds a <code>LinkedHashSet</code>, which keeps insertion order, while the Java version uses a <code>TreeSet</code>, which sorts. Both replicas hold the same <em>set</em>. This is a simplified version of what real systems do with <em>version vectors</em> (Amazon's 2007 Dynamo paper, "Dynamo: Amazon's Highly Available Key-value Store", used exactly this shopping-cart example). Merging only works when the data has a sensible merge: a union is fine for a cart, while two concurrent bank withdrawals can't be "merged".</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p1-1" data-group="Part 1" data-answer="1">
+  <p class="q">What does the CAP theorem actually force you to choose between?</p>
+  <div class="opts"><button>Any two properties, at all times</button><button>Consistency or availability, during a partition</button><button>Latency or durability, during normal operation</button><button>Replication or sharding, before you launch</button></div>
+  <p class="why">CAP only bites when replicas can't reach each other. Brewer called the "2 of 3" reading misleading; with no partition, you can have consistency and availability. The everyday trade-off is PACELC's "else": latency vs consistency.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1" data-answer="3">
+  <p class="q">In the AP cart demo, why did the lamp disappear after the link healed?</p>
+  <div class="opts"><button>Replica A crashed during the partition</button><button>The write was refused while partitioned</button><button>The cart had a maximum size</button><button>Last write wins dropped one write</button></div>
+  <p class="why">Both writes were accepted. On heal, B compared timestamps and kept only the newer version (t=6), dropping A's concurrent write (t=5): "B drops [book,lamp]".</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Timeouts, retries, circuit breakers; a rate limiter</h2><span class="t">~35 min</span></div>
+
+<h3>Timeouts everywhere</h3>
+<p>Every remote call can hang: the other side is overloaded, stuck in a GC pause (L24), or its packets are going nowhere. Java's <code>HttpClient</code> has no request timeout unless you set one. The <code>HttpRequest.Builder.timeout</code> docs say it plainly: "The effect of not setting a timeout is the same as setting an infinite Duration, i.e. block forever" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.net.http/java/net/http/HttpRequest.Builder.html#timeout(java.time.Duration)">docs</a>). Amazon's guidance is blunt too: "A best practice in Amazon is to set a timeout on any remote call, and generally on any call across processes even on the same box" (<a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library: Timeouts, retries, and backoff with jitter</a>).</p>
+<p>Here's why it matters. A dependency has one hung endpoint (<code>/slow</code> sleeps 5 s, standing in for an overloaded service) and one healthy one (<code>/fast</code>). Our service handles requests on a pool of 8 threads (L28). Fifty requests need <code>/slow</code>; then one request needs <code>/fast</code>:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Cascade.kt</figcaption>
+<!--CODE:l43/Cascade.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Cascade.java</figcaption>
+<!--CODE:l43/Cascade.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:Cascade.kt.txt--></pre>
+<pre class="out"><!--OUT:Cascade.java.txt--></pre>
+</div>
+<ol>
+  <li><b>No timeouts.</b> All 8 threads block on <code>/slow</code>. The <code>/fast</code> request, which needs nothing broken, waits in the queue behind 42 doomed requests and never gets a thread. After 5.5 s only the first wave of 8 has finished; the other 42 would take about 30 s more. One slow dependency has made a healthy endpoint unavailable. That's how failures spread: the Google SRE book defines it, "A cascading failure is a failure that grows over time as a result of positive feedback" (<a href="https://sre.google/sre-book/addressing-cascading-failures/">Addressing Cascading Failures</a>). Callers waiting on <em>us</em> now time out, their threads fill up, and so on up the chain.</li>
+  <li><b>300 ms timeouts.</b> Each doomed call gives up quickly, so the pool drains: all 50 fail fast in about 2.1 s (7 waves of 8 × 300 ms), and <code>/fast</code> is answered after 1.8 s. That's still slow, because it queued behind the failures, but it's no longer stuck.</li>
+  <li><b>A bulkhead.</b> Give each dependency its own small pool, like a ship's watertight compartments. The slow pool is still stuck, but <code>/fast</code> runs on its own threads and answers in 4 ms. A bulkhead doesn't fix the broken part; it stops it sinking everything else.</li>
+</ol>
+<p class="note">Notice what the timeout <em>didn't</em> do: the dependency kept sleeping for its full 5 s per request, doing work nobody would read. The SRE book's answer is to propagate deadlines down the call chain, so servers can drop requests their caller has already given up on. You'll see this waste in a trace in the final.</p>
+
+<h3>Retries, with exponential backoff and jitter</h3>
+<p>Many failures are transient: a dropped connection, a server restarting, a brief overload. Retrying turns them into successes. Retries are also dangerous, because they add load exactly when a system is struggling. AWS's article puts it well: "Retries are “selfish.” In other words, when a client retries, it spends more of the server's time to get a higher chance of success." Three rules make retries safe:</p>
+<ol>
+  <li><b>Only retry what's safe to repeat.</b> A failed request may still have had its effect: "A timeout or failure doesn't necessarily mean that side effects haven't happened", and "APIs with side effects aren't safe to retry unless they provide idempotency" (AWS, same article). GET, PUT and DELETE are idempotent by definition (RFC 9110, L31); POST needs an idempotency key (L32).</li>
+  <li><b>Back off exponentially.</b> Wait longer after each failure (50 ms, 100, 200, …, up to a cap) so a struggling server gets breathing room.</li>
+  <li><b>Add jitter.</b> "Jitter adds some amount of randomness to the backoff to spread the retries around in time" (AWS). Google's SRE book agrees: "Always use randomized exponential backoff when scheduling retries."</li>
+</ol>
+<p>The third rule is the one people skip. Marc Brooker's companion post <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">"Exponential Backoff And Jitter"</a> simulates it, and names the simplest variant <dfn>Full Jitter</dfn>: sleep a random time between 0 and the capped exponential backoff. (The post shows its formulas as images; this is the same algorithm in words.) Here's a similar simulation: 100 clients fail at t=0; the server is down until 1 s, then can serve 10 requests per 100 ms window, and anything beyond that also fails. No network, just arithmetic, so both languages print exactly the same:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Backoff.kt</figcaption>
+<!--CODE:l43/Backoff.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Backoff.java</figcaption>
+<!--CODE:l43/Backoff.java--></figure>
+</div>
+<pre class="out"><!--OUT:Backoff.kt.txt--></pre>
+<p>Without jitter, every client sleeps the <em>same</em> amount, so all the retries land together: waves of 100 with silence in between. When the server recovers, each wave brings 100 clients for 10 slots, 90 fail together, and they all back off together again. The last client is served at <b>28.8 s</b>, after 1,050 attempts. With full jitter the same clients spread out: <b>706 attempts</b>, and everyone is served by <b>3.9 s</b>. Randomness made the system both kinder to the server and faster for the clients. Step through it in the <b>Retries: jitter</b> tab below.</p>
+<p>Also limit how much retrying a whole process does. The SRE book suggests "Limit retries per request" and "Consider having a server-wide retry budget. For example, only allow 60 retries per minute in a process, and if the retry budget is exceeded, don't retry; just fail the request." Otherwise one outage turns every request into three.</p>
+
+<h3>Circuit breakers</h3>
+<p>Retries help with brief blips. When a dependency is properly down, retrying every request just hammers it, and makes every caller wait for timeouts. Martin Fowler describes the fix: "You wrap a protected function call in a circuit breaker object, which monitors for failures. Once the failures reach a certain threshold, the circuit breaker trips, and all further calls to the circuit breaker return with an error, without the protected call being made at all." After a while it goes <dfn>half open</dfn>, "meaning the circuit is ready to make a real call as trial to see if the problem is fixed" (<a href="https://martinfowler.com/bliki/CircuitBreaker.html">CircuitBreaker</a>). Here it is by hand, with an injectable clock (L38) so the demo and tests can move time instantly:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Breaker.kt</figcaption>
+<!--CODE:l43/Breaker.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Breaker.java</figcaption>
+<!--CODE:l43/Breaker.java--></figure>
+</div>
+<pre class="out"><!--OUT:Breaker.kt.txt--></pre>
+<p>Pricing is down from 300 ms to 1,500 ms. After three failures in a row the breaker opens and the next four requests fail instantly, without touching pricing. At 1,000 ms one trial call goes through, fails, and the breaker opens again; at 1,500 ms the trial succeeds and traffic resumes. Pricing saw 17 calls instead of 25, and callers got immediate answers instead of slow failures. The Java run prints the same lines.</p>
+<p>Three details make it safe under concurrency (L26–L27): every state change happens inside <code>synchronized</code>; the protected call itself runs <em>outside</em> the lock, so a slow call doesn't block other threads; and <code>trialInFlight</code> lets exactly one request probe a half-open circuit. Production libraries add more. <a href="https://resilience4j.readme.io/docs/circuitbreaker">Resilience4j</a> "uses a sliding window to store and aggregate the outcome of calls", and opens "when the failure rate is equal or greater than a configurable threshold". A failure <em>rate</em> is often a better trigger than consecutive failures, as the final shows. Spring users usually reach it through <a href="https://docs.spring.io/spring-cloud-circuitbreaker/reference/">Spring Cloud CircuitBreaker</a>.</p>
+
+<div class="resilviz" data-src="resil-demo"></div>
+<script type="application/json" id="resil-demo"><!--RESILSPEC--></script>
+
+<h3>Rate limiting: protect yourself from your callers</h3>
+<p>Timeouts and breakers protect you from slow dependencies. A <dfn>rate limiter</dfn> protects you from your callers: one buggy client in a retry loop, or one scraper, shouldn't use up capacity everyone else needs. Two classic algorithms:</p>
+<ul>
+  <li><b>Token bucket.</b> A bucket holds up to <code>capacity</code> tokens and refills at a steady rate. Each request takes one token; with none left, it's rejected. That allows bursts up to the capacity, and the refill rate on average.</li>
+  <li><b>Sliding window log.</b> Remember when each accepted request happened, and allow a new one only if fewer than <code>limit</code> happened in the last window. That's exact and simple, but it stores one timestamp per request.</li>
+</ul>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · RateLimit.kt</figcaption>
+<!--CODE:l43/RateLimit.kt--></figure>
+  <figure class="java"><figcaption>JAVA · RateLimit.java</figcaption>
+<!--CODE:l43/RateLimit.java--></figure>
+</div>
+<pre class="out"><!--OUT:RateLimit.kt.txt--></pre>
+<p>Both allow 5 per second, but they treat the 500 ms burst differently. The token bucket had refilled 2.5 tokens, so it let 2 through. The sliding window still remembered the 5 requests from t=0 and refused all 3, then let 4 through at 1,000 ms when those 5 slid out of the window. Neither is wrong; they're different definitions of "5 per second". Token buckets are the common choice for APIs because they're O(1) memory per client and naturally allow small bursts. Step through the bucket in the <b>Token bucket</b> tab above.</p>
+<p>Over HTTP, a rejected request gets <code>429</code>. RFC 6585 §4: "The 429 status code indicates that the user has sent too many requests in a given amount of time ("rate limiting")", and the response "MAY include a Retry-After header indicating how long to wait before making a new request" (<a href="https://www.rfc-editor.org/rfc/rfc6585#section-4">RFC 6585</a>). <code>Retry-After</code> itself is defined in RFC 9110 §10.2.3, either as an HTTP date or as a number of seconds (<a href="https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3">RFC 9110</a>). One bucket per client, in a <code>ConcurrentHashMap</code> (L27); a greedy client next to a polite one:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · RateLimitServer.kt</figcaption>
+<!--CODE:l43/RateLimitServer.kt--></figure>
+  <figure class="java"><figcaption>JAVA · RateLimitServer.java</figcaption>
+<!--CODE:l43/RateLimitServer.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:RateLimitServer.kt.txt--></pre>
+<pre class="out"><!--OUT:RateLimitServer.java.txt--></pre>
+</div>
+<p>Alice fires about 35 requests a second. She gets 9 through in the first second (the burst of 5 plus one second of refill), then a steady 5 per second, and everything else is a <code>429</code> with <code>Retry-After: 1</code>. Bob asks politely, about 2.5 times a second, and never notices the limiter exists: his bucket is separate. The 429 counts differ slightly between the runs because they depend on timing; the shape doesn't. A well-behaved client reads <code>Retry-After</code> and waits that long, instead of retrying immediately.</p>
+<p class="note">Bridge: in production, rate limiting usually lives in an API gateway or load balancer in front of your services, and per-client buckets live in a shared store (often Redis) so every server instance enforces the same limit. A bucket in one JVM's memory, as here, only limits traffic to that one instance. Mobile clients throttle themselves too: Android's WorkManager runs background work with backoff instead of hammering a server.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b><code>@Synchronized</code></b> on a method is Java's <code>synchronized</code> keyword, and <code>synchronized(this) { }</code> is a stdlib function that works like Java's block (L26). The bytecode is the same.</li>
+    <li><b>SAM conversion for Java interfaces.</b> <code>InstantSource { Instant.ofEpochMilli(now.get()) }</code> turns a lambda into the JDK's one-method interface, just like Java's <code>() -&gt; …</code> (L14). The breaker never knows the clock is fake.</li>
+    <li><b>Ranges read like the problem.</b> <code>now.get() in 300 until 1500</code> vs Java's <code>now.get() &gt;= 300 &amp;&amp; now.get() &lt; 1500</code>.</li>
+    <li><b>Expressions everywhere.</b> <code>val outcome = try { … } catch (…) { … }</code> assigns from a try (L10). Java needs a variable declared first and assigned in each branch.</li>
+    <li><b>Named arguments.</b> <code>TokenBucket(capacity = 5.0, perSecond = 5.0, clock = clock)</code> says which 5.0 is which. Java's <code>new TokenBucket(5.0, 5.0, clock)</code> doesn't.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a reusable retry helper</div>
+  <p>From a blank file, write a generic <code>retry</code> function: it takes a maximum number of attempts, a base and a cap for the backoff, a <code>java.util.Random</code>, a predicate that decides which exceptions are retryable, and the block to run (which receives the attempt number). It retries with capped exponential backoff and <b>full jitter</b>, printing each sleep, and rethrows immediately for a non-retryable exception or after the last attempt. Test it three ways with <code>Random(43)</code>: a call that fails twice with <code>IOException("503")</code> then succeeds; one that throws <code>IllegalArgumentException("400 bad id")</code>, which must not be retried; and one that always fails.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Retry.kt</figcaption>
+<!--CODE:l43/ex/Retry.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Retry.java</figcaption>
+<!--CODE:l43/ex/Retry.java--></figure>
+</div>
+<pre class="out"><!--OUT:Retry.kt.txt--></pre>
+  <p>Both languages print the same, because both use <code>java.util.Random(43)</code>. Notice attempt 2 of the last case slept only 11 ms out of a possible 200: full jitter can pick small numbers. That's the point. Across many clients, the sleeps are spread evenly over the whole window. A 400 is a bug in the request, so retrying it would just repeat the bug. Java needs its own <code>Attempt</code> interface, because <code>Function</code> can't throw checked exceptions; Kotlin's function type can.</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p2-1" data-group="Part 2" data-answer="2">
+  <p class="q">In the cascade demo with no timeouts, why was the healthy <code>/fast</code> request never answered?</p>
+  <div class="opts"><button>The dependency's /fast endpoint was broken too</button><button>HttpClient refuses all requests sent to localhost</button><button>Every pool thread was blocked on /slow</button><button>The JVM ran out of heap memory</button></div>
+  <p class="why">All 8 worker threads were waiting forever on <code>/slow</code>, so <code>/fast</code> sat in the queue. Timeouts free the threads; a bulkhead gives <code>/fast</code> threads of its own.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2" data-answer="0">
+  <p class="q">Why did full jitter finish faster <em>and</em> make fewer attempts than plain exponential backoff?</p>
+  <div class="opts"><button>Retries stopped arriving in synchronized waves</button><button>Jitter makes every backoff sleep shorter</button><button>The server gained capacity per window</button><button>Jittered clients quit after one retry</button></div>
+  <p class="why">Without jitter, 100 clients retried at the same instants and fought over 10 slots; 90 failed together each time. Random sleeps spread the same clients across many windows, so far more of them succeeded on each try.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2" data-answer="3">
+  <p class="q">A circuit breaker is OPEN. What happens to the next call?</p>
+  <div class="opts"><button>It waits until the dependency recovers</button><button>It is retried with exponential backoff</button><button>It is queued for later trials</button><button>It fails immediately without calling anything</button></div>
+  <p class="why">That's the whole point of OPEN: fail fast and give the dependency room. After the open period, one trial call (HALF_OPEN) decides whether to close or reopen.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Observability: logs, metrics, traces</h2><span class="t">~25 min</span></div>
+
+<p>With one program, you debug by reading its output or attaching a debugger (L12). With twenty programs, a user's "it's slow" could be any of them. <dfn>Observability</dfn> is being able to answer "what is the system doing, and why?" from the outside. It usually rests on three kinds of telemetry: <b>logs</b> (events), <b>metrics</b> (numbers over time) and <b>traces</b> (one request's path through every service).</p>
+<p>What should you measure first? Google's SRE book: "The four golden signals of monitoring are latency, traffic, errors, and saturation. If you can only measure four metrics of your user-facing system, focus on these four" (<a href="https://sre.google/sre-book/monitoring-distributed-systems/">Monitoring Distributed Systems</a>). Latency is how long requests take, and the book warns to track failed requests' latency separately, since "a slow error is even worse than a fast error!" Traffic is demand, such as requests per second. Errors is the rate of failing requests. Saturation is "how "full" your service is"; it adds that "Latency increases are often a leading indicator of saturation".</p>
+
+<h3>Metrics: counters, gauges, histograms</h3>
+<p>A <dfn>counter</dfn> only goes up (requests served). A <dfn>gauge</dfn> goes up and down (requests in flight, queue length). A <dfn>histogram</dfn> counts observations into fixed buckets, so you can estimate percentiles without storing every value: this is how L41's p99 is computed in production. Here they are by hand, exposed as text in the shape of <a href="https://prometheus.io/docs/instrumenting/exposition_formats/">Prometheus' text format</a> (<code># HELP</code>/<code># TYPE</code> lines, cumulative <code>_bucket{le="…"}</code> counts, <code>_sum</code> and <code>_count</code>):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Metrics.kt</figcaption>
+<!--CODE:l43/Metrics.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Metrics.java</figcaption>
+<!--CODE:l43/Metrics.java--></figure>
+</div>
+<pre class="out"><!--OUT:Metrics.kt.txt--></pre>
+<p>Each bucket line is cumulative: 588 requests took ≤ 25 ms, 958 took ≤ 50 ms, and so on, up to all 1,000. To estimate p95, find the first bucket whose count reaches 950: that's ≤ 50 ms. The format requires exactly this property: "A histogram must have a bucket with {le="+Inf"}. Its value must be identical to the value of x_count." The estimate is only as good as the buckets. The 4% of slow requests sit somewhere between 250 and 1,000 ms, so p99 can only be reported as "≤ 1000 ms". The exercise measures how much that costs. In real code you'd use <a href="https://docs.micrometer.io/micrometer/reference/">Micrometer</a> (Spring Boot's metrics library), which "provides a simple facade over the instrumentation clients for the most popular observability systems".</p>
+
+<div class="callout">
+  <b>A real bug from writing this lesson.</b> My first Kotlin <code>render()</code> printed this line, while Java printed 1000:
+<pre class="err"><!--OUT:MetricsShadow.kt.txt:20-20--></pre>
+  Inside <code>buildString { … }</code> the receiver is a <code>StringBuilder</code>, so <code>count()</code> resolved to <code>CharSequence.count()</code>, the number of characters written so far, instead of my histogram's <code>count()</code>. kotlinc compiled it without a warning. That's the lambda-with-receiver trap from L15. The fix is to say which receiver you mean: <code>this@Histogram.count()</code>.
+</div>
+
+<h3>Structured logs</h3>
+<p>A log line like <code>Got price for 42 in 125ms</code> is fine for a person reading one file, and terrible for a machine searching a billion lines from fifty services. <dfn>Structured logs</dfn> write one JSON object per line with consistent field names: level, service, message, duration, and the IDs that tie a line to a request. Then "show me every error from <code>pricing</code> slower than 100 ms in trace X" is a query, not a grep puzzle. The JDK has <code>System.Logger</code> and <code>java.util.logging</code>; most JVM projects use SLF4J with Logback or Log4j 2, which can emit JSON. The next demo writes its JSON by hand.</p>
+
+<h3>Traces: one request across three services</h3>
+<p>A <dfn>trace</dfn> follows one request through every service it touches. Each service records a <dfn>span</dfn>; OpenTelemetry's docs: "A span represents a unit of work or operation. Spans are the building blocks of Traces", and each span knows its parent (<a href="https://opentelemetry.io/docs/concepts/signals/traces/">OpenTelemetry: Traces</a>). The services pass the trace along in an HTTP header standardised by the W3C: "The traceparent HTTP header field identifies the incoming request in a tracing system. It has four fields: version, trace-id, parent-id, trace-flags" (<a href="https://www.w3.org/TR/trace-context/">W3C Trace Context</a>, a W3C Recommendation). Its grammar is <code>trace-id = 32HEXDIGLC</code> ("16 bytes array identifier. All zeroes forbidden") and <code>parent-id = 16HEXDIGLC</code>. The spec's own example is <code>traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01</code>.</p>
+<p>Three services in one JVM, a gateway calling books calling pricing. Pricing sleeps 120 ms on purpose to play the slow service:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · TraceDemo.kt</figcaption>
+<!--CODE:l43/TraceDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · TraceDemo.java</figcaption>
+<!--CODE:l43/TraceDemo.java--></figure>
+</div>
+<pre class="out"><!--OUT:TraceDemo.kt.txt--></pre>
+<pre class="out"><!--OUT:TraceDemo.java.txt--></pre>
+<p>Follow the IDs. All three log lines share one <code>trace_id</code>. Pricing's <code>parent_id</code> is books' <code>span_id</code>, and books' <code>parent_id</code> is the gateway's; the gateway has no parent, because the client sent no <code>traceparent</code>, so it started the trace. Rebuilding the tree gives the waterfall, and <dfn>self time</dfn> (a span's duration minus its children's) points at the culprit. The gateway did almost nothing itself; books spent about 40 ms (its fake 10 ms database call plus opening its first connection to pricing); pricing spent all of its time itself. That's where to look. Step through it in the <b>Trace waterfall</b> tab above. In production, each service would send spans to a collector (the OpenTelemetry Collector, Jaeger, Zipkin…) instead of a shared queue, and the OpenTelemetry SDK would read and write <code>traceparent</code> for you.</p>
+<p class="note">Don't forget the JVM's own telemetry. JFR (L24) records GC pauses, lock contention and hot methods with almost no overhead, and <code>jcmd</code> can dump threads and heap from a live process. When a trace says "pricing spent 900 ms itself", JFR on the pricing JVM tells you which method.</p>
+
+<h3>Alert on symptoms; budget for errors</h3>
+<p>Which of all these numbers should wake someone at 3 a.m.? The SRE book separates what's broken (the symptom) from why (the cause): "it’s better to spend much more effort on catching symptoms than causes". Users feel "checkout is slow", not "a disk is 80% full". So page a human on the golden signals as users experience them, and use cause-level metrics to diagnose.</p>
+<p>How bad is too bad? "An SLI is a service level indicator—a carefully defined quantitative measure of some aspect of the level of service that is provided", and "An SLO is a service level objective: a target value or range of values for a service level that is measured by an SLI" (<a href="https://sre.google/sre-book/service-level-objectives/">Service Level Objectives</a>). For example: 99.9% of price lookups succeed in under 300 ms, measured over 30 days. The remaining 0.1% is an <dfn>error budget</dfn>: "The error budget provides a clear, objective metric that determines how unreliable the service is allowed to be within a single quarter" (<a href="https://sre.google/sre-book/embracing-risk/">Embracing Risk</a>). With budget left, ship features; once it's spent, slow down and fix reliability.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Raw strings for JSON.</b> <code>"""{"level":"INFO", …}"""</code> needs no <code>\"</code> escapes. Java needs a backslash before every quote, or a text block.</li>
+    <li><b>Templates with expressions.</b> <code>${parentId?.let { "\"$it\"" } ?: "null"}</code> renders a JSON string or <code>null</code> in place. Java needs a ternary and string concatenation.</li>
+    <li><b><code>generateSequence</code></b> walks up the parent chain to compute a span's depth in one expression (L15). Java uses a <code>for</code> loop with a stream lookup per step.</li>
+    <li><b>Receiver lambdas can shadow your names</b>, as the <code>count()</code> callout shows. That's the price of <code>buildString</code>'s convenience: inside it, name the receiver whenever a method could exist on both.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: how wrong is a bucketed percentile?</div>
+  <p>From a blank file, generate 10,000 request times with <code>Random(43)</code>: 4% between 300 and 999 ms, the rest between 8 and 37 ms. Compute the exact p50, p95 and p99 by sorting. Then estimate each one from two sets of histogram buckets, the coarse set used above (<code>5, 10, 25, 50, 100, 250, 500, 1000</code>) and a finer one (<code>5, 10, 15, …, 40, 50, 100, 250, 400, 600, 800, 1000</code>), by finding the first bucket whose cumulative count reaches the target. Print a table, then explain where the estimates are good and where they're useless.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Percentiles.kt</figcaption>
+<!--CODE:l43/ex/Percentiles.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Percentiles.java</figcaption>
+<!--CODE:l43/ex/Percentiles.java--></figure>
+</div>
+<pre class="out"><!--OUT:Percentiles.kt.txt--></pre>
+  <p>Both languages print the same table. A bucket can only tell you "somewhere up to this bound". Where buckets are dense (p50, p95) the estimate is close, and the finer set tightens p95 from ≤ 50 to ≤ 40 ms. The true p99 is 846 ms, but both sets can only say "≤ 1000 ms", because nothing separates 800 from 1,000 in the region where the slow requests live. Choose bucket bounds around your SLO: if the objective is "99% under 300 ms", you need a bound <em>at</em> 300.</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p3-1" data-group="Part 3" data-answer="1">
+  <p class="q">Which list is the SRE book's four golden signals?</p>
+  <div class="opts"><button>CPU, memory, disk and network</button><button>Latency, traffic, errors and saturation</button><button>Logs, metrics, traces and alerts</button><button>Uptime, throughput, cost and security</button></div>
+  <p class="why">"The four golden signals of monitoring are latency, traffic, errors, and saturation." CPU and disk are causes; the golden signals are what users feel, plus how full you are.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3" data-answer="2">
+  <p class="q">In a trace, how do you know which service caused a slow request?</p>
+  <div class="opts"><button>The span listed first in the logs</button><button>The span with the longest service name</button><button>The span with the largest self time</button><button>The span whose trace id is newest</button></div>
+  <p class="why">The root span is always the longest, because it includes everyone else. Self time (duration minus children) shows where the time was actually spent: here, pricing.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3" data-answer="0">
+  <p class="q">A Kotlin <code>buildString { }</code> block calls <code>count()</code>, meaning the enclosing class's method. What gets called?</p>
+  <div class="opts"><button>The count of characters written</button><button>The enclosing class's own method</button><button>A compile error, ambiguous call</button><button>A runtime exception, every time</button></div>
+  <p class="why">The builder is the closest receiver, so <code>CharSequence.count()</code> wins, silently. My histogram printed <code>_count 536</code>. Write <code>this@Histogram.count()</code>.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>A resilient gateway</h2><span class="t">~25 min</span></div>
+
+<p>Put Part 2 and Part 3 together. Start from a blank Gradle project (as in L11), Kotlin first and then Java, and don't look at the parts above until you've rated yourself.</p>
+<div class="task">
+  <ol>
+    <li><b>A flaky pricing service</b> on <code>127.0.0.1</code>: <code>GET /price/{id}</code> returns a price, but 20% of calls return <code>500</code> and 5% sleep 2 s first. Use a seeded <code>Random</code>. Also script a 2-second outage (every call returns <code>503</code> between 4 s and 6 s after start) so the breaker has something to do.</li>
+    <li><b>A gateway</b> with <code>GET /api/price/{id}</code> that, in this order:
+      <ol>
+        <li>rate limits per client (the <code>X-Client</code> header) with a token bucket of 10, refilling 10/s, answering <code>429</code> with <code>Retry-After</code>;</li>
+        <li>calls pricing through a <b>circuit breaker</b> that opens after 5 consecutive failures, for 1 s;</li>
+        <li>gives every call a <b>300 ms timeout</b>;</li>
+        <li>retries up to 2 more times with exponential backoff (50 ms base, 400 ms cap) and <b>full jitter</b>, for GETs only, and never when the circuit is open;</li>
+        <li>falls back to the <b>last good price</b> for that id, marked <code>"stale":true</code> with an <code>X-Fallback</code> header, or answers <code>503</code> with <code>Retry-After</code> if it has never seen one.</li>
+      </ol></li>
+    <li><b>Telemetry:</b> a JSON log line for every circuit state change; a <code>/metrics</code> endpoint with the golden signals (requests, results by kind, in-flight gauge, circuit gauge, latency histogram); and a <code>traceparent</code> header on every call to pricing, with spans recorded on both sides.</li>
+    <li><b>Tests</b> with a fake clock (<code>InstantSource</code>): the breaker opens after five failures, a success resets the count, open fails fast without calling, and half-open closes or reopens; the bucket allows a burst up to capacity, refills over time, and never grants more than its capacity to 8 threads at once.</li>
+    <li><b>A scripted run</b> of 10 s: three polite clients (one request every 120 ms each) and one greedy client (every 15 ms). Print a table per second (requests, fresh, stale, 429, 503, p95, circuit states seen), one trace waterfall for a request that timed out and was retried, and <code>/metrics</code>. Shut everything down at the end.</li>
+  </ol>
+</div>
+<div class="rating-group">
+  <div class="rating" data-id="final-kt" data-label="Final: resilient gateway (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-jv" data-label="Final: resilient gateway (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-ts" data-label="Final: breaker and bucket tests with a fake clock"><span class="who">TESTS</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+</div>
+
+<details class="solution"><summary>Reference solutions and real output</summary>
+<p>The Gradle projects are generated with <code>gradle init</code> as in L11, with no extra dependencies: the JDK's <code>HttpServer</code> and <code>HttpClient</code> are enough. First the building blocks: the same breaker and bucket as Part 2, plus the retry helper from the exercise.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Resilience.kt</figcaption>
+<!--CODE:l43/gr_kotlin/app/src/main/kotlin/gateway/Resilience.kt--></figure>
+  <figure class="java"><figcaption>JAVA · CircuitBreaker.java</figcaption>
+<!--CODE:l43/gr_java/app/src/main/java/gateway/CircuitBreaker.java--></figure>
+</div>
+<div class="pair">
+  <figure class="java"><figcaption>JAVA · TokenBucket.java</figcaption>
+<!--CODE:l43/gr_java/app/src/main/java/gateway/TokenBucket.java--></figure>
+  <figure class="java"><figcaption>JAVA · Retry.java</figcaption>
+<!--CODE:l43/gr_java/app/src/main/java/gateway/Retry.java--></figure>
+</div>
+<p>Telemetry: JSON, metrics, and <code>traceparent</code> parsing that rejects malformed or all-zero IDs, as the spec requires.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Telemetry.kt</figcaption>
+<!--CODE:l43/gr_kotlin/app/src/main/kotlin/gateway/Telemetry.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Telemetry.java</figcaption>
+<!--CODE:l43/gr_java/app/src/main/java/gateway/Telemetry.java--></figure>
+</div>
+<p>The flaky pricing service:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Pricing.kt</figcaption>
+<!--CODE:l43/gr_kotlin/app/src/main/kotlin/gateway/Pricing.kt--></figure>
+  <figure class="java"><figcaption>JAVA · PricingService.java</figcaption>
+<!--CODE:l43/gr_java/app/src/main/java/gateway/PricingService.java--></figure>
+</div>
+<p>The gateway, where everything meets. Read <code>handle</code> top to bottom: limit, then retry around breaker around timeout, then fallback.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Gateway.kt</figcaption>
+<!--CODE:l43/gr_kotlin/app/src/main/kotlin/gateway/Gateway.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Gateway.java</figcaption>
+<!--CODE:l43/gr_java/app/src/main/java/gateway/Gateway.java--></figure>
+</div>
+<p>One difference is worth noticing. In Kotlin, <code>fetch</code> can throw <code>IOException</code> straight through the breaker, because Kotlin has no checked exceptions. Java's <code>Supplier</code> can't throw one, so <code>fetch</code> wraps it in <code>UncheckedIOException</code>, and the retry predicate also checks the cause.</p>
+<p>The tests, with a fake clock:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · CircuitBreakerTest.kt</figcaption>
+<!--CODE:l43/gr_kotlin/app/src/test/kotlin/gateway/CircuitBreakerTest.kt--></figure>
+  <figure class="java"><figcaption>JAVA · CircuitBreakerTest.java</figcaption>
+<!--CODE:l43/gr_java/app/src/test/java/gateway/CircuitBreakerTest.java--></figure>
+</div>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · TokenBucketTest.kt</figcaption>
+<!--CODE:l43/gr_kotlin/app/src/test/kotlin/gateway/TokenBucketTest.kt--></figure>
+  <figure class="java"><figcaption>JAVA · TokenBucketTest.java</figcaption>
+<!--CODE:l43/gr_java/app/src/test/java/gateway/TokenBucketTest.java--></figure>
+</div>
+<p><code>TraceparentTest</code> checks the header shape and the parser (in <code>.build/l43/gr_*/app/src/test</code>). <code>./gradlew test</code>, both green:</p>
+<div class="pair">
+<pre class="out"><!--OUT:test_kt.txt:13-39--></pre>
+<pre class="out"><!--OUT:test_jv.txt:9-35--></pre>
+</div>
+<p>The scripted run, <code>App.kt</code> and <code>App.java</code>:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · App.kt</figcaption>
+<!--CODE:l43/gr_kotlin/app/src/main/kotlin/gateway/App.kt--></figure>
+  <figure class="java"><figcaption>JAVA · App.java</figcaption>
+<!--CODE:l43/gr_java/app/src/main/java/gateway/App.java--></figure>
+</div>
+<p><code>./gradlew run</code>, Kotlin:</p>
+<pre class="out"><!--OUT:run_kt.txt--></pre>
+<p>Java:</p>
+<pre class="out"><!--OUT:run_jv.txt--></pre>
+<p>What the runs show, in both languages:</p>
+<ul>
+  <li><b>No user saw an error.</b> The <code>503</code> column is 0 in every second, including the scripted outage at 4–6 s. While pricing was down, requests were answered from the last good prices, marked <code>stale</code>, in 0–3 ms each. Whether a stale price is acceptable is a <em>business</em> decision; for a product page it usually is, at checkout it isn't.</li>
+  <li><b>The breaker opened before the outage</b>, at about 2.5 s. Pricing fails 25% of the time (20% errors + 5% timeouts), and four clients share one breaker, so five failures in a row happen by chance within a couple of seconds. That's the weakness of a <em>consecutive</em>-failure trigger under a steady error rate, and the reason libraries like Resilience4j use a failure <em>rate</em> over a sliding window instead. Then it kept re-opening: each trial call during the outage failed, until the first trial after 6 s succeeded.</li>
+  <li><b>The greedy client was contained.</b> Every <code>429</code> belongs to it; the polite clients stayed under 10 requests a second and were never limited. The greedy client's requests still count as traffic, which is why the request column is high.</li>
+  <li><b>The trace shows wasted work.</b> Attempt 1 timed out after 302 ms, yet pricing went on working on it for 2,001 ms, long after the gateway had given up and retried successfully (attempt 2, 2 ms). Without the trace you'd never see those 1.7 s of pointless work. Deadline propagation, from the SRE book, is the fix.</li>
+  <li><b>The histogram's p95 (≤ 50 ms) is far below the per-second p95 in the slow seconds</b> (around 320–340 ms, when timeouts and retries happened). An aggregate over the whole run hides bad seconds. That's why dashboards plot percentiles over short windows.</li>
+</ul>
+<p class="note">Production versions of these pieces: Resilience4j or Spring Cloud CircuitBreaker for breakers and retries; an API gateway, or Redis-backed buckets, for rate limits; Micrometer plus Prometheus for metrics; the OpenTelemetry SDK and Collector for traces and logs. Each is a well-tested version of a class you just wrote.</p>
+</details>
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">L26 + L43: why are <code>tryAcquire</code> and <code>refill</code> in the token bucket <code>synchronized</code>?</p>
+  <div class="opts"><button>HttpServer calls every handler on one thread</button><button>Two threads could take the last token</button><button>Doubles cannot be read without a lock</button><button>The clock only works inside locked code</button></div>
+  <p class="why">"Check tokens ≥ 1, then subtract" is check-then-act on shared state (L26). Without the lock, two request threads can both see 1.0 and both proceed. The 8-thread test proves exactly 100 grants for 100 tokens.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">L31 + L43: which of these requests is safe to retry automatically after a timeout?</p>
+  <div class="opts"><button><code>POST /orders</code></button><button><code>POST /payments/charge</code></button><button><code>PATCH /cart/items</code></button><button><code>GET /price/42</code></button></div>
+  <p class="why">GET is safe and idempotent (RFC 9110). A timed-out POST may already have created the order or charged the card, so retrying it blindly can do it twice, unless the API supports an idempotency key (L32).</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">L38 + L43: why do the breaker and bucket take an <code>InstantSource</code> instead of calling <code>Instant.now()</code>?</p>
+  <div class="opts"><button>Tests can move time without sleeping</button><button>InstantSource is faster than system time</button><button>Instant.now() is not allowed in Kotlin</button><button>It makes the classes automatically thread-safe</button></div>
+  <p class="why">Dependency injection of the clock (L38) lets a test jump 1,000 ms instantly with a fake. The tests run in milliseconds and give the same result every time.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">L24 + L43: a trace shows the pricing span spent 900 ms of self time. What should you reach for next?</p>
+  <div class="opts"><button>A bigger token bucket capacity</button><button>A lower circuit breaker threshold</button><button>JFR on the pricing JVM</button><button>More retries in the gateway</button></div>
+  <p class="why">The trace tells you <em>which service</em>; a profiler tells you <em>which code</em>. JFR's execution samples (L24) find the hot method inside that 900 ms. The other three only hide the symptom.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>State what CAP forces you to choose, and when. Give one piece of data that should choose consistency and one that can choose availability.</li>
+    <li>Explain PACELC's "else" using L42's synchronous and asynchronous replication.</li>
+    <li>Write, from memory, the three states of a circuit breaker and what moves it between them.</li>
+    <li>Write full jitter as one line of code, and explain in one sentence why it beat plain exponential backoff in the simulation.</li>
+    <li>Write a token bucket's <code>refill()</code> from memory. What header goes with a <code>429</code>?</li>
+    <li>Name the four golden signals, and write the four fields of a <code>traceparent</code> header.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  Google's <a href="https://sre.google/sre-book/table-of-contents/"><em>Site Reliability Engineering</em></a> book is free online and is where most of this vocabulary comes from. Read <a href="https://sre.google/sre-book/monitoring-distributed-systems/">"Monitoring Distributed Systems"</a> (the golden signals), <a href="https://sre.google/sre-book/addressing-cascading-failures/">"Addressing Cascading Failures"</a> (timeouts, deadlines, retry budgets) and <a href="https://sre.google/sre-book/service-level-objectives/">"Service Level Objectives"</a>. Then read AWS's <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">"Timeouts, retries, and backoff with jitter"</a> for the client side, and Brewer's <a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/">"CAP Twelve Years Later"</a> for the theory. For depth, <em>Designing Data-Intensive Applications</em> (2nd ed.) covers consistency models and consensus properly, and <a href="https://github.com/donnemartin/system-design-primer">The System Design Primer</a> has a compact section on availability and consistency patterns.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/system-design.html">System Design &amp; Caching</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "should this endpoint retry?", "what threshold should my breaker use?", "is a stale fallback OK here?" or "which buckets should my histogram have?" are exactly the right kind. Paste in a log line, a trace or your metrics output for a second opinion.</p>
+
+<div class="lesson-nav">
+  <a href="0042-scaling-out.html">← L42 · Scaling Out</a>
+  <a href="0044-a-worked-design.html">L44 · A Worked Design →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/resilviz.js"></script>
+</body>
+</html>

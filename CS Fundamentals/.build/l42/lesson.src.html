@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L42 · Scaling Out</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l42">
+<main>
+
+<div class="kicker">Lesson 42 · Phase 12 System Design &amp; Caching · <a href="../reference/roadmap.html#p12">roadmap</a></div>
+<h1>Scaling Out</h1>
+<p class="subtitle">One server can only get so big. This lesson splits a service across several programs: stateless servers behind a load balancer you write yourself, a database copied to a replica and split into shards, and a queue that moves slow work out of the request.</p>
+
+<div class="lesson-meta">
+  <span><b>~110–125 min</b> · warm-up + 3 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll run three copies of the books API behind a load balancer you wrote, crash one in the middle of a test, and watch traffic flow around it. Writes go to a leader database, reads to a lagging replica, and a queue hands thumbnail jobs to workers that survive a crash without doing anything twice. Every piece is a few dozen lines of Kotlin or Java, running on your laptop.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Stateless servers and load balancers</a><span class="t">35 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Replication, read replicas, sharding</a><span class="t">30 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Message queues and asynchronous work</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">Final exercise: scale the books API</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l42/</code>. Every output on this page is a real capture: Kotlin 2.4.20 and JDK 26 on an 18-core Apple M5 Max, <b>all on localhost</b>. Localhost hides real network latency (a round trip here is well under a millisecond), so where a delay matters the programs add one on purpose with <code>Thread.sleep</code>, and say so. Your timings, process ids and ports will differ.</p>
+
+<div class="callout">
+  <p><b>Ground rules for this phase.</b> Nothing here needs Docker, nginx, Redis, Kafka or a cloud account. Each "system" is built small and real from course pieces: JDK <code>HttpServer</code> backends (L32), SQLite files (L34–L36), a <code>BlockingQueue</code> (L27), virtual threads (L28). Every server binds to <code>127.0.0.1</code> and shuts itself down. Where production would use a real product, the lesson names it and links its docs.</p>
+</div>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L19, L30, L36 and L41</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>In cache-aside, what must a write do to the cache, and what goes wrong if it doesn't? (L41)</li>
+    <li>Sketch an accept loop that gives each TCP client its own virtual thread. (L30)</li>
+    <li>Why did L36's concurrent lenders need <code>?transaction_mode=IMMEDIATE</code>? What does that say about how many writers SQLite allows? (L36)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="1">
+  <p class="q">Thousands of requests miss the cache for one hot key at the same instant and all hit the database. What is that called? (L41)</p>
+  <div class="opts"><button>A cache eviction</button><button>A cache stampede</button><button>A write-behind flush</button><button>A negative cache</button></div>
+  <p class="why">A stampede, or thundering herd: every request sees the miss before any of them has refilled the cache. L41's fix was request coalescing, letting one caller load the value while the others wait for it. The same "many arrive at once" shape appears today with load balancers and queues.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">A hash table doubles from 16 to 32 buckets, indexing with <code>h &amp; (n - 1)</code>. Roughly how many keys change bucket? (L19)</p>
+  <div class="opts"><button>About half of them</button><button>Almost none of them</button><button>Every single key moves</button><button>Exactly one key moves</button></div>
+  <p class="why">One more bit of the hash now counts, so each key either keeps its index or moves to index + 16: about half move. Inside one process that's a quick rehash. When the "buckets" are database servers holding terabytes, moving half the data is a disaster, and Part 2 measures something worse.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="3">
+  <p class="q">Why does an L30-style server give each connection its own virtual thread? (L30)</p>
+  <div class="opts"><button>Sockets need their own thread</button><button>Virtual threads make TCP faster</button><button>The OS forbids sharing threads</button><button>Blocking one client blocks nobody</button></div>
+  <p class="why">Each connection mostly waits on the network. With a thread per connection, a slow client blocks only its own thread, and virtual threads make that cheap (<a href="https://openjdk.org/jeps/444">JEP 444</a>). The load balancer you build today serves every request on its own virtual thread for the same reason.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="2">
+  <p class="q">How many connections can write to one SQLite database at the same moment? (L36)</p>
+  <div class="opts"><button>As many as needed</button><button>One per CPU core</button><button>Exactly one at once</button><button>None without a server</button></div>
+  <p class="why">SQLite allows one writer at a time; the others wait or get <code>SQLITE_BUSY</code>, as L36's concurrent lenders showed (<a href="https://www.sqlite.org/isolation.html">SQLite: isolation</a>). Bigger databases allow more, but every database has a limit on one machine. Replication and sharding in Part 2 are how systems get past it.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Stateless servers and load balancers</h2><span class="t">~35 min</span></div>
+
+<h3>Scaling up vs scaling out</h3>
+<p>When one server can't keep up, you have two choices. <dfn>Scaling up</dfn> (vertical scaling) means a bigger machine: more cores, more memory. <dfn>Scaling out</dfn> (horizontal scaling) means more machines, each running a copy of the program, with something in front spreading the work. The System Design Primer puts the trade-off plainly: "Scaling out using commodity machines is more cost efficient and results in higher availability than scaling up a single server on more expensive hardware, called Vertical Scaling" (<a href="https://github.com/donnemartin/system-design-primer#horizontal-scaling">System Design Primer: horizontal scaling</a>).</p>
+<table class="vs">
+  <tr><th></th><th>Scale up</th><th>Scale out</th></tr>
+  <tr><td>How</td><td>a bigger machine</td><td>more machines behind a load balancer</td></tr>
+  <tr><td>Code changes</td><td>none</td><td>servers must be stateless (below)</td></tr>
+  <tr><td>Limit</td><td>the biggest machine you can buy</td><td>the shared parts: database, load balancer</td></tr>
+  <tr><td>One machine dies</td><td>everything is down</td><td>the others carry on</td></tr>
+</table>
+<p>Scaling up is simpler and often right for a long time. You measure the difference between the two near the end of this part.</p>
+
+<h3>Why servers must be stateless</h3>
+<p>The same page of the Primer lists the price of scaling out: "Servers should be stateless: they should not contain any user-related data like sessions or profile pictures", and "Sessions can be stored in a centralized data store such as a database (SQL, NoSQL) or a persistent cache (Redis, Memcached)." Here is what goes wrong otherwise. Two servers, A and B, each keep logged-in sessions in their own memory, and the load balancer happens to send your second request to B:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Sessions.kt</figcaption>
+<!--CODE:l42/Sessions.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Sessions.java</figcaption>
+<!--CODE:l42/Sessions.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:sessions_kt--></pre>
+<pre class="out"><!--OUT:sessions_jv--></pre>
+</div>
+<ul>
+  <li><b>Stateful:</b> A created the session, so only A knows it. One request later you're "logged out", purely because of which server answered.</li>
+  <li><b>Stateless:</b> the server signs the user name with an HMAC (L33) and hands the token to the client. <em>Any</em> server holding the same key can check it, and none of them remembers anything. The token is identical in both languages: same key, same HMAC, same bytes. A forged token fails the signature check. The comparison uses <code>MessageDigest.isEqual</code>, the constant-time compare from L33.</li>
+  <li><b>The key is configuration, not state.</b> Every server starts with the same secret, the way they all start with the same code. What must not differ between servers is anything learned from <em>requests</em>.</li>
+</ul>
+<p>Three ways out of the stateful trap, each with a cost:</p>
+<table class="cmds">
+  <tr><th>Fix</th><th>How</th><th>Cost</th></tr>
+  <tr><td>Shared store</td><td>sessions in a database or Redis that every server reads</td><td>a network round trip per request; the store must scale too</td></tr>
+  <tr><td>Signed token</td><td>the client carries the state, signed (above; JWTs are a standard format for this)</td><td>can't easily revoke a token before it expires</td></tr>
+  <tr><td>Sticky sessions</td><td>the load balancer sends each client back to the same server</td><td>a server crash logs its users out; load can be uneven (the exercise shows another problem)</td></tr>
+</table>
+<p>The Primer lists the sticky option as a load-balancer feature: "Session persistence - Issue cookies and route a specific client's requests to same instance if the web apps do not keep track of sessions" (<a href="https://github.com/donnemartin/system-design-primer#load-balancer">System Design Primer: load balancer</a>).</p>
+
+<h3>A load balancer, by hand</h3>
+<p>"Load balancers distribute incoming client requests to computing resources such as application servers and databases. In each case, the load balancer returns the response from the computing resource to the appropriate client." The Primer adds that they are effective at "Preventing requests from going to unhealthy servers" and "Helping to eliminate a single point of failure". It lists the usual ways of choosing a server: "Random, Least loaded, Session/cookies, Round robin or weighted round robin, Layer 4, Layer 7". Step through what you're about to build (the numbers come from the real run further down):</p>
+
+<div class="scaleviz" data-src="sv-l42"></div>
+<script type="application/json" id="sv-l42"><!--SVSPEC--></script>
+
+<p>First the backend. Each one runs as its <b>own JVM process</b>, started by the demo with <code>ProcessBuilder</code> (L22). Three servers inside one JVM would be simpler, but they'd share a heap and die together; separate processes can be killed one at a time, like real machines. The price is about half a second of JVM start-up each.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Backend.kt</figcaption>
+<!--CODE:l42/Backend.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Backend.java</figcaption>
+<!--CODE:l42/Backend.java--></figure>
+</div>
+<ul>
+  <li><b>One thread per backend, on purpose.</b> The <code>HttpServer</code> docs: "If this method is not called (before <code>start()</code>) or if it is called with a null Executor, then a default implementation is used, which uses the thread which was created by the <code>start()</code> method" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/jdk.httpserver/com/sun/net/httpserver/HttpServer.html#setExecutor(java.util.concurrent.Executor)">HttpServer.setExecutor</a>). So each backend handles one request at a time, like a one-core machine. That makes the effects of load easy to see. The optional third argument gives it a pool instead, for the scale-up comparison.</li>
+  <li><code>/slow</code> sleeps to imitate a slow backend; <code>/work</code> burns CPU with one PBKDF2 hash (L33); <code>/health</code> is what the load balancer polls.</li>
+  <li><code>startBackend</code> launches the same program again as a child process and reads its first line, <code>READY 51234</code>, to learn the port the OS picked.</li>
+</ul>
+<p>Now the load balancer. It's an <code>HttpServer</code> too, serving each request on a virtual thread and forwarding it with <code>HttpClient</code> (L31), a <dfn>reverse proxy</dfn>:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LoadBalancer.kt</figcaption>
+<!--CODE:l42/LoadBalancer.kt--></figure>
+  <figure class="java"><figcaption>JAVA · LoadBalancer.java</figcaption>
+<!--CODE:l42/LoadBalancer.java--></figure>
+</div>
+<ul>
+  <li><b>Round-robin</b> takes the next healthy backend in turn; <b>least-connections</b> takes the one with the fewest requests in flight right now (<code>active</code>). Both are on nginx's list: "round-robin — requests to the application servers are distributed in a round-robin fashion, least-connected — next request is assigned to the server with the least number of active connections" (<a href="https://nginx.org/en/docs/http/load_balancing.html">nginx: load balancing</a>).</li>
+  <li><b>Active health checks:</b> a virtual thread asks every backend for <code>/health</code> every 500 ms, with a 300 ms timeout, and flips <code>healthy</code> on a change.</li>
+  <li><b>Passive health checks and retry</b> (off unless asked for): when a request fails, mark that backend down immediately and try another. nginx does the same: "If the response from a particular server fails with an error, nginx will mark this server as failed, and will try to avoid selecting this server for subsequent inbound requests for a while."</li>
+  <li><b>Only GET is retried.</b> A request that failed might have reached the backend and done its work before the connection dropped. Sending a GET twice is harmless; sending a POST twice could create two books. That's L32's idempotency, and the final shows it.</li>
+  <li><b>Forwarding headers:</b> everything except the per-connection ones (<code>Host</code>, <code>Content-Length</code>, <code>Connection</code>…), which each hop sets for itself. <code>HttpClient</code> refuses to set some of them anyway.</li>
+</ul>
+<p>The demo starts three backends where b2 is ten times slower than the others, compares the two strategies with a steady stream of requests, then kills b2 in the middle of a run, twice:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LbDemo.kt</figcaption>
+<!--CODE:l42/LbDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · LbDemo.java</figcaption>
+<!--CODE:l42/LbDemo.java--></figure>
+</div>
+<p>Kotlin, built with <code>kotlinc Backend.kt LoadBalancer.kt LbDemo.kt Throughput.kt -include-runtime -d l42.jar</code> and run with <code>java -cp l42.jar LbDemoKt</code>. The Java version runs with <code>java LbDemo.java</code> from the folder holding all four <code>.java</code> files: since JDK 22 the source launcher finds the other classes by file name (<a href="https://openjdk.org/jeps/458">JEP 458</a>).</p>
+<div class="pair">
+<pre class="out"><!--OUT:lbdemo_kt--></pre>
+<pre class="out"><!--OUT:lbdemo_jv--></pre>
+</div>
+<ul>
+  <li><b>Least-connections finished four times sooner</b> (about 1.07 s against 4.2 s). Round-robin gave slow b2 its full third, 20 requests, and b2 serves one at a time at 200 ms each: 20 × 200 ms is 4 s. Least-connections saw b2's requests piling up and sent it only 5.</li>
+  <li><b>The health checker marked a working server DOWN.</b> b2 wasn't dead, just busy: its single thread was working through queued slow requests, so <code>/health</code> waited in line past the 300 ms timeout. Under round-robin it then flapped DOWN, UP, DOWN as the queue drained and refilled. That's a real failure mode, not a bug in the demo. An overloaded server fails its health check, the balancer pulls it out, and its load lands on the others, which may then overload in turn. L43 calls this a cascading failure. Real systems answer health checks on a separate thread or port, and require several failures in a row before pulling a server.</li>
+  <li><b>The kill:</b> b2 died at about 690 ms, and its round-robin turns failed with 502 until the next health check, about 330 ms later: 3 failures out of 60. That window is the price of active checks alone.</li>
+  <li><b>With retry on,</b> the first failure marked b2 down on the spot and the request was resent to b3: 60 of 60 succeeded.</li>
+</ul>
+
+<h3>Does it actually scale?</h3>
+<p>A CPU-bound endpoint behind the balancer, with 24 clients calling it as fast as they can for 3 seconds (after a 1-second warm-up), first with one backend, then two, then three. Last, one backend given three threads instead: scaling up.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Throughput.kt</figcaption>
+<!--CODE:l42/Throughput.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Throughput.java</figcaption>
+<!--CODE:l42/Throughput.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:thr_kt--></pre>
+<pre class="out"><!--OUT:thr_jv--></pre>
+</div>
+<ul>
+  <li><b>Near-linear:</b> each one-thread backend does about 600 hashes a second, and three do about three times that.</li>
+  <li><b>Scaling up gave the same number.</b> On one 18-core machine, three one-thread processes and one three-thread process use the same three cores, so they're equally fast. Scaling out doesn't win on speed here. It wins on what this laptop can't show: surviving a dead machine, and growing past the biggest machine you can buy.</li>
+  <li><b>The limit on one machine is the cores.</b> Past 18 backends there would be nothing left to add. The <code>served</code> counts include the warm-up second.</li>
+</ul>
+
+<h3>Layer 4, layer 7, and before the balancer</h3>
+<p>Your balancer reads each HTTP request, so it's a <dfn>layer 7</dfn> balancer (application layer, L30). The Primer: "Layer 7 load balancers terminate network traffic, reads the message, makes a load-balancing decision, then opens a connection to the selected server." A <dfn>layer 4</dfn> balancer only looks at addresses and ports: "Generally, this involves the source, destination IP addresses, and ports in the header, but not the contents of the packet." Layer 4 is cheaper; layer 7 can route on paths, headers and cookies. In production these are <a href="https://nginx.org/en/docs/http/load_balancing.html">nginx</a>, <a href="https://www.haproxy.org/">HAProxy</a> ("a free, very fast and reliable reverse-proxy offering high availability, load balancing, and proxying for TCP and HTTP-based applications"), or a cloud provider's load balancer. A single balancer is itself a single point of failure, so the Primer notes "it's common to set up multiple load balancers, either in active-passive or active-active mode."</p>
+<p>Spreading starts even earlier, in DNS (L30): <code>example.com</code> returned two A records, and clients pick one, a crude form of balancing. <dfn>Anycast</dfn> goes further: "Anycast is the name given to the practice of making a Service Address available to a routing system at Anycast Nodes in two or more discrete locations" (<a href="https://www.rfc-editor.org/rfc/rfc4786">RFC 4786</a>). The same IP address is announced from many places, and internet routing delivers each client to a nearby one.</p>
+
+<div class="callout">
+  <p><b>Bridge.</b> When you deploy a Spring Boot service, the platform (Kubernetes, a cloud load balancer) does this part, and your job is to make the service stateless and give it a health endpoint. Spring Boot's Actuator provides <code>/actuator/health</code> for exactly that. On Android, the app is the <em>client</em> of all this: it talks to one hostname and never knows how many servers are behind it.</p>
+</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>when (strategy)</code> over an enum is an expression, and <code>up.minBy { it.active.get() }</code> picks the least-loaded backend in one call. Java needs a stream with <code>Comparator.comparingInt</code> and <code>orElseThrow()</code>.</li>
+    <li><code>pick(skip = null) ?: return reply(…)</code> handles "no healthy backend" in the same line that picks one.</li>
+    <li><code>use { }</code> closes the load balancer and the executor; Java writes try-with-resources. Default arguments (<code>retryOnFailure = false</code>, <code>slowMs = 0</code>) replace Java's extra constructor or overload.</li>
+    <li>No checked exceptions: <code>Thread.sleep</code> and <code>client.send</code> need no <code>catch (InterruptedException e)</code>. The Java health loop has three catch blocks for the same logic.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: sticky routing, and why mod N bites</div>
+  <p>From a blank file, write <code>pick(client, backends)</code> that sends a client to <code>backends[hash(client) mod size]</code>, so the same client always lands on the same backend. Map ten client names over <code>b1, b2, b3</code>, then over <code>b1, b3</code> as if b2 died. For each client print whether it moved, and whether it <em>had</em> to. Predict before running: how many clients on healthy backends get moved anyway?</p>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex1.kt</figcaption>
+<!--CODE:l42/Ex1.kt--></figure>
+      <figure class="java"><figcaption>JAVA · Ex1.java</figcaption>
+<!--CODE:l42/Ex1.java--></figure>
+    </div>
+<pre class="out"><!--OUT:ex1_kt--></pre>
+    <p>Java prints exactly the same: <code>String.hashCode</code> is the same function in both (L19). Three clients had to move because b2 died. But five more moved although their backend was fine, because dividing by 2 instead of 3 reshuffles almost everyone. With sticky sessions, half your users would have been logged out for no reason. Part 2 measures this at scale and fixes it.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Stateless servers and load balancers" data-answer="2">
+  <p class="q">Server A keeps sessions in a <code>HashMap</code>. The load balancer sends your next request to B. What happens?</p>
+  <div class="opts"><button>B copies the session</button><button>The request is queued</button><button>You look logged out</button><button>A forwards it automatically</button></div>
+  <p class="why">B has its own memory and has never seen your session, exactly as <code>Sessions</code> showed with a 401. Servers behind a balancer must be stateless: keep sessions in a shared store, or in a signed token the client carries.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Stateless servers and load balancers" data-answer="0">
+  <p class="q">In the demo, why did least-connections finish in about 1 s instead of 4 s?</p>
+  <div class="opts"><button>It sent fewer to b2</button><button>It skipped all health checks</button><button>It used more backend threads</button><button>It cached the slow responses</button></div>
+  <p class="why">Least-connections looks at requests in flight. b2's piled up while it slept 200 ms on each, so new requests went to b1 and b3: b2 got 5 instead of 20. Round-robin ignores load and sends b2 its full third.</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Stateless servers and load balancers" data-answer="3">
+  <p class="q">A backend dies, and the balancer has active health checks but no retries. Which requests fail?</p>
+  <div class="opts"><button>Every request from then on</button><button>Only the very first one</button><button>None, TCP resends them all</button><button>Its share until health check</button></div>
+  <p class="why">Until the next health check notices, the dead backend keeps getting its round-robin turns, and each one fails. In the demo that was 3 of 60 requests in a 330 ms window. After the check marks it DOWN, nothing more goes there.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Stateless servers and load balancers" data-answer="1">
+  <p class="q">Why may the load balancer retry a failed GET but not a failed POST?</p>
+  <div class="opts"><button>POST bodies are too large</button><button>GET is idempotent, POST isn't</button><button>HTTP forbids retrying any POST</button><button>Retries only work over TCP</button></div>
+  <p class="why">The failed attempt may have reached the backend and done its work. Repeating a GET changes nothing; repeating a POST might create a second book. RFC 9110 calls GET idempotent and POST not (L32); safe retries of POST need an idempotency key, which L43 covers.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Replication, read replicas, sharding</h2><span class="t">~30 min</span></div>
+
+<p>Part 1's backends are easy to multiply because they keep nothing. The database keeps everything, so all the backends still share one. Two techniques spread a database over several machines. <b>Replication</b> keeps a full copy on each, which helps reads and survives a crash. <b>Sharding</b> gives each a slice, which helps writes and size. <em>Designing Data-Intensive Applications</em> gives each a chapter; read the replication and sharding (partitioning) chapters after this lesson.</p>
+
+<h3>Leader and follower</h3>
+<p>The Primer describes the classic set-up, using the older names master and slave: "The master serves reads and writes, replicating writes to one or more slaves, which serve only reads. Slaves can also replicate to additional slaves in a tree-like fashion. If the master goes offline, the system can continue to operate in read-only mode until a slave is promoted to a master or a new master is provisioned" (<a href="https://github.com/donnemartin/system-design-primer#master-slave-replication">System Design Primer: replication</a>). Today they're usually called <dfn>leader</dfn> and <dfn>follower</dfn>, or primary and replica. Managed databases replicate <em>asynchronously</em> by default. Amazon RDS: "When you make updates to the primary DB instance, Amazon RDS copies them asynchronously to the read replica" (<a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html">Amazon RDS: read replicas</a>).</p>
+<p>Here it is with two SQLite files. Each write goes to the leader together with a row in a <code>changes</code> table (the <dfn>replication log</dfn>), in one transaction (L36). A replicator thread copies changes to the follower in order, each one 300 ms after it was written. That's an artificial delay standing in for the network and a busy replica.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Replication.kt</figcaption>
+<!--CODE:l42/Replication.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Replication.java</figcaption>
+<!--CODE:l42/Replication.java--></figure>
+</div>
+<p>Run with sqlite-jdbc on the classpath, as in L36. Java: <code>java --enable-native-access=ALL-UNNAMED -cp sqlite-jdbc-3.53.4.0.jar Replication.java</code>.</p>
+<div class="pair">
+<pre class="out"><!--OUT:repl_kt--></pre>
+<pre class="out"><!--OUT:repl_jv--></pre>
+</div>
+<ul>
+  <li><b>Read right after a write:</b> the follower hasn't heard about Dune yet and answers "not found". 400 ms later it has. Nothing is broken: the follower is <em>eventually</em> consistent. Step through it in the <b>Replication</b> tab of the diagram above.</li>
+  <li><b>Read-your-writes:</b> the writer remembers the version its write produced and asks for "at least version 2". The follower is only at 1, so the read goes to the leader. Once the follower catches up, reads go back to it. Other users don't get this guarantee unless they carry a version too; the final shows what they see.</li>
+  <li><b>Lag under load:</b> after a burst of 20 writes the follower sat 20 versions behind for about 300 ms. The Primer warns that "The more read slaves, the more you have to replicate, which leads to greater replication lag."</li>
+  <li><b>Four connections, on purpose:</b> a JDBC connection isn't meant for several threads at once, so writers, readers and the replicator each get their own. WAL mode lets a reader read while the replicator writes (<a href="https://www.sqlite.org/wal.html">SQLite: WAL</a>).</li>
+</ul>
+<p><b>Synchronous vs asynchronous.</b> This replicator is asynchronous: the leader commits and answers without waiting for the follower. That's fast, but the Primer lists the risk: "There is a potential for loss of data if the master fails before any newly written data can be replicated to other nodes." A <em>synchronous</em> replica makes the leader wait until the follower has the change too: no loss, but every write is as slow as the slowest replica, and a dead replica blocks writes. Many systems compromise with one synchronous follower and the rest asynchronous. <b>Failover</b>, promoting a follower when the leader dies, is the hard part: deciding the leader really is dead and not just slow (Part 1's health-check false alarm again), and making sure the old leader can't come back and accept writes. "Additional logic is needed to promote a slave to a master," says the Primer. Real databases do this with consensus, which L43 introduces.</p>
+
+<h3>Sharding: splitting the data</h3>
+<p>Replicas copy everything, so every replica still receives every write. To spread <em>writes</em>, split the data. The Primer: "Sharding distributes data across different databases such that each database can only manage a subset of the data. Taking a users database as an example, as the number of users increases, more shards are added to the cluster" (<a href="https://github.com/donnemartin/system-design-primer#sharding">System Design Primer: sharding</a>). Two ways to choose a key's shard:</p>
+<ul>
+  <li><b>By range:</b> users A–F on shard 1, G–M on shard 2, and so on. Range queries stay on one shard, but popular ranges get hot: every new order today lands on the "today" shard.</li>
+  <li><b>By hash:</b> <code>hash(key) mod N</code>. Load spreads evenly, but neighbouring keys scatter, and changing N is painful. That pain is measurable:</li>
+</ul>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Sharding.kt</figcaption>
+<!--CODE:l42/Sharding.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Sharding.java</figcaption>
+<!--CODE:l42/Sharding.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:shard_kt--></pre>
+<pre class="out"><!--OUT:shard_jv--></pre>
+</div>
+<ul>
+  <li><b>mod N moved 80% of the keys</b> when one node was added. A key stays put only if its hash gives the same remainder for 4 and 5, which happens about one time in five. Real shards hold real data, so 80% means copying almost the whole database across the network.</li>
+  <li><b>Consistent hashing</b> puts nodes and keys on the same ring of 64-bit positions, and each key belongs to the first node position clockwise from it. That's a <code>TreeMap.ceilingEntry</code> lookup (L20), wrapping round to <code>firstEntry</code> at the end. Adding n5 only takes over the stretches just before its own positions, so <b>every moved key moved to n5</b>, and none moved between old nodes. The idea comes from Karger and colleagues' 1997 paper "Consistent hashing and random trees". The Primer recommends it: "A sharding function based on consistent hashing can reduce the amount of transferred data."</li>
+  <li><b>Virtual nodes even out the load.</b> With one position per node the slices are luck: n4 owned 41% and n3 only 9%. With 100 positions per node every node gets 22–27%, and adding a fifth moves 22%, close to the ideal fifth. Step through a small ring in the <b>Hash ring</b> tab above.</li>
+  <li><b>Hash quality matters:</b> <code>String.hashCode</code> is fine for <code>mod</code> but clusters similar strings, so the ring uses the first 8 bytes of MD5. Here MD5 is a mixing function, not security (L33).</li>
+</ul>
+<p><b>What sharding costs.</b> The Primer's list: "Data distribution can become lopsided in a shard. For example, a set of power users on a shard could result in increased load to that shard compared to others", "Rebalancing adds additional complexity", and "Joining data from multiple shards is more complex." A single celebrity's account is a <dfn>hot key</dfn> that no hash function can spread, because all of its traffic has one key. A query across shards ("top 10 books by loans") must ask every shard and merge the answers. A transaction that touches two shards loses the simple single-database guarantees of L36 and needs a distributed commit protocol, which is slow and rare. So you choose the shard key to keep each user's or each tenant's data together.</p>
+
+<div class="callout">
+  <p><b>Bridge.</b> Managed databases such as Amazon RDS create read replicas with a click; your code decides which reads may go to them, which is today's read-your-writes problem. On Android, Room is a single local SQLite database (<a href="https://developer.android.com/training/data-storage/room">"an abstraction layer over SQLite"</a>), with no replication at all. The phone's copy plus the server's copy <em>is</em> a replication problem, which offline-first sync has to solve.</p>
+</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>keys.associateWith(ring::nodeFor)</code> builds the key-to-node map in one call; Java needs <code>Collectors.toMap(Function.identity(), ring::nodeFor)</code>.</li>
+    <li><code>groupingBy { it }.eachCount().toSortedMap()</code> is a sorted histogram. Java writes <code>new TreeMap&lt;&gt;(…groupingBy(n -&gt; n, Collectors.counting()))</code>.</li>
+    <li><code>data class Written(val id: Long, val version: Long)</code> returns two values with names; Java's record does the same since JDK 16 (L7).</li>
+    <li><code>(ring.ceilingEntry(h) ?: ring.firstEntry()).value</code> is the whole wrap-around in one expression; Java needs a temporary and a null check.</li>
+    <li>But Kotlin is stricter about nulls, and it shows in the exercise.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a node dies for good</div>
+  <p>From a blank file, reuse your <code>Ring</code>: put n1–n4 on it with 100 virtual nodes, record every key's owner, then <code>remove("n3")</code>. Count the keys that moved, check they were all n3's, and print where they went. Compare with <code>mod 4</code> going to <code>mod 3</code>. Predict first: should n3's keys all land on one node?</p>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · Ex2.kt</figcaption>
+<!--CODE:l42/Ex2.kt--></figure>
+      <figure class="java"><figcaption>JAVA · Ex2.java</figcaption>
+<!--CODE:l42/Ex2.java--></figure>
+    </div>
+<pre class="out"><!--OUT:ex2_kt--></pre>
+    <p>Java prints the same. Only n3's 26,412 keys moved, and they spread over all three survivors, because n3's 100 positions were scattered around the ring. Each neighbour inherits a little, so no single node doubles its load. <code>mod 3</code> would have moved three quarters of everything.</p>
+    <p>A Kotlin trap on the way: my first version grouped by <code>after[it]</code>. A map lookup returns <code>String?</code>, and a nullable key isn't <code>Comparable</code>, so <code>toSortedMap()</code> without a comparator doesn't apply. The error message is confusing:</p>
+<pre class="err"><!--OUT:ex2bad--></pre>
+    <p>(from <code>err/Ex2Bad.kt</code>). <code>after.getValue(it)</code> returns a plain <code>String</code> and throws if the key is missing, which is the honest choice here. Java compiles the equivalent and would only fail at runtime if a null ever appeared.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Replication and sharding" data-answer="1">
+  <p class="q">You write to the leader, then immediately read the same row from an asynchronous replica. What might you see?</p>
+  <div class="opts"><button>A database error message</button><button>The old value, briefly</button><button>Someone else's newer value</button><button>A corrupted half row</button></div>
+  <p class="why">The replica applies changes after a delay, so for a moment it answers with what it had before, or "not found" for a new row, as <code>Replication</code> showed. Read-your-writes fixes it for the writer: carry the version and read the leader until the replica has it.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Replication and sharding" data-answer="3">
+  <p class="q">Sharding with <code>hash mod N</code>, going from 4 to 5 nodes. Roughly what fraction of keys moved?</p>
+  <div class="opts"><button>About one fifth</button><button>About one half</button><button>None of them</button><button>About four fifths</button></div>
+  <p class="why">80,147 of 100,000 in the real run. A key keeps its shard only when its remainder is the same for 4 and 5, about one key in five. That's why plain mod N is a bad sharding function for a cluster that grows.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Replication and sharding" data-answer="0">
+  <p class="q">With consistent hashing, adding node n5 moves keys only…</p>
+  <div class="opts"><button>Onto the new node</button><button>Off the new node</button><button>Between the old nodes</button><button>To random other nodes</button></div>
+  <p class="why">n5's positions take over the stretch of ring just before each of them, so the only keys that change owner are the ones n5 now owns. The run checked it: "all of them to n5: true".</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Replication and sharding" data-answer="2">
+  <p class="q">Why give each node 100 virtual positions on the ring instead of 1?</p>
+  <div class="opts"><button>Lookups become much faster</button><button>Keys never move again</button><button>Load spreads more evenly</button><button>It removes hot keys</button></div>
+  <p class="why">One random position per node gives random slice sizes: 9% to 41% in the run. A hundred small slices per node average out to 22–27% each. Lookups are a little slower (a bigger TreeMap), keys still move, and one hot key is still one hot key.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Message queues and asynchronous work</h2><span class="t">~25 min</span></div>
+
+<p>Some work doesn't belong in the request at all: resizing an image, sending a welcome email, recomputing a report. The user shouldn't wait for it, and a burst of it shouldn't take the web servers down. The Primer's workflow: "An application publishes a job to the queue, then notifies the user of job status. A worker picks up the job from the queue, processes it, then signals the job is complete. The user is not blocked and the job is processed in the background" (<a href="https://github.com/donnemartin/system-design-primer#message-queues">System Design Primer: message queues</a>). A queue also smooths load spikes: jobs wait instead of overwhelming anyone, and workers can be added without touching the producers.</p>
+
+<h3>A queue that survives crashes</h3>
+<p>The hard part is a worker dying halfway through a job. If the queue deleted each message when handing it out, that job would be lost. So real queues hand it out and keep it: "When you receive a message from an Amazon SQS queue, it remains in the queue but becomes temporarily invisible to other consumers… If you don't delete it before the timeout expires, the message becomes visible again in the queue and can be retrieved by another consumer" (<a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">Amazon SQS: visibility timeout</a>). RabbitMQ does the same when the consumer's connection drops: "any delivery (message) that was not acked is automatically requeued" (<a href="https://www.rabbitmq.com/docs/confirms">RabbitMQ: consumer acknowledgements</a>). Here's that design in about forty lines:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · JobQueue.kt</figcaption>
+<!--CODE:l42/JobQueue.kt--></figure>
+  <figure class="java"><figcaption>JAVA · JobQueue.java</figcaption>
+<!--CODE:l42/JobQueue.java--></figure>
+</div>
+<ul>
+  <li><b>Three places a message can be:</b> <code>ready</code> (waiting), <code>inFlight</code> (handed out, with a deadline), or <code>deadLetters</code> (given up on).</li>
+  <li><code>receive</code> moves a message to in-flight and counts the attempt; <code>ack</code> removes it for good. A sweeper thread puts expired in-flight messages back, or into the dead letters after <code>maxAttempts</code>.</li>
+  <li><code>inFlight.remove(id, entry)</code> removes only if the entry is still the one the sweeper saw, so a late ack and the sweeper can't both win (L27's compare-and-set idea).</li>
+  <li><b>Bounded:</b> <code>LinkedBlockingQueue(capacity)</code> makes <code>push</code> block and <code>offer</code> refuse when full.</li>
+</ul>
+<p>Four scenarios: a worker that crashes after doing the work but before acking, the same crash with an idempotent worker, a message that can never succeed, and a producer faster than its consumer:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · QueueDemo.kt</figcaption>
+<!--CODE:l42/QueueDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · QueueDemo.java</figcaption>
+<!--CODE:l42/QueueDemo.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:queue_kt--></pre>
+<pre class="out"><!--OUT:queue_jv--></pre>
+</div>
+<p>Which worker gets which job differs between the two runs (and between your runs): three threads race for messages. The outcomes are the same every time.</p>
+<ul>
+  <li><b>At-least-once delivery means duplicates.</b> A worker crashed between sending email #2 and acking it. After the 300 ms visibility timeout #2 came back and another worker sent it again: 7 emails for 6 jobs. The queue can't tell "crashed before the work" from "crashed after", so it errs on the side of not losing jobs. SQS says it directly: "Design your applications to be idempotent (they should not be affected adversely when processing the same message more than once)" (<a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues-at-least-once-delivery.html">Amazon SQS: at-least-once delivery</a>).</li>
+  <li><b>The idempotent consumer</b> records each job id it finishes and skips ids it has seen: 6 emails for 6 jobs, one redelivery skipped. Here the record is an in-memory set; in production it's a <code>processed_ids</code> table with a unique key (L35). There's still a gap between "email sent" and "id recorded": a crash exactly there would duplicate the email. You close it by writing the effect and the id in <em>one transaction</em> when the effect is a database write (L36), or by passing an idempotency key to the downstream service so it can de-duplicate (L32).</li>
+  <li><b>Poison messages go to the dead letters.</b> "BAD" failed on every attempt. After 3 tries it moved to the dead-letter list instead of looping forever, and the good messages weren't held up. SQS: "The <code>maxReceiveCount</code> is the number of times a consumer can receive a message from a source queue before it is moved to a dead-letter queue" (<a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html">Amazon SQS: dead-letter queues</a>). Someone looks at the dead letters later.</li>
+  <li><b>Backpressure:</b> with room for 5, <code>push</code> blocked whenever the queue was full, so pushing 20 jobs took about 750 ms, the consumer's pace (15 waits × 50 ms). <code>offer</code> refused all 20 extras straight away. The Primer explains why bounded queues are better: "Back pressure can help by limiting the queue size, thereby maintaining a high throughput rate and good response times for jobs already in the queue." It's L28's bounded executor queue again, at system scale.</li>
+</ul>
+
+<h3>Delivery guarantees, ordering, and logs</h3>
+<table class="vs">
+  <tr><th>Guarantee</th><th>How</th><th>Failure looks like</th></tr>
+  <tr><td>At-most-once</td><td>ack (delete) <em>before</em> doing the work</td><td>a crash loses the job</td></tr>
+  <tr><td>At-least-once</td><td>ack <em>after</em> doing the work (today's queue)</td><td>a crash repeats the job</td></tr>
+  <tr><td>"Exactly-once"</td><td>at-least-once + an idempotent consumer</td><td>repeats happen, but have no extra effect</td></tr>
+</table>
+<p>"Exactly-once" delivery over an unreliable network isn't possible in general; what systems offer is exactly-once <em>effect</em>, built from the bottom two rows.</p>
+<p><b>Ordering.</b> With several workers, jobs finish in whatever order the workers manage, not the order they were pushed. In the run above, w1 sent #4–#6 before #2's retry. Often that's fine. When it isn't, say all updates to one user must apply in order, real systems keep order <em>per key</em> rather than globally. Kafka: "Events with the same event key (e.g., a customer or vehicle ID) are written to the same partition, and Kafka guarantees that any consumer of a given topic-partition will always read that partition's events in exactly the same order as they were written" (<a href="https://kafka.apache.org/intro/">Apache Kafka: introduction</a>). That's sharding again, applied to a queue.</p>
+<p><b>Queues vs logs.</b> SQS and RabbitMQ are <em>queues</em>: a message is deleted once acked, and each one goes to one consumer. Kafka is a <em>log</em>: messages are kept for days, and each consumer group remembers its own position, so several independent consumers can read the same stream, and a new one can replay history. DDIA's stream-processing chapter compares the two in depth.</p>
+
+<div class="callout">
+  <p><b>Bridge.</b> On Android, WorkManager is the phone's job queue: it "is intended for work that is required to run reliably even if the user navigates off a screen, the app exits, or the device restarts" (<a href="https://developer.android.com/develop/background-work/background-tasks/persistent">Android: WorkManager</a>), and it retries with backoff, like today's queue. In Spring, <code>@Async</code> runs a method "in a task that has been submitted to a TaskExecutor" (<a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html">Spring: @Async</a>), which is an in-process queue that loses jobs on a crash. Spring Kafka's <code>@KafkaListener</code> and the SQS integrations are the durable kind.</p>
+</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>data class Message</code> plus <code>m.copy(attempts = m.attempts + 1)</code> makes "the same message, one more attempt" one expression. Java's record has no <code>copy</code>, so you call the constructor with every field again.</li>
+    <li><code>ready.poll(…) ?: return null</code> and <code>q.receive(500) ?: break</code> put the empty case on the same line.</li>
+    <li>Destructuring <code>for ((id, entry) in inFlight)</code> reads a map entry by its two parts; Java writes <code>e.getKey()</code> and <code>e.getValue()</code>.</li>
+    <li>No checked <code>InterruptedException</code>: Java's worker lambdas each need a <code>try</code> just to call <code>receive</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a queue broker over TCP</div>
+  <p>Producers and workers are normally separate programs, often on separate machines. From a blank file, put your <code>JobQueue</code> behind L30's line protocol: <code>PUSH &lt;body&gt;</code> → <code>OK</code>; <code>POP</code> → <code>MSG &lt;id&gt; &lt;attempt&gt; &lt;body&gt;</code> or <code>EMPTY</code>; <code>ACK &lt;id&gt;</code> → <code>OK</code> or <code>UNKNOWN</code>. Use a 2-second visibility timeout. Drive it with <code>nc</code>: push two jobs, pop both without acking (two "workers" that die), wait, and pop again.</p>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · QueueServer.kt</figcaption>
+<!--CODE:l42/QueueServer.kt--></figure>
+      <figure class="java"><figcaption>JAVA · QueueServer.java</figcaption>
+<!--CODE:l42/QueueServer.java--></figure>
+    </div>
+<pre class="term"><span class="p">$ </span>java QueueServer.java 18142 &amp;
+queue broker on 127.0.0.1:18142
+<span class="p">$ </span>printf 'PUSH resize cover 7\nPUSH resize cover 8\n' | nc 127.0.0.1 18142
+OK
+OK
+<span class="p">$ </span>printf 'POP\n' | nc 127.0.0.1 18142       <span class="c"># worker A takes #1, then dies without ACK</span>
+MSG 1 1 resize cover 7
+<span class="p">$ </span>printf 'POP\n' | nc 127.0.0.1 18142       <span class="c"># worker B takes #2, and also never acks</span>
+MSG 2 1 resize cover 8
+<span class="p">$ </span>sleep 2.5; printf 'POP\nACK 1\nACK 1\nPOP\n' | nc 127.0.0.1 18142
+MSG 1 2 resize cover 7
+OK
+UNKNOWN
+MSG 2 2 resize cover 8</pre>
+    <p>The Kotlin broker printed the same session on port 18143. After the 2-second timeout both jobs came back as attempt 2: the broker can't know the workers died, it only knows they never acked. The second <code>ACK 1</code> answers <code>UNKNOWN</code> because the message is already gone. (On macOS, <code>nc</code> hangs up as soon as its input ends; with a slow reply, add <code>; sleep 1</code> inside a subshell so the answer has time to arrive.) A real broker also writes messages to disk, so a broker restart doesn't lose them. This one keeps them in memory only.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · Queues and async work" data-answer="2">
+  <p class="q">A worker finishes a job but crashes before acking it. With a visibility timeout, what happens?</p>
+  <div class="opts"><button>The message is lost</button><button>The queue stops working</button><button>It is delivered again</button><button>The producer resends it</button></div>
+  <p class="why">The message stays in flight until its deadline, then the queue makes it visible again and another worker gets it. That's at-least-once delivery: no job lost, but the job ran twice, which is why consumers must be idempotent.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · Queues and async work" data-answer="1">
+  <p class="q">What makes a consumer idempotent?</p>
+  <div class="opts"><button>It acknowledges every message instantly</button><button>Processing twice equals processing once</button><button>It runs on one thread</button><button>It never crashes while working</button></div>
+  <p class="why">Idempotent means a repeat has no extra effect, like the demo's "skips #2: already done". Acking instantly would make delivery at-most-once and lose jobs on a crash; and no consumer can promise never to crash.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · Queues and async work" data-answer="3">
+  <p class="q">A message fails every single time it is processed. What should the queue eventually do?</p>
+  <div class="opts"><button>Retry it forever quietly</button><button>Delete it without trace</button><button>Stop all the workers</button><button>Move it to dead-letters</button></div>
+  <p class="why">After <code>maxAttempts</code> it goes to the dead-letter queue, where someone can inspect and fix it, while the healthy messages keep flowing. Retrying forever wastes workers; deleting it hides a bug.</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · Queues and async work" data-answer="0">
+  <p class="q">The bounded queue is full. What does <code>push()</code> in <code>JobQueue</code> do?</p>
+  <div class="opts"><button>Blocks until there's room</button><button>Drops the oldest job</button><button>Grows the queue unbounded</button><button>Throws away the job</button></div>
+  <p class="why"><code>LinkedBlockingQueue.put</code> waits for space, so a fast producer is slowed to the consumers' pace: 20 pushes took about 750 ms. That's backpressure. <code>offer</code> is the non-blocking choice that says no instead.</p>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p4" data-title="Final exercise"><h2>Scale the books API</h2><span class="t">~25 min</span></div>
+
+<p>Put all three parts together in one program, from a blank file, Kotlin first and then Java. Reuse your <code>LoadBalancer</code>, <code>ReplicatedBooks</code> and <code>JobQueue</code>; write the backend and the test script fresh.</p>
+<div class="task">
+  <ol>
+    <li><b>Three stateless books backends</b> (an L32-style API, smaller). <code>GET /login?user=ada</code> returns an HMAC-signed token. <code>POST /books</code> needs the token, writes the title to the leader and answers <code>201</code> with the new id and an <code>X-Version</code> header. <code>GET /books/{id}</code> reads from the replica, unless the request's <code>X-Min-Version</code> is newer than the replica, in which case it reads the leader. Each backend keeps nothing in its own fields except its dependencies.</li>
+    <li><b>Behind your round-robin load balancer</b> with health checks and retry on. Don't forget a <code>/health</code> endpoint.</li>
+    <li><b>Writes to a leader SQLite database, reads from a follower</b> that lags 300 ms.</li>
+    <li><b>Every new book queues a "thumbnail" job</b> for 2 idempotent workers. Make worker 1 crash once, after making a thumbnail but before acking it.</li>
+    <li><b>A scripted run:</b> log in, then 20 times: create a book, read it back as the writer (sending the version), and read it as another client (no version). Crash b2 before book 10. Print per-backend request counts, errors the client saw, how many of the writer's reads went to the leader, how many of the other client's reads got 404, and the thumbnail jobs, duplicates included. Clean up every server.</li>
+  </ol>
+<pre class="out"><!--OUT:final_kt--></pre>
+  <p>Java: the same, apart from the timings:</p>
+<pre class="out"><!--OUT:final_jv--></pre>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: scale the books API (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: scale the books API (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-sys" data-label="Final: explaining every number in the output"><span class="who">SYSTEMS</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+  <details class="solution"><summary>Reference solutions</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · ScaleBooks.kt</figcaption>
+<!--CODE:l42/ScaleBooks.kt--></figure>
+      <figure class="java"><figcaption>JAVA · ScaleBooks.java</figcaption>
+<!--CODE:l42/ScaleBooks.java--></figure>
+    </div>
+    <ul>
+      <li><b>Why the backends live in one JVM here:</b> one file, one process, and clean-up is a few <code>stop(0)</code> calls. They still share nothing but the database, the queue and the key. Part 1 already showed real separate processes, and <code>server.stop(0)</code> closes the port, so the balancer sees exactly what a crash looks like: connection refused.</li>
+      <li><b>One error, on purpose.</b> The first request to dead b2 was a POST, and POSTs aren't retried: the backend might have created the book before dying. The next request, a GET, failed over to another backend and marked b2 down, and everything after that avoided b2. Making POST safe to retry needs an idempotency key (L43).</li>
+      <li><b>The writer never saw stale data:</b> 19 of its 19 reads went to the leader, because the replica was always behind the version it had just written. <b>The other client did:</b> 19 of 19 reads got 404, because the replica lags 300 ms and the read came a few milliseconds after the write. Same database, different guarantee, depending only on what the reader knew.</li>
+      <li><b>Thumbnails: 19 jobs, 19 made, 1 duplicate skipped.</b> Worker 1's crash left one job unacked; it came back, and the idempotency check skipped it instead of resizing twice.</li>
+      <li><b>The forgotten <code>/health</code>:</b> my first version had none. The health checker got 404 from all three backends and marked them all DOWN in the first 30 ms, so every request answered 503 "no healthy backend". A health endpoint is part of a service's contract with its load balancer.</li>
+    </ul>
+  </details>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">The stateless servers compare token signatures with <code>MessageDigest.isEqual</code>, not <code>equals</code>. Why? (L33)</p>
+  <div class="opts"><button>isEqual is much faster</button><button>It takes constant time</button><button>equals ignores the case</button><button>Strings cannot be compared</button></div>
+  <p class="why"><code>equals</code> stops at the first different character, so an attacker can measure how long a guess took and learn the signature byte by byte. <code>MessageDigest.isEqual</code> takes the same time either way (L33).</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">Which <code>TreeMap</code> call finds the owner of a key's ring position <code>h</code>? (L20)</p>
+  <div class="opts"><button><code>firstKey()</code></button><button><code>floorKey(h)</code></button><button><code>get(h)</code></button><button><code>ceilingEntry(h)</code></button></div>
+  <p class="why">"Clockwise to the first node position" is the smallest key ≥ h: <code>ceilingEntry</code>, falling back to <code>firstEntry()</code> to wrap round. A balanced tree makes it O(log n) (L20). <code>get(h)</code> would almost never find an exact match.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">Which executor rejection policy also pushes back on a producer that is too fast? (L28)</p>
+  <div class="opts"><button><code>CallerRunsPolicy</code></button><button><code>AbortPolicy</code></button><button><code>DiscardPolicy</code></button><button><code>DiscardOldestPolicy</code></button></div>
+  <p class="why">With <code>CallerRunsPolicy</code> a full pool makes the submitting thread run the task itself, so it can't submit more until it's done: backpressure, like <code>push()</code> blocking. <code>AbortPolicy</code> throws, more like <code>offer()</code> returning false; the discard policies silently lose work.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">Several workers record finished job ids in one set at the same time. Which set is safe? (L27)</p>
+  <div class="opts"><button><code>HashSet()</code></button><button><code>TreeSet()</code></button><button><code>ConcurrentHashMap.newKeySet()</code></button><button><code>LinkedHashSet()</code></button></div>
+  <p class="why">Only the concurrent set is built for writers on several threads; the others can lose entries or corrupt themselves (L26–L27). Today's queue and final use <code>ConcurrentHashMap.newKeySet()</code> for exactly this.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Scale up vs scale out: one advantage of each, and the one rule servers must follow before you can scale out.</li>
+    <li>Three places session state can live when servers are stateless, with one cost each.</li>
+    <li>Round-robin vs least-connections: when do they give different results? What did the slow backend do to the health checker?</li>
+    <li>Draw a leader, a follower and a reader. Where can the reader see stale data, and how does read-your-writes avoid it?</li>
+    <li>Why does <code>hash mod N</code> move about 80% of keys going from 4 to 5 nodes, and how does a ring with virtual nodes do better?</li>
+    <li>From a blank file: a queue with receive, ack and a visibility timeout. Then explain at-least-once, idempotent consumers and dead letters in one sentence each.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  <a href="https://github.com/donnemartin/system-design-primer">The System Design Primer</a>, free on GitHub: read the sections <a href="https://github.com/donnemartin/system-design-primer#load-balancer">Load balancer</a> (including layer 4 and layer 7, and horizontal scaling), <a href="https://github.com/donnemartin/system-design-primer#master-slave-replication">Replication</a>, <a href="https://github.com/donnemartin/system-design-primer#sharding">Sharding</a> and <a href="https://github.com/donnemartin/system-design-primer#asynchronism">Asynchronism</a> (message queues and back pressure). It's community-written and interview-flavoured, so for depth read <a href="https://martin.kleppmann.com/2026/03/24/designing-data-intensive-applications-2e.html"><em>Designing Data-Intensive Applications</em>, 2nd ed.</a>, the chapters on replication and on sharding (partitioning), which are the best explanation of replication lag, failover and rebalancing in print. For queue semantics, the SQS pages on <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">visibility timeout</a> and <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html">dead-letter queues</a> are short and precise.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/system-design.html">System Design</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "why did the health check fail when the server was only busy?", "how does a real database pick a new leader?", "where do I put session state in a Spring Boot app?" or "when is a queue overkill?" are exactly the right kind. Paste your final in for a review, and try explaining each number in its output before you do.</p>
+
+<div class="lesson-nav">
+  <a href="0041-latency-and-caching.html">← L41 · Latency &amp; Caching</a>
+  <a href="0043-trade-offs-and-resilience.html">L43 · Trade-offs &amp; Resilience →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/scaleviz.js"></script>
+</body>
+</html>
