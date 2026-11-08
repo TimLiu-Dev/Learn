@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0033: Concurrency Defense: Optimistic (@Version) vs Pessimistic Locking</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Phase 9: High-Throughput Concurrency, Threading & JVM Diagnostics</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Title & Metadata -->
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0033 • Phase 9</span>
+    <h1 style="margin-top: 8px;">Concurrency Defense: Optimistic (@Version) vs Pessimistic Locking</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: When multiple concurrent transactions update the same database record simultaneously, without defensive concurrency control you guarantee data corruption via the 'Lost Update' anomaly. Consider an e-commerce flash sale: two threads read inventory count = 5. Thread A sells 2 units and writes 3. Thread B sells 1 unit and writes 4, overwriting Thread A's update. Two fundamental paradigms exist to prevent this: Optimistic Locking (assume collisions are rare, detect at commit via version columns) and Pessimistic Locking (assume collisions are frequent, lock the physical row via SELECT FOR UPDATE). Choosing the wrong strategy causes either catastrophic deadlock storms or unacceptable abort/retry latency under load.
+    </p>
+  </div>
+
+  <!-- Primary Source -->
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authority: <a href="https://vladmihalcea.com/a-beginners-guide-to-database-locking-and-the-lost-update-phenomena/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">PostgreSQL Documentation: Explicit Locking (Row-Level Locks) & Vlad Mihalcea's High-Performance Java Persistence: Chapter on Locking.</a>. Ground your learning in primary architecture rather than secondary summaries.
+    </p>
+  </div>
+
+  <!-- Main Concept & Code Examples -->
+  
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">A senior engineer must know precisely when to use optimistic locking versus pessimistic locking. Using optimistic locking on a hot flash-sale SKU results in 99% of requests throwing OptimisticLockException and failing. Conversely, using pessimistic locks on low-contention user profiles degrades database throughput by turning multi-core relational databases into sequential single-threaded bottlenecks.</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li>Lost updates occur when concurrent transactions read the same initial state and subsequently overwrite each other without collision detection.</li><li>Optimistic Locking uses JPA '@Version' (integer or timestamp). Hibernate appends 'WHERE id = ? AND version = ?' on update. If row count is 0, it throws 'OptimisticLockException'.</li><li>Optimistic locking requires an explicit retry loop (e.g. Spring Retry or Resilience4j Retry) to reload the latest entity state and re-apply business logic.</li><li>Pessimistic Locking uses database row-level locks via 'SELECT ... FOR UPDATE' (in JPA: '@Lock(LockModeType.PESSIMISTIC_WRITE)'). Other transactions block until the holding transaction commits or rolls back.</li><li>Pessimistic locks risk database deadlocks if two transactions acquire rows in different orders. Always enforce deterministic ordering (e.g., sorting IDs ascending before locking).</li><li>Set query timeout ('jakarta.persistence.lock.timeout') on pessimistic locks to prevent indefinite thread blocking when downstreams stall.</li>
+  </ul>
+
+  
+<h3>1. The Mechanics of Optimistic Locking (@Version)</h3>
+<p>
+Optimistic locking places zero database-level locks on read. The table contains a <code>version INT NOT NULL DEFAULT 0</code> column. When Hibernate updates the entity:
+</p>
+<pre><code>UPDATE inventory_item 
+SET quantity = ?, version = version + 1 
+WHERE id = ? AND version = ?;</code></pre>
+<p>
+If another transaction updated the row first, the version has already incremented, so the <code>UPDATE</code> statement affects 0 rows. Hibernate detects this and immediately throws <code>ObjectOptimisticLockingFailureException</code>.
+</p>
+<p>
+<strong>Crucial Architecture Rule:</strong> Optimistic locking alone does not fix the collision—it only <em>detects</em> it. The application must catch the exception and execute a <strong>Retry Loop</strong> that re-fetches the record with its new version and recalculates the balance.
+</p>
+
+<h3>2. The Mechanics of Pessimistic Locking (SELECT FOR UPDATE)</h3>
+<p>
+When write contention is extremely high (e.g., a ticket reservation system with 5,000 users attempting to buy 10 remaining tickets), optimistic locking causes excessive retry storms and CPU waste. Here, Pessimistic Locking is superior:
+</p>
+<pre><code>@Lock(LockModeType.PESSIMISTIC_WRITE)
+@QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
+@Query("SELECT i FROM InventoryItem i WHERE i.id = :id")
+Optional&lt;InventoryItem&gt; findByIdForUpdate(@Param("id") UUID id);</code></pre>
+<p>
+The database engine (PostgreSQL/MySQL) acquires an exclusive row-level lock on the tuple. All subsequent transactions attempting to read or write with <code>FOR UPDATE</code> are suspended by the database until the first transaction completes.
+</p>
+
+<h3>3. Deadlock Prevention Strategy</h3>
+<p>
+If Transaction 1 locks Account A and wants Account B, while Transaction 2 locks Account B and wants Account A, a classic <strong>Deadlock</strong> occurs. PostgreSQL will detect the cycle after <code>deadlock_timeout</code> (typically 1s) and violently abort one transaction with SQLState <code>40P01</code>.
+</p>
+<p>
+<strong>Rule:</strong> When locking multiple rows in a single transaction, always sort the identifiers in ascending order before executing queries:
+</p>
+<pre><code>List&lt;UUID&gt; sortedIds = ids.stream().sorted().toList();
+List&lt;Account&gt; accounts = repo.findAllByIdInOrderByIdAscForUpdate(sortedIds);</code></pre>
+
+
+  <h2>Production Implementation (Java 21 vs Kotlin 2.x)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Concurrency Defense: Optimistic (@Version) vs Pessimistic Locking</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.concurrency;
+
+import jakarta.persistence.*;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
+import org.springframework.data.repository.query.Param;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Optional;
+import java.util.UUID;
+
+@Entity
+@Table(name = &quot;product_inventory&quot;)
+class ProductInventory {
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(nullable = false)
+    private String sku;
+
+    @Column(nullable = false)
+    private int availableQuantity;
+
+    // Optimistic lock version: incremented automatically by Hibernate
+    @Version
+    private Long version;
+
+    public void deduct(int quantity) {
+        if (this.availableQuantity &lt; quantity) {
+            throw new IllegalStateException(&quot;Insufficient stock for SKU: &quot; + sku);
+        }
+        this.availableQuantity -= quantity;
+    }
+
+    public UUID getId() { return id; }
+    public int getAvailableQuantity() { return availableQuantity; }
+    public Long getVersion() { return version; }
+}
+
+interface ProductInventoryRepository extends JpaRepository&lt;ProductInventory, UUID&gt; {
+    // Pessimistic Write Lock with 3-second timeout
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints({@QueryHint(name = &quot;jakarta.persistence.lock.timeout&quot;, value = &quot;3000&quot;)})
+    @Query(&quot;SELECT p FROM ProductInventory p WHERE p.sku = :sku&quot;)
+    Optional&lt;ProductInventory&gt; findBySkuForUpdate(@Param(&quot;sku&quot;) String sku);
+
+    Optional&lt;ProductInventory&gt; findBySku(String sku);
+}
+
+@Service
+class InventoryService {
+    private final ProductInventoryRepository repository;
+
+    public InventoryService(ProductInventoryRepository repository) {
+        this.repository = repository;
+    }
+
+    // Pattern A: Optimistic Locking with Automatic Retry on collision
+    @Retryable(
+        retryFor = { OptimisticLockException.class },
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 50, multiplier = 2.0)
+    )
+    @Transactional
+    public void deductStockOptimistic(String sku, int amount) {
+        ProductInventory item = repository.findBySku(sku)
+            .orElseThrow(() -&gt; new IllegalArgumentException(&quot;SKU not found&quot;));
+        item.deduct(amount);
+        // Hibernate issues: UPDATE ... WHERE id = ? AND version = ?
+    }
+
+    // Pattern B: Pessimistic Locking for Ultra-High Contention (Flash Sale)
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public void deductStockPessimistic(String sku, int amount) {
+        // Blocks at database level until lock acquired or timeout expires
+        ProductInventory item = repository.findBySkuForUpdate(sku)
+            .orElseThrow(() -&gt; new IllegalArgumentException(&quot;SKU not found&quot;));
+        item.deduct(amount);
+        // Lock released when transaction commits
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.concurrency
+
+import jakarta.persistence.*
+import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Lock
+import org.springframework.data.jpa.repository.Query
+import org.springframework.data.jpa.repository.QueryHints
+import org.springframework.data.repository.query.Param
+import org.springframework.retry.annotation.Backoff
+import org.springframework.retry.annotation.Retryable
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Isolation
+import org.springframework.transaction.annotation.Transactional
+import java.util.UUID
+
+@Entity
+@Table(name = &quot;product_inventory&quot;)
+class ProductInventory(
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    val id: UUID? = null,
+
+    @Column(nullable = false)
+    val sku: String = &quot;&quot;,
+
+    @Column(nullable = false)
+    var availableQuantity: Int = 0
+) {
+    @Version
+    var version: Long? = null
+
+    fun deduct(quantity: Int) {
+        check(availableQuantity &gt;= quantity) { &quot;Insufficient stock for SKU: $sku&quot; }
+        availableQuantity -= quantity
+    }
+}
+
+interface ProductInventoryRepository : JpaRepository&lt;ProductInventory, UUID&gt; {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints(QueryHint(name = &quot;jakarta.persistence.lock.timeout&quot;, value = &quot;3000&quot;))
+    @Query(&quot;SELECT p FROM ProductInventory p WHERE p.sku = :sku&quot;)
+    fun findBySkuForUpdate(@Param(&quot;sku&quot;) sku: String): ProductInventory?
+
+    fun findBySku(sku: String): ProductInventory?
+}
+
+@Service
+class InventoryService(private val repository: ProductInventoryRepository) {
+
+    @Retryable(
+        retryFor = [OptimisticLockException::class],
+        maxAttempts = 3,
+        backoff = Backoff(delay = 50, multiplier = 2.0)
+    )
+    @Transactional
+    fun deductStockOptimistic(sku: String, amount: Int) {
+        val item = repository.findBySku(sku)
+            ?: throw IllegalArgumentException(&quot;SKU not found&quot;)
+        item.deduct(amount)
+    }
+
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    fun deductStockPessimistic(sku: String, amount: Int) {
+        val item = repository.findBySkuForUpdate(sku)
+            ?: throw IllegalArgumentException(&quot;SKU not found&quot;)
+        item.deduct(amount)
+    }
+}</code></pre>
+    </div>
+  </div>
+
+
+  <!-- Active Recall Code Quizzes -->
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis. Review each distractor to build durable failure-mode recognition!
+  </p>
+  
+      <div class="quiz-card" id="q0033_1" data-explanation="Correct! When transactions hold row locks during long processing, waiting threads hold HikariCP connections open, quickly exhausting connection pools and stalling the database.">
+        <span class="quiz-badge">Quiz 1 of 3</span>
+        <div class="quiz-prompt">What is the primary operational risk of using Pessimistic Write Locking (SELECT FOR UPDATE) under sustained high request volume?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. OptimisticLockException only applies to @Version optimistic locking, not SELECT FOR UPDATE.">
+            Every transaction throws an OptimisticLockException if another query executes simultaneously.
+          </button>
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! When transactions hold row locks during long processing, waiting threads hold HikariCP connections open, quickly exhausting connection pools and stalling the database.">
+            Connection pool exhaustion and database thread contention as transactions queue waiting for locks, risking query timeouts and deadlocks.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. WAL is fundamental to ACID durability and is never disabled by row locks.">
+            PostgreSQL disables the write-ahead log (WAL) during pessimistic transactions.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Locking does not alter primary key generation.">
+            Hibernate generates synthetic surrogate keys for every locked entity.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0033_2" data-explanation="Correct! Without a retry mechanism, an OptimisticLockException simply crashes the user&#x27;s request with a 500 error instead of resolving the concurrent update.">
+        <span class="quiz-badge">Quiz 2 of 3</span>
+        <div class="quiz-prompt">Why is an '@Version' column insufficient by itself to build a reliable optimistic concurrency workflow?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Without a retry mechanism, an OptimisticLockException simply crashes the user&#x27;s request with a 500 error instead of resolving the concurrent update.">
+            Because optimistic locking requires the application to implement retry logic (e.g. @Retryable) to reload the fresh state and re-attempt the business action on collision.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. @Version is a JPA standard specification supported on all relational databases.">
+            Because the @Version annotation only works with MySQL and fails on PostgreSQL.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Only the current transaction is rolled back; schema integrity is untouched.">
+            Because Hibernate automatically rolls back the entire database schema if a version mismatch occurs.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Hibernate handles version increments automatically in generated UPDATE statements.">
+            Because @Version fields must be updated manually with SQL trigger functions.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0033_3" data-explanation="Correct! Deadlocks require a circular wait condition. By sorting primary keys ascending before acquiring row locks, circular dependencies become mathematically impossible.">
+        <span class="quiz-badge">Quiz 3 of 3</span>
+        <div class="quiz-prompt">How do you systematically prevent database deadlocks when a transaction needs to lock multiple database rows with SELECT FOR UPDATE?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Random ordering increases the likelihood of cyclic dependency deadlocks.">
+            Execute the queries inside a randomized asynchronous CompletableFuture.
+          </button>
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Deadlocks require a circular wait condition. By sorting primary keys ascending before acquiring row locks, circular dependencies become mathematically impossible.">
+            Always acquire locks on multiple entity rows in a strictly consistent global order (e.g. sorted by primary key ID ascending).
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. SERIALIZABLE in PostgreSQL relies on SSI (Serializable Snapshot Isolation), which actually increases abort and retry rates under write contention.">
+            Set the transaction isolation level to SERIALIZABLE.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Auto-commit is already disabled within Spring managed transactions.">
+            Disable HikariCP connection auto-commit.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+  <!-- Interactive Code Practice Lab -->
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Write and test your solution in either <strong>Java 21</strong> or <strong>Kotlin 2.x</strong>. The automated test runner executes multiple assertions in your browser with zero setup.
+  </p>
+
+  <div class="practice-container" 
+       data-practice-id="lesson-0033-lab"
+       data-starter-java="package com.example.concurrency;
+
+import jakarta.persistence.*;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
+import org.springframework.data.repository.query.Param;
+import java.util.Optional;
+import java.util.UUID;
+
+@Entity
+public class Wallet {
+    @Id
+    private UUID id;
+    private long balance;
+
+    // TODO 1: Add @Version field for optimistic locking
+    private Long version;
+
+    public void debit(long amount) {
+        if (balance &lt; amount) throw new IllegalStateException(&quot;Insufficient funds&quot;);
+        this.balance -= amount;
+    }
+}
+
+interface WalletRepository extends JpaRepository&lt;Wallet, UUID&gt; {
+    // TODO 2: Annotate with Pessimistic Write Lock and 2000ms timeout hint
+    @Query(&quot;SELECT w FROM Wallet w WHERE w.id = :id&quot;)
+    Optional&lt;Wallet&gt; findByIdForUpdate(@Param(&quot;id&quot;) UUID id);
+}"
+       data-starter-kotlin="package com.example.concurrency
+
+import jakarta.persistence.*
+import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Lock
+import org.springframework.data.jpa.repository.Query
+import org.springframework.data.jpa.repository.QueryHints
+import org.springframework.data.repository.query.Param
+import java.util.UUID
+
+@Entity
+class Wallet(
+    @Id val id: UUID,
+    var balance: Long
+) {
+    // TODO 1: Add @Version field
+    var version: Long? = null
+
+    fun debit(amount: Long) {
+        check(balance &gt;= amount) { &quot;Insufficient funds&quot; }
+        balance -= amount
+    }
+}
+
+interface WalletRepository : JpaRepository&lt;Wallet, UUID&gt; {
+    // TODO 2: Annotate with Pessimistic Write Lock and 2000ms timeout
+    @Query(&quot;SELECT w FROM Wallet w WHERE w.id = :id&quot;)
+    fun findByIdForUpdate(@Param(&quot;id&quot;) id: UUID): Wallet?
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0033</span>
+        <span class="practice-title">Concurrency Defense: Optimistic (@Version) vs Pessimistic Locking Practice</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0033-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Implement a high-concurrency wallet balance debit method. Define an entity with an @Version field, a repository method using @Lock(LockModeType.PESSIMISTIC_WRITE) with a 2-second timeout hint, and a service method that deducts safely.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.concurrency;
+
+import jakarta.persistence.*;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
+import org.springframework.data.repository.query.Param;
+import java.util.Optional;
+import java.util.UUID;
+
+@Entity
+public class Wallet {
+    @Id
+    private UUID id;
+    private long balance;
+
+    // TODO 1: Add @Version field for optimistic locking
+    private Long version;
+
+    public void debit(long amount) {
+        if (balance &lt; amount) throw new IllegalStateException(&quot;Insufficient funds&quot;);
+        this.balance -= amount;
+    }
+}
+
+interface WalletRepository extends JpaRepository&lt;Wallet, UUID&gt; {
+    // TODO 2: Annotate with Pessimistic Write Lock and 2000ms timeout hint
+    @Query(&quot;SELECT w FROM Wallet w WHERE w.id = :id&quot;)
+    Optional&lt;Wallet&gt; findByIdForUpdate(@Param(&quot;id&quot;) UUID id);
+}</textarea>
+    </div>
+
+    <!-- Progressive Hints Drawer -->
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Architectural Nudge</div>
+        <div>Annotate 'version' with '@Version' from jakarta.persistence.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Syntax Signature</div>
+        <div>Annotate findByIdForUpdate with '@Lock(LockModeType.PESSIMISTIC_WRITE)'.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Concrete Snippet</div>
+        <div><code>Add &#x27;@QueryHints({@QueryHint(name = &quot;jakarta.persistence.lock.timeout&quot;, value = &quot;2000&quot;)})&#x27; to safeguard against infinite database waits.</code></div>
+      </div>
+    </div>
+
+    <!-- Final Solution Drawer -->
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.concurrency;
+
+import jakarta.persistence.*;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
+import org.springframework.data.repository.query.Param;
+import java.util.Optional;
+import java.util.UUID;
+
+@Entity
+public class Wallet {
+    @Id
+    private UUID id;
+    private long balance;
+
+    @Version
+    private Long version;
+
+    public void debit(long amount) {
+        if (balance &lt; amount) throw new IllegalStateException(&quot;Insufficient funds&quot;);
+        this.balance -= amount;
+    }
+
+    public UUID getId() { return id; }
+    public long getBalance() { return balance; }
+}
+
+interface WalletRepository extends JpaRepository&lt;Wallet, UUID&gt; {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints({@QueryHint(name = &quot;jakarta.persistence.lock.timeout&quot;, value = &quot;2000&quot;)})
+    @Query(&quot;SELECT w FROM Wallet w WHERE w.id = :id&quot;)
+    Optional&lt;Wallet&gt; findByIdForUpdate(@Param(&quot;id&quot;) UUID id);
+}</code></pre>
+      
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.example.concurrency
+
+import jakarta.persistence.*
+import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Lock
+import org.springframework.data.jpa.repository.Query
+import org.springframework.data.jpa.repository.QueryHints
+import org.springframework.data.repository.query.Param
+import java.util.UUID
+
+@Entity
+class Wallet(
+    @Id val id: UUID,
+    var balance: Long
+) {
+    @Version
+    var version: Long? = null
+
+    fun debit(amount: Long) {
+        check(balance &gt;= amount) { &quot;Insufficient funds&quot; }
+        balance -= amount
+    }
+}
+
+interface WalletRepository : JpaRepository&lt;Wallet, UUID&gt; {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints(QueryHint(name = &quot;jakarta.persistence.lock.timeout&quot;, value = &quot;2000&quot;))
+    @Query(&quot;SELECT w FROM Wallet w WHERE w.id = :id&quot;)
+    fun findByIdForUpdate(@Param(&quot;id&quot;) id: UUID): Wallet?
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Follows production patterns to enforce correctness.</p>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run & Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <!-- Terminal Test Output Console -->
+    <div class="test-console"></div>
+  </div>
+
+  <!-- Teacher Agent Probing Questions -->
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"Ask your teacher: 'What is the performance difference between SELECT FOR UPDATE and SELECT FOR UPDATE SKIP LOCKED when building high-concurrency worker queues in PostgreSQL?'"</em>. I am here to explore every trade-off with you.
+    </p>
+  </div>
+
+  <!-- Lesson Navigation Footer -->
+  <div class="lesson-nav">
+    <a href="0032-virtual-threads-loom-and-carrier-pinning.html" class="btn btn-secondary">← Previous: Lesson 0032</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0034-background-jobs-and-distributed-scheduling-shedlock.html" class="btn btn-primary">Next: Lesson 0034 →</a>
+  </div>
+
+  <!-- Site Footer -->
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0033</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0033-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Version Annotation Present",
+    passed: new RegExp("@Version").test(code),
+    error: "Must declare an @Version column for optimistic lock tracking."
+  });
+  tests.push({
+    name: "Pessimistic Write Lock",
+    passed: new RegExp("@Lock\\(\\s*LockModeType\\.PESSIMISTIC_WRITE\\s*\\)").test(code),
+    error: "Must apply @Lock(LockModeType.PESSIMISTIC_WRITE) to findByIdForUpdate."
+  });
+  tests.push({
+    name: "Lock Timeout QueryHint",
+    passed: new RegExp("jakarta\\.persistence\\.lock\\.timeout.*2000").test(code),
+    error: "Must configure jakarta.persistence.lock.timeout hint with 2000 ms to avoid deadlocks."
+  });
+  return tests;
+};
+
+</script>
+</body>
+</html>

@@ -76,6 +76,14 @@
   A free MOOC that follows the book: union-find, analysis, stacks and queues, sorts, priority queues, and symbol tables. It has autograded Java programming assignments, and Part II continues with graphs and strings. There's no certificate. Use for: lectures plus graded hand-written assignments that keep you honest.
 - [Practice: _LeetCode_](https://leetcode.com/)
   A large problem archive that accepts both Java (25) and Kotlin (2.1). Use for: drilling DSA patterns once you've implemented the structures yourself. Type the solutions in the editor without AI help.
+- [Book: _Algorithms_ by Jeff Erickson (free online)](https://jeffe.cs.illinois.edu/teaching/algorithms/)
+  The University of Illinois textbook, free as per-chapter PDFs. It's the clearest treatment of backtracking (ch. 2), greedy algorithms with exchange arguments (ch. 4) and NP-hardness (ch. 12). Its separate "Models of Computation" notes cover automata, Turing machines and undecidability. Use for: the proofs behind L49–L51.
+
+### Maths and Theory
+- [Book: _Mathematics for Computer Science_ by Lehman, Leighton & Meyer (MIT 6.042J, free on OCW)](https://ocw.mit.edu/courses/6-042j-mathematics-for-computer-science-spring-2015/)
+  MIT's free discrete-maths textbook and course: logic, proofs, induction, invariants, number theory, counting and probability, all aimed at programmers. Use for: L48, and whenever a later lesson leans on a proof or a probability.
+- [Article: _Regular Expression Matching Can Be Simple And Fast_ by Russ Cox](https://swtch.com/~rsc/regexp/regexp1.html)
+  It explains Thompson's NFA construction and shows why backtracking regex engines (including Java's) go exponential on some patterns while an NFA simulation stays linear. Use for: L51's regex engine and the ReDoS demo.
 
 ### Testing and Debugging
 - [Docs: _JUnit User Guide_ by the JUnit team](https://docs.junit.org/current/user-guide/)
@@ -109,6 +117,14 @@
 - [Book: _Operating Systems: Three Easy Pieces_ by Remzi H. Arpaci-Dusseau & Andrea C. Arpaci-Dusseau](https://pages.cs.wisc.edu/~remzi/OSTEP/)
   A free University of Wisconsin textbook (v1.10) in three parts: virtualization (processes, scheduling, virtual memory), concurrency (threads, locks, condition variables), and persistence (file systems). Use for: what the OS does beneath the JVM. Read its concurrency part alongside JCIP.
 
+### Computer Architecture and Languages
+- [Course: _Nand2Tetris: The Elements of Computing Systems_ by Noam Nisan & Shimon Schocken](https://www.nand2tetris.org/)
+  A free course with a book (paid) that builds a computer from NAND gates upward: logic, an ALU, memory, a CPU, machine language, then an assembler, a VM and a compiler. Use for: L52's gates-to-CPU path, and as a long follow-up project if hardware hooks you.
+- [Book: _Crafting Interpreters_ by Robert Nystrom (free online)](https://craftinginterpreters.com/)
+  The friendliest book on how languages work. It builds a tree-walking interpreter in Java, then a bytecode VM in C. Use for: L54's scanner, parser, interpreter and VM, and for mission D.
+- [Manual: _jq_ and the _GNU Bash Reference Manual_](https://jqlang.org/manual/)
+  The [Bash manual](https://www.gnu.org/software/bash/manual/bash.html) is the authority on quoting, expansions, `set -euo pipefail` and traps. The jq manual covers filters for JSON on the command line. Use for: L53's scripts and log queries (macOS ships bash 3.2 and jq 1.7).
+
 ### Networking, HTTP, REST and JSON
 - [Docs: _HTTP_ by MDN Web Docs (Mozilla)](https://developer.mozilla.org/en-US/docs/Web/HTTP)
   The best free reference for HTTP: overview, messages, methods, status codes, headers, caching, and CORS. Use for: understanding every request your Android app sends and every response your Spring Boot API returns.
@@ -132,16 +148,28 @@
   The free web edition of "SQL Performance Explained": B-tree indexes, WHERE clauses, joins (including the N+1 problem), sorting, and pagination, across PostgreSQL, MySQL, Oracle, and others. Use for: understanding why a query is slow, which you'll need for Spring Data and JPA.
 - [Video lectures: _CMU 15-445/645 Intro to Database Systems (Fall 2024)_ by Andy Pavlo (Carnegie Mellon)](https://www.youtube.com/playlist?list=PLSE8ODhjZXjYDBpQnSymaectKjxCy6BYq)
   The full recorded university course: storage, buffer pools, hash and B+tree indexes, query execution, concurrency control, and recovery. Slides are on the course site, 15445.courses.cs.cmu.edu. Use for: how a database works on the inside.
+- [Paper: _Bitcask: A Log-Structured Hash Table for Fast Key/Value Data_ by Justin Sheehy & David Smith (Basho, 2010)](https://riak.com/assets/bitcask-intro.pdf)
+  A six-page paper describing a whole storage engine: an append-only log, an in-memory hash index (the "keydir"), merging and hint files. Use for: L56's log store, the simplest real engine you can build in an afternoon.
 
 ### System Design and Caching
 - [Guide: _The System Design Primer_ by Donne Martin (GitHub)](https://github.com/donnemartin/system-design-primer)
   A free, widely used overview of scalability, load balancing, caching strategies (cache-aside, write-through, write-behind), replication, sharding, queues and CAP, with latency numbers in its appendix. It's interview-flavoured and community-written, so check deep claims against DDIA. Use for: the map of the territory and quick reference.
 - [Book: _Designing Data-Intensive Applications, 2nd ed._ by Martin Kleppmann & Chris Riccomini](https://martin.kleppmann.com/2026/03/24/designing-data-intensive-applications-2e.html)
   The canonical book on reliable, scalable data systems (O'Reilly, 2026): storage engines, replication, partitioning, transactions, consistency and stream processing. Paid. Use for: the deep, trustworthy explanation behind every system-design trade-off.
+- [Paper: _In Search of an Understandable Consensus Algorithm (Extended Version)_ by Diego Ongaro & John Ousterhout](https://raft.github.io/raft.pdf)
+  The Raft paper. Its Figure 2 is the whole algorithm on one page, and [raft.github.io](https://raft.github.io/) has a visualisation and a list of implementations. Use for: L57's election simulator, and mission C's full Raft.
+- [Paper: _Time, Clocks, and the Ordering of Events in a Distributed System_ by Leslie Lamport (1978)](https://lamport.azurewebsites.net/pubs/time-clocks.pdf)
+  Defines happens-before and logical clocks in ten readable pages. Use for: why ordering events doesn't need synchronised clocks (L57).
+- [Lecture notes: _Concurrent and Distributed Systems_ by Martin Kleppmann (Cambridge)](https://www.cl.cam.ac.uk/teaching/2425/ConcDisSys/dist-sys-notes.pdf)
+  Free notes covering clocks, broadcast ordering, replication, quorums, consensus and two-phase commit, at the level of a university course. Use for: a free companion to DDIA for L57.
 
 ### Security Basics
 - [Standard: _OWASP Top 10:2025_ by OWASP](https://top10.owasp.org/2025)
   The ten most critical web application risks in the 2025 edition: broken access control, misconfiguration, supply chain failures, cryptographic failures, injection, and more. Use for: a checklist of mistakes to avoid before you build anything with Spring Boot.
+- [Guides: _OWASP Cheat Sheet Series_](https://cheatsheetseries.owasp.org/)
+  Short, practical guides per topic: Session Management, Authentication, Cross-Site Request Forgery Prevention, JSON Web Token for Java, and Authorization. Use for: L55; each sheet says exactly which defence to apply and why.
+- [Standard: _RFC 9700, Best Current Practice for OAuth 2.0 Security_ (IETF, 2025)](https://www.rfc-editor.org/rfc/rfc9700)
+  The current rules for OAuth 2.0: authorization code with PKCE for every client, no implicit flow, refresh-token rotation, exact redirect-URI matching. Use for: L55's OAuth part, and checking any OAuth tutorial for outdated advice.
 
 ### Future missions (after the course)
 - [Book: _Crafting Interpreters_ by Robert Nystrom](https://craftinginterpreters.com/)

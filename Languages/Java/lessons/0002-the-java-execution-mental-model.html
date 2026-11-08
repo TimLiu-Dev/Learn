@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0002: The Java Execution Mental Model &amp; Toolchain</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0001-master-plan-and-curriculum.html">&larr; Prev: Lesson 0001</a></div>
+      <div class="lesson-nav-center"><a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan &amp; Index</a></div>
+      <div><a href="0003-primitive-data-types-and-memory.html">Next: Lesson 0003 &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Phase 1 &bull; Stage 1 &bull; Lesson 0002</div>
+      <h1>The Java Execution Mental Model &amp; Toolchain</h1>
+      <p class="lesson-subtitle">
+        How OpenJDK 21 translates source code through bytecode verification, tiered C1/C2 JIT compilation, speculative deoptimization, and CLI diagnostics.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. From Source to Silicon: The HotSpot Two-Stage Pipeline</h2>
+      <p>
+        Ahead-of-time (AOT) languages like C++ or Rust lower source code directly into static x86_64 or ARM64 machine instructions at build time. Purely interpreted runtimes parse or step through ASTs/opcodes without global hardware optimization. OpenJDK HotSpot combines portable ahead-of-time bytecode generation with a profile-guided, adaptive <strong>Tiered Just-In-Time (JIT)</strong> compiler at runtime:
+      </p>
+      <ol>
+        <li>
+          <strong>Ahead-of-Time Bytecode Compilation (<code>javac</code>):</strong> Validates syntax, resolves overload bindings, checks generic bounds, desugars syntactic constructs, and emits compact architecture-neutral <code>.class</code> files targeting the JVM stack machine.
+        </li>
+        <li>
+          <strong>ClassLoading &amp; Bytecode Verification:</strong> At runtime, the <code>ClassLoader</code> hierarchy loads <code>.class</code> bytes into Metaspace. The <strong>Bytecode Verifier</strong> checks StackMapTable frames (mandatory since Java 7) in linear <code>O(N)</code> single-pass time to guarantee that local variable slots and the operand stack never underflow, overflow, or forge arbitrary memory pointers.
+        </li>
+        <li>
+          <strong>Tiered Execution (Interpreter &rarr; C1 &rarr; C2):</strong> Every method begins in <strong>Tier 0</strong> (the template interpreter) while gathering runtime execution profiles—branch taken probabilities, call-site receiver types, and loop back-edge counts. Warm methods compile via <strong>C1</strong> (Tiers 1–3, fast compilation with lightweight profiling), and hot methods promote to <strong>C2</strong> (Tier 4, aggressive global optimization: deep method inlining, Escape Analysis scalar replacement, loop unrolling, and SIMD auto-vectorization).
+        </li>
+      </ol>
+
+      <div class="callout tip">
+        <div class="callout-title">&#9889; Speculative Optimization &amp; Uncommon Traps</div>
+        Why can JIT-compiled Java match or beat static C++ on polymorphic workloads? Because C2 optimizes <em>optimistically</em> based on live production traffic. If an interface has 10 implementations on the classpath, yet 100% of calls since startup used <code>FastJsonCodec</code>, C2 devirtualizes and inlines <code>FastJsonCodec</code> directly behind a single class-word guard. If a rare <code>XmlCodec</code> finally arrives hours later, the guard triggers an <strong>uncommon trap</strong>: HotSpot safely deoptimizes the stack frame back to the interpreter and recompiles with a wider profile.
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Production Trap: Cold-JVM Latency Spikes &amp; Naive Microbenchmarks</h2>
+      <p>
+        A frequent engineering mistake in both performance reviews and financial low-latency services is measuring Java code with a single cold <code>System.nanoTime()</code> loop—or exposing a freshly booted pod directly to peak production traffic before Tier 4 compilation completes.
+      </p>
+      <pre><code>// ANTI-PATTERN: Flawed microbenchmark &amp; cold-start measurement
+public class BrokenBenchmark {
+    public static void main(String[] args) {
+        long start = System.nanoTime();
+        long sum = 0;
+        for (int i = 0; i &lt; 10_000; i++) {
+            sum += i * 31L; // 1. Runs mostly in Tier 0 interpreter (not warmed up!)
+        }                   // 2. If 'sum' is never read, C2 Dead-Code Eliminates the entire loop!
+        long elapsedNanos = System.nanoTime() - start;
+        System.out.println("Elapsed ns: " + elapsedNanos);
+    }
+}</code></pre>
+      <p>
+        Two hazards distort this code:
+      </p>
+      <ul>
+        <li><strong>Cold-Path Tail Latency:</strong> During the first few thousand invocations, requests execute in Tier 0/C1 while background compiler threads consume CPU cycles compiling hot methods—causing 10x–50x P99 latency spikes on fresh deployments unless endpoints are warmed up or backed by Class Data Sharing (AppCDS).</li>
+        <li><strong>Dead-Code Elimination (DCE) &amp; Constant Folding:</strong> Once C2 compiles a benchmark loop whose result is never externally observable, it legally deletes the computation, reporting artificial zero-nanosecond throughput. Always use <strong>JMH (Java Microbenchmark Harness)</strong> and its <code>Blackhole.consume(...)</code> sink for microbenchmarks.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>3. Under the Hood: Stack-Machine Bytecode &amp; <code>javap</code></h2>
+      <p>
+        Unlike physical CPUs (which use hardware registers like <code>rax</code> or <code>x0</code>), JVM bytecode targets an abstract <strong>operand stack</strong> plus an indexed <strong>Local Variable Array (LVA)</strong> per method call frame. Consider a minimal class and the exact bytecode disassembled via <code>javap -c</code>:
+      </p>
+      <pre><code>// Source: OrderReceipt.java
+public class OrderReceipt {
+    public static String formatLine(String sku, int qty, int unitCents) {
+        int total = qty * unitCents;
+        return sku + ":" + total;
+    }
+}
+
+/* Disassembled via: javac OrderReceipt.java &amp;&amp; javap -c OrderReceipt
+  public static java.lang.String formatLine(java.lang.String, int, int);
+    Code:
+       0: iload_1                 // Push 'qty' (LVA slot 1) onto operand stack
+       1: iload_2                 // Push 'unitCents' (LVA slot 2) onto operand stack
+       2: imul                    // Pop two ints, multiply, push 32-bit product
+       3: istore_3                // Pop product into 'total' (LVA slot 3)
+       4: aload_0                 // Push 'sku' reference (LVA slot 0)
+       5: iload_3                 // Push 'total' (LVA slot 3)
+       6: invokedynamic #7,  0    // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;I)Ljava/lang/String;
+      11: areturn                 // Return resulting String reference
+*/</code></pre>
+      <p>
+        Notice offset <code>6: invokedynamic</code>. Prior to Java 9, <code>javac</code> hardcoded <code>new StringBuilder().append(...)</code> directly into bytecode. Modern OpenJDK emits an <code>invokedynamic</code> bootstrap call to <code>StringConcatFactory</code> (JEP 280), enabling the JVM to allocate an exact-sized <code>byte[]</code> buffer in one pass without intermediate buffer resizing—and allowing future JDK upgrades to accelerate existing <code>.class</code> files without recompilation!
+      </p>
+    </section>
+
+    <section>
+      <h2>4. Idiomatic Java 21 Entry Points &amp; Essential Toolchain</h2>
+      <p>
+        In production CLI utilities, batch workers, and container health probes, your <code>main</code> entry point should inspect runtime capabilities cleanly and return explicit OS exit codes for orchestrators like Kubernetes or systemd:
+      </p>
+      <pre><code>// IDIOMATIC JAVA 21: Deterministic health &amp; runtime probe CLI
+public final class RuntimeHealthProbe {
+    private RuntimeHealthProbe() {} // Prevent accidental instantiation
+
+    public static void main(String[] args) {
+        int featureVersion = Runtime.version().feature();
+        Runtime rt = Runtime.getRuntime();
+        int cores = rt.availableProcessors();
+        long maxHeapMb = rt.maxMemory() / (1024L * 1024L);
+
+        if (featureVersion &lt; 21 || maxHeapMb &lt; 128) {
+            System.err.printf("UNHEALTHY: jdk=%d maxHeapMb=%d%n", featureVersion, maxHeapMb);
+            System.exit(1); // Non-zero exit code signals container failure
+        }
+
+        System.out.printf("HEALTHY: jdk=%d cores=%d maxHeapMb=%d args=%d%n",
+                featureVersion, cores, maxHeapMb, args.length);
+    }
+}</code></pre>
+
+      <table>
+        <thead>
+          <tr>
+            <th>JDK 21 Binary</th>
+            <th>Primary Engineering Role</th>
+            <th>Production / Diagnostic Flag Example</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>javac</code></td>
+            <td>Compiles <code>.java</code> source into verified <code>.class</code> bytecode.</td>
+            <td><code>javac --release 21 -Xlint:all App.java</code></td>
+          </tr>
+          <tr>
+            <td><code>java</code></td>
+            <td>Launches the HotSpot JVM (or runs single-file source directly via JEP 330).</td>
+            <td><code>java -Xms512m -Xmx512m -XX:+UseZGC -XX:+ZGenerational App</code></td>
+          </tr>
+          <tr>
+            <td><code>javap</code></td>
+            <td>Disassembles <code>.class</code> files, constant pools, and method descriptors.</td>
+            <td><code>javap -c -v -p OrderReceipt.class</code></td>
+          </tr>
+          <tr>
+            <td><code>jcmd</code></td>
+            <td>Swiss-army live JVM diagnostic tool (thread dumps, heap histograms, JFR, JIT).</td>
+            <td><code>jcmd &lt;pid&gt; Thread.print</code> / <code>VM.flags</code> / <code>GC.heap_info</code></td>
+          </tr>
+          <tr>
+            <td><code>jshell</code></td>
+            <td>Interactive REPL for rapid API and snippet prototyping.</td>
+            <td><code>jshell --enable-preview</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>5. Interactive JDK 21 Terminal Simulator</h2>
+      <p>
+        Step through compilation, execution, bytecode disassembly, and live <code>jcmd</code> diagnostics directly inside this simulated terminal:
+      </p>
+
+      <div class="terminal-simulator" id="term-1" data-responses='{
+        "javac HealthProbe.java": "Compiling HealthProbe.java (--release 21)...\nGenerated HealthProbe.class (major version 65 = Java 21, 742 bytes)",
+        "java HealthProbe": "HEALTHY: jdk=21 cores=8 maxHeapMb=4096 args=0",
+        "javap -c HealthProbe": "Compiled from \"HealthProbe.java\"\npublic final class HealthProbe {\n  public static void main(java.lang.String[]);\n    Code:\n       0: invokestatic  #7                  // Method java/lang/Runtime.version:()Ljava/lang/Runtime$Version;\n       3: invokevirtual #13                 // Method java/lang/Runtime$Version.feature:()I\n       6: istore_1\n       7: getstatic     #19                 // Field java/lang/System.out:Ljava/io/PrintStream;\n      10: iload_1\n      11: invokedynamic #25,  0             // InvokeDynamic #0:makeConcatWithConstants:(I)Ljava/lang/String;\n      16: invokevirtual #29                 // Method java/io/PrintStream.println:(Ljava/lang/String;)V\n      19: return\n}",
+        "jcmd 4821 VM.version": "4821:\nOpenJDK 64-Bit Server VM version 21.0.2+13-LTS\nJDK 21.0.2 (TieredCompilation, CompressedOops, Generational ZGC ready)",
+        "jshell": "|  Welcome to JShell -- Version 21.0.2\njshell&gt; Runtime.version().feature()\n$1 ==&gt; 21\njshell&gt; /exit\n|  Goodbye"
+      }'>
+        <div class="terminal-titlebar">
+          <div class="terminal-dots">
+            <div class="terminal-dot dot-red"></div>
+            <div class="terminal-dot dot-yellow"></div>
+            <div class="terminal-dot dot-green"></div>
+          </div>
+          <div class="terminal-title">zsh &mdash; openjdk-21-toolchain</div>
+          <div style="width: 40px;"></div>
+        </div>
+        <div class="terminal-actions-bar">
+          <span style="font-size: 0.78rem; color: #8b949e; margin-right: 0.3rem;">Quick Commands:</span>
+          <button type="button" class="terminal-btn" onclick="runTerminalCommand('term-1', 'javac HealthProbe.java')">javac HealthProbe.java</button>
+          <button type="button" class="terminal-btn" onclick="runTerminalCommand('term-1', 'java HealthProbe')">java HealthProbe</button>
+          <button type="button" class="terminal-btn" onclick="runTerminalCommand('term-1', 'javap -c HealthProbe')">javap -c HealthProbe</button>
+          <button type="button" class="terminal-btn" onclick="runTerminalCommand('term-1', 'jcmd 4821 VM.version')">jcmd 4821 VM.version</button>
+          <button type="button" class="terminal-btn" onclick="runTerminalCommand('term-1', 'jshell')">jshell</button>
+          <button type="button" class="terminal-btn" onclick="runTerminalCommand('term-1', 'clear')">clear</button>
+        </div>
+        <div class="terminal-screen">
+          <div class="term-line"><span class="term-prompt">$</span> <span class="term-cmd">java --version</span></div>
+          <div class="term-output">openjdk 21.0.2 2024-01-16 LTS
+OpenJDK Runtime Environment (build 21.0.2+13-LTS)
+OpenJDK 64-Bit Server VM (build 21.0.2+13-LTS, mixed mode, sharing)</div>
+        </div>
+        <div class="terminal-input-bar">
+          <span class="term-prompt">$</span>
+          <input type="text" class="terminal-input" placeholder="Type a command (e.g. javap -c HealthProbe, jcmd 4821 VM.version) and press Enter..." onkeydown="if(event.key==='Enter') runTerminalCommand('term-1')">
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>6. Hands-On Practice Workbenches</h2>
+      <p>
+        Complete both exercises below: first build a container runtime probe from scratch, then diagnose and repair a broken production launcher class.
+      </p>
+
+      <div id="ex-1" class="workbench-container"></div>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>7. Senior Concept &amp; Code Quiz</h2>
+      <p>
+        Verify your mental model of JVM entry-point linking, C2 speculative optimization, and bytecode generation:
+      </p>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <p>
+        Study the authoritative Java Virtual Machine Specification on classfile verification, frame layouts, and instruction semantics:
+      </p>
+      <ul>
+        <li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html" target="_blank" rel="noopener"><strong>The Java Virtual Machine Specification (Java SE 21 Edition) &mdash; Chapter 2: The Structure of the JVM</strong></a></li>
+        <li><a href="https://dev.java/learn/jvm/" target="_blank" rel="noopener"><strong>Dev.java: Inside the JVM &amp; Command-Line Tooling</strong></a></li>
+      </ul>
+
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> "Walk me through how HotSpot Tiered Compilation uses invocation counters and back-edge counters to trigger On-Stack Replacement (OSR) inside a long-running <code>main</code> loop before the method ever returns."
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0001-master-plan-and-curriculum.html">&larr; Prev: Lesson 0001</a></div>
+      <div><a href="../reference/0002-jvm-execution-and-toolchain.html">&#128196; Reference Sheet 0002</a> &bull; <a href="0001-master-plan-and-curriculum.html">Course Hub</a></div>
+      <div><a href="0003-primitive-data-types-and-memory.html">Next: Lesson 0003 &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+  {
+    "exercises": [
+      {
+        "id": "ex-1",
+        "filename": "JvmRuntimeProbe.java",
+        "badge": "Implementation Drill",
+        "instructions": "<p>Implement a container startup diagnostic probe inside <code>JvmRuntimeProbe</code>:</p><ol><li>Declare the standard JVM entry point <code>public static void main(String[] args)</code>.</li><li>Read the feature release number via <code>Runtime.version().feature()</code> and available CPU cores via <code>Runtime.getRuntime().availableProcessors()</code>.</li><li>Compute max heap in megabytes via <code>Runtime.getRuntime().maxMemory() / (1024L * 1024L)</code>.</li><li>Print the result using <code>System.out.printf(\"JDK=%d cores=%d maxHeapMb=%d%n\", ...)</code>.</li></ol>",
+        "initialCode": "public final class JvmRuntimeProbe {\n    private JvmRuntimeProbe() {}\n\n    // TODO: Declare public static void main(String[] args)\n    // TODO: Query feature version, availableProcessors(), and maxMemory() in MiB\n    // TODO: Output with System.out.printf(\"JDK=%d cores=%d maxHeapMb=%d%n\", ...)\n}\n",
+        "solution": "public final class JvmRuntimeProbe {\n    private JvmRuntimeProbe() {}\n\n    public static void main(String[] args) {\n        int jdkFeature = Runtime.version().feature();\n        Runtime rt = Runtime.getRuntime();\n        int cores = rt.availableProcessors();\n        long maxHeapMb = rt.maxMemory() / (1024L * 1024L);\n        System.out.printf(\"JDK=%d cores=%d maxHeapMb=%d%n\", jdkFeature, cores, maxHeapMb);\n    }\n}\n",
+        "solutionExplanation": "The JVM launcher invokes main(String[]) statically without allocating an instance of JvmRuntimeProbe. Runtime.version().feature() returns the integer Java release (21) without brittle string parsing of 'java.version', while dividing maxMemory() using 64-bit long literals prevents any 32-bit intermediate overflow.",
+        "hints": [
+          "Start by adding <code>public static void main(String[] args) { ... }</code> inside <code>JvmRuntimeProbe</code>.",
+          "Fetch the JDK integer version with <code>int jdk = Runtime.version().feature();</code> and get the singleton runtime handle with <code>Runtime rt = Runtime.getRuntime();</code>.",
+          "Compute <code>long maxHeapMb = rt.maxMemory() / (1024L * 1024L);</code> and format with <code>System.out.printf(\"JDK=%d cores=%d maxHeapMb=%d%n\", jdk, rt.availableProcessors(), maxHeapMb);</code>."
+        ],
+        "tests": [
+          {
+            "name": "Entry point signature",
+            "regex": "public\\s+static\\s+void\\s+main\\s*\\(\\s*String\\s*(\\[\\s*\\]\\s*\\w+|\\w+\\s*\\[\\s*\\])\\s*\\)",
+            "flags": "m",
+            "passMessage": "Valid public static void main(String[] args) signature declared.",
+            "failMessage": "Declare the exact entry point: public static void main(String[] args)."
+          },
+          {
+            "name": "Queries Runtime.version().feature()",
+            "regex": "Runtime\\.version\\s*\\(\\s*\\)\\.feature\\s*\\(\\s*\\)",
+            "flags": "m",
+            "passMessage": "Reads JDK feature release using Runtime.version().feature().",
+            "failMessage": "Use Runtime.version().feature() to obtain the integer JDK version."
+          },
+          {
+            "name": "Queries cores and maxMemory in MiB",
+            "regex": "availableProcessors\\s*\\(\\s*\\)[\\s\\S]*maxMemory\\s*\\(\\s*\\)\\s*/\\s*\\(?\\s*1024L?\\s*\\*\\s*1024L?\\s*\\)?",
+            "flags": "m",
+            "passMessage": "Inspects both availableProcessors() and maxMemory() converted to MiB.",
+            "failMessage": "Call availableProcessors() and divide maxMemory() by (1024L * 1024L)."
+          },
+          {
+            "name": "Formatted printf diagnostic output",
+            "regex": "System\\.out\\.printf\\s*\\(\\s*\"JDK=%d\\s+cores=%d\\s+maxHeapMb=%d%n\"",
+            "flags": "m",
+            "passMessage": "Outputs structured probe line via System.out.printf.",
+            "failMessage": "Print using System.out.printf(\"JDK=%d cores=%d maxHeapMb=%d%n\", ...)."
+          }
+        ],
+        "simulatedOutput": "JDK=21 cores=8 maxHeapMb=4096\nProcess finished with exit code 0"
+      },
+      {
+        "id": "ex-2",
+        "filename": "BootEntryPointFix.java",
+        "badge": "Bug-Fix Challenge",
+        "instructions": "<p>A C++ engineer ported a CLI worker to Java, introducing <strong>4 compilation and JVM-launcher bugs</strong>. Diagnose and fix all 4 defects:</p><ol><li>The public class name must match <code>BootEntryPointFix.java</code>.</li><li>The <code>main</code> method is missing <code>static</code> and wrongly returns <code>int</code> instead of <code>void</code>.</li><li>When <code>args.length == 0</code>, signal a non-zero exit code via <code>System.exit(1);</code> instead of <code>return 1;</code>.</li><li>Fix the invalid <code>System.out.printline(...)</code> method call and remove <code>return 0;</code>.</li></ol>",
+        "initialCode": "public class WrongWorkerName {\n    public int main(String[] args) {\n        if (args.length == 0) {\n            System.err.println(\"Missing config path\");\n            return 1;\n        }\n        System.out.printline(\"Booting worker with \" + args[0]);\n        return 0;\n    }\n}\n",
+        "solution": "public class BootEntryPointFix {\n    public static void main(String[] args) {\n        if (args.length == 0) {\n            System.err.println(\"Missing config path\");\n            System.exit(1);\n        }\n        System.out.println(\"Booting worker with \" + args[0]);\n    }\n}\n",
+        "solutionExplanation": "JLS 7.6 requires a public top-level class to match its source filename (BootEntryPointFix.java). Furthermore, JVMS 5.2 specifies that the launcher resolves strictly 'public static void main(String[])' (descriptor '([Ljava/lang/String;)V'). Unlike C/C++, OS process exit codes are emitted via System.exit(status), not returned from main.",
+        "hints": [
+          "Rename <code>public class WrongWorkerName</code> to <code>public class BootEntryPointFix</code> so <code>javac</code> accepts the compilation unit.",
+          "Change <code>public int main(String[] args)</code> to <code>public static void main(String[] args)</code>.",
+          "Replace <code>return 1;</code> with <code>System.exit(1);</code>, fix <code>printline</code> to <code>println</code>, and delete <code>return 0;</code>."
+        ],
+        "tests": [
+          {
+            "name": "Public class matches filename",
+            "regex": "public\\s+class\\s+BootEntryPointFix\\b",
+            "flags": "m",
+            "mustNotMatch": "WrongWorkerName",
+            "passMessage": "Public class name matches BootEntryPointFix.java.",
+            "failMessage": "Rename WrongWorkerName to BootEntryPointFix."
+          },
+          {
+            "name": "Valid static void main descriptor",
+            "regex": "public\\s+static\\s+void\\s+main\\s*\\(\\s*String\\s*(\\[\\s*\\]\\s*args|args\\s*\\[\\s*\\])\\s*\\)",
+            "flags": "m",
+            "mustNotMatch": "public\\s+(static\\s+)?int\\s+main",
+            "passMessage": "main is declared public static void.",
+            "failMessage": "main must be declared 'public static void main(String[] args)', not returning int."
+          },
+          {
+            "name": "Uses System.exit(1) instead of returning int",
+            "regex": "System\\.exit\\s*\\(\\s*1\\s*\\)\\s*;",
+            "flags": "m",
+            "mustNotMatch": "return\\s+[01]\\s*;",
+            "passMessage": "Signals failure exit status via System.exit(1).",
+            "failMessage": "Replace 'return 1;' and 'return 0;' with System.exit(1) on the error branch."
+          },
+          {
+            "name": "Uses PrintStream.println",
+            "regex": "System\\.out\\.println\\s*\\(",
+            "flags": "m",
+            "mustNotMatch": "printline",
+            "passMessage": "Calls System.out.println(...) properly.",
+            "failMessage": "Replace the non-existent System.out.printline with System.out.println."
+          }
+        ],
+        "simulatedOutput": "Booting worker with /etc/worker/prod.yml\nProcess finished with exit code 0"
+      }
+    ],
+    "quiz": {
+      "id": "quiz-main",
+      "questions": [
+        {
+          "question": "Consider this class compiled with javac and launched via `java Launcher` on OpenJDK 21. What happens?",
+          "code": "public class Launcher {\n    public static int main(String[] args) {\n        System.out.println(\"Ready\");\n        return 0;\n    }\n}",
+          "correctIndex": 1,
+          "options": [
+            {
+              "text": "Compilation fails because `main` is a reserved keyword requiring `void`.",
+              "explanation": "`main` is not a reserved keyword in the Java Language Specification; `javac` treats `public static int main(String[])` as a completely legal ordinary static method."
+            },
+            {
+              "text": "It compiles cleanly, but `java Launcher` fails to find `main`.",
+              "explanation": "`javac` compiles the method with descriptor `([Ljava/lang/String;)I`, whereas the JVM launcher strictly looks up descriptor `([Ljava/lang/String;)V` (`void` return) and aborts at startup."
+            },
+            {
+              "text": "It prints `Ready` and exits the OS process with status zero.",
+              "explanation": "C and C++ return an integer exit code from `main`, but the JVM specification requires `void` and ignores methods returning `int` when searching for the entry point."
+            },
+            {
+              "text": "It prints `Ready`, then throws `ClassCastException` during JVM shutdown.",
+              "explanation": "The method is never invoked at all because method descriptor resolution fails before application execution begins; no `ClassCastException` occurs."
+            }
+          ]
+        },
+        {
+          "question": "For 2 hours after startup, `codec` in the hot method below is always `JsonCodec`. Suddenly a request passes `ProtobufCodec`. How does HotSpot C2 handle this?",
+          "code": "public byte[] encodePayload(PayloadCodec codec, Order order) {\n    return codec.serialize(order); // Hot call site (10M+ prior calls)\n}",
+          "correctIndex": 2,
+          "options": [
+            {
+              "text": "It throws `IncompatibleClassChangeError` because C2 locked the monomorphic receiver type.",
+              "explanation": "Speculative JIT optimizations must preserve full Java semantics; encountering a valid new subtype never throws linkage errors."
+            },
+            {
+              "text": "It permanently disables JIT compilation for `encodePayload` until JVM restart.",
+              "explanation": "HotSpot allows re-profiling and recompilation (e.g., into a bimorphic inline cache or virtual dispatch) rather than permanently locking the method in the interpreter."
+            },
+            {
+              "text": "It hits an uncommon trap, deoptimizes to interpreter, and re-profiles.",
+              "explanation": "C2 guards its speculative `JsonCodec` inline with a fast class-pointer check; when `ProtobufCodec` arrives, the guard triggers an uncommon trap, safely transferring the frame to the interpreter so C2 can recompile with updated receiver profiles."
+            },
+            {
+              "text": "It blocks all application threads to rewrite `.class` files on disk.",
+              "explanation": "JIT compilation and deoptimization operate purely on in-memory CodeCache native frames and never mutate `.class` bytecode files on disk."
+            }
+          ]
+        },
+        {
+          "question": "Why does OpenJDK 21 compile `\"order=\" + id` into an `invokedynamic` call (`StringConcatFactory`) instead of `new StringBuilder().append(...)` bytecode?",
+          "correctIndex": 0,
+          "options": [
+            {
+              "text": "It decouples bytecode from concatenation mechanics, enabling single-allocation runtime sizing.",
+              "explanation": "By deferring concatenation strategy to `StringConcatFactory` at link time via `invokedynamic` (JEP 280), HotSpot pre-calculates exact byte length and allocates one backing array without recompiling `.class` files on newer JDKs."
+            },
+            {
+              "text": "It forces strings to allocate directly on the thread call stack.",
+              "explanation": "`StringConcatFactory` still constructs a standard `String` backed by a `byte[]` on the heap (unless later scalar-replaced by C2 Escape Analysis); `invokedynamic` itself does not stack-allocate strings."
+            },
+            {
+              "text": "It bypasses the JVM Bytecode Verifier to accelerate cold application startup.",
+              "explanation": "Every `invokedynamic` call site and its bootstrap method descriptor still undergo full StackMapTable bytecode verification during class linking."
+            },
+            {
+              "text": "It automatically interns every concatenated result inside the global String Pool.",
+              "explanation": "Dynamic string concatenation produces a fresh heap `String` instance and never interns automatically unless `.intern()` is explicitly called."
+            }
+          ]
+        }
+      ]
+    }
+  }
+  </script>
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/workbench.js"></script>
+</body>
+</html>

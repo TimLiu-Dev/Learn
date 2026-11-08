@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0056: JDBC Batching, PreparedStatement Plans &amp; HikariCP Pool Sizing</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0055-runtime-generics-type-tokens-json.html">&larr; Previous Lesson</a></div>
+      <div class="lesson-nav-center"><a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a></div>
+      <div><a href="../reference/0056-jdbc-and-pools.html">&#128214; Quick Reference</a></div>
+      <div><a href="0057-jpa-hibernate-entity-lifecycle.html">Next Lesson &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Phase 3 &bull; Framework Internals &bull; Lesson 0056</div>
+      <h1>JDBC Batching, PreparedStatement Plans &amp; HikariCP Pool Sizing</h1>
+      <p class="lesson-subtitle">
+        Master wire-level PreparedStatement execution, multi-row JDBC batch rewriting, manual transaction boundaries, and HikariCP concurrency math.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. Every ORM Speaks JDBC Under the Hood</h2>
+      <p>
+        Whether your service uses Hibernate, Spring Data JPA, jOOQ, or Spring <code>JdbcClient</code>, every relational query on the JVM ultimately crosses a <code>javax.sql.DataSource</code> and executes over <strong>JDBC (Java Database Connectivity)</strong>. Senior engineers treat ORMs as convenience layers on top of TCP sockets, database wire protocols, and connection pools—because almost every catastrophic database outage in production traces back to how JDBC connections and statements are acquired, batched, and released.
+      </p>
+
+      <h3>The Naive Production Trap: Per-Row Round-Trips &amp; Connection Starvation</h3>
+      <p>
+        Consider a payment settlement job that inserts <code>10,000</code> ledger rows while calling an external fraud-scoring HTTP endpoint inside the same loop. Three compounding mistakes turn a <code>40ms</code> batch operation into a cluster-wide outage:
+      </p>
+      <pre><code>// ANTI-PATTERN: Three production-killing JDBC mistakes in 20 lines
+public void processSettlementsBad(DataSource dataSource, List&lt;Settlement&gt; items) throws SQLException {
+    // 1. Acquires a scarce pooled connection BEFORE slow external HTTP I/O!
+    try (Connection conn = dataSource.getConnection();
+         Statement stmt = conn.createStatement()) {
+
+        for (Settlement item : items) {
+            // 2. External HTTP call holds the DB connection hostage for 50-500ms per item!
+            FraudScore score = fraudHttpClient.verify(item.accountId());
+
+            // 3. String concatenation (SQL Injection + zero server plan reuse)
+            //    PLUS autoCommit=true forces a synchronous WAL fsync + TCP round-trip per row!
+            String sql = "INSERT INTO ledger (acct, cents, risk) VALUES ('"
+                + item.accountId() + "', " + item.amountCents() + ", " + score.value() + ")";
+            stmt.executeUpdate(sql);
+        }
+    }
+}</code></pre>
+      <p>
+        With a <code>0.5ms</code> network RTT and <code>autoCommit = true</code>, executing <code>10,000</code> individual <code>executeUpdate()</code> statements forces <code>10,000</code> network round-trips and <code>10,000</code> transaction commits (Write-Ahead Log flushes). Worse, holding the <code>Connection</code> across <code>fraudHttpClient.verify(...)</code> pins a HikariCP slot while waiting on external TCP sockets. If the fraud service experiences a <code>3s</code> latency spike, 10 concurrent threads exhaust a 10-connection pool in milliseconds, causing unrelated health checks and login queries to fail with <code>SQLTransientConnectionException: HikariPool-1 - Connection is not available</code>.
+      </p>
+    </section>
+
+    <section>
+      <h2>2. Under the Hood: Wire Protocols, Server Plans &amp; Batch Rewriting</h2>
+      <p>
+        Switching from <code>Statement</code> to <code>PreparedStatement</code> does far more than block SQL injection. In the PostgreSQL v3 Extended Query Protocol (and MySQL binary protocol), <code>PreparedStatement</code> separates the SQL AST structure from bind parameter bytes on the wire:
+      </p>
+      <pre><code>// PostgreSQL Extended Query Wire Lifecycle (pgjdbc)
+// Executions 1..4 (client-side unnamed statement):
+//   [Parse: "INSERT INTO ledger (acct, cents, risk) VALUES ($1, $2, $3)"]
+//   [Bind:  param1="ACC-9", param2=45000 (int8 binary), param3=12 (int4 binary)]
+//   [Execute] -&gt; [Sync]
+//
+// Execution 5+ ( hits prepareThreshold=5 default in pgjdbc ):
+//   Driver promotes statement to a named server-side portal ("S_1").
+//   PostgreSQL caches the parsed AST &amp; generic execution plan in backend memory;
+//   subsequent calls send ONLY [Bind "S_1" + raw parameter bytes] -&gt; [Execute]!
+
+// Wire impact of addBatch() + executeBatch() WITHOUT vs WITH reWriteBatchedInserts=true:
+// WITHOUT flag: Driver pipelines 1,000 individual Parse/Bind/Execute messages
+//               -&gt; PostgreSQL still runs 1,000 executor invocations &amp; index maintenance loops.
+// WITH jdbc:postgresql://db:5432/app?reWriteBatchedInserts=true:
+//   pgjdbc rewrites the PreparedStatement on the fly into multi-row packets (up to bind limit):
+//   INSERT INTO ledger (acct, cents, risk) VALUES ($1,$2,$3), ($4,$5,$6), ..., ($382,$383,$384)
+//   -&gt; Collapses 1,000 executor invocations into ~8 multi-row inserts (10x-25x faster)!</code></pre>
+
+      <div class="callout warning">
+        <div class="callout-title">&#9888; Senior Driver Nuance: Bind Variable Limits &amp; Chunking</div>
+        <p>
+          PostgreSQL's wire protocol encodes bind parameter count as a signed 16-bit integer (max <code>32,767</code> parameters per query, which <code>pgjdbc</code> automatically splits when rewriting batches). However, calling <code>ps.addBatch()</code> <code>500,000</code> times before calling <code>ps.executeBatch()</code> buffers every parameter array in JVM Heap, risking an <code>OutOfMemoryError</code>. Always flush batches in chunks of <strong>500 to 1,000 rows</strong> using <code>ps.executeBatch()</code> followed by <code>ps.clearBatch()</code>.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>3. HikariCP Internals &amp; The Pool Sizing Formula</h2>
+      <p>
+        Opening a raw PostgreSQL connection spawns an OS process via <code>fork()</code>, negotiates TLS 1.3, authenticates SCRAM-SHA-256, and allocates backend work memory—costing <code>25ms–150ms</code>. <strong>HikariCP</strong> amortizes this cost by maintaining pre-warmed connections inside a lock-free <code>ConcurrentBag</code> backed by thread-local caching and custom <code>FastList</code> array wrappers that eliminate <code>ArrayList</code> range-check and iterator overhead on <code>PreparedStatement</code> tracking.
+      </p>
+      <p>
+        The single biggest misconception in backend engineering is increasing <code>maximumPoolSize</code> from <code>20</code> to <code>200</code> when database queries slow down. A single CPU core can execute only one thread slice at a time; benchmarked across PostgreSQL, MySQL, and Oracle, optimal connection concurrency follows the HikariCP formula:
+      </p>
+      <p>
+        <code>connections = (core_count * 2) + effective_spindle_count</code>
+      </p>
+      <p>
+        On modern cloud NVMe SSDs where <code>effective_spindle_count</code> is effectively <code>1</code>, an <strong>8-vCPU PostgreSQL primary reaches peak throughput at roughly 17 to 20 active concurrent queries</strong>. Pushing <code>200</code> simultaneous active queries onto 8 cores forces the Linux scheduler into relentless context switching, invalidates CPU L1/L2 caches, and triggers spinlock contention on PostgreSQL's internal <code>ProcArrayLock</code> and buffer-pool <code>LWLock</code>s—<em>dropping</em> total transactions per second while spiking p99 latency! If you deploy 4 Kubernetes pods sharing one 8-vCPU database, each pod's HikariCP pool should be sized around <code>maximumPoolSize = 5</code> to <code>10</code> (not <code>100</code>!), letting excess app threads queue cleanly in JVM memory for <code>1–2ms</code> rather than thrashing the database kernel.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>HikariCP Property</th>
+            <th>Default</th>
+            <th>Senior Production Recommendation &amp; Rationale</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>maximumPoolSize</code></td>
+            <td><code>10</code></td>
+            <td><code>10–25</code> per pod (ensure <code>replicas * maximumPoolSize &lt; DB max_connections</code> minus admin reserve).</td>
+          </tr>
+          <tr>
+            <td><code>minimumIdle</code></td>
+            <td><code>= maximumPoolSize</code></td>
+            <td>Keep equal to <code>maximumPoolSize</code> so HikariCP acts as a fixed-size pool and never stalls traffic bursts opening new TLS sockets.</td>
+          </tr>
+          <tr>
+            <td><code>connectionTimeout</code></td>
+            <td><code>30000ms</code> (30s)</td>
+            <td>Lower to <code>1500ms–3000ms</code> in user-facing APIs so overloaded pods fail fast instead of queueing threads for 30 seconds.</td>
+          </tr>
+          <tr>
+            <td><code>maxLifetime</code></td>
+            <td><code>1800000ms</code> (30m)</td>
+            <td>Set <code>30s–60s</code> <strong>shorter</strong> than AWS RDS Proxy, Cloud SQL, or NAT gateway idle TCP timeouts to avoid broken-pipe resets.</td>
+          </tr>
+          <tr>
+            <td><code>leakDetectionThreshold</code></td>
+            <td><code>0</code> (disabled)</td>
+            <td>Set to <code>5000ms–10000ms</code> in staging/production to log exact stack traces of code holding connections too long.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>4. Idiomatic Java 21 Production Pattern: Scoped Connections &amp; Chunked Batching</h2>
+      <p>
+        In production code, complete all external network calls and CPU transformations <em>before</em> borrowing a connection from HikariCP, disable <code>autoCommit</code> explicitly for atomic multi-statement work, batch writes in bounded chunks, and always restore <code>autoCommit</code> in <code>finally</code> before closing the pooled wrapper:
+      </p>
+      <pre><code>public record EnrichedSettlement(String accountId, long amountCents, int riskScore) {}
+
+public void persistSettlementBatch(DataSource dataSource, List&lt;Settlement&gt; rawItems) throws SQLException {
+    // STEP 1: Execute external HTTP calls OUTSIDE the database connection scope!
+    List&lt;EnrichedSettlement&gt; ready = rawItems.stream()
+        .map(item -&gt; new EnrichedSettlement(
+            item.accountId(),
+            item.amountCents(),
+            fraudHttpClient.verify(item.accountId()).value()))
+        .toList();
+
+    String sql = """
+        INSERT INTO ledger (acct, cents, risk)
+        VALUES (?, ?, ?)
+        """;
+
+    // STEP 2: Borrow pooled connection ONLY for pure SQL execution (~4ms total)
+    try (Connection conn = dataSource.getConnection()) {
+        boolean priorAutoCommit = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            int count = 0;
+            for (EnrichedSettlement row : ready) {
+                ps.setString(1, row.accountId());
+                ps.setLong(2, row.amountCents());
+                ps.setInt(3, row.riskScore());
+                ps.addBatch();
+
+                if (++count % 500 == 0) {
+                    ps.executeBatch();
+                    ps.clearBatch();
+                }
+            }
+            if (count % 500 != 0) {
+                ps.executeBatch();
+            }
+            conn.commit();
+        } catch (Exception ex) {
+            try {
+                conn.rollback();
+            } catch (SQLException rbEx) {
+                ex.addSuppressed(rbEx);
+            }
+            throw ex;
+        } finally {
+            conn.setAutoCommit(priorAutoCommit);
+        }
+    }
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>5. Interactive Hands-On Workbench</h2>
+      <p>
+        Practice implementing atomic chunked JDBC batching from scratch, then refactor a production checkout service suffering from SQL injection and connection pool starvation.
+      </p>
+
+      <div id="ex-1" class="workbench-container"></div>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>6. Senior Architecture &amp; Code Check</h2>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <p>
+        Read Brett Wooldridge's canonical engineering breakdown on connection pool sizing and PostgreSQL batch rewriting:
+        <a href="https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing" target="_blank" rel="noopener noreferrer">HikariCP Official Wiki: About Pool Sizing</a> and
+        <a href="https://jdbc.postgresql.org/documentation/use/" target="_blank" rel="noopener noreferrer">PostgreSQL JDBC Driver Documentation (Server Prepared Statements &amp; Batch Rewriting)</a>.
+      </p>
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> "If we deploy 20 Spring Boot pods with Java 21 Virtual Threads enabled against a single 16-vCPU PostgreSQL RDS instance (<code>max_connections = 300</code>) and introduce PgBouncer in transaction pooling mode, how do <code>prepareThreshold</code> and HikariCP <code>maximumPoolSize</code> interact with PgBouncer?"
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0055-runtime-generics-type-tokens-json.html">&larr; Previous Lesson</a></div>
+      <div><a href="../reference/0056-jdbc-and-pools.html">&#128214; Reference Sheet 0056</a></div>
+      <div><a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a></div>
+      <div><a href="0057-jpa-hibernate-entity-lifecycle.html">Next Lesson &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+  {
+    "exercises": [
+      {
+        "id": "ex-1",
+        "filename": "JdbcBatchSettlementRepository.java",
+        "badge": "Implementation Drill",
+        "instructions": "<p>Implement <code>insertBatchAtomically(DataSource ds, List&lt;LedgerEntry&gt; entries)</code> using raw JDBC best practices:</p><ol><li>Acquire a <code>Connection</code> via <code>try-with-resources</code> and disable auto-commit with <code>conn.setAutoCommit(false)</code>.</li><li>Prepare a parameterized <code>INSERT INTO ledger_entries (tx_id, account_code, amount_cents) VALUES (?, ?, ?)</code> using <code>conn.prepareStatement(...)</code>.</li><li>Bind each record's fields, call <code>ps.addBatch()</code>, flush every <code>500</code> rows (and any trailing remainder) using <code>ps.executeBatch()</code>, and call <code>conn.commit()</code> on success.</li><li>Catch exceptions to invoke <code>conn.rollback()</code> (preserving suppressed exceptions if needed) and rethrow.</li></ol>",
+        "initialCode": "import javax.sql.DataSource;\nimport java.sql.Connection;\nimport java.sql.PreparedStatement;\nimport java.sql.SQLException;\nimport java.util.List;\n\npublic class JdbcBatchSettlementRepository {\n\n    public record LedgerEntry(String txId, String accountCode, long amountCents) {}\n\n    public int insertBatchAtomically(DataSource ds, List<LedgerEntry> entries) throws SQLException {\n        String sql = \"INSERT INTO ledger_entries (tx_id, account_code, amount_cents) VALUES (?, ?, ?)\";\n        // TODO: Acquire Connection via try-with-resources, disable autoCommit,\n        //       bind parameters in PreparedStatement, batch in chunks of 500,\n        //       commit on success, and rollback on failure.\n        return 0;\n    }\n}\n",
+        "solution": "import javax.sql.DataSource;\nimport java.sql.Connection;\nimport java.sql.PreparedStatement;\nimport java.sql.SQLException;\nimport java.util.List;\n\npublic class JdbcBatchSettlementRepository {\n\n    public record LedgerEntry(String txId, String accountCode, long amountCents) {}\n\n    public int insertBatchAtomically(DataSource ds, List<LedgerEntry> entries) throws SQLException {\n        String sql = \"INSERT INTO ledger_entries (tx_id, account_code, amount_cents) VALUES (?, ?, ?)\";\n        try (Connection conn = ds.getConnection()) {\n            boolean prevAutoCommit = conn.getAutoCommit();\n            conn.setAutoCommit(false);\n            try (PreparedStatement ps = conn.prepareStatement(sql)) {\n                int count = 0;\n                for (LedgerEntry entry : entries) {\n                    ps.setString(1, entry.txId());\n                    ps.setString(2, entry.accountCode());\n                    ps.setLong(3, entry.amountCents());\n                    ps.addBatch();\n                    if (++count % 500 == 0) {\n                        ps.executeBatch();\n                        ps.clearBatch();\n                    }\n                }\n                if (count % 500 != 0) {\n                    ps.executeBatch();\n                }\n                conn.commit();\n                return count;\n            } catch (Exception ex) {\n                try {\n                    conn.rollback();\n                } catch (SQLException rbEx) {\n                    ex.addSuppressed(rbEx);\n                }\n                throw ex;\n            } finally {\n                conn.setAutoCommit(prevAutoCommit);\n            }\n        }\n    }\n}\n",
+        "solutionExplanation": "Disabling autoCommit groups all multi-row batches into a single atomic WAL commit, chunking at 500 rows bounds pgjdbc client heap usage while enabling reWriteBatchedInserts multi-row packet compression, and restoring autoCommit in finally prevents leaking dirty connection state back into HikariCP.",
+        "hints": [
+          "Open <code>try (Connection conn = ds.getConnection())</code>, save <code>conn.getAutoCommit()</code>, and call <code>conn.setAutoCommit(false)</code> before creating the <code>PreparedStatement</code>.",
+          "Inside the loop over <code>entries</code>, bind parameters 1, 2, and 3 with <code>ps.setString</code> / <code>ps.setLong</code>, call <code>ps.addBatch()</code>, and flush with <code>ps.executeBatch()</code> every 500 items plus any remaining items after the loop.",
+          "Call <code>conn.commit()</code> after the final batch flush, and inside <code>catch (Exception ex)</code> call <code>conn.rollback()</code> before rethrowing <code>ex</code>."
+        ],
+        "tests": [
+          {
+            "name": "Disables autoCommit for atomic batch transaction",
+            "regex": "setAutoCommit\\s*\\(\\s*false\\s*\\)",
+            "flags": "m",
+            "passMessage": "Explicitly disables autoCommit before executing batch statements.",
+            "failMessage": "Call conn.setAutoCommit(false) before running the batch."
+          },
+          {
+            "name": "Uses PreparedStatement with bind setters",
+            "regex": "prepareStatement\\s*\\([\\s\\S]*?setString\\s*\\(\\s*1[\\s\\S]*?setLong\\s*\\(\\s*3",
+            "flags": "ms",
+            "passMessage": "Uses parameterized PreparedStatement with typed setters.",
+            "failMessage": "Prepare the SQL with conn.prepareStatement(sql) and bind parameters 1..3."
+          },
+          {
+            "name": "Batches rows with addBatch() and executeBatch()",
+            "regex": "addBatch\\s*\\(\\s*\\)[\\s\\S]*?executeBatch\\s*\\(\\s*\\)",
+            "flags": "ms",
+            "passMessage": "Queues rows via addBatch() and flushes via executeBatch().",
+            "failMessage": "Use ps.addBatch() inside the loop and flush chunks with ps.executeBatch()."
+          },
+          {
+            "name": "Commits on success and rolls back on failure",
+            "regex": "commit\\s*\\(\\s*\\)[\\s\\S]*?catch\\s*\\([^)]+\\)[\\s\\S]*?rollback\\s*\\(\\s*\\)",
+            "flags": "ms",
+            "passMessage": "Atomically commits on success and rolls back in the catch block.",
+            "failMessage": "Call conn.commit() after flushing batches and conn.rollback() inside catch."
+          }
+        ],
+        "simulatedOutput": "[HikariPool-1] Acquired connection conn0 (active=1, idle=9, waiting=0)\n[pgjdbc] reWriteBatchedInserts=true -> Rewrote 500 batched rows into 4 multi-row INSERT packets\n[pgjdbc] Rewrote 120 trailing rows into 1 multi-row INSERT packet\n[PostgreSQL] COMMIT single WAL flush completed in 3.4ms (620 rows persisted, 0 leaked connections)"
+      },
+      {
+        "id": "ex-2",
+        "filename": "OrderCheckoutJdbcService.java",
+        "badge": "Bug-Fix Challenge",
+        "instructions": "<p>This checkout service caused a P1 production outage during a payment gateway slowdown. Diagnose and fix <strong>all three bugs</strong>:</p><ol><li>Move the slow external HTTP call <code>paymentGateway.authorize(sku, cents)</code> <strong>outside and before</strong> acquiring the JDBC <code>Connection</code> so HikariCP slots are never held across external HTTP I/O.</li><li>Replace the vulnerable <code>createStatement()</code> string-concatenated SQL with a parameterized <code>PreparedStatement</code> using <code>?</code> placeholders (<code>sku</code>, <code>cents</code>, <code>authCode</code>).</li><li>Disable <code>autoCommit</code>, call <code>conn.commit()</code> after <code>ps.executeUpdate()</code>, and call <code>conn.rollback()</code> in <code>catch</code> if the database write fails.</li></ol>",
+        "initialCode": "import javax.sql.DataSource;\nimport java.sql.Connection;\nimport java.sql.SQLException;\nimport java.sql.Statement;\n\npublic class OrderCheckoutJdbcService {\n\n    public interface PaymentGatewayClient {\n        String authorize(String sku, long amountCents);\n    }\n\n    private final DataSource dataSource;\n    private final PaymentGatewayClient paymentGateway;\n\n    public OrderCheckoutJdbcService(DataSource dataSource, PaymentGatewayClient paymentGateway) {\n        this.dataSource = dataSource;\n        this.paymentGateway = paymentGateway;\n    }\n\n    public void checkout(String sku, long cents) throws SQLException {\n        // BUG 1: Acquires DB connection BEFORE slow external HTTP call!\n        try (Connection conn = dataSource.getConnection();\n             Statement stmt = conn.createStatement()) {\n\n            String authCode = paymentGateway.authorize(sku, cents);\n\n            // BUG 2 & 3: SQL injection via concatenation + no explicit commit/rollback boundary!\n            String sql = \"INSERT INTO orders (sku, cents, auth_code) VALUES ('\"\n                + sku + \"', \" + cents + \", '\" + authCode + \"')\";\n            stmt.executeUpdate(sql);\n        }\n    }\n}\n",
+        "solution": "import javax.sql.DataSource;\nimport java.sql.Connection;\nimport java.sql.PreparedStatement;\nimport java.sql.SQLException;\n\npublic class OrderCheckoutJdbcService {\n\n    public interface PaymentGatewayClient {\n        String authorize(String sku, long amountCents);\n    }\n\n    private final DataSource dataSource;\n    private final PaymentGatewayClient paymentGateway;\n\n    public OrderCheckoutJdbcService(DataSource dataSource, PaymentGatewayClient paymentGateway) {\n        this.dataSource = dataSource;\n        this.paymentGateway = paymentGateway;\n    }\n\n    public void checkout(String sku, long cents) throws SQLException {\n        String authCode = paymentGateway.authorize(sku, cents);\n\n        String sql = \"INSERT INTO orders (sku, cents, auth_code) VALUES (?, ?, ?)\";\n        try (Connection conn = dataSource.getConnection()) {\n            boolean prevAutoCommit = conn.getAutoCommit();\n            conn.setAutoCommit(false);\n            try (PreparedStatement ps = conn.prepareStatement(sql)) {\n                ps.setString(1, sku);\n                ps.setLong(2, cents);\n                ps.setString(3, authCode);\n                ps.executeUpdate();\n                conn.commit();\n            } catch (Exception ex) {\n                try {\n                    conn.rollback();\n                } catch (SQLException rbEx) {\n                    ex.addSuppressed(rbEx);\n                }\n                throw ex;\n            } finally {\n                conn.setAutoCommit(prevAutoCommit);\n            }\n        }\n    }\n}\n",
+        "solutionExplanation": "Executing paymentGateway.authorize() before dataSource.getConnection() reduces HikariCP connection hold time from ~400ms (HTTP RTT) to ~1.2ms (pure SQL I/O), multiplying effective pool capacity by >300x while eliminating SQL injection via PreparedStatement bind parameters.",
+        "hints": [
+          "Call <code>String authCode = paymentGateway.authorize(sku, cents);</code> at the very start of <code>checkout(...)</code>, before opening <code>try (Connection conn = dataSource.getConnection())</code>.",
+          "Delete <code>createStatement()</code> and string concatenation; use <code>conn.prepareStatement(\"INSERT INTO orders (sku, cents, auth_code) VALUES (?, ?, ?)\")</code>.",
+          "Wrap the <code>PreparedStatement</code> execution with <code>conn.setAutoCommit(false)</code>, <code>conn.commit()</code>, and <code>conn.rollback()</code> in <code>catch</code>."
+        ],
+        "tests": [
+          {
+            "name": "Invokes external HTTP payment gateway before acquiring DB connection",
+            "regex": "paymentGateway\\.authorize\\s*\\([^)]*\\)[\\s\\S]*?dataSource\\.getConnection\\s*\\(\\s*\\)",
+            "flags": "ms",
+            "passMessage": "External HTTP call executes outside the HikariCP connection scope.",
+            "failMessage": "Move paymentGateway.authorize(...) BEFORE dataSource.getConnection()."
+          },
+          {
+            "name": "Eliminates raw Statement and string-concatenated SQL",
+            "regex": "prepareStatement\\s*\\(",
+            "flags": "m",
+            "mustNotMatch": "createStatement\\s*\\(|VALUES\\s*\\(\\s*'\"",
+            "passMessage": "Uses PreparedStatement without SQL string concatenation.",
+            "failMessage": "Remove createStatement() and concatenated SQL; use prepareStatement with ? placeholders."
+          },
+          {
+            "name": "Binds sku, cents, and authCode safely",
+            "regex": "setString\\s*\\(\\s*1\\s*,\\s*sku\\s*\\)[\\s\\S]*?setLong\\s*\\(\\s*2\\s*,\\s*cents\\s*\\)[\\s\\S]*?setString\\s*\\(\\s*3\\s*,\\s*authCode\\s*\\)",
+            "flags": "ms",
+            "passMessage": "All three bind parameters are bound with strongly typed setters.",
+            "failMessage": "Bind parameters 1 (sku), 2 (cents), and 3 (authCode) on PreparedStatement."
+          },
+          {
+            "name": "Manages explicit commit and rollback boundaries",
+            "regex": "setAutoCommit\\s*\\(\\s*false\\s*\\)[\\s\\S]*?commit\\s*\\(\\s*\\)[\\s\\S]*?rollback\\s*\\(\\s*\\)",
+            "flags": "ms",
+            "passMessage": "Explicit transaction commit and rollback boundaries verified.",
+            "failMessage": "Disable autoCommit, commit after executeUpdate(), and rollback on exception."
+          }
+        ],
+        "simulatedOutput": "[CheckoutLoadTest] Simulating 200 concurrent checkouts with 350ms payment gateway latency (HikariPool max=10)...\n[HikariPool-1] Peak active connections: 2 / 10 | Avg connection hold time: 1.1ms | Timeouts: 0\n[SecurityAudit] SQL injection payload \"SKU-1'; DROP TABLE orders;--\" safely bound as literal VARCHAR parameter."
+      }
+    ],
+    "quiz": {
+      "id": "quiz-main",
+      "questions": [
+        {
+          "question": "A Spring Boot service runs against PostgreSQL using the JDBC batch code below, yet inserting 10,000 rows still takes 4.8 seconds instead of 150ms. Why?",
+          "code": "// URL: jdbc:postgresql://db-prod:5432/ledger\ntry (Connection c = ds.getConnection();\n     PreparedStatement ps = c.prepareStatement(\"INSERT INTO events (id, payload) VALUES (?, ?)\")) {\n    c.setAutoCommit(false);\n    for (Event e : tenThousandEvents) {\n        ps.setObject(1, e.id());\n        ps.setString(2, e.payload());\n        ps.addBatch();\n    }\n    ps.executeBatch();\n    c.commit();\n}",
+          "correctIndex": 1,
+          "options": [
+            {
+              "text": "Calling `setAutoCommit(false)` forces PostgreSQL to flush WAL segments after each batched row.",
+              "explanation": "Disabling autoCommit actually prevents per-row WAL flushes and defers durability sync until `c.commit()` is invoked at the end."
+            },
+            {
+              "text": "Without `reWriteBatchedInserts=true`, pgjdbc sends 10,000 individual `Bind`/`Execute` statements instead of multi-row `VALUES`.",
+              "explanation": "Correct! By default, `pgjdbc` pipelines 10,000 separate single-row executions; enabling `reWriteBatchedInserts=true` rewrites them into multi-row `INSERT ... VALUES (...), (...)` packets, slashing executor and index overhead."
+            },
+            {
+              "text": "PostgreSQL rejects `PreparedStatement` batches unless `Statement.RETURN_GENERATED_KEYS` is passed during preparation.",
+              "explanation": "Passing `RETURN_GENERATED_KEYS` is optional and in fact can inhibit certain multi-row batch optimizations if unnecessary keys must be returned."
+            },
+            {
+              "text": "HikariCP intercepts `executeBatch()` and serializes every row across separate pooled connections.",
+              "explanation": "A `PreparedStatement` is bound to the single `Connection` that created it; HikariCP never splits a batch across multiple connections."
+            }
+          ]
+        },
+        {
+          "question": "An 8-vCPU PostgreSQL instance on NVMe SSD hits 95% CPU during traffic spikes. An engineer raises HikariCP `maximumPoolSize` from 20 to 250 across pods. What happens?",
+          "code": null,
+          "correctIndex": 3,
+          "options": [
+            {
+              "text": "Database throughput scales linearly by 12x because 250 queries execute simultaneously in hardware.",
+              "explanation": "An 8-vCPU machine can only execute 8 instruction streams per clock cycle; 250 runnable processes cannot run in parallel on 8 cores."
+            },
+            {
+              "text": "HikariCP automatically multiplexes all 250 virtual connections onto 8 non-blocking NIO database sockets.",
+              "explanation": "Standard JDBC is synchronous blocking I/O per connection, and PostgreSQL spawns one dedicated OS backend process per physical connection."
+            },
+            {
+              "text": "PostgreSQL promotes `READ COMMITTED` queries into lock-free memory snapshots with zero CPU overhead.",
+              "explanation": "Even read-only MVCC snapshots acquire shared `ProcArray` and buffer locks and compete for CPU cache lines under heavy connection counts."
+            },
+            {
+              "text": "Throughput drops and p99 latency spikes from OS context switching and PostgreSQL `LWLock` contention.",
+              "explanation": "Correct! Per `(core_count * 2) + spindle_count`, an 8-core SSD database peaks near ~17-20 active connections; 250 active backends thrash CPU caches and internal database spinlocks."
+            }
+          ]
+        },
+        {
+          "question": "Under AWS NAT Gateway or RDS Proxy with a 10-minute idle TCP timeout, what failure occurs with the HikariCP configuration below?",
+          "code": "HikariConfig cfg = new HikariConfig();\ncfg.setMaximumPoolSize(15);\ncfg.setConnectionTimeout(2000);\ncfg.setMaxLifetime(1_800_000); // 30 minutes",
+          "correctIndex": 0,
+          "options": [
+            {
+              "text": "Firewalls silently drop idle sockets after 10 minutes, causing broken-pipe `SQLException` errors on checkout.",
+              "explanation": "Correct! When `maxLifetime` (30m) exceeds an intermediate network firewall or proxy idle timeout (10m), half-open dead sockets remain in the pool until a request writes to them and fails; `maxLifetime` must always be shorter than infrastructure timeouts."
+            },
+            {
+              "text": "HikariCP refuses to boot whenever `maxLifetime` is greater than `connectionTimeout` multiplied by ten.",
+              "explanation": "HikariCP requires `maxLifetime` (minimum 30,000ms) to be much larger than `connectionTimeout` (typically 1.5s-30s); this boots normally."
+            },
+            {
+              "text": "Setting `connectionTimeout` to 2000ms kills active SQL queries that run longer than two seconds.",
+              "explanation": "`connectionTimeout` only bounds how long a caller thread waits to borrow a connection from `dataSource.getConnection()`, not SQL query execution time (`queryTimeout` / `socketTimeout`)."
+            },
+            {
+              "text": "Omitting `minimumIdle` sets idle capacity to zero, closing every connection immediately after commit.",
+              "explanation": "In HikariCP, omitting `minimumIdle` defaults it to `maximumPoolSize` (15), maintaining a fixed-size pool of pre-warmed connections."
+            }
+          ]
+        }
+      ]
+    }
+  }
+  </script>
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/workbench.js"></script>
+</body>
+</html>

@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0065: Multi-Tier Caching: Caffeine (W-TinyLFU), Redis, Stampede Protection &amp; After-Commit Eviction</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0064-restclient-resilience4j-and-idempotency.html">&larr; Previous Lesson</a></div>
+      <div class="lesson-nav-center">
+        <a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a>
+        <a href="../reference/0065-caffeine-and-redis-caching.html">&#128214; Reference 0065</a>
+      </div>
+      <div><a href="0066-production-testing-mockmvc-testcontainers.html">Next Lesson &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Phase 4 &bull; Spring Boot 3 &bull; Lesson 0065</div>
+      <h1>Multi-Tier Caching: Caffeine (W-TinyLFU), Redis, Stampede Protection &amp; After-Commit Eviction</h1>
+      <p class="lesson-subtitle">
+        Architect high-hit-ratio L1/L2 caches in Java 21, defeat cache stampedes, penetration, and avalanches, and eliminate stale-read database race conditions.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. The Naive <code>@Cacheable</code> Production Trap</h2>
+      <p>
+        Slapping <code>@Cacheable("catalog")</code> onto a Spring service backed by default <code>RedisCacheManager</code> looks effortless in staging and causes catastrophic outages under real traffic. Default Spring Redis configuration uses <code>JdkSerializationRedisSerializer</code>, which writes brittle Java bytecode streams tied to <code>serialVersionUID</code>, bloats payload sizes by 3&ndash;5x, and breaks rolling deployments whenever a DTO field changes.
+      </p>
+      <p>
+        Even worse, four subtle concurrency and distributed-systems hazards lurk inside naive cache-aside code:
+      </p>
+      <pre><code>// ANTI-PATTERN: Four production outages waiting to happen in 25 lines
+@Service
+public class NaiveCatalogService {
+
+    @Autowired private RedisTemplate&lt;Object, Object&gt; redisTemplate; // Trap 1: JDK binary serialization!
+    @Autowired private ProductRepository repository;
+
+    // Trap 2: No sync=true -&gt; 5,000 virtual threads stampede PostgreSQL when a hot SKU expires!
+    // Trap 3: Fixed TTL across bulk-warmed keys -&gt; Cache Avalanche when all keys expire simultaneously!
+    @Cacheable(value = "products", key = "#sku")
+    public ProductDto getProduct(String sku) {
+        return repository.findBySku(sku)
+            .map(ProductDto::from)
+            .orElse(null); // Trap 4: Returning null allows Cache Penetration on random/attack SKUs!
+    }
+
+    @Transactional
+    public void updatePrice(String sku, BigDecimal newPrice) {
+        repository.updatePriceBySku(sku, newPrice);
+        // Trap 5: Evicting BEFORE the DB transaction commits!
+        // A concurrent reader misses Redis, reads the OLD committed price from PostgreSQL,
+        // and writes the stale price right back into Redis until TTL expiry!
+        redisTemplate.delete("products::" + sku);
+    }
+}</code></pre>
+
+      <div class="callout danger">
+        <div class="callout-title">&#9888; The Pre-Commit Cache Eviction Race Condition</div>
+        <p style="margin:0;">
+          Under PostgreSQL's default <code>READ COMMITTED</code> isolation, uncommitted writes from Thread A are invisible to Thread B. If Thread A deletes the Redis key inside <code>@Transactional</code> before <code>COMMIT</code> finishes on the wire, Thread B suffers a cache miss, queries PostgreSQL (receiving the <em>old</em> row), and repopulates Redis with stale data that persists for the entire TTL.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Under the Hood: Caffeine <code>W-TinyLFU</code> &amp; Multi-Tier L1/L2 Mechanics</h2>
+      <p>
+        Why is <strong>Caffeine</strong> the undisputed standard for in-heap Java caching over legacy <code>ConcurrentHashMap</code> + LRU wrappers or Guava Cache? Classic <strong>LRU</strong> suffers from <em>scan pollution</em>: a single batch reporting job scanning 100,000 cold keys flushes your hottest working set out of memory. Pure <strong>LFU</strong> suffers from the opposite flaw: an item that went viral yesterday accumulates 1,000,000 hits and squats in heap long after traffic moves on, plus maintaining exact per-key frequency heaps costs <code>O(log N)</code> under lock contention.
+      </p>
+      <p>
+        Caffeine implements <strong>Window-TinyLFU (<code>W-TinyLFU</code>)</strong> with lock-free striped ring buffers, achieving near-optimal hit ratios in <code>O(1)</code> time and 8 bytes of frequency state per capacity slot:
+      </p>
+      <pre><code>// Caffeine W-TinyLFU Memory &amp; Admission Pipeline:
+//
+// Incoming Read/Write --&gt; [ Striped RingBuffer ] (lock-free CAS, avoids monitor contention)
+//                                  |
+//                      (Async drain on maintenance)
+//                                  v
+// +-----------------------+    Victim     +------------------------------+
+// | 1% Window Cache (LRU) | ------------&gt; | TinyLFU Admission Filter     |
+// | Absorbs bursty scans! |               | 4-bit Count-Min Sketch       |
+// +-----------------------+               | Periodically halves all      |
+//                                         | counters (aging out old hot) |
+//                                         +--------------+---------------+
+//                                                        |
+//                        Compare sketch(candidate) vs sketch(probationVictim)
+//                                                        v
+//                       +------------------------------------------------+
+//                       | 99% Segmented LRU Main Space                   |
+//                       |  - 20% Probationary Segment (new admissions)   |
+//                       |  - 80% Protected Segment (promoted on 2nd hit) |
+//                       +------------------------------------------------+</code></pre>
+
+      <p>
+        In high-throughput microservices, combining an <strong>L1 In-Heap Caffeine Cache</strong> with an <strong>L2 Distributed Redis Cache</strong> gives sub-microsecond hot-key reads without melting Redis network I/O on viral keys (like a flash-sale homepage banner):
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Dimension</th>
+            <th>L1: In-Heap (Caffeine)</th>
+            <th>L2: Distributed (Redis)</th>
+            <th>Defense Against Failure Modes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Read Latency</strong></td>
+            <td><code>~50&ndash;150 ns</code> (direct OOP reference)</td>
+            <td><code>~0.8&ndash;2.5 ms</code> (TCP + JSON parse)</td>
+            <td><strong>Stampede (Hot Key Expiry):</strong> Coalesce concurrent misses with Caffeine <code>AsyncLoadingCache</code> single-flight or <code>@Cacheable(sync = true)</code>; proactively reload via <code>refreshAfterWrite</code>.</td>
+          </tr>
+          <tr>
+            <td><strong>Memory Footprint</strong></td>
+            <td>Bounded strictly via <code>maximumSize</code> / <code>maximumWeight</code> (never unbounded TTL-only!)</td>
+            <td>Off-JVM cluster RAM; survives pod restarts and horizontal autoscaling</td>
+            <td><strong>Penetration (Non-Existent IDs):</strong> Cache a short-lived negative sentinel (<code>"__NULL__"</code> for 30s) or reject impossible keys upfront via a <strong>Bloom Filter</strong>.</td>
+          </tr>
+          <tr>
+            <td><strong>Cross-Pod Consistency</strong></td>
+            <td>Per-JVM local state; requires short TTL (e.g., 15&ndash;60s) or Redis Pub/Sub invalidation</td>
+            <td>Shared single source of cached truth across all replicas</td>
+            <td><strong>Avalanche (Mass Simultaneous Expiry):</strong> Always add random jitter (e.g., <code>baseTtl + random(0..120s)</code>) when writing to L2 Redis.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>3. Idiomatic Java 21 Production Solution: Single-Flight, Typed JSON &amp; <code>AFTER_COMMIT</code></h2>
+      <p>
+        To build a rock-solid two-tier cache in Spring Boot 3 and Java 21:
+      </p>
+      <ul>
+        <li>Use <code>Caffeine.newBuilder().maximumSize(...).refreshAfterWrite(...).buildAsync(...)</code> so concurrent Virtual Threads requesting the same missing key share a <strong>single in-flight <code>CompletableFuture</code></strong>, while stale-while-revalidate background refreshes hide database latency on hot keys.</li>
+        <li>Use <code>StringRedisTemplate</code> with explicit Jackson JSON serialization, negative-cache sentinels, and randomized TTL jitter.</li>
+        <li>Emit an immutable Java 21 <code>record</code> domain event inside <code>@Transactional</code> and evict Redis + local Caffeine inside <code>@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)</code> so eviction happens strictly <em>after</em> PostgreSQL commits the new row.</li>
+      </ul>
+
+      <pre><code>import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import java.math.BigDecimal;
+import java.time.Duration;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+public record ProductView(String sku, String title, BigDecimal price) {}
+public record ProductUpdatedEvent(String sku) {}
+
+@Service
+public class ResilientCatalogCacheService {
+
+    private static final String NEGATIVE_SENTINEL = "__MISSING__";
+    private static final Duration REDIS_BASE_TTL = Duration.ofMinutes(15);
+    private static final Duration NEGATIVE_TTL = Duration.ofSeconds(30);
+
+    private final StringRedisTemplate redis;
+    private final ObjectMapper objectMapper;
+    private final ProductRepository repository;
+    private final ApplicationEventPublisher events;
+    private final AsyncLoadingCache&lt;String, Optional&lt;ProductView&gt;&gt; l1Cache;
+
+    public ResilientCatalogCacheService(
+            StringRedisTemplate redis,
+            ObjectMapper objectMapper,
+            ProductRepository repository,
+            ApplicationEventPublisher events) {
+        this.redis = redis;
+        this.objectMapper = objectMapper;
+        this.repository = repository;
+        this.events = events;
+
+        Executor vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        this.l1Cache = Caffeine.newBuilder()
+            .maximumSize(10_000) // Hard heap bound via W-TinyLFU
+            .refreshAfterWrite(Duration.ofSeconds(30)) // Async background refresh for hot keys
+            .expireAfterWrite(Duration.ofMinutes(2))   // Hard staleness ceiling per pod
+            .recordStats()                             // Expose hit/miss/eviction to Micrometer
+            .executor(vtExecutor)
+            .buildAsync((sku, executor) -&gt; CompletableFuture.supplyAsync(() -&gt; loadFromL2OrDb(sku), executor));
+    }
+
+    public Optional&lt;ProductView&gt; findBySku(String sku) {
+        // Single-flight guarantee: 1,000 concurrent misses on the same SKU join ONE CompletableFuture!
+        return l1Cache.get(sku).join();
+    }
+
+    private Optional&lt;ProductView&gt; loadFromL2OrDb(String sku) {
+        String redisKey = "catalog:v1:sku:" + sku;
+        String rawJson = redis.opsForValue().get(redisKey);
+
+        if (NEGATIVE_SENTINEL.equals(rawJson)) {
+            return Optional.empty(); // Defeats Cache Penetration without hitting PostgreSQL
+        }
+        if (rawJson != null) {
+            return Optional.of(deserialize(rawJson));
+        }
+
+        Optional&lt;ProductView&gt; dbResult = repository.findBySku(sku).map(ProductView::fromEntity);
+        if (dbResult.isPresent()) {
+            long jitterSeconds = ThreadLocalRandom.current().nextLong(0, 120);
+            redis.opsForValue().set(
+                redisKey,
+                serialize(dbResult.get()),
+                REDIS_BASE_TTL.plusSeconds(jitterSeconds) // Defeats Cache Avalanche
+            );
+        } else {
+            redis.opsForValue().set(redisKey, NEGATIVE_SENTINEL, NEGATIVE_TTL);
+        }
+        return dbResult;
+    }
+
+    @Transactional
+    public void updatePrice(String sku, BigDecimal newPrice) {
+        repository.updatePriceBySku(sku, newPrice);
+        // Recorded in Spring transaction synchronization; does NOT fire if transaction rolls back!
+        events.publishEvent(new ProductUpdatedEvent(sku));
+    }
+
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onProductUpdated(ProductUpdatedEvent event) {
+        redis.delete("catalog:v1:sku:" + event.sku());
+        l1Cache.synchronous().invalidate(event.sku());
+        redis.convertAndSend("catalog:invalidation", event.sku()); // Fan out L1 eviction to peer pods
+    }
+
+    private String serialize(ProductView view) { /* Jackson writeValueAsString */ return ""; }
+    private ProductView deserialize(String json) { /* Jackson readValue */ return null; }
+}</code></pre>
+
+      <div class="callout tip">
+        <div class="callout-title">&#128161; Senior Operational Rule: Always Bound <code>maximumSize</code> or <code>maximumWeight</code></div>
+        <p style="margin:0;">
+          Never configure an in-heap Caffeine cache using <em>only</em> <code>expireAfterWrite</code>! If an attacker or batch job requests 5,000,000 distinct keys inside a 5-minute TTL window, an unbounded heap cache triggers a fatal <code>OutOfMemoryError: Java heap space</code> before time-based expiration can reclaim entries.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>4. Interactive Hands-On Workbench</h2>
+      <p>
+        Complete both production caching drills below: first build a bounded W-TinyLFU + jittered Redis loader from scratch, then fix a pre-commit cache eviction &amp; stampede bug.
+      </p>
+
+      <div id="ex-1" class="workbench-container"></div>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>5. Senior Architecture &amp; Code Check</h2>
+      <p>Test your mastery of W-TinyLFU mechanics, stampede protection, and transactional cache consistency.</p>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <ul>
+        <li>
+          <a href="https://github.com/ben-manes/caffeine/wiki/Efficiency" target="_blank" rel="noopener">
+            Caffeine Official Architecture Wiki &mdash; W-TinyLFU Efficiency &amp; Admission Policy
+          </a>
+        </li>
+        <li>
+          <a href="https://docs.spring.io/spring-framework/reference/integration/cache.html" target="_blank" rel="noopener">
+            Spring Framework 6 Reference &mdash; Cache Abstraction &amp; Synchronized Caching
+          </a>
+        </li>
+      </ul>
+
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> "Show me how to wire a lightweight Redis Pub/Sub <code>MessageListener</code> in Spring Boot 3 so that when Pod A invalidates a key after a PostgreSQL commit, Pods B through N immediately evict that key from their local L1 Caffeine caches without polling."
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0064-restclient-resilience4j-and-idempotency.html">&larr; Previous Lesson</a></div>
+      <div>
+        <a href="../reference/0065-caffeine-and-redis-caching.html">&#128214; Reference Cheat Sheet</a> &bull;
+        <a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a>
+      </div>
+      <div><a href="0066-production-testing-mockmvc-testcontainers.html">Next Lesson &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+  {
+    "exercises": [
+      {
+        "id": "ex-1",
+        "filename": "TieredInventoryCache.java",
+        "badge": "Implementation Drill",
+        "instructions": "<p>Implement the core resilience protections inside <code>TieredInventoryCache</code>:</p><ol><li>Configure the L1 Caffeine builder with a hard capacity bound via <code>.maximumSize(5_000)</code>, proactive background reload via <code>.refreshAfterWrite(Duration.ofSeconds(30))</code>, and metrics via <code>.recordStats()</code>.</li><li>In <code>computeJitteredTtl</code>, add random jitter using <code>ThreadLocalRandom.current().nextLong(...)</code> to <code>baseTtl</code> to prevent Cache Avalanche.</li><li>In <code>cacheDbLookup</code>, when <code>dbValue.isEmpty()</code>, store the <code>NEGATIVE_SENTINEL</code> string in Redis with a short TTL to stop Cache Penetration.</li></ol>",
+        "initialCode": "import com.github.benmanes.caffeine.cache.AsyncLoadingCache;\nimport com.github.benmanes.caffeine.cache.Caffeine;\nimport java.time.Duration;\nimport java.util.Optional;\nimport java.util.concurrent.ThreadLocalRandom;\n\npublic class TieredInventoryCache {\n    public static final String NEGATIVE_SENTINEL = \"__MISSING__\";\n\n    public AsyncLoadingCache<String, Optional<Integer>> buildL1Cache() {\n        // TODO 1: Bound maximumSize(5_000), add refreshAfterWrite(Duration.ofSeconds(30)), and recordStats()\n        return Caffeine.newBuilder()\n            .expireAfterWrite(Duration.ofMinutes(2))\n            .buildAsync((sku, executor) -> null);\n    }\n\n    public Duration computeJitteredTtl(Duration baseTtl) {\n        // TODO 2: Add random seconds via ThreadLocalRandom.current().nextLong(...) to baseTtl\n        return baseTtl;\n    }\n\n    public void cacheDbLookup(RedisPort redis, String key, Optional<Integer> dbValue, Duration baseTtl) {\n        if (dbValue.isPresent()) {\n            redis.set(key, String.valueOf(dbValue.get()), computeJitteredTtl(baseTtl));\n        }\n        // TODO 3: When dbValue is empty, write NEGATIVE_SENTINEL with Duration.ofSeconds(30)\n    }\n\n    interface RedisPort {\n        void set(String key, String value, Duration ttl);\n    }\n}",
+        "solution": "import com.github.benmanes.caffeine.cache.AsyncLoadingCache;\nimport com.github.benmanes.caffeine.cache.Caffeine;\nimport java.time.Duration;\nimport java.util.Optional;\nimport java.util.concurrent.CompletableFuture;\nimport java.util.concurrent.ThreadLocalRandom;\n\npublic class TieredInventoryCache {\n    public static final String NEGATIVE_SENTINEL = \"__MISSING__\";\n\n    public AsyncLoadingCache<String, Optional<Integer>> buildL1Cache() {\n        return Caffeine.newBuilder()\n            .maximumSize(5_000)\n            .refreshAfterWrite(Duration.ofSeconds(30))\n            .expireAfterWrite(Duration.ofMinutes(2))\n            .recordStats()\n            .buildAsync((sku, executor) -> CompletableFuture.completedFuture(Optional.empty()));\n    }\n\n    public Duration computeJitteredTtl(Duration baseTtl) {\n        long jitterSec = ThreadLocalRandom.current().nextLong(15, 90);\n        return baseTtl.plusSeconds(jitterSec);\n    }\n\n    public void cacheDbLookup(RedisPort redis, String key, Optional<Integer> dbValue, Duration baseTtl) {\n        if (dbValue.isPresent()) {\n            redis.set(key, String.valueOf(dbValue.get()), computeJitteredTtl(baseTtl));\n        } else {\n            redis.set(key, NEGATIVE_SENTINEL, Duration.ofSeconds(30));\n        }\n    }\n\n    interface RedisPort {\n        void set(String key, String value, Duration ttl);\n    }\n}",
+        "solutionExplanation": "Bounding maximumSize(5_000) activates Caffeine's W-TinyLFU eviction policy to prevent OutOfMemoryError under key-scan attacks, while refreshAfterWrite reloads hot keys asynchronously without blocking callers. Adding ThreadLocalRandom TTL jitter spreads L2 Redis expirations over time to prevent Cache Avalanche, and writing NEGATIVE_SENTINEL with a short 30-second TTL blocks Cache Penetration on non-existent SKUs.",
+        "hints": [
+          "Chain <code>.maximumSize(5_000)</code>, <code>.refreshAfterWrite(Duration.ofSeconds(30))</code>, and <code>.recordStats()</code> directly onto <code>Caffeine.newBuilder()</code> before <code>.buildAsync(...)</code>.",
+          "Use <code>ThreadLocalRandom.current().nextLong(15, 90)</code> and return <code>baseTtl.plusSeconds(jitterSec)</code> instead of returning a fixed <code>baseTtl</code>.",
+          "Add an <code>else</code> branch in <code>cacheDbLookup</code> calling <code>redis.set(key, NEGATIVE_SENTINEL, Duration.ofSeconds(30));</code>."
+        ],
+        "tests": [
+          {
+            "name": "Bounds heap with W-TinyLFU maximumSize",
+            "regex": "\\.maximumSize\\s*\\(\\s*5_?000\\s*\\)",
+            "flags": "m",
+            "passMessage": "Configured hard heap entry limit with maximumSize(5_000).",
+            "failMessage": "Add .maximumSize(5_000) to Caffeine.newBuilder() so heap usage cannot grow unbounded."
+          },
+          {
+            "name": "Enables non-blocking refreshAfterWrite and stats",
+            "regex": "\\.refreshAfterWrite\\s*\\([\\s\\S]*?\\)[\\s\\S]*?\\.recordStats\\s*\\(\\s*\\)|\\.recordStats\\s*\\(\\s*\\)[\\s\\S]*?\\.refreshAfterWrite\\s*\\(",
+            "flags": "m",
+            "passMessage": "Enabled proactive refreshAfterWrite and Micrometer-ready recordStats().",
+            "failMessage": "Configure both .refreshAfterWrite(Duration.ofSeconds(30)) and .recordStats() on the Caffeine builder."
+          },
+          {
+            "name": "Adds ThreadLocalRandom TTL jitter against Cache Avalanche",
+            "regex": "ThreadLocalRandom\\.current\\(\\s*\\)\\.nextLong\\s*\\(",
+            "flags": "m",
+            "passMessage": "Applied ThreadLocalRandom jitter to Redis expiration TTL.",
+            "failMessage": "Use ThreadLocalRandom.current().nextLong(...) in computeJitteredTtl() to randomize TTL expiration."
+          },
+          {
+            "name": "Writes short-TTL negative sentinel against Cache Penetration",
+            "regex": "redis\\.set\\s*\\(\\s*key\\s*,\\s*NEGATIVE_SENTINEL\\s*,",
+            "flags": "m",
+            "passMessage": "Negative sentinel cached for empty DB lookups.",
+            "failMessage": "When dbValue is empty, call redis.set(key, NEGATIVE_SENTINEL, Duration.ofSeconds(30))."
+          }
+        ],
+        "simulatedOutput": "[Caffeine] W-TinyLFU AsyncLoadingCache initialized (maxSize=5000, refreshAfterWrite=30s, stats=ENABLED)\n[Redis L2] Key 'inv:SKU-900' cached with jittered TTL PT15M47S\n[Redis L2] Missing key 'inv:SKU-FAKE' negative-cached (__MISSING__) for PT30S\nBUILD SUCCESSFUL - 0 heap leaks, 0 penetration leaks."
+      },
+      {
+        "id": "ex-2",
+        "filename": "PriceServiceRefactor.java",
+        "badge": "Bug-Fix Challenge",
+        "instructions": "<p>Diagnose and fix <strong>two production concurrency bugs</strong> in <code>PriceServiceRefactor</code>:</p><ol><li><code>readPrice</code> uses <code>@Cacheable(value = \"prices\", key = \"#sku\")</code> without single-flight synchronization, causing a thundering herd on hot key expiration. Add <code>sync = true</code>.</li><li><code>changePrice</code> deletes the Redis cache key <em>directly inside</em> <code>@Transactional</code> before commit! Replace the direct <code>redis.delete(...)</code> call inside <code>changePrice</code> with <code>publisher.publishEvent(new PriceUpdatedEvent(sku))</code>, and annotate <code>evictAfterCommit</code> with <code>@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)</code> to delete the key safely after commit.</li></ol>",
+        "initialCode": "import java.math.BigDecimal;\nimport org.springframework.cache.annotation.Cacheable;\nimport org.springframework.context.ApplicationEventPublisher;\nimport org.springframework.data.redis.core.StringRedisTemplate;\nimport org.springframework.transaction.annotation.Transactional;\nimport org.springframework.transaction.event.TransactionPhase;\nimport org.springframework.transaction.event.TransactionalEventListener;\n\npublic class PriceServiceRefactor {\n    public record PriceUpdatedEvent(String sku) {}\n\n    private final PriceRepository repository;\n    private final StringRedisTemplate redis;\n    private final ApplicationEventPublisher publisher;\n\n    public PriceServiceRefactor(PriceRepository repository, StringRedisTemplate redis, ApplicationEventPublisher publisher) {\n        this.repository = repository;\n        this.redis = redis;\n        this.publisher = publisher;\n    }\n\n    // BUG 1: Missing stampede protection on @Cacheable\n    @Cacheable(value = \"prices\", key = \"#sku\")\n    public BigDecimal readPrice(String sku) {\n        return repository.findPrice(sku);\n    }\n\n    @Transactional\n    public void changePrice(String sku, BigDecimal updated) {\n        repository.savePrice(sku, updated);\n        // BUG 2: Pre-commit cache eviction race condition!\n        redis.delete(\"prices::\" + sku);\n    }\n\n    // TODO: Wire this listener to run strictly AFTER_COMMIT\n    public void evictAfterCommit(PriceUpdatedEvent event) {\n        redis.delete(\"prices::\" + event.sku());\n    }\n\n    interface PriceRepository {\n        BigDecimal findPrice(String sku);\n        void savePrice(String sku, BigDecimal price);\n    }\n}",
+        "solution": "import java.math.BigDecimal;\nimport org.springframework.cache.annotation.Cacheable;\nimport org.springframework.context.ApplicationEventPublisher;\nimport org.springframework.data.redis.core.StringRedisTemplate;\nimport org.springframework.transaction.annotation.Transactional;\nimport org.springframework.transaction.event.TransactionPhase;\nimport org.springframework.transaction.event.TransactionalEventListener;\n\npublic class PriceServiceRefactor {\n    public record PriceUpdatedEvent(String sku) {}\n\n    private final PriceRepository repository;\n    private final StringRedisTemplate redis;\n    private final ApplicationEventPublisher publisher;\n\n    public PriceServiceRefactor(PriceRepository repository, StringRedisTemplate redis, ApplicationEventPublisher publisher) {\n        this.repository = repository;\n        this.redis = redis;\n        this.publisher = publisher;\n    }\n\n    @Cacheable(value = \"prices\", key = \"#sku\", sync = true)\n    public BigDecimal readPrice(String sku) {\n        return repository.findPrice(sku);\n    }\n\n    @Transactional\n    public void changePrice(String sku, BigDecimal updated) {\n        repository.savePrice(sku, updated);\n        publisher.publishEvent(new PriceUpdatedEvent(sku));\n    }\n\n    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)\n    public void evictAfterCommit(PriceUpdatedEvent event) {\n        redis.delete(\"prices::\" + event.sku());\n    }\n\n    interface PriceRepository {\n        BigDecimal findPrice(String sku);\n        void savePrice(String sku, BigDecimal price);\n    }\n}",
+        "solutionExplanation": "Adding sync = true instructs the Spring CacheManager to lock per-key during a cache miss so only a single thread queries PostgreSQL while concurrent callers await the populated value. Moving redis.delete(...) out of @Transactional and into a @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT) guarantees that Redis is only invalidated once the new price is durably committed and visible to all concurrent READ COMMITTED transactions.",
+        "hints": [
+          "Update <code>@Cacheable(value = \"prices\", key = \"#sku\", sync = true)</code> on <code>readPrice</code>.",
+          "Remove <code>redis.delete(\"prices::\" + sku);</code> from inside <code>changePrice</code> and call <code>publisher.publishEvent(new PriceUpdatedEvent(sku));</code> instead.",
+          "Annotate <code>evictAfterCommit</code> with <code>@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)</code>."
+        ],
+        "tests": [
+          {
+            "name": "Enables synchronized single-flight @Cacheable",
+            "regex": "@Cacheable\\s*\\([^)]*sync\\s*=\\s*true[^)]*\\)",
+            "flags": "m",
+            "passMessage": "Stampede protection enabled with @Cacheable(..., sync = true).",
+            "failMessage": "Add sync = true to @Cacheable on readPrice() to prevent thundering-herd DB queries."
+          },
+          {
+            "name": "Publishes domain event inside @Transactional",
+            "regex": "publisher\\.publishEvent\\s*\\(\\s*new\\s+PriceUpdatedEvent\\s*\\(\\s*sku\\s*\\)\\s*\\)",
+            "flags": "m",
+            "mustNotMatch": "changePrice\\s*\\([^)]*\\)\\s*\\{[^}]*?redis\\.delete",
+            "antiFlags": "m",
+            "passMessage": "Removed pre-commit redis.delete() and published PriceUpdatedEvent.",
+            "failMessage": "Remove redis.delete() from changePrice() and call publisher.publishEvent(new PriceUpdatedEvent(sku))."
+          },
+          {
+            "name": "Evicts Redis strictly in TransactionPhase.AFTER_COMMIT",
+            "regex": "@TransactionalEventListener\\s*\\(\\s*(phase\\s*=\\s*)?TransactionPhase\\.AFTER_COMMIT\\s*\\)",
+            "flags": "m",
+            "passMessage": "Cache invalidation bound to TransactionPhase.AFTER_COMMIT.",
+            "failMessage": "Annotate evictAfterCommit() with @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)."
+          }
+        ],
+        "simulatedOutput": "[Test] 200 concurrent virtual threads queried missing 'SKU-77' -> 1 SQL SELECT executed (sync=true)\n[Tx] UPDATE prices SET amount=49.99 WHERE sku='SKU-77' -> COMMIT completed\n[AfterCommit] Evicted Redis key 'prices::SKU-77' post-commit (0 stale read races)"
+      }
+    ],
+    "quiz": {
+      "id": "quiz-main",
+      "questions": [
+        {
+          "question": "What happens under bursty traffic when this Spring service method updates an order status?",
+          "code": "@Transactional\npublic void markShipped(long orderId) {\n    orderRepository.updateStatus(orderId, Status.SHIPPED);\n    redisTemplate.delete(\"orders::\" + orderId);\n    auditClient.recordTransition(orderId); // 80ms HTTP call inside tx\n}",
+          "correctIndex": 1,
+          "options": [
+            {
+              "text": "Redis automatically delays the key deletion until the PostgreSQL transaction commits.",
+              "explanation": "Redis has no distributed XA transaction coordination with PostgreSQL; redisTemplate.delete() executes immediately over TCP before the JDBC transaction commits."
+            },
+            {
+              "text": "Concurrent readers can miss Redis, read uncommitted-blind old DB state, and re-cache stale data.",
+              "explanation": "During the 80ms window before COMMIT completes, another thread misses Redis, queries PostgreSQL under READ COMMITTED (seeing the old status), and writes the stale status back into Redis."
+            },
+            {
+              "text": "Spring rolls back the Redis deletion automatically if auditClient throws a RuntimeException.",
+              "explanation": "Spring's PlatformTransactionManager rolls back the JDBC connection on RuntimeException, but an already-executed Redis DELETE command cannot be undone or rolled back."
+            },
+            {
+              "text": "PostgreSQL blocks all SELECT queries on that order row until redisTemplate.delete finishes.",
+              "explanation": "In PostgreSQL MVCC, writers never block non-locking SELECT readers; concurrent readers immediately read the previous committed tuple snapshot without waiting."
+            }
+          ]
+        },
+        {
+          "question": "Why does Caffeine's W-TinyLFU eviction policy outperform standard LRU when a microservice runs periodic catalog-wide analytics scans?",
+          "code": "Cache<String, Item> cache = Caffeine.newBuilder()\n    .maximumSize(50_000)\n    .recordStats()\n    .build();",
+          "correctIndex": 3,
+          "options": [
+            {
+              "text": "It pins every entry in off-heap direct ByteBuffers to bypass garbage collection.",
+              "explanation": "Caffeine stores Java object references on the JVM heap; it does not serialize entries into off-heap direct ByteBuffers."
+            },
+            {
+              "text": "It blocks background batch threads whenever the cache reaches ninety percent capacity.",
+              "explanation": "Caffeine never blocks reader or writer threads at capacity thresholds; it performs non-blocking asynchronous eviction maintenance."
+            },
+            {
+              "text": "It stores exact 64-bit access timestamps in a red-black tree sorted by frequency.",
+              "explanation": "Maintaining a red-black tree of exact frequencies would cost O(log N) per read under contention; Caffeine uses an O(1) 4-bit Count-Min Sketch instead."
+            },
+            {
+              "text": "Its Count-Min Sketch admission filter rejects one-hit scan victims that have lower frequency.",
+              "explanation": "Scan items pass through the 1% Eden window and are rejected by the TinyLFU Count-Min Sketch when their estimated frequency is lower than the main-space victim's frequency."
+            }
+          ]
+        },
+        {
+          "question": "Examine this Caffeine configuration on a 2 GB Kubernetes pod. Which severe production failure mode does it introduce?",
+          "code": "LoadingCache<String, byte[]> payloadCache = Caffeine.newBuilder()\n    .expireAfterWrite(Duration.ofMinutes(15))\n    .refreshAfterWrite(Duration.ofMinutes(5))\n    .build(this::fetchReportBytes);",
+          "correctIndex": 0,
+          "options": [
+            {
+              "text": "Unbounded key cardinality within fifteen minutes can exhaust heap and trigger OutOfMemoryError.",
+              "explanation": "Without maximumSize or maximumWeight, time-based expiration alone puts zero cap on entry count or byte footprint during a 15-minute traffic spike or enumeration attack."
+            },
+            {
+              "text": "Combining expireAfterWrite with refreshAfterWrite throws IllegalStateException during Spring bean startup.",
+              "explanation": "Combining expireAfterWrite and refreshAfterWrite is completely valid and idiomatic in Caffeine: hot keys refresh asynchronously while idle keys expire completely."
+            },
+            {
+              "text": "Caffeine eagerly refreshes every idle key every five minutes even without incoming reads.",
+              "explanation": "Caffeine's refreshAfterWrite is lazy and demand-driven: an eligible entry is only refreshed asynchronously when an incoming request actually queries that key."
+            },
+            {
+              "text": "Using byte[] values forces Caffeine to fall back to JDK ObjectOutputStream serialization.",
+              "explanation": "Caffeine is an in-process heap cache that stores object references directly in memory without performing any serialization."
+            }
+          ]
+        }
+      ]
+    }
+  }
+  </script>
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/workbench.js"></script>
+</body>
+</html>

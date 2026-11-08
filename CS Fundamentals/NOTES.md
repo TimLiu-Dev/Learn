@@ -119,3 +119,70 @@
   - `reference/capstone.html`: 6 sections. The roadmap links L45–L47; L44's nav links L45; L47's nav ends with "Back to the roadmap ↑".
 - Final QA (2026-10-28): 47 lessons OK in qa.py; all 62 lesson + reference pages sw ≤ 500 with no JS errors; every reference sheet fits at 500/900/1200.
 - Still pending from the learner: the L1 placement results, to steer warm-ups and recall cards. Future work, only if asked: spaced-review sessions, learning records from results, and next missions (roadmap "After the course").
+- 2026-11-06: **Roadmap v5 drafted ("every core CS subject"), nothing built yet.** The user asked for full CS-fundamentals coverage, roadmap first. Audit vs Teach Yourself CS: v4 lacked maths, architecture, theory of computation, languages/compilers, distributed agreement and storage engines; also auth, algorithm patterns and the shell. Planned, in study order (new lessons take the next free numbers so existing links and "(Lnn)" references stay valid):
+  - Phase 6: **L48 Maths for CS** (before L16; logic/induction/invariants, counting/probability, logs/sums/modular arithmetic, bitwise ops), then L16–L21, **L49 Greedy, Shortest Paths & Union-Find**, **L50 Pointers, Backtracking & Tries** (+ practice track), **L51 The Limits of Computation** (automata/regex, halting, P/NP).
+  - Phase 7: **L52 From Gates to Instructions** (before L22), L22, **L53 The Shell & the Unix Toolkit** (+ a shell reference sheet), L23, **L54 How Languages Work** (lexer, parser, interpreter, mini bytecode VM), L24, L25.
+  - Phase 9: a new L32 part on dates/times/time zones and monotonic clocks; **L55 Authentication & Authorization** after L33.
+  - Phase 10: **L56 Storage Engines & Other Data Models** after L36.
+  - Phase 12: **L57 Time, Order & Agreement** after L43 (clocks, Lamport, Raft simulated, 2PC vs sagas).
+  - Also planned: "optional deep dive" labels in L23, L24, L42, L43, L46.
+  - A pasted "drop-ins" list was checked: try-with-resources (L10), JIT benchmark traps (L16/L24), CountDownLatch (L26), runTest (L29), Selector I/O (L30), reflection vs codegen JSON (L32), pooling/env config/shutdown (L46) were already covered. Bitwise ops (into L48) and clocks (into L32) were valid.
+  - 2026-11-06 (later): the user said "build all of them in study order". `chrome_qa.py` was never broken: it needs the ABSOLUTE workspace path (a relative `.` gives NO RESULT); all 62 pages pass. kotlinc 2.4.20 now lives durably in `.build/tools/kotlinc` (sha256 verified), since the scratchpad got wiped again. Shared fork rules: `.build/rules/v5-rules.md`. Added `.deep-tag` to `assets/course.css` for "Optional deep dive" labels. Batches in study order: (1) L48–L51, (2) L52–L54, (3) L32 time part + deep-dive labels, L55, L56, L57; then integration (nav rewiring in existing lessons and templates, sheets, roadmap links).
+- 2026-11-06: **v5 Batch 1 built and integrated (L48–L51).** Builders hit a usage limit mid-run and were resumed by message after the reset.
+  - L48 `0048-maths-for-computer-science.html`: 24 quizzes; Gradle final with 7 tests/language (isqrt + powMod with invariants); asset `mathviz.js` (class prefix `mz-`, since `mv-` collides with memviz). Rebuild: `build.py` only.
+  - L49 `0049-greedy-shortest-paths-and-union-find.html`: 20 quizzes; 8 tests/language; algs4 data in `.build/l49/src/` (sha256-checked); asset `pathviz.js`. Rebuild: `python3 l49/fill.py` then `build.py`.
+  - L50 `0050-pointers-backtracking-and-tries.html`: 24 quizzes; 10 tests/language; Alice text in `.build/l50/data/`; practice track (15 problems, 6-week schedule); asset `windowviz.js`. Rebuild: `l50/viz/inject.py` → `build.py` → `l50/fill.py`.
+  - L51 `0051-the-limits-of-computation.html`: 25 quizzes; TinyRegex final with 10 tests/language (found a real JLS §15.26.1 array-reference bug); asset `automataviz.js`. Rebuild: `build.py`; outputs pasted by hand (raw in `.build/l51/out/`).
+  - New sheet `reference/maths-and-theory.html` (L48 + L51 parts); `data-structures-and-algorithms.html` extended with L49 + L50 parts. Nav rewired with `.build/bin/v5_nav.py 1` (L15→L48→L16, L21→L49). Roadmap links L48–L51. RESOURCES: Erickson, MCS, Russ Cox.
+  - Still to add: L47's look-back lists every sheet; add maths-and-theory, shell, and the new lessons at the end of v5.
+- 2026-11-06/07: **v5 Batch 2 built and integrated (L52–L54).** Builders again hit a usage limit and were resumed after the reset.
+  - L52 `0052-from-gates-to-instructions.html`: 20 quizzes; toy CPU final, 9 tests/language; asset `cpuviz.js` (frames from real `Toy.Cpu` via `l52/viz/CpuTrace.java`). Rebuild: `build.py` then `l52/fill.py`. ARM64 field layout found by experiment (Arm's site returned 403).
+  - L53 `0053-the-shell-and-the-unix-toolkit.html`: 25 quizzes; real replays in clean `zsh -f` with a scratch HOME (real ~/.ssh untouched); asset `shellviz.js`. Rebuild: optional `l53/rec.py` / `l53/viz/capture.py`, then `l53/fill.py` → `build.py`.
+  - L54 `0054-how-languages-work.html`: 22 quizzes; Calc language final, 10 tests/language with a 10k-program differential test; asset `parseviz.js`. Rebuild: `l54/fill.py` → `build.py`.
+  - New sheet `reference/shell.html` (5 L53 parts); `runtime-and-os.html` gets L52 parts first, L54 parts after L23's; `cli-git-cheatsheet.html` links to the shell sheet. Nav: `v5_nav.py 2` (L51→L52→L22→L53→L23→L54→L24). Roadmap links L52–L54. RESOURCES: new "Computer Architecture and Languages" section.
+- 2026-11-07: **v5 Batch 3 built and integrated (L32 time part + deep-dive labels, L55, L56, L57). ROADMAP v5 IS COMPLETE: 57 lessons, 17 reference pages.**
+  - L32 Part 4 "Time on the wire" (id `p5`, so the final keeps `p4`'s saved progress): five `java.time` types, tzdb 2026a, the DST gap/overlap, RFC 3339; Jackson 3's defaults drop the zone id (fixed with `WRITE_DATES_WITH_ZONE_ID` + disabling `ADJUST_DATES_TO_CONTEXT_TIME_ZONE`); a simulated NTP step (wall −1,750 ms vs monotonic 256 ms). New sources `.build/l32/{TimeTypes,Dst,Wire,Clocks,Ex4}`; L32 now has 28 quizzes. Section added to `networks-and-web.html`.
+  - `.deep-tag` labels: L23 (inlining/escape-analysis items only; dead-code elimination stays core), L24 JMH, L42 TCP broker, L43 PACELC, L46 Exercise 2. Skipping any of them breaks nothing later.
+  - L55 `0055-authentication-and-authorization.html`: 26 quizzes; 10 tests/language; real headless-Chrome CSRF/CORS runs; asset `authviz.js` (generic sequence stepper). Rebuild: `build.py` only (outputs were pasted into the template).
+    - The first builder was stopped three times by a safety classifier around the JWT-pitfalls material. Forging code was removed: pitfalls are a strict verifier + rejection table, plus prose citing RFC 8725/OWASP (a 2-line `unsigned()` test helper remains for that table). A fresh builder wrote the page.
+    - Fixed a wrong comment in `.build/l55/Routes.java` (output unchanged).
+    - OWASP's "JWT for Java" cheat sheet now 404s; the lesson cites `JSON_Web_Token_Cheat_Sheet.html`.
+  - L56 `0056-storage-engines-and-other-data-models.html`: 23 quizzes; 11 tests/language including a real SIGKILL test; asset `logviz.js`. Rebuild: optional `l56/capture.sh`, then `build.py` → `l56/fill.py`. Section added to `databases.html`.
+  - L57 `0057-time-order-and-agreement.html`: 17 quizzes; 9 tests/language; deterministic Raft simulator (2,000-seed sweep: 0 split terms); asset `raftviz.js` (`rft-`). Source PDFs with SHA256SUMS in `.build/l57/src/`. Rebuild: `l57/fill.py` → `build.py`. Section added to `system-design.html`.
+  - Nav: `v5_nav.py 3`. Walking from L1 via "next" visits all 57 in study order with reciprocal back-links.
+  - L47 look-back: `.build/l47/fill.py` `PHASES` now holds study-order lesson lists plus the new sheets (maths-and-theory, shell); rating labels show the ranges (e.g. "L48, L16–L21, L49–L51"); "57 lessons" in the text. Rebuilt via `extract.py` → `fill.py` → `build.py`.
+  - Roadmap: all titles linked; stats "57 lessons"; closing box updated. RESOURCES: Bitcask, Raft, Lamport, Kleppmann's notes, OWASP cheat sheets, RFC 9700.
+  - Final QA (2026-11-07): qa.py 57/57 OK; chrome_qa 74/74 pages with no errors and sw ≤ 500; sheet_fit 17 sheets × 3 widths all fit.
+  - Unverified items the builders flagged: ARM64 field layout found by experiment (Arm site 403); DDIA 2nd-ed chapter titles (O'Reilly 403, cited by topic); the Raft Figure 2 text can't be extracted (checked against §5 prose); `localhost:3000`/`:8080` sharing cookies is cited from the specs, not run.
+  - Still pending from the learner: the L1 placement results.
+- 2026-11-07: **v6 started: run code in the page, practice with checks, code quizzes, per-option explanations, final triple check.** The user asked: "lessons contain code examples and code practice in the html that can also run and checks with hints and final answer, and also code quizzes with multiple choices and why answer is correct and wrong … check if all the lessons are good … this will be the last final check before i start".
+  - **User choices:**
+    - Runner: the online JetBrains Kotlin Playground. They were offered a local runner and declined. It runs Kotlin 2.4.21 on Java 17 (verified via api.kotlinlang.org); Java runs in IntelliJ.
+    - Every existing quiz gets per-option explanations.
+    - One practice per teaching part.
+  - **The Playground server rejects `Origin: null`** (verified with curl), so in-page running needs http. Added `Open Course.command`: it serves the course with the JDK's `jwebserver` on 127.0.0.1:8000–8005 and opens the roadmap. jwebserver isn't on PATH on macOS, so the script finds it via `/usr/libexec/java_home`.
+  - **Assets:**
+    - `assets/playground.js` is loaded by `lesson.js`. It gives Run buttons on Kotlin listings listed in `assets/pg-runnable.js`, a Copy button on Java listings with a main, and Kotlin practice with JUnit 4 hidden tests. It detects compile errors by polling for the loader, because the Playground sends no event for them.
+    - SQL practice uses sql.js 1.15.1 from cdnjs, which works from `file://` too.
+    - `lesson.js`: `<ol class="whyopts">` per quiz, the `quiz:answered` event, and practice in the summary and reset. Matching CSS.
+  - **Build and verification (`.build/bin`):**
+    - `build.py`: `<!--PRACTICE:lNN/practice/pK-->` (an SQL variant if the folder has setup.sql), and `--inplace` for hand-written L1–L3.
+    - `pgapi.py`: Playground client with a cache in `.build/cache/pgapi.json`.
+    - `pg_check.py`: verifies practice folders and `cq/` snippets. Starter fails, solution passes, Mistake files are caught, the Java CHECKS blocks are identical, and outputs match `.out`.
+    - `pg_manifest.py`: runs every Kotlin listing with a main on the Playground and writes `pg-runnable.js`. **Re-run it after lessons change; it's cached.**
+    - `cdp.mjs`: a headless-Chrome driver (Node 22 WebSocket, no packages).
+    - `qa.py --strict`: whyopts required.
+  - **Rules for builders:** `.build/rules/v6-rules.md`. Gold standard: L8, built by hand, with 4 practices, 4 code quizzes and whyopts on all 22 quizzes.
+  - **Gap analysis against ACM CS2023:** report saved at the scratchpad `gap-report.md`. Summary: very complete. Additions, assigned to the lesson builders:
+    - L40: branching and releases (MUST).
+    - L25: licences (MUST); BOMs and multi-module builds.
+    - L33/L46: personal data (MUST).
+    - L47: ethics and disclosure (MUST).
+    - L2: Unicode part 2.
+    - L28/L42: Amdahl and Little.
+    - L48: Bayes and variance.
+    - L33: security principles named.
+    - L44 and roadmap: accessibility.
+    - L45: coverage and property tests.
+  - **Batches** (one builder per lesson): A = L1–L7; then L9–L15; L48, L16–L21; L49–L52, L22, L53, L23; L54, L24–L29; L30–L33, L55, L34–L36; L56, L37–L43; L57, L44–L47.
+  - **Then:** an independent second review of every lesson (check #2), and automated QA, manifest, chrome and nav (check #3).

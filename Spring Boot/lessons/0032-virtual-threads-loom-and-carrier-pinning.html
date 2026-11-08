@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0032: Java 21 Virtual Threads (Project Loom) in Spring Boot 3.2+</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Phase 9: High-Throughput Concurrency, Threading & JVM Diagnostics</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Title & Metadata -->
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0032 • Phase 9</span>
+    <h1 style="margin-top: 8px;">Java 21 Virtual Threads (Project Loom) in Spring Boot 3.2+</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Java 21 Project Loom fundamentally reshapes backend scalability by decoupling Java threads from operating system kernel threads. For 25 years, Java backends followed a 'thread-per-request' model bounded by OS thread memory (1MB stack) and kernel context-switch overhead (limiting servers to ~2,000–5,000 concurrent threads). Reactive programming (Project Reactor, WebFlux) emerged to overcome this limit, but at the cost of catastrophic code complexity, unreadable stack traces, and fragmented debuggers. Virtual Threads restore the clean, imperative thread-per-request paradigm while scaling to millions of concurrent tasks. However, enabling virtual threads is not free magic: thread pinning, unconstrained database connection pools, and thread-local misuse can destroy performance if not guarded.
+    </p>
+  </div>
+
+  <!-- Primary Source -->
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authority: <a href="https://openjdk.org/jeps/444" target="_blank" style="color: var(--accent-spring); font-weight: 600;">JEP 444: Virtual Threads (Java 21 Official Specification) & Spring Boot 3.2 Reference Documentation: Virtual Threads Support.</a>. Ground your learning in primary architecture rather than secondary summaries.
+    </p>
+  </div>
+
+  <!-- Main Concept & Code Examples -->
+  
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">In high-concurrency microservices doing significant I/O (database queries, REST calls, cache lookups), switching to virtual threads yields 3x–10x throughput gains without reactive complexity. But if your team relies on synchronized blocks holding blocking I/O or assumes thread pools naturally throttle database connections, enabling virtual threads will exhaust your HikariCP pool and deadlock carrier threads.</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li>Enable virtual threads in Spring Boot 3.2+ with a single property: 'spring.threads.virtual.enabled=true', which configures Tomcat, Jetty, @Async, and TaskExecutors to dispatch onto virtual threads.</li><li>Virtual threads are mounted on a small pool of OS 'carrier threads' (defaulting to ForkJoinPool with worker count equal to available CPU cores).</li><li>Thread Pinning occurs when a virtual thread performs blocking I/O inside a 'synchronized' block or native method, preventing it from unmounting from its carrier thread. Always replace 'synchronized' with 'ReentrantLock' for blocking operations.</li><li>Never pool virtual threads! They are cheap, disposable metadata objects (a few hundred bytes). Pooling them destroys their performance advantage.</li><li>Virtual threads do NOT make CPU-bound tasks faster; they only improve throughput for I/O-bound workloads by yielding during blocking waits.</li><li>Bounding concurrency: Because virtual threads are unbounded, you must bound access to scarce downstream resources (e.g., third-party APIs, DB connections) using 'Semaphore' rather than fixed thread pools.</li>
+  </ul>
+
+  
+<h3>1. The Architecture of Virtual Threads vs Platform Threads</h3>
+<p>
+Standard Java threads (platform threads) wrap OS kernel threads 1:1. Each consumes ~1MB of memory and switching between them incurs an OS kernel trap. When a platform thread waits on a blocking database query, the OS thread sits idle, wasting RAM and scheduler cycles.
+</p>
+<p>
+Virtual Threads (JEP 444) are user-mode threads managed by the JVM. A virtual thread is mounted onto a carrier thread (an underlying platform thread in a <code>ForkJoinPool</code>) when executing CPU instructions. When it encounters a blocking operation (socket read, <code>Thread.sleep()</code>, lock acquisition), the JVM unmounts the virtual thread, copies its minimal stack frame to the heap, and assigns the carrier thread to another runnable virtual thread. When the I/O completes, the OS epoll/kqueue mechanism signals the JVM, which remounts the virtual thread onto any available carrier thread.
+</p>
+
+<h3>2. The Thread Pinning Trap</h3>
+<p>
+A virtual thread is <strong>pinned</strong> to its carrier thread if it blocks while:
+</p>
+<ol>
+  <li>Executing inside a <code>synchronized</code> block or synchronized method.</li>
+  <li>Executing a native method (JNI) or foreign function.</li>
+</ol>
+<p>
+When pinned, the underlying carrier thread cannot be unmounted. If 16 carrier threads are all pinned waiting on I/O, the entire JVM stalls. Java 24 addresses synchronized pinning in JEP 491, but in Java 21, you must detect pinned threads using <code>-Djdk.tracePinnedThreads=full</code> and migrate blocking locks to <code>java.util.concurrent.locks.ReentrantLock</code>.
+</p>
+
+<h3>3. Concurrency Bounding with Semaphores</h3>
+<p>
+With platform threads, developers accidentally used thread pools for rate-limiting (e.g. an executor pool of 10 threads ensured at most 10 concurrent calls to a downstream service). If you launch 10,000 virtual threads that all hit a downstream service or HikariCP pool of 20 connections, you will instantly cause connection timeouts or crash the downstream API.
+</p>
+<p>
+The cloud-native pattern is to bound concurrent execution using a <code>Semaphore</code> while letting the virtual threads suspend cleanly when permits are exhausted:
+</p>
+<pre><code>private final Semaphore rateLimiter = new Semaphore(25);
+
+public Response callDownstream() {
+    rateLimiter.acquire();
+    try {
+        return restClient.get().retrieve().body(Response.class);
+    } finally {
+        rateLimiter.release();
+    }
+}</code></pre>
+
+
+  <h2>Production Implementation (Java 21 vs Kotlin 2.x)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Java 21 Virtual Threads (Project Loom) in Spring Boot 3.2+</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.loom;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.support.TaskExecutorAdapter;
+import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.client.RestClient;
+
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.ReentrantLock;
+
+@Configuration
+class VirtualThreadConfig {
+    // In Spring Boot 3.2+, setting &#x27;spring.threads.virtual.enabled=true&#x27;
+    // auto-configures Tomcat and TaskExecutors.
+    // Explicit bean definition for custom virtual thread executors:
+    @Bean
+    public TaskExecutorAdapter virtualTaskExecutor() {
+        return new TaskExecutorAdapter(Executors.newVirtualThreadPerTaskExecutor());
+    }
+}
+
+@Service
+class ExternalPartnerGateway {
+    private static final Logger log = LoggerFactory.getLogger(ExternalPartnerGateway.class);
+    private final RestClient restClient;
+    // Bounded concurrency: max 15 concurrent calls to downstream partner
+    private final Semaphore partnerSemaphore = new Semaphore(15);
+    // Use ReentrantLock instead of synchronized to prevent carrier thread pinning!
+    private final ReentrantLock stateLock = new ReentrantLock();
+    private long totalRequestsServed = 0;
+
+    public ExternalPartnerGateway(RestClient.Builder builder) {
+        this.restClient = builder.baseUrl(&quot;https://api.partner.com&quot;).build();
+    }
+
+    public String fetchWithVirtualThreadSafety() {
+        try {
+            partnerSemaphore.acquire();
+            try {
+                // Blocking HTTP call: virtual thread cleanly unmounts from carrier thread!
+                String result = restClient.get().uri(&quot;/data&quot;).retrieve().body(String.class);
+                
+                stateLock.lock();
+                try {
+                    totalRequestsServed++;
+                } finally {
+                    stateLock.unlock();
+                }
+                return result;
+            } finally {
+                partnerSemaphore.release();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(&quot;Virtual thread interrupted during downstream call&quot;, e);
+        }
+    }
+}
+
+@RestController
+@RequestMapping(&quot;/api/loom&quot;)
+class LoomInspectionController {
+    @GetMapping(&quot;/thread-info&quot;)
+    public String currentThreadInfo() {
+        Thread current = Thread.currentThread();
+        return &quot;Thread Name: &quot; + current.getName() + 
+               &quot; | Is Virtual: &quot; + current.isVirtual() + 
+               &quot; | Carrier/Class: &quot; + current.getClass().getName();
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.loom
+
+import org.slf4j.LoggerFactory
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.core.task.support.TaskExecutorAdapter
+import org.springframework.stereotype.Service
+import org.springframework.web.bind.annotation.GetMapping
+import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RestController
+import org.springframework.web.client.RestClient
+import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+@Configuration
+class VirtualThreadConfig {
+    @Bean
+    fun virtualTaskExecutor(): TaskExecutorAdapter {
+        return TaskExecutorAdapter(Executors.newVirtualThreadPerTaskExecutor())
+    }
+}
+
+@Service
+class ExternalPartnerGateway(restClientBuilder: RestClient.Builder) {
+    private val log = LoggerFactory.getLogger(ExternalPartnerGateway::class.java)
+    private val restClient = restClientBuilder.baseUrl(&quot;https://api.partner.com&quot;).build()
+    
+    // Concurrency boundary: never exhaust downstream service capacity
+    private val partnerSemaphore = Semaphore(15)
+    // Non-pinning lock
+    private val stateLock = ReentrantLock()
+    private var totalRequestsServed: Long = 0
+
+    fun fetchWithVirtualThreadSafety(): String? {
+        partnerSemaphore.acquire()
+        try {
+            val response = restClient.get()
+                .uri(&quot;/data&quot;)
+                .retrieve()
+                .body(String::class.java)
+
+            stateLock.withLock {
+                totalRequestsServed++
+            }
+            return response
+        } finally {
+            partnerSemaphore.release()
+        }
+    }
+}
+
+@RestController
+@RequestMapping(&quot;/api/loom&quot;)
+class LoomInspectionController {
+    @GetMapping(&quot;/thread-info&quot;)
+    fun currentThreadInfo(): Map&lt;String, Any&gt; {
+        val current = Thread.currentThread()
+        return mapOf(
+            &quot;name&quot; to current.name,
+            &quot;isVirtual&quot; to current.isVirtual,
+            &quot;threadClass&quot; to current.javaClass.simpleName
+        )
+    }
+}</code></pre>
+    </div>
+  </div>
+
+
+  <!-- Active Recall Code Quizzes -->
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis. Review each distractor to build durable failure-mode recognition!
+  </p>
+  
+      <div class="quiz-card" id="q0032_1" data-explanation="Correct! When a virtual thread enters a synchronized block and performs blocking I/O, it pins the carrier thread. If all carrier threads become pinned, JVM throughput collapses.">
+        <span class="quiz-badge">Quiz 1 of 3</span>
+        <div class="quiz-prompt">What happens when a Java 21 Virtual Thread executes a blocking JDBC query inside a 'synchronized' method?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. In Java 21, the &#x27;synchronized&#x27; keyword pins the virtual thread to its underlying OS carrier thread, preventing unmounting.">
+            The JVM unmounts the virtual thread and schedules another task onto the carrier thread.
+          </button>
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! When a virtual thread enters a synchronized block and performs blocking I/O, it pins the carrier thread. If all carrier threads become pinned, JVM throughput collapses.">
+            Thread Pinning occurs: the carrier thread is blocked and cannot execute other virtual threads until the I/O completes.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Project Loom does not convert code to reactive streams; it operates strictly on thread state scheduling in the runtime.">
+            The JVM automatically converts the synchronized block to a non-blocking reactive mono pipeline.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Synchronized blocks are fully legal on virtual threads; they simply cause thread pinning during blocking calls.">
+            An IllegalThreadStateException is thrown immediately upon entering the synchronized block.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0032_2" data-explanation="Correct! Virtual threads weigh only a few hundred bytes. Pooling them wastes resources and introduces unnecessary queue contention. Create a new virtual thread per task!">
+        <span class="quiz-badge">Quiz 2 of 3</span>
+        <div class="quiz-prompt">Why is pooling Virtual Threads (e.g. creating an executor with a fixed pool of 50 virtual threads) considered an anti-pattern?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Virtual threads weigh only a few hundred bytes. Pooling them wastes resources and introduces unnecessary queue contention. Create a new virtual thread per task!">
+            Virtual threads are lightweight, cheap to construct, and intended to be created per task; pooling them adds memory overhead and defeats their design.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. The carrier threads are independent of virtual thread instances; pooling simply prevents efficient lifecycle garbage collection.">
+            Fixed virtual thread pools cause the ForkJoinPool carrier threads to terminate with OutOfMemoryError.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. The compiler does not prevent it, but JVM architects explicitly document pooling virtual threads as a serious anti-pattern.">
+            The Java 21 compiler rejects code that passes a VirtualThreadFactory to ThreadPoolExecutor.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Threads yield and remount repeatedly during their lifecycle; pooling them is wrong because instantiation cost is virtually zero.">
+            Virtual threads cannot be reused once they yield execution to another thread.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0032_3" data-explanation="Correct! When thread count is unbounded, resource access must be bounded explicitly with Semaphores. Virtual threads waiting on acquire() suspend without consuming carrier threads.">
+        <span class="quiz-badge">Quiz 3 of 3</span>
+        <div class="quiz-prompt">How should an engineering team prevent 10,000 concurrent Virtual Threads from overwhelming a 20-connection HikariCP database pool or external API?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. When &#x27;spring.threads.virtual.enabled=true&#x27;, Tomcat dispatches each HTTP request to a new unpooled virtual thread, bypassing the 200 thread ceiling.">
+            Rely on the default Tomcat thread pool limit of 200 threads.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. PostgreSQL cannot handle 10,000 concurrent backend processes and will crash due to OS process and RAM saturation.">
+            Increase HikariCP maximumPoolSize to 10,000 connections.
+          </button>
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! When thread count is unbounded, resource access must be bounded explicitly with Semaphores. Virtual threads waiting on acquire() suspend without consuming carrier threads.">
+            Use a java.util.concurrent.Semaphore to explicitly throttle concurrent operations to the downstream resource.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Synchronized blocks pin carrier threads, worsening thread starvation and degrading the entire application.">
+            Wrap the database operations in synchronized(this) blocks.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+  <!-- Interactive Code Practice Lab -->
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Write and test your solution in either <strong>Java 21</strong> or <strong>Kotlin 2.x</strong>. The automated test runner executes multiple assertions in your browser with zero setup.
+  </p>
+
+  <div class="practice-container" 
+       data-practice-id="lesson-0032-lab"
+       data-starter-java="package com.example.loom;
+
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class VirtualThreadThrottler {
+    // TODO 1: Initialize a Semaphore with 10 permits
+    private final Semaphore semaphore = null;
+    // TODO 2: Initialize a ReentrantLock for critical section protection
+    private final ReentrantLock lock = null;
+    private int counter = 0;
+
+    public String executeThrottled(Runnable task) throws InterruptedException {
+        // TODO 3: Acquire semaphore, execute task, increment counter with ReentrantLock, and release
+        return &quot;executed&quot;;
+    }
+
+    public boolean isRunningOnVirtualThread() {
+        // TODO 4: Return whether current thread is virtual
+        return false;
+    }
+}"
+       data-starter-kotlin="package com.example.loom
+
+import java.util.concurrent.Semaphore
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+class VirtualThreadThrottler {
+    // TODO 1: Initialize Semaphore(10)
+    val semaphore: Semaphore = Semaphore(10)
+    // TODO 2: Initialize ReentrantLock()
+    val lock: ReentrantLock = ReentrantLock()
+    var counter: Int = 0
+
+    fun executeThrottled(task: Runnable): String {
+        // TODO 3: acquire semaphore, run task, increment counter withLock, release semaphore
+        return &quot;executed&quot;
+    }
+
+    fun isRunningOnVirtualThread(): Boolean {
+        // TODO 4: check Thread.currentThread().isVirtual
+        return false
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0032</span>
+        <span class="practice-title">Java 21 Virtual Threads (Project Loom) in Spring Boot 3.2+ Practice</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0032-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Configure a thread-safe downstream client for Virtual Threads. Enable virtual thread compatibility by ensuring: 1) A Semaphore bounds concurrency to 10 permits, 2) A ReentrantLock is used instead of synchronized for internal accounting, and 3) Thread.currentThread().isVirtual() is verified.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.loom;
+
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class VirtualThreadThrottler {
+    // TODO 1: Initialize a Semaphore with 10 permits
+    private final Semaphore semaphore = null;
+    // TODO 2: Initialize a ReentrantLock for critical section protection
+    private final ReentrantLock lock = null;
+    private int counter = 0;
+
+    public String executeThrottled(Runnable task) throws InterruptedException {
+        // TODO 3: Acquire semaphore, execute task, increment counter with ReentrantLock, and release
+        return &quot;executed&quot;;
+    }
+
+    public boolean isRunningOnVirtualThread() {
+        // TODO 4: Return whether current thread is virtual
+        return false;
+    }
+}</textarea>
+    </div>
+
+    <!-- Progressive Hints Drawer -->
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Architectural Nudge</div>
+        <div>Initialize 'semaphore = new Semaphore(10)' and 'lock = new ReentrantLock()'.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Syntax Signature</div>
+        <div>Inside executeThrottled: call semaphore.acquire(), wrap execution in a try-finally block to ensure semaphore.release() is always called.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Concrete Snippet</div>
+        <div><code>To check virtual thread status, call Thread.currentThread().isVirtual().</code></div>
+      </div>
+    </div>
+
+    <!-- Final Solution Drawer -->
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.loom;
+
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class VirtualThreadThrottler {
+    private final Semaphore semaphore = new Semaphore(10);
+    private final ReentrantLock lock = new ReentrantLock();
+    private int counter = 0;
+
+    public String executeThrottled(Runnable task) throws InterruptedException {
+        semaphore.acquire();
+        try {
+            task.run();
+            lock.lock();
+            try {
+                counter++;
+            } finally {
+                lock.unlock();
+            }
+            return &quot;executed: &quot; + counter;
+        } finally {
+            semaphore.release();
+        }
+    }
+
+    public boolean isRunningOnVirtualThread() {
+        return Thread.currentThread().isVirtual();
+    }
+}</code></pre>
+      
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.example.loom
+
+import java.util.concurrent.Semaphore
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+class VirtualThreadThrottler {
+    val semaphore = Semaphore(10)
+    val lock = ReentrantLock()
+    var counter = 0
+
+    fun executeThrottled(task: Runnable): String {
+        semaphore.acquire()
+        try {
+            task.run()
+            lock.withLock {
+                counter++
+            }
+            return &quot;executed: $counter&quot;
+        } finally {
+            semaphore.release()
+        }
+    }
+
+    fun isRunningOnVirtualThread(): Boolean {
+        return Thread.currentThread().isVirtual
+    }
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Follows production patterns to enforce correctness.</p>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run & Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <!-- Terminal Test Output Console -->
+    <div class="test-console"></div>
+  </div>
+
+  <!-- Teacher Agent Probing Questions -->
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"Ask your teacher: 'How do thread dumps in Java 21 change when running 500,000 virtual threads, and how does jcmd Thread.dump_to_file handle open file descriptors?'"</em>. I am here to explore every trade-off with you.
+    </p>
+  </div>
+
+  <!-- Lesson Navigation Footer -->
+  <div class="lesson-nav">
+    <a href="0031-oauth2-resource-server-and-mtls.html" class="btn btn-secondary">← Previous: Lesson 0031</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0033-concurrency-defense-optimistic-vs-pessimistic-locking.html" class="btn btn-primary">Next: Lesson 0033 →</a>
+  </div>
+
+  <!-- Site Footer -->
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0032</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0032-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Semaphore Concurrency Bound",
+    passed: new RegExp("Semaphore\\s*\\(\\s*10\\s*\\)").test(code),
+    error: "Must initialize Semaphore with exactly 10 permits to bound downstream concurrency."
+  });
+  tests.push({
+    name: "Non-pinning ReentrantLock Usage",
+    passed: new RegExp("ReentrantLock").test(code),
+    error: "Must use ReentrantLock instead of synchronized to avoid carrier thread pinning."
+  });
+  tests.push({
+    name: "Safe Semaphore Release",
+    passed: new RegExp("finally\\s*\\{\\s*(\\w+\\.)?release\\s*\\(\\s*\\)").test(code),
+    error: "Semaphore release() must be invoked inside a finally block."
+  });
+  tests.push({
+    name: "Virtual Thread Verification",
+    passed: new RegExp("isVirtual(\\(\\))?").test(code),
+    error: "Must check Thread.currentThread().isVirtual() to verify thread context."
+  });
+  return tests;
+};
+
+</script>
+</body>
+</html>

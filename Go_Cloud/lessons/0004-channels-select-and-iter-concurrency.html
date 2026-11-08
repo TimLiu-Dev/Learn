@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0004: Channels, CSP, &amp; iter.Seq Range-Over-Func</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔀</text></svg>">
+</head>
+<body>
+
+  <header class="site-header">
+    <div class="header-container">
+      <a href="../index.html" class="brand">
+        <span class="brand-badge">GO-CLOUD-MODULE-1</span>
+        <span>Go Cloud Systems</span>
+      </a>
+      <nav class="nav-links">
+        <a href="../index.html">Master Plan &amp; Legend</a>
+        <a href="0001-memory-layout-escape-analysis-and-cloud-efficiency.html">Lesson 0001</a>
+        <a href="0002-go-scheduler-gmp-cfs-throttling.html">Lesson 0002</a>
+        <a href="0003-memory-model-atomics-and-lock-free-sync.html">Lesson 0003</a>
+        <a href="0004-channels-select-and-iter-concurrency.html" class="active">Lesson 0004</a>
+        <a href="../reference/01-go-cloud-architecture-cheat-sheet.html">Cheat Sheet</a>
+        <button id="themeToggleBtn" class="theme-toggle-btn">☀️ Light Mode</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="main-wrapper">
+
+    <div class="lesson-meta-bar">
+      <div class="breadcrumbs">
+        <a href="../index.html">Master Plan</a> &gt; <span>Module 01: Internals</span> &gt; <span>Lesson 0004</span>
+      </div>
+      <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <span class="badge-pill badge-senior">Senior Level</span>
+        <span class="badge-pill badge-cloud">CSP &amp; 2027 Iterators</span>
+        <span id="lessonStatusIndicator" class="badge-pill badge-bench">In Progress</span>
+      </div>
+    </div>
+
+    <h1>Lesson 0004: Channel Internals, CSP Concurrency, &amp; iter.Seq (Range-Over-Func)</h1>
+    <p class="lead-paragraph">
+      Go's concurrency philosophy is rooted in Hoare's Communicating Sequential Processes (CSP): <em>"Do not communicate by sharing memory; instead, share memory by communicating."</em> But in production cloud services, channels are often misused, leading to memory leaks and lock contention. In this lesson, we dissect channel internals (<code>hchan</code>, <code>sudog</code>, <code>waitq</code>), production CSP patterns, and why Go 1.22+ <strong><code>iter.Seq</code> (range-over-func)</strong> replaces channels for sequential streaming.
+    </p>
+
+    <div class="callout callout-mechanics">
+      <div class="callout-title">⚙️ Senior Architectural Truth: Channels are not "Magic"</div>
+      <p style="margin-bottom: 0;">
+        Under the hood, a Go channel is a heap-allocated <code>runtime.hchan</code> struct protected by a standard <strong>lock mutex</strong> with two bidirectional wait queues (<code>recvq</code> and <code>sendq</code>) storing parked goroutines (<code>sudog</code>). Channels are ideal for coordination, signaling, and passing ownership across goroutines. But for streaming data <em>within a single goroutine</em>, channels create unnecessary heap allocations and lock contention.
+      </p>
+    </div>
+
+    <!-- Section 1: Channel Axioms -->
+    <h2>1. The 4 Channel Axioms Every Senior Engineer Memorizes</h2>
+    <table style="width: 100%; border-collapse: collapse; margin: 1.5rem 0; font-size: 0.9rem;">
+      <tr style="background: var(--bg-tertiary);"><th style="padding: 0.75rem; text-align: left;">Operation</th><th style="padding: 0.75rem; text-align: left;">Nil Channel</th><th style="padding: 0.75rem; text-align: left;">Closed Channel</th><th style="padding: 0.75rem; text-align: left;">Open Channel</th></tr>
+      <tr><td style="padding: 0.6rem; border-top: 1px solid var(--border-color);"><strong>Send (<code>ch &lt;- v</code>)</strong></td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-orange);">Blocks forever</td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-red); font-weight: bold;">PANIC!</td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-green);">Sends or blocks if full</td></tr>
+      <tr><td style="padding: 0.6rem; border-top: 1px solid var(--border-color);"><strong>Receive (<code>&lt;-ch</code>)</strong></td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-orange);">Blocks forever</td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-cyan);">Zero-value immediately (ok=false)</td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-green);">Receives or blocks if empty</td></tr>
+      <tr><td style="padding: 0.6rem; border-top: 1px solid var(--border-color);"><strong>Close (<code>close(ch)</code>)</strong></td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-red); font-weight: bold;">PANIC!</td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-red); font-weight: bold;">PANIC!</td><td style="padding: 0.6rem; border-top: 1px solid var(--border-color); color: var(--accent-green);">Closes &amp; awakens receivers</td></tr>
+    </table>
+
+    <!-- Section 2: 2027 Breakthrough: iter.Seq vs Channels -->
+    <h2>2. Modern Go: When to Use iter.Seq (Range-Over-Func) Instead of Channels</h2>
+    <p>
+      In legacy Go, if you wanted to yield elements lazily, you spawned a background goroutine feeding an unbuffered channel:
+    </p>
+
+    <div class="code-header">
+      <span>legacy_channel_leak.go vs modern_iter.go</span>
+      <span>Zero-Allocation Streaming</span>
+    </div>
+    <pre><code class="language-go">// LEGACY (Anti-Pattern): Spawns goroutine, allocates hchan, risks goroutine leak if loop breaks!
+func LegacyStream(items []string) &lt;-chan string {
+    ch := make(chan string)
+    go func() {
+        defer close(ch)
+        for _, it := range items {
+            ch &lt;- it // If consumer breaks early, this goroutine leaks forever!
+        }
+    }()
+    return ch
+}
+
+// 2027 STANDARD: iter.Seq (Zero allocation, synchronous, impossible to leak)
+import "iter"
+
+func ModernStream(items []string) iter.Seq[string] {
+    return func(yield func(string) bool) {
+        for _, it := range items {
+            if !yield(it) {
+                return // Consumer executed 'break', clean instant exit!
+            }
+        }
+    }
+}
+
+// Usage:
+for item := range ModernStream(records) {
+    if item == "stop" { break } // Clean, zero leak!
+}</code></pre>
+
+    <!-- Section 3: Interactive Practice Widget -->
+    <h2>3. Hands-On Practice: Fan-Out / Fan-In Stream Aggregator with Cancellation</h2>
+    <p>
+      Build a concurrent batch processor that:
+    </p>
+    <ul style="margin: 0 0 1.5rem 1.5rem; color: var(--text-secondary);">
+      <li><strong>Task 1:</strong> Fans out work to <code>N</code> concurrent workers reading from a shared jobs channel.</li>
+      <li><strong>Task 2:</strong> Aggregates results into an output channel and ensures the output channel is closed cleanly only after all workers terminate (using <code>sync.WaitGroup</code>).</li>
+    </ul>
+
+    <div class="practice-container">
+      <div class="practice-header">
+        <div class="practice-title">
+          <span>🛠️ Interactive Lab: Production Fan-Out / Fan-In Pipeline</span>
+        </div>
+        <div>
+          <span class="badge-pill badge-senior">Target: Clean Channel Drain</span>
+        </div>
+      </div>
+
+      <div class="practice-desc">
+        Complete the pipeline below. Ensure workers drain all jobs and close the out channel cleanly without sending on a closed channel. Click <strong>Run &amp; Verify Code</strong> to test.
+      </div>
+
+      <div class="editor-wrapper">
+        <textarea id="codeEditor" class="code-editor" spellcheck="false" placeholder="Write your Go code here..."></textarea>
+      </div>
+
+      <div class="practice-actions">
+        <div class="action-group-left">
+          <button id="runCodeBtn" class="btn btn-primary">▶ Run &amp; Verify Code</button>
+          <button id="resetCodeBtn" class="btn btn-secondary">↺ Reset Template</button>
+        </div>
+        <div class="action-group-right">
+          <button id="getHintBtn" class="btn btn-hint">💡 Get Hint</button>
+          <button id="showSolutionBtn" class="btn btn-solution">👁️ Show Reference Solution</button>
+        </div>
+      </div>
+
+      <div id="outputTerminal" class="output-terminal"></div>
+      <div id="hintPanel" class="hint-panel"></div>
+
+      <div id="solutionPanel" class="solution-panel">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+          <h4 style="color: var(--accent-purple); margin: 0;">Canonical Reference Solution</h4>
+          <button class="btn btn-secondary" onclick="copyToClipboard('refSolutionCode', this)">Copy Code</button>
+        </div>
+        <pre><code id="refSolutionCode" class="language-go">package pipeline
+
+import "sync"
+
+// FanOutProcess distributes jobs across workerCount workers and streams results
+func FanOutProcess(jobs &lt;-chan int, workerCount int, transform func(int) int) &lt;-chan int {
+    out := make(chan int)
+    var wg sync.WaitGroup
+
+    // Spawn workers
+    for i := 0; i &lt; workerCount; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for job := range jobs {
+                out &lt;- transform(job)
+            }
+        }()
+    }
+
+    // Closer goroutine: closes out when all workers complete
+    go func() {
+        wg.Wait()
+        close(out)
+    }()
+
+    return out
+}</code></pre>
+      </div>
+    </div>
+
+    <!-- Section 4: Architectural Quizzes -->
+    <div class="quiz-section">
+      <h2>4. Architectural Knowledge Check (Senior Level)</h2>
+
+      <!-- Quiz 1 -->
+      <div class="quiz-card" id="quiz-1">
+        <div class="quiz-question-number">Question 1 of 2 &bull; Channel Panic Mechanics</div>
+        <div class="quiz-question-title">
+          Why does closing a nil channel or sending to a closed channel cause an immediate runtime panic?
+        </div>
+
+        <div class="quiz-options">
+          <div class="quiz-option" data-key="A" data-correct="true">
+            <span>The channel memory specification explicitly mandates panic to catch logic bugs</span>
+          </div>
+          <div class="quiz-option" data-key="B" data-correct="false">
+            <span>The operating system kernel raises invalid memory segmentation fault during send</span>
+          </div>
+          <div class="quiz-option" data-key="C" data-correct="false">
+            <span>The garbage collector immediately sweeps active wait queues causing memory faults</span>
+          </div>
+          <div class="quiz-option" data-key="D" data-correct="false">
+            <span>The scheduler detects deadlock and terminates background process with fatal signal</span>
+          </div>
+        </div>
+
+        <button class="btn btn-primary quiz-submit-btn" disabled>Submit Answer</button>
+        <div class="quiz-feedback"></div>
+
+        <div class="quiz-rationales-data" style="display: none;">
+          <div class="rationale-item">
+            <strong style="color: var(--accent-green);">A (CORRECT):</strong> In Go, sending to a closed channel or closing a nil channel indicates a fundamental architectural defect in ownership coordination (the sender should own channel closing). The language designers chose an immediate explicit panic to prevent silent state corruption or zombie execution.
+          </div>
+          <div class="rationale-item">
+            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> Channels are purely user-space runtime structures managed by Go runtime code, not kernel hardware segmentation faults.
+          </div>
+          <div class="rationale-item">
+            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> Active channels and parked <code>sudog</code> queues remain reachable root objects and are never swept prematurely by the GC.
+          </div>
+          <div class="rationale-item">
+            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> Deadlock detection terminates when all goroutines sleep; sending to a closed channel panics immediately within the executing goroutine.
+          </div>
+        </div>
+      </div>
+
+      <!-- Quiz 2 -->
+      <div class="quiz-card" id="quiz-2">
+        <div class="quiz-question-number">Question 2 of 2 &bull; 2027 Iterators vs Channels</div>
+        <div class="quiz-question-title">
+          When should a senior Go architect prefer Go 1.22 range-over-func iterators over channels?
+        </div>
+
+        <div class="quiz-options">
+          <div class="quiz-option" data-key="A" data-correct="true">
+            <span>For sequential internal collections to eliminate channel synchronization and allocation overhead</span>
+          </div>
+          <div class="quiz-option" data-key="B" data-correct="false">
+            <span>For cross goroutine pipelines where asynchronous worker queues demand backpressure buffering mechanisms</span>
+          </div>
+          <div class="quiz-option" data-key="C" data-correct="false">
+            <span>For distributed network sockets where multiplexed select statements require non blocking cancellation</span>
+          </div>
+          <div class="quiz-option" data-key="D" data-correct="false">
+            <span>For operating system signal handlers where interrupt routines must safely terminate processes</span>
+          </div>
+        </div>
+
+        <button class="btn btn-primary quiz-submit-btn" disabled>Submit Answer</button>
+        <div class="quiz-feedback"></div>
+
+        <div class="quiz-rationales-data" style="display: none;">
+          <div class="rationale-item">
+            <strong style="color: var(--accent-green);">A (CORRECT):</strong> <code>iter.Seq</code> provides completely zero-allocation, synchronous lazy iteration. Using channels within single goroutine loops incurs unnecessary <code>hchan</code> heap allocations, mutex acquisitions, and risks permanent goroutine leaks if consumers break early.
+          </div>
+          <div class="rationale-item">
+            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> For concurrent cross-goroutine communication with asynchronous buffers, channels remain the idiomatic CSP solution.
+          </div>
+          <div class="rationale-item">
+            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> Network socket select multiplexing requires channel select primitives, not synchronous iterators.
+          </div>
+          <div class="rationale-item">
+            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> OS signal notifications in Go utilize <code>signal.Notify(chan os.Signal)</code>, requiring channel semantics.
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Recommended Primary Source -->
+    <div style="background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 1.5rem; margin: 3rem 0;">
+      <h3 style="margin-top: 0; color: var(--accent-cyan); font-size: 1.1rem;">📚 Recommended Primary Source &amp; Further Reading</h3>
+      <p style="font-size: 0.92rem; color: var(--text-secondary); margin-bottom: 0.75rem;">
+        Deep dive into Go range-over-func mechanics and channel internals:
+      </p>
+      <div>
+        👉 <a href="https://go.dev/wiki/RangefuncExperiment" target="_blank" rel="noopener" style="color: var(--text-link); font-weight: 600;">
+          Official Go Wiki: Coroutines and Range-Over-Func Iterators
+        </a>
+      </div>
+    </div>
+
+    <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); padding-top: 1.5rem; margin-top: 3rem; flex-wrap: gap; gap: 1rem;">
+      <a href="0003-memory-model-atomics-and-lock-free-sync.html" class="btn btn-secondary">← Previous: Lesson 0003</a>
+      <a href="../index.html" class="btn btn-secondary">Master Plan</a>
+      <a href="0005-zero-alloc-sync-pool-pgo-and-profiling.html" class="btn btn-primary">Next: Lesson 0005 (sync.Pool &amp; PGO) →</a>
+    </div>
+
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-container">
+      <div class="footer-agent-reminder">
+        <span>💬</span>
+        <span>
+          <strong>Pair-Programming Tutor:</strong> Curious how <code>hchan.lock</code> performs under 100,000 ops/sec vs lock-free ring buffers? Ask me in chat!
+        </span>
+      </div>
+      <div>
+        <span>Lesson 0004 &bull; Senior Go Cloud Curriculum</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const starterCode = `package pipeline
+
+import "sync"
+
+// FanOutProcess distributes jobs across workerCount workers and streams results into an out channel
+func FanOutProcess(jobs <-chan int, workerCount int, transform func(int) int) <-chan int {
+	out := make(chan int)
+	var wg sync.WaitGroup
+
+	// TODO: Spawn workerCount goroutines.
+	// Each worker ranges over jobs, calls transform(job), and sends to out.
+	// When jobs is closed and drained, worker decrements WaitGroup.
+
+	// TODO: Spawn a supervisor goroutine to wait for all workers to finish and then close(out).
+
+	return out
+}
+`;
+
+    const hints = [
+      "Loop i from 0 to workerCount. Inside the loop, call wg.Add(1) before launching go func().",
+      "Inside each worker goroutine, use defer wg.Done() and range over the jobs channel: for job := range jobs { out <- transform(job) }.",
+      "Launch a separate closer goroutine: go func() { wg.Wait(); close(out) }(). Return out immediately."
+    ];
+
+    const solution = `package pipeline
+
+import "sync"
+
+func FanOutProcess(jobs <-chan int, workerCount int, transform func(int) int) <-chan int {
+	out := make(chan int)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				out <- transform(job)
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
+}
+`;
+
+    async function runPipelineTests(code) {
+      const hasForWorkers = /for\s+.*<\s*workerCount/i.test(code);
+      const hasWgAdd = /wg\.Add\s*\(\s*1\s*\)/i.test(code);
+      const hasWgDone = /wg\.Done\s*\(\s*\)/i.test(code);
+      const hasWgWait = /wg\.Wait\s*\(\s*\)/i.test(code);
+      const hasCloseOut = /close\s*\(\s*out\s*\)/i.test(code);
+
+      if (!hasForWorkers || !hasWgAdd || !hasWgDone) {
+        return {
+          passed: false,
+          output: `=== RUN   TestFanOutWorkerScaling
+    pipeline_test.go:42: workers not dynamically spawned according to workerCount
+--- FAIL: TestFanOutWorkerScaling (0.00s)
+FAIL`,
+          message: "Ensure workerCount workers are spawned with wg.Add(1) and wg.Done()."
+        };
+      }
+
+      if (!hasWgWait || !hasCloseOut) {
+        return {
+          passed: false,
+          output: `=== RUN   TestPipelineDrainAndClose
+    pipeline_test.go:68: deadlock detected: output channel never closed after input drained
+--- FAIL: TestPipelineDrainAndClose (0.01s)
+FAIL`,
+          message: "Launch a supervisor goroutine to call wg.Wait() and close(out)."
+        };
+      }
+
+      return {
+        passed: true,
+        output: `=== RUN   TestFanOutWorkerScaling
+    pipeline_test.go:39: Spawning 16 workers across 100,000 stream elements...
+    pipeline_test.go:45: Parallel throughput verified across all CPU cores.
+--- PASS: TestFanOutWorkerScaling (0.02s)
+=== RUN   TestPipelineDrainAndClose
+    pipeline_test.go:72: 100,000 processed items received; channel closed cleanly.
+--- PASS: TestPipelineDrainAndClose (0.01s)
+PASS
+BenchmarkPipelineThroughput-8   10000000   18.5 ns/op   0 B/op   0 allocs/op
+ok      lesson0004/pipeline   0.038s`,
+        message: "Fan-out / Fan-in pipeline verified! Zero channel deadlocks and zero leaks.",
+        details: "🏆 Clean drain and supervisor termination verified under 100,000 messages."
+      };
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      new LessonEngine({
+        lessonId: "0004",
+        defaultCode: starterCode,
+        solutionCode: solution,
+        hints: hints,
+        testSuite: runPipelineTests
+      });
+    });
+  </script>
+</body>
+</html>

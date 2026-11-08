@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · TCP Reliability: Sequence Numbers and ACKs</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<article class="page">
+
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 2 — Transport · Session 16</p>
+  <h1>TCP reliability: Sequence numbers, ACKs, and loss recovery</h1>
+  <p class="subtitle">Turning an unreliable, lossy packet network into a flawless byte stream</p>
+  <div class="meta"><span>~25 minutes</span><span>Tools: Wireshark</span><span class="badge prod">⚡ production</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>You'll calculate exact TCP sequence and acknowledgment numbers down to the byte, explain how Selective ACKs (SACK) save network capacity, and understand how Fast Retransmit recovers lost packets in milliseconds without waiting for a timer to expire.</p>
+  </div>
+
+  <div class="warmup">
+    <span class="box-label">Warm-up · from earlier sessions</span>
+    <p>Two minutes, from memory, before you read on:</p>
+    <div class="recall" data-key="0016-warmup-handshake">
+      <p class="r-prompt">What sequence number and acknowledgment number does the server return in step 2 of the 3-way handshake?</p>
+      <div class="keypoints">
+        The server returns <code>seq = server_isn</code> (its own randomly chosen Initial Sequence Number) and <code>ack = client_isn + 1</code> (confirming receipt of the client's SYN).
+      </div>
+    </div>
+  </div>
+
+  <h2>Sequence numbers count bytes, not packets</h2>
+  <p class="lede">The most common misunderstanding of TCP is assuming sequence numbers count packets (packet 1, packet 2, packet 3). They do not. <strong>TCP sequence numbers count individual bytes in the stream.</strong></p>
+
+  <p>If a sender transmits a segment with Sequence Number <code>10,001</code> containing <code>1,000 bytes</code> of payload:</p>
+  <ul>
+    <li>The segment carries bytes <code>10,001</code> through <code>11,000</code>.</li>
+    <li>The <em>next</em> segment sent by this host will have Sequence Number <code>11,001</code>.</li>
+    <li>When the receiver gets this segment intact, it returns an Acknowledgment Number of <code>11,001</code>: <em>"I have successfully received everything up to byte 11,000; I am expecting byte 11,001 next."</em></li>
+  </ul>
+
+  <p>TCP acknowledgments are <strong class="term">cumulative</strong>: an ACK for byte <var>N</var> confirms that <em>every single byte</em> before <var>N</var> has arrived safely.</p>
+
+  <h2>Handling packet loss: The gap problem</h2>
+  <p>Suppose a sender transmits three segments of 1,000 bytes each: Segment A (bytes 1–1,000), Segment B (bytes 1,001–2,000), and Segment C (bytes 2,001–3,000). A router drops Segment B in transit:</p>
+
+  <figure class="fullwidth" style="max-width:37rem">
+    <svg class="dia" viewBox="0 0 600 220" role="img" aria-label="TCP packet loss diagram: Segment A arrives, receiver sends ACK 1001. Segment B is lost. Segment C arrives, receiver sends duplicate ACK 1001.">
+      <defs><marker id="ack-ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--layer-transport)"/></marker></defs>
+      <line class="line dashed" x1="100" y1="20" x2="100" y2="200"/>
+      <line class="line dashed" x1="500" y1="20" x2="500" y2="200"/>
+      <text x="100" y="15" text-anchor="middle" style="font-weight:600">Sender</text>
+      <text x="500" y="15" text-anchor="middle" style="font-weight:600">Receiver</text>
+
+      <!-- Segment A -->
+      <line x1="100" y1="40" x2="495" y2="60" style="stroke:var(--ok);stroke-width:2" marker-end="url(#ack-ah)"/>
+      <text x="110" y="45" style="font-size:11px">Seg A: Seq=1 (1000B)</text>
+      <line x1="500" y1="70" x2="105" y2="90" style="stroke:var(--layer-transport);stroke-width:1.5" marker-end="url(#ack-ah)"/>
+      <text x="490" y="75" text-anchor="end" style="font-size:11px">ACK = 1001</text>
+
+      <!-- Segment B: Lost -->
+      <line x1="100" y1="100" x2="280" y2="110" style="stroke:var(--bad);stroke-width:2"/>
+      <text x="290" y="115" style="fill:var(--bad);font-weight:700">✕ DROPPED</text>
+      <text x="110" y="105" style="font-size:11px">Seg B: Seq=1001 (1000B)</text>
+
+      <!-- Segment C -->
+      <line x1="100" y1="130" x2="495" y2="150" style="stroke:var(--ok);stroke-width:2" marker-end="url(#ack-ah)"/>
+      <text x="110" y="135" style="font-size:11px">Seg C: Seq=2001 (1000B)</text>
+      <line x1="500" y1="160" x2="105" y2="180" style="stroke:var(--bad);stroke-width:1.5" marker-end="url(#ack-ah)"/>
+      <text x="490" y="165" text-anchor="end" style="fill:var(--bad);font-size:11px;font-weight:600">Duplicate ACK = 1001!</text>
+    </svg>
+    <figcaption>Cumulative ACKs during packet loss. When out-of-order Segment C arrives, the receiver cannot acknowledge byte 3001; it re-sends ACK 1001.</figcaption>
+  </figure>
+
+  <p>Because ACKs are strictly cumulative, when the receiver gets Segment C, it cannot acknowledge byte 3,001—doing so would falsely imply that Segment B was received! The receiver buffers Segment C in memory and immediately repeats: <strong>ACK = 1001</strong>. This is a <strong class="term">duplicate ACK</strong>.</p>
+
+  <h2>Selective Acknowledgment (SACK)</h2>
+  <p>In standard TCP, the sender only knows that byte 1,001 is missing. It has no way of knowing whether the receiver received Segment C, D, or E. In the old days, the sender had to retransmit <em>everything</em> from byte 1,001 onwards (a wasteful strategy called Go-Back-N).<span class="sn"></span><span class="sidenote"><a href="https://www.rfc-editor.org/rfc/rfc2018.html">RFC 2018</a>: TCP Selective Acknowledgment Options. SACK is enabled by default on all modern OS kernels.</span></p>
+
+  <p>With <strong class="term">SACK (Selective ACK)</strong>, the receiver appends an optional block in the TCP header: <em>"I still need byte 1,001, but I have already safely stored bytes 2,001 to 3,000."</em> Now, the sender selectively retransmits only the single missing 1,000-byte hole, saving massive amounts of bandwidth!</p>
+
+  <h2>How loss is detected: Timers vs. Fast Retransmit</h2>
+  <p>A sender detects that a packet was lost through one of two mechanisms:</p>
+
+  <ol>
+    <li>
+      <strong class="term">Retransmission Timeout (RTO):</strong> The sender starts a countdown timer whenever it sends a segment. If no ACK arrives before the timer expires, it assumes loss, retransmits the segment, and doubles the timer (exponential backoff).<br>
+      <em>The problem:</em> RTO is typically between 200 ms and 1,000 ms. Waiting for a timer to expire causes a noticeable stall in user-facing throughput.
+    </li>
+    <li>
+      <strong class="term">Fast Retransmit (3 Duplicate ACKs):</strong> If the sender receives <strong>three duplicate ACKs</strong> in a row for the same byte (e.g., four ACKs for 1001 total), it doesn't wait for the RTO timer. The sender reasons: <em>"Packets are clearly still flowing through the network to generate duplicate ACKs; only segment 1001 went missing."</em> It immediately retransmits the missing segment within milliseconds!
+    </li>
+  </ol>
+
+  <!-- Interactive Fill-In Drill -->
+  <h3>Practice: Sequence &amp; ACK math</h3>
+  <div class="widget fill-in">
+    <ol style="margin:.4rem 0; padding-left:1.3rem;">
+      <li style="margin-bottom:.8rem;">
+        A sender transmits a segment with <code>Seq = 4000</code> carrying <code>500 bytes</code> of payload data. What Sequence Number will the next segment carry?<br>
+        Next Sequence Number = <input class="blank" data-answer="4500" size="6" aria-label="Seq number">
+      </li>
+      <li style="margin-bottom:.8rem;">
+        What Acknowledgment Number will the receiver return upon receiving the 500-byte segment above?<br>
+        Expected ACK Number = <input class="blank" data-answer="4500" size="6" aria-label="ACK number">
+      </li>
+      <li>
+        How many duplicate ACKs must a sender receive before triggering a Fast Retransmit without waiting for the timer?<br>
+        Duplicate ACKs threshold = <input class="blank" data-answer="3" size="3" aria-label="Count">
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>Try it: spotting retransmissions in Wireshark</h2>
+  <p>Wireshark features built-in expert analysis that flags TCP sequence anomalies automatically.</p>
+
+  <ol class="steps" data-key="0016-tcp-retrans">
+    <li>Open Wireshark and inspect any capture with significant traffic (or capture while downloading a large file).</li>
+    <li>Type this display filter into the filter bar:
+      <pre><code><span class="prompt">$ </span>tcp.analysis.retransmission || tcp.analysis.duplicate_ack</code></pre>
+    </li>
+    <li>Wireshark highlights duplicate ACKs in black and retransmissions in red.</li>
+    <li>Expand <strong>Transmission Control Protocol &rarr; [SEQ/ACK analysis]</strong> in the details pane to view the calculated RTT and delay since the original transmission.</li>
+  </ol>
+</section>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0016-reliability-recall">
+    <p class="r-prompt">From memory: explain how cumulative ACKs differ from Selective ACKs (SACK). How does Fast Retransmit detect packet loss before a timeout occurs?</p>
+    <div class="keypoints">
+      <p><strong>Key points to compare against:</strong></p>
+      <ul>
+        <li><strong>Cumulative vs SACK:</strong> A cumulative ACK only reports the contiguous prefix of received bytes (next expected byte). If a gap occurs, the receiver cannot acknowledge newer out-of-order bytes. SACK adds explicit blocks in the TCP header naming disjoint received ranges, allowing the sender to retransmit only the missing holes.</li>
+        <li><strong>Fast Retransmit:</strong> When the receiver gets out-of-order segments past a hole, it repeatedly sends duplicate ACKs. Upon receiving 3 duplicate ACKs, the sender infers that the network is healthy and delivering later packets, but that one specific segment was dropped, triggering an immediate retransmit without waiting for the slow RTO timer.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+
+  <h2>Code Example: TCP Cumulative ACK & Sequence Tracker in Java &amp; Kotlin</h2>
+  <div class="code-tabs">
+    <div class="code-tabs-nav">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+      <button type="button" class="code-copy-btn" aria-label="Copy code">Copy</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <pre><code>public class TcpAckExample {
+    public static void main(String[] args) {
+        System.out.println("Three duplicate ACKs trigger Fast Retransmit without waiting for RTO timeout.");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <pre><code>object TcpAckExample {
+    fun main() {
+        println("Three duplicate ACKs trigger Fast Retransmit without waiting for RTO timeout.")
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Interactive Code Practice: TCP Cumulative ACK & Sequence Tracker</h2>
+  <div class="code-practice" data-key="0016-tcp-ack-tracker">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Implement TCP cumulative sequence number and ACK tracking: sequence advancement, ACK response computation, and out-of-order segment detection.</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">public class Solution {
+    private long expectedSeq = 0;
+
+    public Solution(long initialSeq) {
+        this.expectedSeq = initialSeq;
+    }
+
+    // Process incoming segment with sequence number and payload byte length
+    // If seq == expectedSeq: advance expectedSeq by len and return new cumulative ACK
+    // If seq > expectedSeq: return current expectedSeq (trigger duplicate ACK!)
+    public long processSegment(long seq, int len) {
+        // TODO: implement
+        return 0L;
+    }
+
+    public long getExpectedAck() {
+        return expectedSeq;
+    }
+}</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">public class Solution {
+    private long expectedSeq = 0;
+
+    public Solution(long initialSeq) {
+        this.expectedSeq = initialSeq;
+    }
+
+    // Process incoming segment with sequence number and payload byte length
+    // If seq == expectedSeq: advance expectedSeq by len and return new cumulative ACK
+    // If seq > expectedSeq: return current expectedSeq (trigger duplicate ACK!)
+    public long processSegment(long seq, int len) {
+        // TODO: implement
+        return 0L;
+    }
+
+    public long getExpectedAck() {
+        return expectedSeq;
+    }
+}</script>
+    <script type="text/plain" class="test-harness">
+// __STUDENT_CODE__
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0;
+        int total = 3;
+
+        Solution tcp = new Solution(1000L);
+
+        // Test 1: In-order segment: seq=1000, len=500 -> ACK = 1500
+        long ack1 = tcp.processSegment(1000L, 500);
+        if (ack1 == 1500L) {
+            System.out.println("PASS: Test 1: Cumulative ACK advanced to 1500");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 1: expected 1500, got " + ack1);
+        }
+
+        // Test 2: Out-of-order packet: seq=2000 arrives, but expecting 1500! -> Duplicate ACK = 1500
+        long ack2 = tcp.processSegment(2000L, 500);
+        if (ack2 == 1500L) {
+            System.out.println("PASS: Test 2: Out-of-order packet generated duplicate ACK 1500");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 2: expected dup ACK 1500, got " + ack2);
+        }
+
+        // Test 3: Missing packet arrives: seq=1500, len=500 -> ACK advances to 2000
+        long ack3 = tcp.processSegment(1500L, 500);
+        if (ack3 == 2000L) {
+            System.out.println("PASS: Test 3: Repaired segment advanced ACK to 2000");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 3: expected 2000, got " + ack3);
+        }
+
+        System.out.println("SUMMARY:" + passed + "/" + total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">public class Solution {
+    private long expectedSeq;
+
+    public Solution(long initialSeq) {
+        this.expectedSeq = initialSeq;
+    }
+
+    public long processSegment(long seq, int len) {
+        if (seq == expectedSeq) {
+            expectedSeq += len;
+        }
+        return expectedSeq;
+    }
+
+    public long getExpectedAck() {
+        return expectedSeq;
+    }
+}</script>
+    <script type="application/json" class="hints-data">["TCP ACKs are cumulative: ACK number indicates the next sequence byte the receiver expects to receive.", "If seq == expectedSeq, advance expectedSeq += len.", "If an out-of-order segment arrives (seq > expectedSeq), TCP returns the current expectedSeq as a duplicate ACK."]</script>
+  </div>
+
+<section>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="q" data-answer="1">
+      <p class="q-prompt">What does a TCP Acknowledgment Number of 8001 signify?</p>
+      <ol class="options">
+        <li data-why="Incorrect: ACK N does not acknowledge only packet N; TCP acknowledgments are cumulative.">packet number 8001 was dropped</li>
+        <li data-why="Correct! TCP uses cumulative acknowledgments: ACK N confirms that the receiver has successfully received all contiguous stream bytes up to N-1, and expects byte N next.">all bytes up to 8000 were received</li>
+        <li data-why="Incorrect: Sequence numbers count bytes in the data stream, not application packet message counts.">the sender must pause 8001 ms</li>
+        <li data-why="Incorrect: The ACK field indicates the next byte expected, not the sender's congestion window size.">the receiver window is 8001 bytes</li>
+      </ol>
+      <div class="q-explain">TCP ACKs are cumulative. An ACK of 8001 confirms receipt of all bytes up to 8000 and requests byte 8001 next.</div>
+    </div>
+    <div class="q" data-answer="2">
+      <p class="q-prompt">What triggers a Fast Retransmit in standard TCP?</p>
+      <ol class="options">
+        <li data-why="Incorrect: A single ACK is normal traffic; packet loss cannot be deduced from a single acknowledgment.">an ICMP Destination Unreachable packet</li>
+        <li data-why="Correct! Fast Retransmit (RFC 5681) is triggered when the sender receives 3 duplicate ACKs (4 identical ACKs total), indicating a segment was lost while subsequent data arrived.">the expiration of the RTO timer</li>
+        <li data-why="Incorrect: Fast Retransmit triggers well before the full RTO timer expires, enabling rapid recovery without stalling.">arrival of three duplicate ACKs</li>
+        <li data-why="Incorrect: A TCP RST resets the connection entirely; it does not trigger retransmissions.">a sudden drop in link bandwidth</li>
+      </ol>
+      <div class="q-explain">When a sender receives 3 duplicate ACKs, it infers packet loss and immediately retransmits the missing segment before the RTO timer expires.</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">What is the major efficiency advantage of enabling TCP Selective Acknowledgment (SACK)?</p>
+      <ol class="options">
+        <li data-why="Correct! Without SACK, cumulative ACKs only report the left edge of received data, forcing retransmission of all subsequent packets. SACK informs the sender of isolated discontinuous blocks received.">avoids retransmitting received data</li>
+        <li data-why="Incorrect: SACK does not encrypt sequence numbers; encryption is handled by TLS.">eliminates TCP sequence numbers</li>
+        <li data-why="Incorrect: SACK reports received sequence blocks, not flow control receiver buffer window sizes.">doubles the maximum packet size</li>
+        <li data-why="Incorrect: SACK does not compress TCP options.">encrypts packet payload headers</li>
+      </ol>
+      <div class="q-explain">SACK informs the sender exactly which out-of-order blocks have already arrived, preventing the sender from unnecessarily retransmitting data that was already received.</div>
+    </div>
+    <div class="q" data-answer="3">
+      <p class="q-prompt">What happens to the Retransmission Timeout (RTO) timer when a retransmission itself times out?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Fixed static timers cannot adapt to varying network latency (e.g. 1 ms LAN vs 200 ms transpacific link).">it resets to zero milliseconds</li>
+        <li data-why="Correct! Modern TCP dynamically tracks smoothed round-trip time (SRTT) and round-trip variance (RTTVAR) using Jacobson's algorithm (RFC 6298) to calculate adaptive RTOs.">it shrinks by half its value</li>
+        <li data-why="Incorrect: RTO is computed dynamically by the sender from round-trip measurements, not configured statically by remote DNS records.">it stays completely constant</li>
+        <li data-why="Incorrect: Subnet prefix length indicates IP network size and has no relation to round-trip latency.">it doubles in length (backoff)</li>
+      </ol>
+      <div class="q-explain">TCP uses exponential backoff: upon consecutive timeouts, it doubles the RTO interval to prevent overloading an already congested network.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://gaia.cs.umass.edu/kurose_ross/index.php">Kurose &amp; Ross</a> §3.5.4 ("Reliable Data Transfer") and <a href="https://book.systemsapproach.org/e2e/tcp.html#reliable-transmission">Systems Approach §5.2.4 ("Reliable Transmission")</a>.</p>
+    <p>Going deeper: <a href="https://www.rfc-editor.org/rfc/rfc2018.html">RFC 2018 (TCP SACK)</a> and <a href="https://www.rfc-editor.org/rfc/rfc6298.html">RFC 6298 (Computing TCP's Retransmission Timer)</a>.</p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>Anything unclear, or anything here you think is wrong: ask your teacher in chat. Bring your sequence number calculations and any Wireshark duplicate ACK traces; I'll give you feedback on your reasoning.</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0015-tcp-connections.html"><small>Previous · Session 15</small>TCP: Handshake &amp; TIME_WAIT</a>
+  <a class="next" href="0017-tcp-flow-and-congestion.html"><small>Next · Session 17</small>Flow &amp; congestion control</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

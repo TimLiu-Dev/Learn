@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>63 · eBPF Modern Networking &amp; Cilium</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<article class="page">
+
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 5 — Track C: Cloud &amp; Infra · Session 63</p>
+  <h1>eBPF Modern Networking: Bypassing iptables with Cilium</h1>
+  <p class="subtitle">Kernel sandboxing, XDP line-rate processing, socket-layer short-circuiting, and replacing kube-proxy</p>
+  <div class="meta"><span>~25 minutes</span><span>Tools: <code>bpftool</code> &amp; Cilium CLI</span><span class="badge interview">★ interview</span><span class="badge prod">⚡ modern</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>You'll understand the most important paradigm shift in Linux networking in twenty years: how extended Berkeley Packet Filter (eBPF) allows safe, sandboxed programs to execute inside the kernel, how Cilium completely eliminates kube-proxy and iptables, and how socket-level short-circuiting doubles container throughput.</p>
+  </div>
+
+  <div class="warmup">
+    <span class="box-label">Warm-up · from earlier sessions</span>
+    <p>Two minutes, from memory, before you read on:</p>
+    <div class="recall" data-key="0063-warmup-iptables-limit">
+      <p class="r-prompt">Why does iptables suffer severe performance degradation in massive Kubernetes clusters?</p>
+      <div class="keypoints">
+        iptables evaluates packet rules sequentially in <var>O</var>(<var>N</var>) time. When thousands of services generate tens of thousands of sequential rules, packet evaluation latency spikes and updating rules locks the kernel.
+      </div>
+    </div>
+  </div>
+
+  <h2>The 25-year-old Linux kernel bottleneck</h2>
+  <p class="lede">For a quarter of a century, the Linux networking stack followed an immutable path: when a packet hits a network interface, the kernel allocates a heavy data structure (<code>sk_buff</code>), passes it through device drivers, pushes it through Netfilter (iptables), processes TCP checksums, and delivers it to user-space sockets.<span class="sn"></span><span class="sidenote">See <a href="https://cilium.io/">Cilium Documentation</a>: Why eBPF is Replacing iptables in Kubernetes.</span></p>
+
+  <p>In a modern Kubernetes node hosting 100 containers, two Pods talking to each other on the <em>exact same physical node</em> traverse this full TCP/IP stack twice (Pod A &rarr; veth &rarr; host Netfilter &rarr; veth &rarr; Pod B), burning massive CPU cycles in redundant serialization, routing lookups, and memory copies. <strong class="term">eBPF</strong> obliterates this overhead.</p>
+
+  <h2>What is eBPF? (The Kernel Sandbox)</h2>
+  <p><strong class="term">eBPF (extended Berkeley Packet Filter)</strong> is a revolutionary technology built directly into the modern Linux kernel (4.19+ and 5.x+). It allows engineers to run custom, sandboxed bytecode inside the Linux kernel <em>without modifying the kernel source code or loading risky kernel modules!</em></p>
+
+  <figure class="fullwidth" style="max-width:37rem">
+    <svg class="dia" viewBox="0 0 600 230" role="img" aria-label="eBPF Architecture: User-space program compiles to eBPF bytecode. In-kernel Verifier guarantees safety. JIT compiler produces native machine code executed at XDP and socket hooks.">
+      <!-- User Space -->
+      <rect x="20" y="30" width="160" height="160" rx="4" style="fill:var(--panel); stroke:var(--rule);"/>
+      <text x="100" y="55" text-anchor="middle" style="font-weight:700">User Space</text>
+      <rect x="35" y="80" width="130" height="35" rx="2" style="fill:var(--layer-app);"/><text x="100" y="102" text-anchor="middle" class="on-fill" style="font-size:9px">Cilium Control Agent</text>
+      <rect x="35" y="130" width="130" height="35" rx="2" style="fill:var(--ok);"/><text x="100" y="152" text-anchor="middle" class="on-fill" style="font-size:9px">eBPF C Bytecode</text>
+
+      <!-- Kernel Space -->
+      <rect x="220" y="30" width="360" height="160" rx="4" style="fill:var(--panel); stroke:var(--accent); stroke-width:1.5;"/>
+      <text x="400" y="55" text-anchor="middle" style="font-weight:700; fill:var(--accent)">Linux Kernel Space</text>
+
+      <!-- Verifier -->
+      <rect x="240" y="75" width="140" height="40" rx="3" style="fill:var(--bg); stroke:var(--accent);"/>
+      <text x="310" y="95" text-anchor="middle" style="font-weight:700; font-size:10px; fill:var(--accent)">In-Kernel Verifier</text>
+      <text x="310" y="107" text-anchor="middle" class="muted" style="font-size:7px">Guarantees safety &amp; no panics</text>
+
+      <!-- JIT Engine -->
+      <line class="line" x1="165" y1="147" x2="240" y2="95" style="stroke-width:2; stroke:var(--ok);"/>
+      <line class="line" x1="380" y1="95" x2="420" y2="95" style="stroke-width:2; stroke:var(--ok);"/>
+
+      <rect x="420" y="75" width="140" height="40" rx="3" style="fill:var(--ok);"/>
+      <text x="490" y="95" text-anchor="middle" class="on-fill" style="font-weight:700; font-size:10px">JIT Compiler</text>
+      <text x="490" y="107" text-anchor="middle" class="on-fill" style="font-size:7px">Native CPU Assembly</text>
+
+      <!-- Hooks -->
+      <rect x="240" y="135" width="320" height="40" rx="3" style="fill:var(--bg); stroke:var(--rule);"/>
+      <text x="400" y="152" text-anchor="middle" style="font-size:9px; font-weight:600">Attached Hooks: XDP (NIC Driver) &amp; Socket Layers (sock_ops)</text>
+      <text x="400" y="166" text-anchor="middle" class="muted" style="font-size:8px">Runs at line rate in nanoseconds!</text>
+    </svg>
+    <figcaption>eBPF Architecture: Verified bytecode executes inside kernel event hooks at bare-metal line rate without kernel panic risk.</figcaption>
+  </figure>
+
+  <h3>The In-Kernel Verifier: Zero Crashes</h3>
+  <p>In traditional Linux, loading a custom kernel module (.ko) risked crashing the entire server with a kernel panic if a pointer was null. eBPF solves this via the <strong class="term">In-Kernel Verifier</strong>:</p>
+  <ul>
+    <li>Before bytecode executes, the verifier analyzes all possible code paths.</li>
+    <li>It proves that the program <em>never accesses uninitialized memory</em>, <em>never dereferences a null pointer</em>, and <em>guarantees termination</em> (bounded loops).</li>
+    <li>Once verified, a Just-In-Time (JIT) compiler compiles the bytecode into native machine instructions executing at hardware line rate!</li>
+  </ul>
+
+  <h2>How Cilium Replaces kube-proxy</h2>
+  <p><strong class="term">Cilium</strong> is the flagship eBPF-powered CNI for Kubernetes. It runs in <strong class="term">kube-proxy-replacement mode</strong>, completely deleting every iptables rule from your cluster:<span class="sn"></span><span class="sidenote">See Cilium Docs: Kubernetes Without kube-proxy.</span></p>
+
+  <ol>
+    <li><strong class="term">eBPF Maps (<var>O</var>(1) Hash Tables):</strong> Instead of 100,000 sequential iptables rules, Cilium maintains shared memory hash tables (eBPF maps) inside the kernel. Service lookups are resolved in constant <var>O</var>(1) time regardless of cluster size!</li>
+    <li><strong class="term">XDP (eXpress Data Path):</strong> Cilium can attach eBPF programs directly to the physical network card driver (XDP hook). Dropping malicious DDoS packets or load-balancing NodePort traffic occurs <em>before the Linux kernel even allocates a single byte of memory!</em></li>
+  </ol>
+
+  <h2>Socket-Level Short-Circuiting (The veth Bypass)</h2>
+  <p>Cilium's greatest performance innovation is <strong class="term">Socket-Level Short-Circuiting</strong> using eBPF <code>sock_ops</code>:</p>
+
+  <figure class="fullwidth" style="max-width:37rem">
+    <svg class="dia" viewBox="0 0 600 210" role="img" aria-label="Socket-Level Short-Circuiting: Cilium bypasses veth pairs and TCP/IP stack, streaming data directly between container socket buffers.">
+      <!-- Traditional Slow Path -->
+      <text x="30" y="25" style="font-weight:700; font-size:10px">Traditional Linux Path (Double TCP Stack + iptables):</text>
+      <rect class="box" x="30" y="35" width="100" height="30" rx="2"/><text x="80" y="54" text-anchor="middle" style="font-size:9px">Pod A Socket</text>
+      <line class="line" x1="130" y1="50" x2="180" y2="50" style="stroke:var(--rule);"/>
+      <rect class="box" x="180" y="35" width="90" height="30" rx="2"/><text x="225" y="54" text-anchor="middle" style="font-size:8px">veth A &rarr; host</text>
+      <line class="line" x1="270" y1="50" x2="320" y2="50" style="stroke:var(--rule);"/>
+      <rect class="box" x="320" y="35" width="90" height="30" rx="2"/><text x="365" y="54" text-anchor="middle" style="font-size:8px">iptables NAT</text>
+      <line class="line" x1="410" y1="50" x2="460" y2="50" style="stroke:var(--rule);"/>
+      <rect class="box" x="460" y="35" width="100" height="30" rx="2"/><text x="510" y="54" text-anchor="middle" style="font-size:9px">Pod B Socket</text>
+
+      <!-- Cilium eBPF Short-Circuit -->
+      <text x="30" y="115" style="font-weight:700; font-size:10px; fill:var(--ok)">Cilium eBPF Socket Bypass (Zero-Copy Memory Stream):</text>
+      <rect class="box" x="80" y="130" width="130" height="45" rx="3" style="stroke:var(--ok); stroke-width:1.5;"/><text x="145" y="157" text-anchor="middle" style="font-weight:600; font-size:10px">Pod A Socket</text>
+      
+      <!-- Direct Bypass Arrow -->
+      <path d="M 210,152 L 370,152" fill="none" stroke="var(--ok)" stroke-width="3"/>
+      <polygon points="370,152 360,147 360,157" fill="var(--ok)"/>
+      <text x="290" y="142" text-anchor="middle" style="font-size:9px; font-weight:700; fill:var(--ok)">sock_ops Fast-Path</text>
+      <text x="290" y="172" text-anchor="middle" class="muted" style="font-size:8px">Bypasses veth pairs, Netfilter &amp; IP stack entirely!</text>
+
+      <rect class="box" x="370" y="130" width="130" height="45" rx="3" style="stroke:var(--ok); stroke-width:1.5;"/><text x="435" y="157" text-anchor="middle" style="font-weight:600; font-size:10px">Pod B Socket</text>
+    </svg>
+    <figcaption>Cilium Socket Short-Circuiting: eBPF recognizes when two local Pods communicate, streaming data directly between socket buffers and cutting CPU latency in half.</figcaption>
+  </figure>
+
+  <p>When Pod A establishes a TCP connection to Pod B on the same node, Cilium attaches an eBPF program directly to the socket layer (<code>sock_ops</code>). When Pod A calls <code>write()</code> on its socket, eBPF intercepts the data bytes and deposits them <strong>directly into Pod B's socket receive buffer!</strong></p>
+  <p>It completely bypasses the veth pairs, drops, and IP stack traversals. This doubles local pod-to-pod throughput and cuts packet latency by 50%.</p>
+
+  <!-- Interactive Fill-In Drill -->
+  <h3>Practice: eBPF Mechanics</h3>
+  <div class="widget fill-in">
+    <ol style="margin:.4rem 0; padding-left:1.3rem;">
+      <li style="margin-bottom:.8rem;">
+        What in-kernel safety component statically verifies that eBPF bytecode will never crash or hang the operating system?<br>
+        Safety Component = In-Kernel <input class="blank" data-answer="Verifier|verifier" size="10" aria-label="Component">
+      </li>
+      <li style="margin-bottom:.8rem;">
+        What high-performance hook allows eBPF to process or drop packets directly inside the network card driver?<br>
+        Hook Acronym = <input class="blank" data-answer="XDP" size="5" aria-label="Hook">
+      </li>
+      <li>
+        What flagship eBPF-based CNI replaces kube-proxy and iptables in modern Kubernetes clusters?<br>
+        CNI Name = <input class="blank" data-answer="Cilium|cilium" size="8" aria-label="CNI Name">
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>Hands-on: Inspecting active eBPF programs with bpftool</h2>
+  <p>eBPF executes inside the Linux kernel (not macOS Darwin/XNU). On macOS, inspect the Linux VM kernel powering Docker/OrbStack/Lima with: <code>docker run --rm -it --privileged --pid=host ubuntu bash -c "apt-get update &amp;&amp; apt-get install -y linux-tools-generic bpftool || true; bash"</code> (or inside a Cilium-enabled <code>kind</code> cluster node container).</p>
+  <ol class="steps" data-key="0063-ebpf-cli">
+    <li>List all active eBPF programs currently running in the Linux kernel:
+      <pre><code><span class="prompt">$ </span>sudo bpftool prog show</code></pre>
+      Look for program types: <code>type cgroup_skb</code>, <code>type sched_cls</code>, or <code>type xdp</code>!
+    </li>
+    <li>Inspect the in-kernel eBPF maps storing load balancing data:
+      <pre><code><span class="prompt">$ </span>sudo bpftool map list</code></pre>
+      Observe the hash table maps (<code>type hash</code>) that replace sequential iptables rules.
+    </li>
+    <li>View live Cilium service endpoints using the Cilium CLI:
+      <pre><code><span class="prompt">$ </span>cilium service list</code></pre>
+      Notice the <var>O</var>(1) mapping of frontend virtual IPs directly to backend Pod endpoints.
+    </li>
+  </ol>
+</section>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0063-recall">
+    <p class="r-prompt">From memory: how does eBPF ensure safety without risking kernel panics? How does socket-level short-circuiting accelerate local pod communication?</p>
+    <div class="keypoints">
+      <p><strong>Key points to compare against:</strong></p>
+      <ul>
+        <li><strong>eBPF kernel safety:</strong> Before execution, the In-Kernel Verifier validates all bytecode paths. It mathematically guarantees that memory access remains within bounds, prevents null pointer dereferences, and verifies bounded termination to make kernel hangs or panics impossible.</li>
+        <li><strong>Socket-level short-circuiting:</strong> By hooking the Linux socket layer (`sock_ops`), eBPF recognizes when two communicating Pods reside on the same physical host. It copies data directly from the sender's socket buffer into the receiver's socket buffer, completely bypassing veth virtual devices, Netfilter/iptables, and IP stack encapsulation.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+
+  <h2>Code Implementation: Java &amp; Kotlin</h2>
+  <div class="code-tabs">
+    <div class="tab-buttons">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <div class="code-block-header">
+        <span class="code-lang-label">Java 25</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// eBPF XDP Packet Filter in Java
+import java.util.*;
+
+public class EbpfXdpSimulator {
+    public static final int XDP_DROP = 1;
+    public static final int XDP_PASS = 2;
+
+    public static int runXdp(byte[] frame, Set&lt;String&gt; bpfBlockMap) {
+        if (frame.length &lt; 34) return XDP_PASS;
+        int etherType = ((frame[12] &amp; 0xFF) &lt;&lt; 8) | (frame[13] &amp; 0xFF);
+        if (etherType != 0x0800) return XDP_PASS;
+        var src = (frame[26] &amp; 0xFF) + "." + (frame[27] &amp; 0xFF) + "." +
+                  (frame[28] &amp; 0xFF) + "." + (frame[29] &amp; 0xFF);
+        return bpfBlockMap.contains(src) ? XDP_DROP : XDP_PASS;
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <div class="code-block-header">
+        <span class="code-lang-label">Kotlin</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// eBPF XDP Packet Filter in Kotlin
+const val XDP_DROP = 1
+const val XDP_PASS = 2
+
+fun runXdp(frame: ByteArray, bpfBlockMap: Set&lt;String&gt;): Int {
+    if (frame.size &lt; 34) return XDP_PASS
+    val etherType = ((frame[12].toInt() and 0xFF) shl 8) or (frame[13].toInt() and 0xFF)
+    if (etherType != 0x0800) return XDP_PASS
+    val src = "${frame[26].toInt() and 0xFF}.${frame[27].toInt() and 0xFF}.${frame[28].toInt() and 0xFF}.${frame[29].toInt() and 0xFF}"
+    return if (src in bpfBlockMap) XDP_DROP else XDP_PASS
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Interactive Code Practice: eBPF XDP Packet Parser & Fast Hash Drop Filter</h2>
+  <div class="code-practice" data-key="0063-ebpf-xdp-filter">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Simulate an eBPF XDP (eXpress Data Path) program in the network driver. Given raw Ethernet + IPv4 bytes, extract the source IPv4 address (offset 26..29). Check if the source IP is in a blocked IPs hash set. If blocked, return XDP_DROP (1); otherwise return XDP_PASS (2). If packet is shorter than 34 bytes (14 Ethernet + 20 IP) or not IPv4 (EtherType != 0x0800), return XDP_PASS (2).</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">import java.util.*;
+
+public class Solution {
+    public static final int XDP_DROP = 1;
+    public static final int XDP_PASS = 2;
+
+    public static int xdpFilter(byte[] pkt, Set<String> blockedIps) {
+        // TODO: 1. Check packet length >= 34
+        // TODO: 2. Check EtherType at offset 12..13 is 0x0800 (IPv4)
+        // TODO: 3. Extract src IP at bytes 26..29 and format as "a.b.c.d"
+        // TODO: 4. If blockedIps contains src IP, return XDP_DROP; else XDP_PASS
+        return XDP_PASS;
+    }
+}</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">import java.util.*;
+
+public class Solution {
+    public static final int XDP_DROP = 1;
+    public static final int XDP_PASS = 2;
+
+    public static int xdpFilter(byte[] pkt, Set<String> blockedIps) {
+        // TODO: 1. Check packet length >= 34
+        // TODO: 2. Check EtherType at offset 12..13 is 0x0800 (IPv4)
+        // TODO: 3. Extract src IP at bytes 26..29 and format as "a.b.c.d"
+        // TODO: 4. If blockedIps contains src IP, return XDP_DROP; else XDP_PASS
+        return XDP_PASS;
+    }
+}</script>
+    <script type="text/plain" class="test-harness">
+// __STUDENT_CODE__
+
+import java.util.*;
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0;
+        int total = 3;
+
+        Set<String> blocklist = new HashSet<>(Arrays.asList("198.51.100.4", "203.0.113.88"));
+
+        // Build valid 34-byte packet from 198.51.100.4 (blocked)
+        byte[] pBlocked = new byte[34];
+        pBlocked[12] = 0x08; pBlocked[13] = 0x00; // EtherType 0x0800
+        pBlocked[26] = (byte)198; pBlocked[27] = 51; pBlocked[28] = 100; pBlocked[29] = 4;
+
+        // Build valid packet from 10.0.0.1 (allowed)
+        byte[] pAllowed = new byte[34];
+        pAllowed[12] = 0x08; pAllowed[13] = 0x00;
+        pAllowed[26] = 10; pAllowed[27] = 0; pAllowed[28] = 0; pAllowed[29] = 1;
+
+        // Test 1: Blocked IP returns XDP_DROP
+        int a1 = Solution.xdpFilter(pBlocked, blocklist);
+        if (a1 == Solution.XDP_DROP) {
+            passed++;
+        } else {
+            System.err.println("Test 1 failed: expected XDP_DROP (1), got " + a1);
+        }
+
+        // Test 2: Clean IP returns XDP_PASS
+        int a2 = Solution.xdpFilter(pAllowed, blocklist);
+        if (a2 == Solution.XDP_PASS) {
+            passed++;
+        } else {
+            System.err.println("Test 2 failed: expected XDP_PASS (2), got " + a2);
+        }
+
+        // Test 3: Short packet passes without crash
+        int a3 = Solution.xdpFilter(new byte[10], blocklist);
+        if (a3 == Solution.XDP_PASS) {
+            passed++;
+        } else {
+            System.err.println("Test 3 failed: expected XDP_PASS on short packet, got " + a3);
+        }
+
+        System.out.printf("Passed %d of %d tests.%n", passed, total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">import java.util.*;
+
+public class Solution {
+    public static final int XDP_DROP = 1;
+    public static final int XDP_PASS = 2;
+
+    public static int xdpFilter(byte[] pkt, Set<String> blockedIps) {
+        if (pkt == null || pkt.length < 34) return XDP_PASS;
+        int etherType = ((pkt[12] & 0xFF) << 8) | (pkt[13] & 0xFF);
+        if (etherType != 0x0800) return XDP_PASS;
+
+        String srcIp = String.format("%d.%d.%d.%d",
+            pkt[26] & 0xFF,
+            pkt[27] & 0xFF,
+            pkt[28] & 0xFF,
+            pkt[29] & 0xFF
+        );
+
+        return blockedIps.contains(srcIp) ? XDP_DROP : XDP_PASS;
+    }
+}</script>
+    <script type="application/json" class="hints-data">["Offset 12 and 13 represent the 16-bit EtherType: `((pkt[12] & 0xFF) << 8) | (pkt[13] & 0xFF)`.", "IPv4 source address starts at byte offset 26 through 29.", "Format the octets with `& 0xFF` to avoid negative signed byte values."]</script>
+  </div>
+
+<section>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="q" data-answer="2">
+      <p class="q-prompt">What primary advantage does XDP (eXpress Data Path) provide for high-throughput packet processing?</p>
+      <ol class="options">
+        <li data-why="Incorrect: eBPF programs are sandboxed and verified; they do not crash or corrupt kernel memory.">it processes packets after Netfilter iptables completes DNAT lookups</li>
+        <li data-why="Correct! eBPF (extended Berkeley Packet Filter) allows developers to run sandboxed, verified bytecode programs directly inside the Linux kernel at runtime in response to events (like packet arrival), without modifying kernel code or loading kernel modules.">it offloads TLS 1.3 handshake cryptography to user-space Envoy proxies</li>
+        <li data-why="Incorrect: eBPF is a software kernel virtual machine, not hardware ASIC microcode.">it processes packets at the device driver layer before allocating sk_buffs</li>
+        <li data-why="Incorrect: eBPF operates in kernel space; it does not replace the POSIX C standard library.">it buffers full TCP streams in user space before kernel socket delivery</li>
+      </ol>
+      <div class="q-explain">XDP executes directly inside the network interface driver, dropping or routing packets before memory allocations occur.</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">How does Cilium achieve O(1) constant-time service load balancing lookups in massive clusters?</p>
+      <ol class="options">
+        <li data-why="Incorrect: XDP executes long before packets reach user-space socket buffers.">by maintaining in-kernel eBPF hash-table maps instead of sequential iptables</li>
+        <li data-why="Correct! XDP hooks execute at the lowest possible level in the network subsystem: directly inside the network device driver before the kernel allocates the costly `sk_buff` data structure, enabling line-rate DDoS filtering.">by sending every packet to a centralized cloud router across public fiber</li>
+        <li data-why="Incorrect: Netfilter iptables chains execute much higher in the network stack after sk_buff allocation.">by turning off all TCP sequence number verifications inside the kernel</li>
+        <li data-why="Incorrect: XDP is an ingress packet hook, not an outbound queue scheduler.">by caching DNS responses inside each container's /etc/hosts file</li>
+      </ol>
+      <div class="q-explain">Cilium stores service endpoints in eBPF hash tables, enabling O(1) instant lookups regardless of cluster scale.</div>
+    </div>
+    <div class="q" data-answer="1">
+      <p class="q-prompt">Why does eBPF not require compiling a custom Linux kernel or loading external kernel modules (.ko)?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Cilium routes packets natively without wrapping all traffic in WireGuard.">it links static C libraries directly into user-space application binaries</li>
+        <li data-why="Correct! Cilium attaches eBPF programs directly to the socket layer (`sockops`) and network device hooks (`tc`/XDP), doing $O(1)$ BPF map lookups to forward packets directly between sockets, completely bypassing the netfilter iptables stack.">it loads safe bytecode verified at runtime into existing native kernel hooks</li>
+        <li data-why="Incorrect: Cilium operates on standard Linux kernels without proprietary vendor drivers.">it emulates a full Linux guest virtual machine per container Pod</li>
+        <li data-why="Incorrect: Cilium manages pod networking while preserving standard Linux process separation.">it rewrites system call tables without performing memory bounds checks</li>
+      </ol>
+      <div class="q-explain">eBPF loads verified bytecode dynamically into built-in kernel hooks, combining safety, performance, and portability.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://ebpf.io/">eBPF.io: What is eBPF? An Introduction to Modern Kernel Sandboxing</a>.</p>
+    <p>Architecture review: <a href="https://cilium.io/">Cilium Architectural Whitepaper: eBPF-based Networking, Observability, and Security</a>.</p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>Anything unclear, or anything here you think is wrong: ask your teacher in chat. Bring your <code>bpftool</code> outputs or socket bypass questions; I'll give you feedback on your reasoning.</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0062-kubernetes-services-and-kubeproxy.html"><small>Previous · Session 62</small>Kubernetes Services &amp; kube-proxy</a>
+  <a class="next" href="0064-service-mesh-and-envoy.html"><small>Next · Session 64</small>Service Mesh architecture &amp; Envoy</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

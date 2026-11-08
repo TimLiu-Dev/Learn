@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>34 · Resilient Client Architecture</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<article class="page">
+
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 3 — Developer Track · Session 34</p>
+  <h1>Resilient client architecture: Pools, timeouts, and circuit breakers</h1>
+  <p class="subtitle">Preventing cascading microservice collapses, thundering herds, and socket exhaustion</p>
+  <div class="meta"><span>~25 minutes</span><span>Tools: Timeout configurations</span><span class="badge prod">⚡ production</span><span class="badge interview">★ interview</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>You'll configure the two non-negotiable timeouts (Connect vs. Read) to prevent thread exhaustion, implement Exponential Backoff with Jitter to avoid crushing recovering databases, and apply the Circuit Breaker pattern to isolate distributed failures.</p>
+  </div>
+
+  <div class="warmup">
+    <span class="box-label">Warm-up · from earlier sessions</span>
+    <p>Two minutes, from memory, before you read on:</p>
+    <div class="recall" data-key="0034-warmup-ephemeral">
+      <p class="r-prompt">What happens when a microservice creates thousands of new HTTP connections per second without pooling?</p>
+      <div class="keypoints">
+        The client operating system exhausts its pool of dynamic ephemeral ports (49152–65535) and crashes with errors like <code>Cannot assign requested address</code> or <code>Address already in use</code>.
+      </div>
+    </div>
+  </div>
+
+  <h2>The fallacies of distributed computing</h2>
+  <p class="lede">In 1994, Sun Microsystems engineer L. Peter Deutsch outlined the <em>Fallacies of Distributed Computing</em>: false assumptions made by developers writing network software.<span class="sn"></span><span class="sidenote">Deutsch, Gosling et al.: "The Fallacies of Distributed Computing Explained".</span></p>
+
+  <p>The top three fallacies that take down production systems:</p>
+  <ol>
+    <li><em>"The network is reliable."</em> (Routers reboot, Wi-Fi drops, cables are cut).</li>
+    <li><em>"Latency is zero."</em> (Physics imposes an inescapable speed-of-light tax).</li>
+    <li><em>"Bandwidth is infinite."</em> (Buffers fill, queues drop packets).</li>
+  </ol>
+
+  <h2>The two timeouts you must always configure</h2>
+  <p>Default HTTP clients in many languages (including early Java and Python) have **no timeouts** by default. If a remote server hangs, your application threads freeze indefinitely, accumulating until your entire web server runs out of memory and crashes!</p>
+
+  <div class="table-wrap">
+  <table>
+    <tr><th>Timeout Name</th><th>What it measures</th><th>Recommended Value</th><th>What fails if unset</th></tr>
+    <tr><td><strong>Connect Timeout</strong></td><td>Time to complete the TCP 3-way handshake and TLS setup.</td><td><strong>1 to 2 seconds</strong></td><td>If an upstream server is partitioned or dropped into a black hole, client threads hang for minutes waiting for kernel SYN retries!</td></tr>
+    <tr><td><strong>Read (Socket) Timeout</strong></td><td>Maximum time allowed between incoming data bytes once connected.</td><td><strong>3 to 5 seconds</strong></td><td>If a downstream database query hangs or locks, client threads freeze forever waiting for response bytes.</td></tr>
+  </table>
+  </div>
+
+  <h2>Connection pooling</h2>
+  <p>Establishing a fresh TCP connection plus TLS 1.3 handshake burns multiple round trips and CPU cryptography cycles. A <strong class="term">Connection Pool</strong> (such as OkHttp, Apache HttpClient, or HikariCP) keeps a warm pool of established, pre-authenticated sockets ready for instant reuse.</p>
+  <ul>
+    <li><strong>Sizing the Pool:</strong> Sized to handle concurrent request bursts without creating thousands of idle connections.</li>
+    <li><strong>Evicting Stale Connections:</strong> Firewalls and NAT gateways silently drop idle connections after a timeout without sending a FIN packet. Client pools must periodically validate sockets with TCP keep-alives or maximum idle time limits to prevent writing to "dead" sockets.</li>
+  </ul>
+
+  <h2>Retries &amp; the thundering herd problem</h2>
+  <p>When an API call fails with a network glitch, the natural impulse is to retry. But <strong>naive immediate retries are lethal</strong>.</p>
+  <p>If an overloaded database hiccups for two seconds, causing 5,000 client queries to fail, and all 5,000 clients retry immediately at the exact same millisecond, they deliver a coordinated sledgehammer that obliterates the database just as it begins to recover! This is the <strong class="term">Thundering Herd Problem (Retry Storm)</strong>.</p>
+
+  <figure class="fullwidth" style="max-width:37rem">
+    <svg class="dia" viewBox="0 0 600 170" role="img" aria-label="Jitter diagram showing how randomized delays disperse retry waves over time rather than hammering a server all at once.">
+      <line class="line" x1="40" y1="130" x2="560" y2="130"/>
+      <text x="300" y="155" text-anchor="middle" style="font-size:11px">Time</text>
+      <!-- Clustered spike -->
+      <rect x="100" y="30" width="15" height="100" style="fill:var(--bad);"/><rect x="117" y="20" width="15" height="110" style="fill:var(--bad);"/><rect x="134" y="40" width="15" height="90" style="fill:var(--bad);"/>
+      <text x="125" y="15" text-anchor="middle" style="fill:var(--bad);font-weight:700;font-size:10px">No Jitter (Herd Spike!)</text>
+
+      <!-- Dispersed jitter -->
+      <rect x="280" y="80" width="12" height="50" style="fill:var(--ok);"/><rect x="330" y="90" width="12" height="40" style="fill:var(--ok);"/><rect x="375" y="70" width="12" height="60" style="fill:var(--ok);"/><rect x="440" y="85" width="12" height="45" style="fill:var(--ok);"/><rect x="500" y="95" width="12" height="35" style="fill:var(--ok);"/>
+      <text x="410" y="55" text-anchor="middle" style="fill:var(--ok);font-weight:700;font-size:10px">Exponential Backoff with Full Jitter (Dispersed smoothly!)</text>
+    </svg>
+    <figcaption>Preventing retry storms. Adding random jitter disperses retries across time, allowing backend services to recover.</figcaption>
+  </figure>
+
+  <p><strong>The Fix: Exponential Backoff with Jitter:</strong></p>
+  <ul>
+    <li><strong>Exponential Backoff:</strong> Double the wait time on each attempt: <var>t</var>, 2<var>t</var>, 4<var>t</var>, 8<var>t</var>&hellip;</li>
+    <li><strong>Full Jitter:</strong> Add random noise: <code>sleep = random(0, backoff)</code>. This completely breaks up the synchronization of retrying clients!<span class="sn"></span><span class="sidenote"><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">AWS Architecture Blog: Exponential Backoff And Jitter</a> by Marc Brooker.</span></li>
+  </ul>
+
+  <h2>The circuit breaker pattern</h2>
+  <p>When an upstream service is completely dead, repeatedly retrying burns client threads and server resources. The <strong class="term">Circuit Breaker</strong> (popularized by Netflix Hystrix and Resilience4j) operates in three states:<span class="sn"></span><span class="sidenote">Michael Nygard: <em>Release It! Design and Deploy Production-Ready Software</em> (O'Reilly).</span></p>
+
+  <div class="table-wrap">
+  <table>
+    <tr><th>State</th><th>Behavior</th><th>Transition</th></tr>
+    <tr><td><strong>Closed (Normal)</strong></td><td>Requests flow through to the network normally.</td><td>If error rate exceeds threshold (e.g. 50% failures over 10s), <strong>trips Open</strong>!</td></tr>
+    <tr><td><strong>Open (Failing Fast)</strong></td><td>All calls fail immediately in memory <em>without touching the network</em>! Returns fallback data instantly.</td><td>After a sleep window (e.g. 30 seconds), transitions to <strong>Half-Open</strong>.</td></tr>
+    <tr><td><strong>Half-Open (Trial)</strong></td><td>Allows a small sample of trial requests through to the server.</td><td>If trials succeed, resets to <strong>Closed</strong>. If trials fail, trips back to <strong>Open</strong>.</td></tr>
+  </table>
+  </div>
+
+  <!-- Interactive Fill-In Drill -->
+  <h3>Practice: Client Resilience</h3>
+  <div class="widget fill-in">
+    <ol style="margin:.4rem 0; padding-left:1.3rem;">
+      <li style="margin-bottom:.8rem;">
+        What timeout limits how long a client waits for the initial TCP 3-way handshake to complete?<br>
+        Timeout Name = <input class="blank" data-answer="Connect Timeout" size="16" aria-label="Timeout">
+      </li>
+      <li style="margin-bottom:.8rem;">
+        What mathematical technique randomizes retry delays to prevent the thundering herd problem?<br>
+        Technique = <input class="blank" data-answer="Jitter" size="8" aria-label="Technique">
+      </li>
+      <li>
+        In what circuit breaker state do requests fail immediately in memory without attempting network I/O?<br>
+        State = <input class="blank" data-answer="Open" size="5" aria-label="State"> state
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0034-resilience-recall">
+    <p class="r-prompt">From memory: explain the difference between Connect Timeout and Socket Read Timeout. What is a Circuit Breaker and why is it vital in microservice architectures?</p>
+    <div class="keypoints">
+      <p><strong>Key points to compare against:</strong></p>
+      <ul>
+        <li><strong>Connect vs Read Timeout:</strong> Connect Timeout bounds the time required to complete the TCP 3-way handshake and TLS setup (protects against network partitioning / routing drops). Read (Socket) Timeout bounds the time waiting for response bytes once connected (protects against hanging server processes).</li>
+        <li><strong>Circuit Breaker:</strong> A stability pattern that monitors failure rates. When errors exceed a threshold, it trips to an "Open" state, failing subsequent calls fast in local memory without attempting network calls. This shields failing dependencies from overload and prevents client thread pool exhaustion.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+
+  <h2>Code Example: Exponential Backoff with Full Jitter & Circuit Breaker in Java &amp; Kotlin</h2>
+  <div class="code-tabs">
+    <div class="code-tabs-nav">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+      <button type="button" class="code-copy-btn" aria-label="Copy code">Copy</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <pre><code>public class ResilienceExample {
+    public static void main(String[] args) {
+        System.out.println("Always add jitter to exponential retries to prevent synchronized thundering herd spikes on downstream databases.");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <pre><code>object ResilienceExample {
+    fun main() {
+        println("Always add jitter to exponential retries to prevent synchronized thundering herd spikes on downstream databases.")
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Interactive Code Practice: Exponential Backoff with Full Jitter & Circuit Breaker</h2>
+  <div class="code-practice" data-key="0034-client-resilience">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Implement client resilience: Exponential Backoff with Full Jitter and Circuit Breaker state transitions (CLOSED, OPEN, HALF_OPEN).</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">public class Solution {
+    // 1. Calculate Exponential Backoff with Full Jitter:
+    // capped = min(maxDelayMs, baseDelayMs * 2^attempt)
+    // Return random value between 0 and capped (for deterministic testing, return capped)
+    public static long getBackoffDelay(int attempt, long baseDelayMs, long maxDelayMs) {
+        // TODO: implement
+        return 0L;
+    }
+
+    // 2. Circuit Breaker State Transition:
+    // "CLOSED" + 5 consecutive failures -> "OPEN"
+    // "OPEN" + cooldown passed -> "HALF_OPEN"
+    // "HALF_OPEN" + success -> "CLOSED"
+    public static String updateCircuitBreaker(String state, int failCount, boolean cooldownPassed, boolean lastCallSuccess) {
+        // TODO: implement
+        return state;
+    }
+}</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">public class Solution {
+    // 1. Calculate Exponential Backoff with Full Jitter:
+    // capped = min(maxDelayMs, baseDelayMs * 2^attempt)
+    // Return random value between 0 and capped (for deterministic testing, return capped)
+    public static long getBackoffDelay(int attempt, long baseDelayMs, long maxDelayMs) {
+        // TODO: implement
+        return 0L;
+    }
+
+    // 2. Circuit Breaker State Transition:
+    // "CLOSED" + 5 consecutive failures -> "OPEN"
+    // "OPEN" + cooldown passed -> "HALF_OPEN"
+    // "HALF_OPEN" + success -> "CLOSED"
+    public static String updateCircuitBreaker(String state, int failCount, boolean cooldownPassed, boolean lastCallSuccess) {
+        // TODO: implement
+        return state;
+    }
+}</script>
+    <script type="text/plain" class="test-harness">
+// __STUDENT_CODE__
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0;
+        int total = 3;
+
+        // Test 1: Exponential backoff capping
+        long d0 = Solution.getBackoffDelay(0, 100, 1000); // 100
+        long d2 = Solution.getBackoffDelay(2, 100, 1000); // 400
+        long d5 = Solution.getBackoffDelay(5, 100, 1000); // 3200 -> capped at 1000
+        if (d0 == 100L && d2 == 400L && d5 == 1000L) {
+            System.out.println("PASS: Test 1: Exponential backoff calculation and cap enforced");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 1: Backoff calculation incorrect");
+        }
+
+        // Test 2: Circuit breaker opens on 5 failures
+        String s1 = Solution.updateCircuitBreaker("CLOSED", 5, false, false);
+        if ("OPEN".equals(s1)) {
+            System.out.println("PASS: Test 2: Circuit breaker tripped OPEN after 5 failures");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 2: Circuit breaker should trip open");
+        }
+
+        // Test 3: Half-open recovery
+        String s2 = Solution.updateCircuitBreaker("OPEN", 5, true, false);
+        String s3 = Solution.updateCircuitBreaker("HALF_OPEN", 0, false, true);
+        if ("HALF_OPEN".equals(s2) && "CLOSED".equals(s3)) {
+            System.out.println("PASS: Test 3: Circuit recovered to CLOSED after successful probe");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 3: Recovery transition failed");
+        }
+
+        System.out.println("SUMMARY:" + passed + "/" + total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">public class Solution {
+    public static long getBackoffDelay(int attempt, long baseDelayMs, long maxDelayMs) {
+        long multiplier = 1L << Math.min(attempt, 30);
+        long delay = baseDelayMs * multiplier;
+        return Math.min(delay, maxDelayMs);
+    }
+
+    public static String updateCircuitBreaker(String state, int failCount, boolean cooldownPassed, boolean lastCallSuccess) {
+        if ("CLOSED".equals(state) && failCount >= 5) {
+            return "OPEN";
+        }
+        if ("OPEN".equals(state) && cooldownPassed) {
+            return "HALF_OPEN";
+        }
+        if ("HALF_OPEN".equals(state)) {
+            return lastCallSuccess ? "CLOSED" : "OPEN";
+        }
+        return state;
+    }
+}</script>
+    <script type="application/json" class="hints-data">["Exponential backoff formula: baseDelay * 2^attempt, capped by maxDelay.", "Full jitter picks a uniform random value in [0, cappedDelay] to prevent the thundering herd problem.", "Circuit Breaker prevents cascading distributed system collapse by failing fast when upstream services fail."]</script>
+  </div>
+
+<section>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="q" data-answer="1">
+      <p class="q-prompt">What dangerous failure occurs when hundreds of clients retry failed requests simultaneously without jitter?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Jitter does not shorten average latency; it introduces controlled randomization.">a DNS negative caching failure</li>
+        <li data-why="Incorrect: Jitter is applied to application retry timers, not TCP sequence counters.">a thundering herd retry storm</li>
+        <li data-why="Correct! Jitter decorrelates retry intervals across clients, preventing the 'thundering herd' problem where thousands of clients retry simultaneously in lockstep waves.">a TCP sliding window collapse</li>
+        <li data-why="Incorrect: Jitter has no effect on ephemeral port exhaustion.">an operating system kernel panic</li>
+      </ol>
+      <div class="q-explain">Synchronized retries hammer a struggling downstream server simultaneously, compounding the outage (the thundering herd problem).</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">What does a circuit breaker in the 'Open' state do when an application initiates a request?</p>
+      <ol class="options">
+        <li data-why="Incorrect: In Half-Open state, the breaker does not reject all traffic; it is testing recovery.">fails fast immediately in memory</li>
+        <li data-why="Correct! The Half-Open state permits a limited trial number of requests through. If they succeed, the breaker resets to Closed (healthy); if they fail, it trips back to Open (failing).">spins up a new virtual thread</li>
+        <li data-why="Incorrect: Half-Open does not route traffic to backup databases; it probes the primary service.">sends five parallel UDP packets</li>
+        <li data-why="Incorrect: The circuit breaker evaluates real-time error rates, not operating system CPU metrics.">retries the request every 10 ms</li>
+      </ol>
+      <div class="q-explain">An Open circuit breaker immediately rejects incoming calls in local memory without sending network packets, allowing downstream services to recover.</div>
+    </div>
+    <div class="q" data-answer="3">
+      <p class="q-prompt">Why is connection pooling essential for high-throughput HTTP clients?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Connection pooling does not compress JSON payloads.">it compresses JSON data by 50%</li>
+        <li data-why="Incorrect: Connection pooling respects all operating system firewall rules.">it bypasses local operating system firewalls</li>
+        <li data-why="Incorrect: Memory buffers are allocated per active pooled socket.">it eliminates server-side memory buffers</li>
+        <li data-why="Correct! Connection pooling maintains pre-warmed established TCP and TLS connections, eliminating redundant multi-RTT handshakes and avoiding local ephemeral port exhaustion.">it reuses sockets to avoid handshake RTTs</li>
+      </ol>
+      <div class="q-explain">Connection pooling maintains warm, established TCP+TLS connections, eliminating redundant handshake round trips and preventing ephemeral port exhaustion.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">AWS Architecture Blog: Exponential Backoff And Jitter</a> by Marc Brooker.</p>
+    <p>Going deeper: Michael T. Nygard, <em>Release It! Design and Deploy Production-Ready Software</em> (Chapters 4–5 on Stability Patterns: Timeouts and Circuit Breakers).</p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>Anything unclear, or anything here you think is wrong: ask your teacher in chat. Bring your timeout configurations and retry strategies; I'll give you feedback on your reasoning.</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0033-grpc-and-rpc.html"><small>Previous · Session 33</small>High-performance RPC</a>
+  <a class="next" href="0035-review-developer-track.html"><small>Next · Session 35</small>Review: Developer networking</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

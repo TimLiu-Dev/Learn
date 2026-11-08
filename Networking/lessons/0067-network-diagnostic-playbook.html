@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>67 · The Network Diagnostic Playbook</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<article class="page">
+
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 6 — Capstones &amp; Forensics · Session 67</p>
+  <h1>The Network Diagnostic Playbook: Systematic Triage</h1>
+  <p class="subtitle">Layer-by-layer troubleshooting, the socket error rosetta stone, and distinguishing refusal from timeout</p>
+  <div class="meta"><span>~25 minutes</span><span>Tools: <code>nc</code>, <code>mtr</code>, <code>openssl</code>, <code>curl</code></span><span class="badge interview">★★ interview</span><span class="badge prod">⚡ production</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>You'll acquire the systematic troubleshooting methodology of a Senior Site Reliability Engineer: diagnosing outages from Physical to Application layers in under five minutes, and deciphering socket error codes (Refused vs Timeout vs Reset) with 100% precision.</p>
+  </div>
+
+  <div class="warmup">
+    <span class="box-label">Warm-up · from earlier sessions</span>
+    <p>Two minutes, from memory, before you read on:</p>
+    <div class="recall" data-key="0067-warmup-rst">
+      <p class="r-prompt">What TCP flag is sent by an operating system when a SYN packet arrives on a port where no application is listening?</p>
+      <div class="keypoints">
+        The operating system immediately replies with a <strong>TCP RST (Reset)</strong> packet, aborting the connection attempt.
+      </div>
+    </div>
+  </div>
+
+  <h2>Stop guessing, start triaging</h2>
+  <p class="lede">When a production system is down and executives are in the incident bridge, amateur engineers panic: they flush DNS caches, tweak environment variables, and randomly reboot servers.<span class="sn"></span><span class="sidenote">See Brendan Gregg, <em>Systems Performance: Enterprise and the Cloud</em>.</span></p>
+
+  <p>Staff engineers never guess. They follow a deterministic, layer-by-layer diagnostic playbook that isolates the broken layer in minutes by evaluating feedback from the network stack.</p>
+
+  <h2>The 5-Phase Diagnostic Hierarchy</h2>
+  <figure class="fullwidth" style="max-width:37rem">
+    <svg class="dia" viewBox="0 0 600 240" role="img" aria-label="The 5-Phase Diagnostic Hierarchy: Layer 1/2 Physical Link -> Layer 3 IP & Routing -> Layer 3.5 DNS Resolution -> Layer 4 TCP Port Reachability -> Layer 7 TLS and Application.">
+      <!-- Step 1 -->
+      <rect x="30" y="20" width="540" height="35" rx="3" style="fill:var(--panel); stroke:var(--rule);"/>
+      <text x="50" y="42" style="font-weight:700; font-size:11px">Phase 1: Physical &amp; Local Link (L1/L2)</text>
+      <text x="320" y="42" class="muted" style="font-size:10px">Is link UP? CRC errors? Can we ARP gateway?</text>
+
+      <!-- Step 2 -->
+      <rect x="30" y="65" width="540" height="35" rx="3" style="fill:var(--panel); stroke:var(--rule);"/>
+      <text x="50" y="87" style="font-weight:700; font-size:11px">Phase 2: Network &amp; Routing (L3)</text>
+      <text x="320" y="87" class="muted" style="font-size:10px">Do we have IP? Default route? Can we ping 8.8.8.8?</text>
+
+      <!-- Step 3 -->
+      <rect x="30" y="110" width="540" height="35" rx="3" style="fill:var(--panel); stroke:var(--rule);"/>
+      <text x="50" y="132" style="font-weight:700; font-size:11px">Phase 3: DNS Resolution (L5/Name)</text>
+      <text x="320" y="132" class="muted" style="font-size:10px">Does dig resolve IP? Is DNS timing out?</text>
+
+      <!-- Step 4 -->
+      <rect x="30" y="155" width="540" height="35" rx="3" style="fill:var(--panel); stroke:var(--accent); stroke-width:1.5;"/>
+      <text x="50" y="177" style="font-weight:700; font-size:11px; fill:var(--accent)">Phase 4: Transport Reachability (L4)</text>
+      <text x="320" y="177" class="muted" style="font-size:10px">Can we complete 3-way handshake? (nc -zv)</text>
+
+      <!-- Step 5 -->
+      <rect x="30" y="200" width="540" height="35" rx="3" style="fill:var(--panel); stroke:var(--ok); stroke-width:1.5;"/>
+      <text x="50" y="222" style="font-weight:700; font-size:11px; fill:var(--ok)">Phase 5: TLS &amp; Application (L7)</text>
+      <text x="320" y="222" class="muted" style="font-size:10px">TLS cert valid? HTTP 200 vs 502 vs 504?</text>
+    </svg>
+    <figcaption>The Diagnostic Funnel: Always troubleshoot from the bottom up. Testing Layer 7 when Layer 3 is broken wastes hours of precious outage time.</figcaption>
+  </figure>
+
+  <h2>The Socket Error Rosetta Stone</h2>
+  <p>When an application fails to connect, the OS kernel returns a specific POSIX error code. Each error pinpoints an exact failure mode:</p>
+
+  <table class="session-table" style="margin: 1.2rem 0;">
+    <thead>
+      <tr><th>Operating System Error</th><th>Network Phenomenon</th><th>Definitive Root Cause</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Connection refused</code><br>(<code>ECONNREFUSED</code>)</td>
+        <td>The target host sent an immediate <strong>TCP RST</strong> packet back.</td>
+        <td>The network path is <strong>100% fine!</strong> The packet reached the target machine, but <strong>no application is listening on that port</strong> (the process crashed), or a local host firewall (iptables) rejected the port.</td>
+      </tr>
+      <tr>
+        <td><code>Connection timed out</code><br>(<code>ETIMEDOUT</code>)</td>
+        <td>Client transmitted TCP SYNs repeatedly with exponential backoff; <strong>zero response was received</strong>.</td>
+        <td>Packets were <strong>silently dropped</strong> along the path! A cloud Security Group, hardware firewall, or ISP routing black hole is discarding the packet without sending any ICMP error.</td>
+      </tr>
+      <tr>
+        <td><code>Connection reset by peer</code><br>(<code>ECONNRESET</code>)</td>
+        <td>An active, established connection was abruptly aborted by a TCP RST mid-session.</td>
+        <td>The remote application process crashed, an intermediate stateful firewall timed out the idle connection, or an upstream WAF/DPI middlebox terminated the socket.</td>
+      </tr>
+      <tr>
+        <td><code>No route to host</code><br>(<code>EHOSTUNREACH</code>)</td>
+        <td>An intermediate router returned an <strong>ICMP Destination Unreachable</strong> (Type 3).</td>
+        <td>Routing table error. An intermediate router has no matching route to the destination IP or the destination subnet is administratively down.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>The 5-Minute Terminal Triage Runbook</h2>
+  <ol>
+    <li><strong class="term">Step 1: Test IP connectivity directly (Bypass DNS!):</strong>
+      <pre><code><span class="prompt">$ </span>ping -c 3 8.8.8.8</code></pre>
+      If this succeeds, your local link, IP address, default gateway, and internet NAT are working! If this fails, ping your local gateway (<code>192.168.1.1</code>); if you can't ping your gateway, check <code>arp -a</code> and cable status.
+    </li>
+    <li><strong class="term">Step 2: Test DNS resolution:</strong>
+      <pre><code><span class="prompt">$ </span>dig +short api.example.com</code></pre>
+      If pinging <code>8.8.8.8</code> worked in Step 1 but <code>dig</code> returns nothing, your local DNS resolver is broken.
+    </li>
+    <li><strong class="term">Step 3: Test TCP socket reachability with netcat:</strong>
+      <pre><code><span class="prompt">$ </span>nc -zv -w 3 api.example.com 443</code></pre>
+      Look at the result:
+      <ul>
+        <li><code>Connection to api.example.com 443 port [tcp/https] succeeded!</code> &rarr; L4 is healthy! Problem is at Layer 7.</li>
+        <li><code>Connection refused</code> &rarr; App is down on remote server.</li>
+        <li><code>Operation timed out</code> &rarr; Firewall / Security Group is dropping packets!</li>
+      </ul>
+    </li>
+    <li><strong class="term">Step 4: Test TLS handshake integrity:</strong>
+      <pre><code><span class="prompt">$ </span>openssl s_client -connect api.example.com:443 -servername api.example.com</code></pre>
+      Verify: <code>Verify return code: 0 (ok)</code>. Look for certificate expiration, self-signed root errors, or SNI mismatches.
+    </li>
+    <li><strong class="term">Step 5: Inspect HTTP status codes:</strong>
+      <pre><code><span class="prompt">$ </span>curl -Iv https://api.example.com/healthz</code></pre>
+      <ul>
+        <li><code>502 Bad Gateway</code>: The reverse proxy (Nginx/ALB) reached the backend, but the backend application crashed or returned an invalid HTTP response.</li>
+        <li><code>504 Gateway Timeout</code>: The reverse proxy reached the backend, but the backend took too long to answer and timed out.</li>
+      </ul>
+    </li>
+  </ol>
+
+  <!-- Interactive Fill-In Drill -->
+  <h3>Practice: Diagnostic Error Decoding</h3>
+  <div class="widget fill-in">
+    <ol style="margin:.4rem 0; padding-left:1.3rem;">
+      <li style="margin-bottom:.8rem;">
+        What error is returned when packets reach a server, but no application process is listening on the port?<br>
+        Error Message = Connection <input class="blank" data-answer="refused|Refused" size="8" aria-label="Error message">
+      </li>
+      <li style="margin-bottom:.8rem;">
+        What error occurs when packets are silently dropped along the path by a cloud Security Group?<br>
+        Error Message = Connection <input class="blank" data-answer="timed out|timeout|Timed out" size="10" aria-label="Error message">
+      </li>
+      <li>
+        Does an HTTP 502 Bad Gateway error indicate that the reverse proxy failed to reach the upstream or that the upstream crashed?<br>
+        Failure = Upstream <input class="blank" data-answer="crashed|failed|returned invalid" size="8" aria-label="Upstream failure">
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>Hands-on: Reproducing socket errors in the terminal</h2>
+  <ol class="steps" data-key="0067-diag-cli">
+    <li>Trigger a real <code>Connection refused</code> error by querying a port with no listening service:
+      <pre><code><span class="prompt">$ </span>nc -zv 127.0.0.1 59999</code></pre>
+      Notice the immediate, instantaneous rejection (TCP RST emitted by your own kernel!).
+    </li>
+    <li>Trigger a <code>Connection timed out</code> error by attempting to connect to a blackholed/firewalled IP:
+      <pre><code><span class="prompt">$ </span>nc -zv -w 2 192.0.2.1 443</code></pre>
+      Notice the 2-second hang as SYN packets disappear into the void with zero response.
+    </li>
+    <li>Diagnose latency spikes and intermediate packet loss using <code>mtr</code> or <code>traceroute</code>:
+      <pre><code><span class="prompt">$ </span>traceroute -m 10 1.1.1.1</code></pre>
+      Identify the exact hop where latency jumps or asterisks (<code>* * *</code>) appear.
+    </li>
+  </ol>
+</section>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0067-recall">
+    <p class="r-prompt">From memory: explain the exact difference between "Connection refused" and "Connection timed out." What does each tell you about the state of the network?</p>
+    <div class="keypoints">
+      <p><strong>Key points to compare against:</strong></p>
+      <ul>
+        <li><strong>Connection refused (ECONNREFUSED):</strong> Proves the network path is fully functional. The client's TCP SYN reached the destination server, but the destination OS kernel sent back an immediate TCP RST because no application is bound to that port (or a host firewall rejected it).</li>
+        <li><strong>Connection timed out (ETIMEDOUT):</strong> The network path is blocked. The client sent TCP SYNs but received zero response. A firewall (like an AWS Security Group), packet filter, or dead router dropped the packet silently without emitting an ICMP error or TCP RST.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+
+  <h2>Code Implementation: Java &amp; Kotlin</h2>
+  <div class="code-tabs">
+    <div class="tab-buttons">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <div class="code-block-header">
+        <span class="code-lang-label">Java 25</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// Network Diagnostic Triage Classifier in Java
+public class NetworkTriage {
+    public static String classify(boolean dns, boolean ping, boolean tcp, boolean tls, int http) {
+        if (!dns) return "L3_DNS_FAILURE";
+        if (!ping &amp;&amp; !tcp) return "L3_HOST_UNREACHABLE";
+        if (!tcp) return "L4_PORT_CLOSED_OR_FIREWALL";
+        if (!tls) return "L6_TLS_CERT_OR_CIPHER_FAILURE";
+        return switch (http) {
+            case 200 -&gt; "HEALTHY";
+            case 502 -&gt; "L7_BAD_GATEWAY";
+            case 504 -&gt; "L7_UPSTREAM_TIMEOUT";
+            default -&gt; "UNKNOWN";
+        };
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <div class="code-block-header">
+        <span class="code-lang-label">Kotlin</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// Network Diagnostic Triage Classifier in Kotlin
+fun classifyTriage(dns: Boolean, ping: Boolean, tcp: Boolean, tls: Boolean, http: Int): String = when {
+    !dns -&gt; "L3_DNS_FAILURE"
+    !ping &amp;&amp; !tcp -&gt; "L3_HOST_UNREACHABLE"
+    !tcp -&gt; "L4_PORT_CLOSED_OR_FIREWALL"
+    !tls -&gt; "L6_TLS_CERT_OR_CIPHER_FAILURE"
+    http == 200 -&gt; "HEALTHY"
+    http == 502 -&gt; "L7_BAD_GATEWAY"
+    http == 504 -&gt; "L7_UPSTREAM_TIMEOUT"
+    else -&gt; "UNKNOWN"
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Interactive Code Practice: Network Diagnostic Triage Root-Cause Engine</h2>
+  <div class="code-practice" data-key="0067-diagnostic-triage">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Implement a layered network diagnostic classifier: evaluates probe results (DNS, ICMP ping, TCP port probe, TLS handshake, HTTP status code) and pinpoint the root-cause failure layer.</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">public class Solution {
+    public static String diagnose(
+            boolean dnsSuccess,
+            boolean pingSuccess,
+            boolean tcpPortOpen,
+            boolean tlsHandshakeOk,
+            int httpStatusCode) {
+        // TODO:
+        // 1. If !dnsSuccess -> "L3_DNS_FAILURE"
+        // 2. If !pingSuccess && !tcpPortOpen -> "L3_HOST_UNREACHABLE"
+        // 3. If pingSuccess && !tcpPortOpen -> "L4_PORT_CLOSED_OR_FIREWALL"
+        // 4. If tcpPortOpen && !tlsHandshakeOk -> "L6_TLS_CERT_OR_CIPHER_FAILURE"
+        // 5. If httpStatusCode == 504 -> "L7_UPSTREAM_TIMEOUT"
+        // 6. If httpStatusCode == 502 -> "L7_BAD_GATEWAY"
+        // 7. If httpStatusCode == 200 -> "HEALTHY"
+        return "UNKNOWN";
+    }
+}</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">public class Solution {
+    public static String diagnose(
+            boolean dnsSuccess,
+            boolean pingSuccess,
+            boolean tcpPortOpen,
+            boolean tlsHandshakeOk,
+            int httpStatusCode) {
+        // TODO:
+        // 1. If !dnsSuccess -> "L3_DNS_FAILURE"
+        // 2. If !pingSuccess && !tcpPortOpen -> "L3_HOST_UNREACHABLE"
+        // 3. If pingSuccess && !tcpPortOpen -> "L4_PORT_CLOSED_OR_FIREWALL"
+        // 4. If tcpPortOpen && !tlsHandshakeOk -> "L6_TLS_CERT_OR_CIPHER_FAILURE"
+        // 5. If httpStatusCode == 504 -> "L7_UPSTREAM_TIMEOUT"
+        // 6. If httpStatusCode == 502 -> "L7_BAD_GATEWAY"
+        // 7. If httpStatusCode == 200 -> "HEALTHY"
+        return "UNKNOWN";
+    }
+}</script>
+    <script type="text/plain" class="test-harness">
+// __STUDENT_CODE__
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0;
+        int total = 3;
+
+        // Test 1: Host responds to ping but port 443 closed -> L4_PORT_CLOSED_OR_FIREWALL
+        String d1 = Solution.diagnose(true, true, false, false, 0);
+        if ("L4_PORT_CLOSED_OR_FIREWALL".equals(d1)) {
+            passed++;
+        } else {
+            System.err.println("Test 1 failed: expected L4_PORT_CLOSED_OR_FIREWALL, got " + d1);
+        }
+
+        // Test 2: TCP open but TLS handshake certificate expired -> L6_TLS_CERT_OR_CIPHER_FAILURE
+        String d2 = Solution.diagnose(true, true, true, false, 0);
+        if ("L6_TLS_CERT_OR_CIPHER_FAILURE".equals(d2)) {
+            passed++;
+        } else {
+            System.err.println("Test 2 failed: expected L6_TLS_CERT_OR_CIPHER_FAILURE, got " + d2);
+        }
+
+        // Test 3: Upstream reverse proxy timeout -> L7_UPSTREAM_TIMEOUT
+        String d3 = Solution.diagnose(true, true, true, true, 504);
+        if ("L7_UPSTREAM_TIMEOUT".equals(d3)) {
+            passed++;
+        } else {
+            System.err.println("Test 3 failed: expected L7_UPSTREAM_TIMEOUT, got " + d3);
+        }
+
+        System.out.printf("Passed %d of %d tests.%n", passed, total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">public class Solution {
+    public static String diagnose(
+            boolean dnsSuccess,
+            boolean pingSuccess,
+            boolean tcpPortOpen,
+            boolean tlsHandshakeOk,
+            int httpStatusCode) {
+        if (!dnsSuccess) return "L3_DNS_FAILURE";
+        if (!pingSuccess && !tcpPortOpen) return "L3_HOST_UNREACHABLE";
+        if (pingSuccess && !tcpPortOpen) return "L4_PORT_CLOSED_OR_FIREWALL";
+        if (!tlsHandshakeOk) return "L6_TLS_CERT_OR_CIPHER_FAILURE";
+        if (httpStatusCode == 504) return "L7_UPSTREAM_TIMEOUT";
+        if (httpStatusCode == 502) return "L7_BAD_GATEWAY";
+        if (httpStatusCode == 200) return "HEALTHY";
+        return "UNKNOWN";
+    }
+}</script>
+    <script type="application/json" class="hints-data">["Evaluate in order from lowest to highest network layer: DNS -> L3 Connectivity -> L4 Transport -> L6 TLS -> L7 HTTP.", "If ping succeeds but TCP connection fails, the host is reachable but the target port is closed or blocked by a stateful firewall.", "Map 504 to L7_UPSTREAM_TIMEOUT and 502 to L7_BAD_GATEWAY."]</script>
+  </div>
+
+<section>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="q" data-answer="1">
+      <p class="q-prompt">An application fails to connect to a database with "Connection refused." What should you check first?</p>
+      <ol class="options">
+        <li data-why="Incorrect: 'Connection refused' means a TCP RST was received from the target host; the physical network path reached the destination.">check if the transatlantic subsea optical fiber has been severed</li>
+        <li data-why="Correct! 'Connection refused' (TCP RST) proves that the network path and target host are reachable, but no process is actively listening on that destination port (or local firewall explicitly rejected it). Check if the database service is running and bound to the correct interface.">verify whether the database process is running and bound to the port</li>
+        <li data-why="Incorrect: If a Network ACL dropped the packet, the client would experience a connection timeout, not an immediate 'Connection refused'.">modify the subnet Network ACL to allow ephemeral ports inbound</li>
+        <li data-why="Incorrect: Client disk space does not cause the remote host kernel to return a TCP RST.">check whether the client operating system has run out of disk space</li>
+      </ol>
+      <div class="q-explain">Connection refused proves the network reached the server; the database process is either stopped or listening on a different interface/port.</div>
+    </div>
+    <div class="q" data-answer="2">
+      <p class="q-prompt">An application returns "Connection timed out" when connecting to an internal cloud server. What is the most likely cause?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Duplex mismatches cause packet loss and collisions, but typically result in degraded performance rather than complete connection timeouts.">the client computer is running on half-duplex copper Ethernet</li>
+        <li data-why="Incorrect: Server cookies are HTTP application headers that have no effect on establishing initial TCP handshakes.">the remote server's web browser cookie storage has overflowed</li>
+        <li data-why="Correct! 'Connection timed out' occurs when the client transmits TCP SYN packets but receives zero reply. This is the classic symptom of a stateful firewall or cloud Security Group silently dropping packets without sending a rejection.">a cloud Security Group or firewall is silently dropping the SYN packet</li>
+        <li data-why="Incorrect: OSPF routing anomalies would result in 'Destination Host Unreachable' (ICMP Type 3), not silent drop timeouts.">the BGP looking glass is running an unauthenticated OSPF process</li>
+      </ol>
+      <div class="q-explain">Timeouts occur when packets vanish without reply, characteristically caused by stateful firewalls or security groups dropping traffic.</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">What is the difference between an HTTP 502 Bad Gateway and an HTTP 504 Gateway Timeout?</p>
+      <ol class="options">
+        <li data-why="Correct! 502 (Bad Gateway) means the proxy contacted the upstream server, but the upstream returned an invalid response, reset the TCP connection, or crashed prematurely. 504 (Gateway Timeout) means the proxy sent the request but the upstream failed to reply before the read timeout expired.">502 means upstream returned an invalid response; 504 means upstream timed out</li>
+        <li data-why="Incorrect: Client authentication failures return 401 Unauthorized or 403 Forbidden.">502 means client auth failed; 504 means request payload was too large</li>
+        <li data-why="Incorrect: Client socket timeouts are detected on the client, whereas 502/504 are HTTP responses generated by the reverse proxy.">502 means client socket timed out; 504 means TLS verification failed</li>
+        <li data-why="Incorrect: Client certificate errors return 400 Bad Request or fail at the TLS layer; DNS failures prevent reaching the proxy entirely.">502 means the client lacks a TLS certificate; 504 means DNS failed</li>
+      </ol>
+      <div class="q-explain">502 indicates the proxy received a malformed/crashed response from upstream; 504 indicates the proxy gave up waiting for upstream to reply.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://www.brendangregg.com/systems-performance-2nd-edition-book.html">Brendan Gregg, <em>Systems Performance: Enterprise and the Cloud</em> (2nd Edition)</a>, Chapter 10: Network.</p>
+    <p>Operational classic: W. Richard Stevens, <em>TCP/IP Illustrated, Volume 1: The Protocols</em>.</p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>Anything unclear, or anything here you think is wrong: ask your teacher in chat. Bring your socket error logs or <code>mtr</code> latency traces; I'll give you feedback on your reasoning.</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0066-the-url-question.html"><small>Previous · Session 66</small>Capstone: The URL Question</a>
+  <a class="next" href="0068-project-raw-socket-http-server-1.html"><small>Next · Session 68</small>Project: Raw socket HTTP server (Part 1)</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

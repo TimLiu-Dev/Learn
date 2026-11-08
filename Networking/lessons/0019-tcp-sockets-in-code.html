@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Sockets in Code: Raw TCP Server</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<article class="page">
+
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 2 — Transport · Session 19</p>
+  <h1>Sockets in code: Raw TCP server and stream framing</h1>
+  <p class="subtitle">ServerSocket, blocking I/O, and solving the boundary problem in continuous byte streams</p>
+  <div class="meta"><span>~30 minutes</span><span>Tools: Java/Kotlin, <code>nc</code></span><span class="badge interview">★ interview</span><span class="badge prod">💻 code</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>You'll build and run a multithreaded TCP server from raw sockets in Java/Kotlin, connect to it using Netcat, and implement the two universal stream framing techniques (delimiters and length-prefixes) that every network protocol on Earth must use.</p>
+  </div>
+
+  <div class="warmup">
+    <span class="box-label">Warm-up · from earlier sessions</span>
+    <p>Two minutes, from memory, before you read on:</p>
+    <div class="recall" data-key="0019-warmup-nagle">
+      <p class="r-prompt">Why does combining Nagle's algorithm with Delayed ACKs cause artificial 200 ms latency spikes, and what socket flag fixes it?</p>
+      <div class="keypoints">
+        Nagle holds small outgoing packets until prior data is ACKed, while Delayed ACK holds incoming ACKs up to 200 ms waiting for a reply. When an app sends two small writes back-to-back, neither side moves until the 200 ms timer fires. Fixed with <code>socket.setTcpNoDelay(true)</code>.
+      </div>
+    </div>
+  </div>
+
+  <h2>The Berkeley sockets API</h2>
+  <p class="lede">Every modern operating system implements the BSD socket interface designed in 1983. Whether you write in C, Java, Kotlin, Python, or Go, the underlying system calls are identical:<span class="sn"></span><span class="sidenote"><a href="https://beej.us/guide/bgnet/">Beej's Guide to Network Programming</a>: The classic handbook for the BSD socket API.</span></p>
+
+  <div class="table-wrap">
+  <table>
+    <tr><th>Server Call</th><th>What it does</th><th>Client Call</th><th>What it does</th></tr>
+    <tr><td><code>socket()</code></td><td>Creates a socket file descriptor in kernel memory.</td><td><code>socket()</code></td><td>Creates a client socket descriptor.</td></tr>
+    <tr><td><code>bind(port)</code></td><td>Associates the socket with a specific local port and IP.</td><td>—</td><td>—</td></tr>
+    <tr><td><code>listen()</code></td><td>Marks socket as passive, ready to accept connections.</td><td>—</td><td>—</td></tr>
+    <tr><td><code>accept()</code></td><td><strong>Blocks</strong> until a 3-way handshake completes; returns a new socket for that client!</td><td><code>connect()</code></td><td><strong>Blocks</strong> while sending SYN and performing the 3-way handshake.</td></tr>
+    <tr><td><code>read() / write()</code></td><td>Reads and writes bytes over the established stream.</td><td><code>read() / write()</code></td><td>Reads and writes bytes over the established stream.</td></tr>
+    <tr><td><code>close()</code></td><td>Sends FIN to begin the 4-way teardown.</td><td><code>close()</code></td><td>Sends FIN to begin the 4-way teardown.</td></tr>
+  </table>
+  </div>
+
+  <h2>The stream framing dilemma</h2>
+  <p>In session 14, we saw that UDP is message-oriented (preserves packet boundaries). <strong>TCP is a continuous byte stream. It has zero concept of message boundaries!</strong></p>
+
+  <p>If your client sends two messages:</p>
+  <pre><code>out.write("Hello");
+out.write("World");</code></pre>
+
+  <p>TCP treats this as a single sequence of 10 bytes: <code>H-e-l-l-o-W-o-r-l-d</code>. Due to packet fragmentation, buffering, and Nagle coalescing, the server's <code>read()</code> call might return:</p>
+  <ul>
+    <li>Case 1: <code>"HelloWorld"</code> (both messages packed into one packet).</li>
+    <li>Case 2: <code>"Hel"</code> followed by <code>"loWorld"</code> (split across two packet arrivals).</li>
+    <li>Case 3: <code>"Hello"</code> followed by <code>"World"</code> (two separate reads).</li>
+  </ul>
+
+  <p>Because any of these cases can happen at any moment, the application protocol <strong>must invent its own framing</strong> to tell where one message ends and the next begins:</p>
+
+  <div class="callout">
+    <span class="box-label">The Two Universal Framing Strategies</span>
+    <ol style="margin:.3rem 0; padding-left:1.2rem;">
+      <li style="margin-bottom:.5rem;"><strong>Delimiter-Based Framing:</strong> Terminate each message with a special sentinel byte sequence. For example, SMTP, Redis (RESP), and HTTP headers use <code>\r\n</code> (CRLF). The receiver buffers incoming bytes until it sees the delimiter.</li>
+      <li><strong>Length-Prefix Framing:</strong> Prepend every message with a fixed-size number indicating how many payload bytes follow. For example, gRPC, Protobuf, and WebSocket frames prepend a length header; HTTP uses <code>Content-Length: 42</code>. The receiver reads the header, knows exactly how many bytes to expect, and loops until all bytes arrive.</li>
+    </ol>
+  </div>
+
+  <h2>Code: A multithreaded raw TCP server in Java</h2>
+  <p>Save this as <code>EchoServer.java</code>. You can run it directly on modern Java (JDK 21+) with <code>java EchoServer.java</code>. It uses modern virtual threads to handle thousands of concurrent clients effortlessly:</p>
+
+  <pre><code>import java.io.*;
+import java.net.*;
+import java.util.concurrent.*;
+
+public class EchoServer {
+    public static void main(String[] args) throws IOException {
+        int port = 8080;
+        try (var serverSocket = new ServerSocket(port)) {
+            System.out.println("EchoServer listening on port " + port + "...");
+            
+            // Modern Java: One virtual thread per client connection!
+            try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                while (true) {
+                    Socket clientSocket = serverSocket.accept();
+                    clientSocket.setTcpNoDelay(true); // Disable Nagle!
+                    executor.submit(() -> handleClient(clientSocket));
+                }
+            }
+        }
+    }
+
+    private static void handleClient(Socket socket) {
+        try (socket;
+             var reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+             var writer = new PrintWriter(socket.getOutputStream(), true)) {
+            
+            System.out.println("New client connected: " + socket.getRemoteSocketAddress());
+            String line;
+            // Delimiter-based framing: reads until newline '\n'
+            while ((line = reader.readLine()) != null) {
+                if ("quit".equalsIgnoreCase(line.trim())) break;
+                System.out.println("Received: " + line);
+                writer.println("ECHO: " + line); // Echo back with newline delimiter
+            }
+        } catch (IOException e) {
+            System.err.println("Client error: " + e.getMessage());
+        }
+    }
+}</code></pre>
+
+  <!-- Interactive Fill-In Drill -->
+  <h3>Practice: Socket Methods &amp; Framing</h3>
+  <div class="widget fill-in">
+    <ol style="margin:.4rem 0; padding-left:1.3rem;">
+      <li style="margin-bottom:.8rem;">
+        Which ServerSocket method blocks execution until an incoming client completes the 3-way handshake?<br>
+        Method = <input class="blank" data-answer="accept()" size="9" aria-label="Method name">
+      </li>
+      <li style="margin-bottom:.8rem;">
+        What character sequence is used by HTTP/1.1 to delimit the end of request headers?<br>
+        Delimiter = <input class="blank" data-answer="\r\n\r\n" size="9" aria-label="Delimiter">
+      </li>
+      <li>
+        In length-prefix framing, what information does the fixed-size header carry?<br>
+        Payload property = <input class="blank" data-answer="length" size="8" aria-label="Property">
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>Try it: test your server with Netcat</h2>
+  <ol class="steps" data-key="0019-socket-run">
+    <li>Open a terminal on your Mac and run the Java server:
+      <pre><code><span class="prompt">$ </span>java EchoServer.java</code></pre>
+    </li>
+    <li>Open a second terminal window and connect as a raw TCP client:
+      <pre><code><span class="prompt">$ </span>nc 127.0.0.1 8080</code></pre>
+    </li>
+    <li>Type "Hello Networking!" and press Return. Notice the immediate reply: <code>ECHO: Hello Networking!</code></li>
+    <li>Type "quit" to gracefully trigger socket close.</li>
+  </ol>
+</section>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0019-sockets-recall">
+    <p class="r-prompt">From memory: why can't a TCP server assume that one write() call on the client equals one read() call on the server? Describe the two main framing solutions.</p>
+    <div class="keypoints">
+      <p><strong>Key points to compare against:</strong></p>
+      <ul>
+        <li><strong>Why writes don't equal reads:</strong> TCP is a continuous byte stream with no message boundaries. The OS kernel may buffer, coalesce (Nagle), or fragment bytes into segments based on MSS and window sizes. Multiple writes can arrive in one read, or one write can be split across multiple reads.</li>
+        <li><strong>The two framing solutions:</strong> (1) <strong>Delimiter-based framing:</strong> append a unique delimiter (like <code>\n</code> or <code>\r\n\r\n</code>) to mark message boundaries; (2) <strong>Length-prefix framing:</strong> prepend a fixed-size header containing the byte length of the following payload (like <code>Content-Length</code> in HTTP or length prefixes in gRPC).</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+
+  <h2>Code Example: Stream Framing: Delimiter & Length-Prefix Parsers in Java &amp; Kotlin</h2>
+  <div class="code-tabs">
+    <div class="code-tabs-nav">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+      <button type="button" class="code-copy-btn" aria-label="Copy code">Copy</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <pre><code>public class FramingExample {
+    public static void main(String[] args) {
+        System.out.println("TCP has no concept of packet boundaries; application protocols must frame with delimiters or length-prefixes.");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <pre><code>object FramingExample {
+    fun main() {
+        println("TCP has no concept of packet boundaries; application protocols must frame with delimiters or length-prefixes.")
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Interactive Code Practice: Stream Framing: Delimiter & Length-Prefix Parsers</h2>
+  <div class="code-practice" data-key="0019-stream-framing">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Implement delimiter-based framing (e.g. CRLF) to split a continuous TCP byte stream into discrete application messages.</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">import java.util.*;
+
+public class Solution {
+    // Parse continuous byte stream buffer into discrete messages separated by delimiter (e.g. "\\n")
+    // Trailing incomplete data should NOT be emitted as a message
+    public static List<String> parseDelimiterMessages(String stream, String delimiter) {
+        // TODO: implement
+        return Collections.emptyList();
+    }
+}</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">import java.util.*;
+
+public class Solution {
+    // Parse continuous byte stream buffer into discrete messages separated by delimiter (e.g. "\\n")
+    // Trailing incomplete data should NOT be emitted as a message
+    public static List<String> parseDelimiterMessages(String stream, String delimiter) {
+        // TODO: implement
+        return Collections.emptyList();
+    }
+}</script>
+    <script type="text/plain" class="test-harness">
+// __STUDENT_CODE__
+import java.util.*;
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0;
+        int total = 3;
+
+        // Test 1: Complete messages
+        List<String> m1 = Solution.parseDelimiterMessages("PING\nPONG\n", "\n");
+        if (m1.size() == 2 && "PING".equals(m1.get(0)) && "PONG".equals(m1.get(1))) {
+            System.out.println("PASS: Test 1: Extracted 2 complete delimiter messages");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 1: Complete message extraction failed");
+        }
+
+        // Test 2: Incomplete trailing packet fragment (not emitted until delimiter arrives!)
+        List<String> m2 = Solution.parseDelimiterMessages("MSG1\r\nMSG2\r\nINCOMPL", "\r\n");
+        if (m2.size() == 2 && "MSG1".equals(m2.get(0)) && "MSG2".equals(m2.get(1))) {
+            System.out.println("PASS: Test 2: Incomplete trailing fragment correctly retained");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 2: Incomplete trailing fragment handling failed");
+        }
+
+        // Test 3: No delimiters present in stream
+        List<String> m3 = Solution.parseDelimiterMessages("PARTIAL_PAYLOAD", "\n");
+        if (m3.isEmpty()) {
+            System.out.println("PASS: Test 3: Zero messages emitted when delimiter absent");
+            passed++;
+        } else {
+            System.out.println("FAIL: Test 3: Should return empty list");
+        }
+
+        System.out.println("SUMMARY:" + passed + "/" + total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">import java.util.*;
+
+public class Solution {
+    public static List<String> parseDelimiterMessages(String stream, String delimiter) {
+        List<String> messages = new ArrayList<>();
+        if (stream == null || delimiter == null || delimiter.isEmpty()) return messages;
+
+        int start = 0;
+        int idx;
+        while ((idx = stream.indexOf(delimiter, start)) != -1) {
+            messages.add(stream.substring(start, idx));
+            start = idx + delimiter.length();
+        }
+        return messages;
+    }
+}</script>
+    <script type="application/json" class="hints-data">["Use stream.indexOf(delimiter, start) in a while loop.", "Only add substring(start, idx) to the result list when a delimiter is found.", "Any characters after the last delimiter represent an in-flight fragment that must wait for more bytes to arrive over TCP."]</script>
+  </div>
+
+<section>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="q" data-answer="1">
+      <p class="q-prompt">What does the accept() call return on a TCP ServerSocket?</p>
+      <ol class="options">
+        <li data-why="Incorrect: The ServerSocket itself already holds the listening port number.">the server listening port number</li>
+        <li data-why="Correct! accept() blocks until an incoming client connects, then returns a brand-new Socket dedicated to communicating with that specific client over the established 5-tuple.">a new socket for that specific client</li>
+        <li data-why="Incorrect: Byte counters are tracked by socket streams, not returned by accept().">the total bytes received so far</li>
+        <li data-why="Incorrect: Gateway IP is a routing property, not returned by socket connection calls.">the IP address of the local gateway</li>
+      </ol>
+      <div class="q-explain">accept() returns a new dedicated Socket representing the established 5-tuple connection with that specific client, leaving the ServerSocket free to accept further connections.</div>
+    </div>
+    <div class="q" data-answer="3">
+      <p class="q-prompt">Why does HTTP/1.1 send a Content-Length header with request bodies?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Content-Length has no bearing on router queue latency.">to calculate router queue latency</li>
+        <li data-why="Incorrect: TLS encryption handles security independently of HTTP Content-Length.">to encrypt the body with TLS</li>
+        <li data-why="Incorrect: Content-Length reports uncompressed or compressed payload byte length, but its primary purpose is framing.">to compress the payload bytes</li>
+        <li data-why="Correct! Because TCP is an unstructured continuous stream of bytes, the receiver needs Content-Length to know exactly how many payload bytes belong to this message before parsing the next.">to tell the receiver where the body ends</li>
+      </ol>
+      <div class="q-explain">Because TCP is a continuous byte stream, the receiver needs Content-Length (length-prefix framing) to know exactly how many body bytes to read before waiting for the next request.</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">Which method does a client call to initiate the TCP 3-way handshake?</p>
+      <ol class="options">
+        <li data-why="Correct! The client invokes connect(), which dispatches the initial SYN segment and blocks until the 3-way handshake completes.">connect()</li>
+        <li data-why="Incorrect: bind() assigns a local IP:port to a socket, but does not initiate a connection.">bind()</li>
+        <li data-why="Incorrect: listen() is a server-side call that transitions a socket into the passive listening state.">listen()</li>
+        <li data-why="Incorrect: accept() is a server-side call that extracts established connections from the listen queue.">accept()</li>
+      </ol>
+      <div class="q-explain">The client invokes connect(), which dispatches the SYN segment and blocks until the SYN-ACK and ACK handshake exchange completes.</div>
+    </div>
+    <div class="q" data-answer="2">
+      <p class="q-prompt">What happens if a TCP server uses delimiter framing with '\n' but the payload contains unescaped '\n' bytes?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Routers do not inspect application payload delimiters; packets are forwarded normally.">the router drops the entire packet</li>
+        <li data-why="Incorrect: The operating system manages raw bytes; delimiter parsing is performed in user space without kernel crashes.">the OS crashes with a buffer error</li>
+        <li data-why="Correct! In delimiter framing, if the delimiter character (e.g. '\n') appears unescaped within user data, the receiver treats it as the end of the message, prematurely slicing the payload.">the message is prematurely sliced</li>
+        <li data-why="Incorrect: TCP connection state is unaffected by application payload framing errors.">TCP resets the connection with RST</li>
+      </ol>
+      <div class="q-explain">If delimiter characters appear unescaped inside user data, the receiver assumes the message ended early, corrupting message parsing.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://docs.oracle.com/javase/tutorial/networking/sockets/index.html">Oracle Java Networking Tutorial: All About Sockets</a>. The canonical reference for Java socket programming.</p>
+    <p>Going deeper: <a href="https://beej.us/guide/bgnet/">Beej's Guide to Network Programming</a> (Chapters 3–5) and <a href="https://book.systemsapproach.org/e2e/sockets.html">Systems Approach §1.4 ("Socket Interface")</a>.</p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>Anything unclear, or anything here you think is wrong: ask your teacher in chat. Bring your Netcat echo testing results and your thoughts on delimiter vs length-prefix framing; I'll give you feedback on your reasoning.</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0018-tcp-dilemmas.html"><small>Previous · Session 18</small>Transport dilemmas: Nagle &amp; HoL</a>
+  <a class="next" href="0020-review-transport.html"><small>Next · Session 20</small>Review: Transport layer mastery</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

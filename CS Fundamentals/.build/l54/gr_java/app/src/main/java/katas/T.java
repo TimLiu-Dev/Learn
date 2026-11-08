@@ -1,0 +1,3 @@
+package katas;
+
+public enum T { NUMBER, IDENT, LET, PLUS, MINUS, STAR, SLASH, PERCENT, CARET, LPAREN, RPAREN, EQUAL, SEMI, EOF }

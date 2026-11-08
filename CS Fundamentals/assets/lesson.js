@@ -11,6 +11,10 @@
  *       <p class="why">Explanation, shown after answering.</p>
  *     </div>
  *     data-answer is the 0-based index of the correct button.
+ *     Optional, after .why: <ol class="whyopts"><li>…</li>…</ol>, one <li> per button in the same order,
+ *     saying why that option is right or wrong. Shown after answering, each labelled with its option.
+ *     A code question uses <div class="q"> so it can hold a <pre> listing.
+ *     Answering fires a "quiz:answered" event on the .quiz (playground.js uses it to unlock running its code).
  *
  *   Self-rating: pick one value per row.
  *     <div class="rating" data-id="T1-kotlin" data-label="T1 Temps (Kotlin)">
@@ -27,6 +31,12 @@
  *   Reset: <button class="btn ghost" data-reset>Reset this lesson</button>
  */
 (function () {
+  // Runnable Kotlin and practice widgets live in playground.js, next to this file.
+  if (document.currentScript) {
+    const pg = document.createElement("script");
+    pg.src = new URL("playground.js", document.currentScript.src).href;
+    document.head.appendChild(pg);
+  }
   const lesson = document.body.dataset.lesson || "lesson";
   const KEY = "csf:" + lesson;
 
@@ -60,6 +70,20 @@
         v.textContent = ok ? "CORRECT ·" : "NOT QUITE ·";
         why.prepend(v);
       }
+      const whyopts = quiz.querySelector(".whyopts");
+      if (whyopts && !whyopts.dataset.ready) {
+        whyopts.dataset.ready = "1";
+        [...whyopts.children].forEach((li, i) => {
+          if (!buttons[i]) return;
+          const tag = document.createElement("b");
+          tag.className = "opt";
+          tag.innerHTML = (i === answer ? "✓ " : "✗ ") + buttons[i].innerHTML.trim();   // keeps <code> styling
+          li.prepend(tag, " ");
+          if (i === answer) li.classList.add("right");
+          if (i === chosen) li.classList.add("chosen");
+        });
+      }
+      quiz.dispatchEvent(new CustomEvent("quiz:answered", { bubbles: true }));
     }
 
     buttons.forEach((b, i) =>
@@ -146,6 +170,16 @@
         });
       }
 
+      const practices = [...document.querySelectorAll(".practice")];
+      if (practices.length) {
+        let solved = {};
+        try { solved = JSON.parse(localStorage.getItem(KEY + ":practice")) || {}; } catch (e) { /* ignore */ }
+        const ids = practices.map((p) => p.dataset.id);
+        lines.push("", `Practice solved in page: ${ids.filter((id) => solved[id] && solved[id].solved).length} of ${ids.length}`);
+        const open = ids.filter((id) => !(solved[id] && solved[id].solved));
+        if (open.length) lines.push(`  Not yet: ${open.join(", ")}`);
+      }
+
       const partsDone = partBoxes.filter((b) => b.checked).map((b) => b.dataset.part);
       lines.push("", `Parts done: ${partsDone.length ? partsDone.join(", ") : "none"} of ${partBoxes.length}`);
       lines.push("", "Notes for my teacher: ");
@@ -169,7 +203,7 @@
   document.querySelectorAll("[data-reset]").forEach((btn) =>
     btn.addEventListener("click", () => {
       if (!confirm("Clear all saved answers and progress for this lesson?")) return;
-      try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
+      try { localStorage.removeItem(KEY); localStorage.removeItem(KEY + ":practice"); } catch (e) { /* ignore */ }
       location.reload();
     })
   );

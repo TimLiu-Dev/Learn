@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L57 · Time, Order &amp; Agreement</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l57">
+<main>
+
+<div class="kicker">Lesson 57 · Phase 12 System Design &amp; Caching · <a href="../reference/roadmap.html#p12">roadmap</a></div>
+<h1>Time, Order &amp; Agreement</h1>
+<p class="subtitle">L42 gave you a leader and its replicas, and L43 showed what happens when the network splits them. This lesson goes one level down, to the three questions every replicated system has to answer: whose clock do you trust, what happened before what, and who gets to be the leader when machines crash and messages are lost?</p>
+
+<div class="lesson-meta">
+  <span><b>~115–130 min</b> · warm-up + 4 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll build a working Raft cluster in a simulator you control completely: five nodes elect a leader, replicate a log and commit by majority. Then you'll cut the network in two, watch the old leader keep accepting a write that can never commit, and watch the whole cluster heal into one agreed history. Two tests prove it, and a one-line bug makes them fail.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Why clocks lie</a><span class="t">25 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Logical clocks</a><span class="t">25 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Leader election and consensus: Raft</a><span class="t">35 min</span></li>
+  <li data-part="p4"><a href="#p4">4 · Two-phase commit vs sagas</a><span class="t">20 min</span></li>
+  <li data-part="p5"><a href="#p5">Final exercise: Raft through a partition</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l57/</code>. Every output on this page comes from a real run: JDK 26.0.1 and Kotlin 2.4.20 on an Apple M5 Max. Most programs here are <b>simulations with virtual time</b>: "machines" are objects in one JVM, "the network" is a priority queue of messages with random delays, and nothing actually sleeps. That's how distributed-systems engineers test this kind of code: a seeded simulation replays the exact same history every time, so a bug you find once, you can find again. Kotlin and Java use the same <code>java.util.Random</code> with the same seed, so both print identical output.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L27, L36, L42, L43, L48 and L53</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>In L43's two-replica demo, last write wins threw away the lamp. Which write won, and where did the timestamps come from? (L43)</li>
+    <li>State the Java memory model's happens-before rule in one sentence, and name two kinds of edge that create it. (L27)</li>
+    <li>"Exactly-once delivery" isn't possible over an unreliable network. What do systems build instead, and from which two pieces? (L42)</li>
+    <li>Pick any 3 servers out of 5, then any other 3. Why must the two groups share at least one server? (L48)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="2">
+  <p class="q">L43's replicas resolved a conflict with last write wins. What happened to the other concurrent write? (L43)</p>
+  <div class="opts"><button>It was merged in automatically</button><button>It was retried until success</button><button>It was silently thrown away</button><button>It was rejected with 409</button></div>
+  <p class="why">Last write wins keeps the version with the bigger timestamp and discards the rest, with no error anywhere. L43 got its timestamps from one shared counter. Part 1 shows what happens when each machine uses its own clock instead.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">Two groups of 3 are chosen from the same 5 servers. What must be true? (L48)</p>
+  <div class="opts"><button>They share at least one server</button><button>They share exactly two of them</button><button>They never share a single server</button><button>They always contain all five servers</button></div>
+  <p class="why">3 + 3 = 6 slots but only 5 servers, so by the pigeonhole principle (L48) some server is in both. That overlap is the whole reason a majority vote can't elect two leaders. Part 3 builds on it.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="3">
+  <p class="q">Which signal can a JVM's shutdown hook never react to? (L53)</p>
+  <div class="opts"><button><code>SIGTERM</code></button><button><code>SIGINT</code></button><button><code>SIGHUP</code></button><button><code>SIGKILL</code></button></div>
+  <p class="why">SIGKILL "cannot be caught or ignored" (L53): the process just stops. That's the crash model in this lesson's simulations. A node vanishes mid-step, and only what it had already saved survives.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="1">
+  <p class="q">Inside one database, what does a transaction's atomicity promise? (L36)</p>
+  <div class="opts"><button>Each statement runs on one core</button><button>All statements happen, or none do</button><button>Readers never wait for any writer</button><button>Every row gets its own lock</button></div>
+  <p class="why">One database can promise all-or-nothing because it controls every write. Part 4 asks how to get the same promise across <em>two</em> databases or services, and why that's much harder.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Why clocks lie</h2><span class="t">~25 min</span></div>
+
+<p>Every computer keeps time with a quartz crystal, and no two crystals tick at exactly the same rate. Martin Kleppmann's Cambridge lecture notes (free, and this lesson's best companion) put it plainly: "The rate by which a clock runs fast or slow is called <dfn>drift</dfn>", measured in parts per million, where "1 ppm = 1 microsecond/second = 86 ms/day = 32 s/year" (<a href="https://www.cl.cam.ac.uk/teaching/2425/ConcDisSys/dist-sys-notes.pdf">Kleppmann, <em>Distributed Systems</em> notes</a>, §3.1). The difference between two clocks at one moment is <dfn>clock skew</dfn>. To keep skew small, machines regularly ask a time server for the correct time. "The Network Time Protocol (NTP) is widely used to synchronize computer clocks in the Internet" (<a href="https://www.rfc-editor.org/rfc/rfc5905">RFC 5905</a>).</p>
+<p>Correcting a clock means changing it, sometimes by a jump. That's why the JVM gives you two different clocks. L32's time part showed them inside one program; here's why the difference matters across machines:</p>
+<table class="vs">
+  <tr><th>Clock</th><th>Kotlin / Java</th><th>Good for</th><th>Trap</th></tr>
+  <tr><td><b>Time-of-day</b></td><td><code>Clock.System.now()</code> · <code>System.currentTimeMillis()</code>, <code>Instant.now()</code></td><td>"What time is it?" Timestamps people read.</td><td>"When the NTP client steps the local clock, a time-of-day clock may jump" (Kleppmann, §3.2), even backwards.</td></tr>
+  <tr><td><b>Monotonic</b></td><td><code>TimeSource.Monotonic</code> · <code>System.nanoTime()</code></td><td>Durations, timeouts, benchmarks (L16).</td><td>Meaningless across machines: <code>nanoTime</code> "can only be used to measure elapsed time and is not related to any other notion of system or wall-clock time" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/System.html#nanoTime()">System.nanoTime</a>).</td></tr>
+</table>
+<p>Kotlin's own docs warn about the first row: with <code>Clock.System</code>, "Successive calls to now will not necessarily return increasing Instant values, and when they do, these increases will not necessarily correspond to the elapsed time" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.time/-clock/-system/">Clock.System</a>). Kleppmann sums up the second row: "nanoTime() is a monotonic clock, which is not affected by NTP stepping: it still counts seconds elapsed, but it always moves forward." Kotlin's <code>TimeSource.Monotonic</code> "returns its readings from a source of monotonic time when it is available in a target platform" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.time/-time-source/-monotonic/">TimeSource.Monotonic</a>); on the JVM that source is <code>System.nanoTime()</code>.</p>
+
+<h3>Two bugs a skewed clock causes</h3>
+<p>The program below gives each simulated node its own clock: true time plus an offset. Only the simulation knows true time; the nodes never see it. First it replays L43's last-write-wins replicas, except that timestamps now come from each node's own clock, which is how real replicas get them. Then it measures a 5-second timeout with a time-of-day clock while NTP steps it.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Skew.kt</figcaption>
+<!--CODE:l57/Skew.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Skew.java</figcaption>
+<!--CODE:l57/Skew.java--></figure>
+</div>
+<pre class="out">== Last write wins with a clock that is 300 ms slow
+true 1000 ms  user saves name=Ana      on A, A's clock says 1000
+true 1100 ms  user saves name=Ana Lima on B, B's clock says 800
+after replication: A=Ana  B=Ana
+the later edit lost: 800 &lt; 1000, so LWW kept the older value
+
+== Lost? (rows: clock skew, columns: gap between the two edits)
+skew      10ms   50ms  100ms  500ms
+   0ms      ok     ok     ok     ok
+  20ms    LOST     ok     ok     ok
+ 100ms    LOST   LOST   LOST     ok
+ 300ms    LOST   LOST   LOST     ok
+
+== A 5 s timeout measured with the time-of-day clock, while NTP steps it
+step -2000 ms at 1 s: timeout fired after 7.0 s of real time
+step +2000 ms at 1 s: timeout fired after 3.0 s of real time
+
+== The fix for durations: a monotonic clock (real run)
+TimeSource.Monotonic: slept 50 ms, measured 60 ms
+System.nanoTime():    slept 50 ms, measured 62 ms</pre>
+<p>Java prints the same, except that it has no <code>TimeSource</code> line. The two sleep timings are real and came out at 60–62 ms, not 50. <code>Thread.sleep</code> promises <em>at least</em> the time you ask for, and this machine was busy.</p>
+<ul>
+  <li><b>The user's latest edit vanished.</b> B's clock was 300 ms slow, so its later write carried an <em>earlier</em> timestamp, and last write wins kept the older value on both replicas. No error, no log line. Kleppmann describes the rule exactly: "the update with the greatest timestamp takes effect, and any concurrent updates with lower timestamps to the same key are discarded" (§5.1). With skewed clocks, "greatest timestamp" no longer means "latest".</li>
+  <li><b>The table is the real rule.</b> Last write wins is only safe when two writes are further apart than the clocks' skew. Two edits 10 ms apart lose one as soon as the skew passes 10 ms. L43 avoided this by sharing one counter between both replicas, a luxury that machines in different buildings don't have.</li>
+  <li><b>The timeout fired at 7 s or 3 s, never 5 s.</b> When NTP stepped the clock back 2 s, the elapsed time measured by the time-of-day clock shrank by 2 s. Stepping forward made it fire early. A lease, a lock expiry or a rate limiter (L43) built on <code>currentTimeMillis</code> inherits exactly this bug. Measure durations with a monotonic clock, always.</li>
+</ul>
+<p class="note">Bridge: on Android the user can set the phone's clock to anything they like. Never let a client's timestamp decide which write wins on your server: the server assigns the order, or you use Part 2's logical clocks.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Typed durations.</b> <code>TimeSource.Monotonic.markNow()</code> returns a mark, and <code>mark.elapsedNow()</code> returns a <code>Duration</code>. Java's <code>System.nanoTime()</code> returns a bare <code>long</code> of nanoseconds, so subtracting and dividing by 1,000,000 is your job, and so is remembering the unit.</li>
+    <li><b>Data class vs record.</b> <code>data class Versioned(…)</code> and <code>record Versioned(…)</code> both generate <code>equals</code>, <code>hashCode</code> and <code>toString</code> (L7).</li>
+    <li><b><code>!!</code> says "I know it's set".</b> <code>a.current!!.value</code> throws if <code>current</code> is null. Java's <code>a.current.value()</code> throws the same <code>NullPointerException</code>, but the type never warned you it could be null (L3).</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: how far apart can two synced clocks get?</div>
+  <p>Kleppmann's notes say most computer clocks stay within about 50 ppm. From a blank file, simulate two clocks in 1 ms steps for two hours: clock A gains 50 ppm and clock B loses 50 ppm, and both are reset to true time every <code>T</code> seconds. Print the worst skew you saw for <code>T</code> = 16, 64 and 1024 s, next to the formula 2 × ppm × T. (RFC 5905's table lists NTP poll intervals from a "minimum poll exponent (16 s)" to a "maximum poll exponent (36 h)".) Then decide: how far apart must two writes be for last write wins to be safe?</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · DriftBound.kt</figcaption>
+<!--CODE:l57/ex/DriftBound.kt--></figure>
+  <figure class="java"><figcaption>JAVA · DriftBound.java</figcaption>
+<!--CODE:l57/ex/DriftBound.java--></figure>
+</div>
+<pre class="out">sync every    simulated  2 x ppm x T
+16 s             1.6 ms       1.6 ms
+64 s             6.4 ms       6.4 ms
+1024 s         102.4 ms     102.4 ms</pre>
+  <p>Both languages print this table. The simulation matches the formula exactly, because the worst moment is always just before a sync, when one clock has gained ppm × T and the other has lost the same. Syncing every 16 s keeps two good clocks within about 1.6 ms of each other; a machine that syncs every 17 minutes can be 100 ms out. That's only drift: real NTP adds its own error, and "the exact accuracy achieved in a particular system depends on the timing properties of the network between client and server" (Kleppmann, §3.2). So last write wins is safe only for writes further apart than drift <em>plus</em> NTP error, a number you rarely know. Two clicks a user makes 50 ms apart can easily fall inside it.</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p1-1" data-group="Part 1" data-answer="1">
+  <p class="q">A rate limiter refills tokens based on elapsed time. Which clock should measure that time?</p>
+  <div class="opts"><button><code>System.currentTimeMillis()</code></button><button><code>System.nanoTime()</code></button><button><code>Instant.now()</code></button><button><code>LocalDateTime.now()</code></button></div>
+  <p class="why">Elapsed time needs a monotonic clock, and <code>nanoTime</code> is the JVM's. The other three are time-of-day clocks that NTP can step, so a backwards step would stall the refill and a forward one would grant a burst. (L43's token bucket used an injected clock for testing; in production it should sit on a monotonic source.)</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1" data-answer="3">
+  <p class="q">Two replicas use last write wins. B's clock is 100 ms slow, and a user edits on A, then on B 50 ms later. Which value survives?</p>
+  <div class="opts"><button>The value from B</button><button>Both values, merged together</button><button>Neither value, both rejected</button><button>The value from A</button></div>
+  <p class="why">B stamps its write 50 − 100 = 50 ms <em>earlier</em> than A's, so last write wins keeps A's older value and drops the user's latest edit. That's the "100ms / 50ms" cell of the table: LOST.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Logical clocks</h2><span class="t">~25 min</span></div>
+
+<p>If physical clocks can't tell you what happened first, what can? In 1978 Leslie Lamport answered with one of the most cited papers in computing, "Time, Clocks, and the Ordering of Events in a Distributed System". Its abstract: "The concept of one event happening before another in a distributed system is examined, and is shown to define a partial ordering of the events" (<a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Lamport, 1978</a>). He defines the <dfn>happened-before</dfn> relation, written →, as the smallest relation where:</p>
+<ol>
+  <li>"If a and b are events in the same process, and a comes before b, then a → b."</li>
+  <li>"If a is the sending of a message by one process and b is the receipt of the same message by another process, then a → b."</li>
+  <li>"If a → b and b → c then a → c."</li>
+</ol>
+<p>Two events where neither happened before the other are <dfn>concurrent</dfn>. This is the shape you met in L27. The Java memory model's happens-before is also built from program order plus extra edges (unlocks before locks, <code>volatile</code> writes before reads), closed under transitivity. There the edges are synchronization between threads; here they are messages between machines. Both say the same thing: <em>a could have influenced b only if there is a chain of edges from a to b</em>.</p>
+
+<h3>Lamport clocks</h3>
+<p>Lamport then gives every process a counter and two rules that make timestamps respect →:</p>
+<ul>
+  <li><b>IR1.</b> "Each process Pi increments Ci between any two successive events."</li>
+  <li><b>IR2.</b> "(a) If event a is the sending of a message m by process Pi, then the message m contains a timestamp Tm = Ci(a). (b) Upon receiving a message m, [the receiver] sets [its clock] greater than or equal to its present value and greater than Tm."</li>
+</ul>
+<p>Together they guarantee his <dfn>Clock Condition</dfn>: "For any events a, b: if a → b then C(a) &lt; C(b)." A <dfn>vector clock</dfn> goes further, and Part 2's program runs both over the same script. Kleppmann explains why you'd want the second one: "If we do want to detect when events are concurrent, we need a different type of logical time: a vector clock" (§3.4). Each node keeps one counter <em>per node</em>; "Whenever an event occurs at node Ni, it increments the i th entry (its own entry) in its vector clock", and a receiver takes the element-wise maximum of its vector and the message's before incrementing its own entry.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Clocks.kt</figcaption>
+<!--CODE:l57/Clocks.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Clocks.java</figcaption>
+<!--CODE:l57/Clocks.java--></figure>
+</div>
+<p>Both print exactly this (checked with <code>diff</code>):</p>
+<pre class="out">== One run, two kinds of logical clock
+event        Lamport  vector
+P1 a               1  [1,0,0]
+P1 send m1         2  [2,0,0]
+P2 b               1  [0,1,0]
+P2 recv m1         3  [2,2,0]
+P2 send m2         4  [2,3,0]
+P3 c               1  [0,0,1]
+P3 recv m2         5  [2,3,2]
+P1 d               3  [3,0,0]
+
+== What each clock can tell you about a pair of events
+P1 send m1 vs P2 recv m1  Lamport 2 &lt; 3   vector BEFORE
+P1 a       vs P3 recv m2  Lamport 1 &lt; 5   vector BEFORE
+P2 b       vs P1 d        Lamport 1 &lt; 3   vector CONCURRENT
+P1 d       vs P3 recv m2  Lamport 3 &lt; 5   vector CONCURRENT
+P1 a       vs P3 c        Lamport 1 = 1   vector CONCURRENT
+
+== A total order: sort by (Lamport time, process number)
+P1 a@1  P2 b@1  P3 c@1  P1 send m1@2  P1 d@3  P2 recv m1@3  P2 send m2@4  P3 recv m2@5
+
+== Version vectors on two cart replicas (entry 0 counts A's writes, entry 1 B's)
+[book,lamp] [2,0] vs [book,pen] [1,1]: CONCURRENT -&gt; keep both, merge
+[book,lamp,pen] [2,2] vs [book,lamp] [2,0]: AFTER -&gt; safe to overwrite
+[book] [1,0] vs [book,lamp,pen] [2,2]: BEFORE -&gt; a stale write, ignore it</pre>
+<ul>
+  <li><b>Lamport clocks respect causality.</b> The send of m1 (2) comes before its receipt (3), and the chain a → send m1 → recv m1 → send m2 → recv m2 gives 1 &lt; 5.</li>
+  <li><b>They can't detect concurrency.</b> P2's b (1) and P1's d (3) never exchanged a message, yet Lamport gives them an order, 1 &lt; 3. Lamport says so himself: "Note that we cannot expect the converse condition to hold as well, since that would imply that any two concurrent events must occur at the same time." A smaller Lamport time means "maybe before", never "definitely before".</li>
+  <li><b>Vector clocks can.</b> <code>compare</code> returns BEFORE only when every entry is ≤ and one is &lt;; if each vector is ahead somewhere, the events are CONCURRENT. b's [0,1,0] and d's [3,0,0] are concurrent, which is the truth.</li>
+  <li><b>A total order is still useful.</b> Sorting by (Lamport time, process number) gives every node the same order of all events, consistent with causality. It's arbitrary for concurrent events, but it's the <em>same</em> arbitrary choice everywhere. Lamport's paper uses exactly this to build a distributed lock.</li>
+  <li><b>Version vectors fix L43's cart.</b> A vector per <em>replica</em> counts each replica's writes. [2,0] vs [1,1] is CONCURRENT, so instead of silently dropping one cart, the replica keeps both and merges. A merge written later dominates both parents, and a stale write is recognised as old. L43's exercise did this with parent pointers; Amazon's Dynamo paper, cited there, used vectors.</li>
+</ul>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Sealed interface + <code>when</code>.</b> <code>when (s) { is Local -> …; is Send -> …; is Recv -> … }</code> is checked for exhaustiveness and smart-casts <code>s</code> in each branch. Java 21's pattern-matching <code>switch</code> over a <code>sealed interface … permits</code> does the same (<a href="https://openjdk.org/jeps/441">JEP 441</a>), but needs the <code>permits</code> list and a <code>yield</code> inside block branches.</li>
+    <li><b>Pairs and destructuring.</b> <code>val (l, v) = … to …</code> returns two values without a class. Java declares <code>record Stamps(long lamport, int[] vector)</code> just to carry them.</li>
+    <li><b>Properties instead of getters.</b> <code>override val name = "send $msg"</code> inside a data class is a computed property. Java's record needs an explicit <code>public String name()</code> method.</li>
+    <li><b><code>compareBy({ … }, { … })</code></b> builds a multi-key comparator in one call; Java chains <code>comparingLong(…).thenComparingInt(…)</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a chat that never answers before the question</div>
+  <p>In a group chat, Ana asks "Dinner at 7?", Bob replies "Yes, 7 works", and Cleo, who hasn't seen anything yet, posts something unrelated. The network delivers Bob's reply to Cleo <em>before</em> Ana's question. From a blank file, build members that attach a vector clock to every message they send, and only show a received message when it is <dfn>causally ready</dfn>: it is the next message from its sender (<code>vc[sender] == delivered[sender] + 1</code>), and the sender hadn't seen anything this member hasn't shown yet (<code>vc[k] ≤ delivered[k]</code> for every other k). Otherwise hold it back. Print each member's screen.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · CausalChat.kt</figcaption>
+<!--CODE:l57/ex/CausalChat.kt--></figure>
+  <figure class="java"><figcaption>JAVA · CausalChat.java</figcaption>
+<!--CODE:l57/ex/CausalChat.java--></figure>
+</div>
+<pre class="out">  Cleo holds back Bob: "Yes, 7 works" (missing an earlier message)
+Ana's screen:
+    Ana: Dinner at 7?
+    Cleo: I'm running late today
+    Bob: Yes, 7 works
+Bob's screen:
+    Ana: Dinner at 7?
+    Bob: Yes, 7 works
+    Cleo: I'm running late today
+Cleo's screen:
+    Cleo: I'm running late today
+    Ana: Dinner at 7?
+    Bob: Yes, 7 works</pre>
+  <p>Both languages print this. Cleo held Bob's reply until Ana's question arrived, so every screen shows the question before the answer. Cleo's own message lands in a different place on each screen, and that's fine: it's concurrent with the conversation, so no order is "wrong". This is <dfn>causal broadcast</dfn>, the subject of Kleppmann's §4; group chats and collaborative editors need exactly this guarantee.</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p2-1" data-group="Part 2" data-answer="2">
+  <p class="q">Event x has Lamport time 4 and event y has Lamport time 9. What do you know for certain?</p>
+  <div class="opts"><button>x certainly happened before y did</button><button>x and y were certainly concurrent</button><button>y did not happen before x</button><button>both ran on the same node</button></div>
+  <p class="why">The Clock Condition says if y → x then C(y) &lt; C(x). Here C(y) &gt; C(x), so y → x is impossible. But x → y isn't guaranteed either: they could be concurrent. Only a vector clock can tell those apart.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2" data-answer="0">
+  <p class="q">Compare the vector clocks [2,1,0] and [1,1,3]. What's the relation?</p>
+  <div class="opts"><button>The two are concurrent</button><button>The first came before</button><button>The second came before</button><button>The two are equal</button></div>
+  <p class="why">The first is ahead in entry 0 (2 &gt; 1), and the second is ahead in entry 2 (3 &gt; 0). Neither dominates, so neither event could have seen the other: concurrent.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Leader election and consensus: Raft</h2><span class="t">~35 min</span></div>
+
+<p>L42's leader database had a weak spot you may have noticed: if the leader dies, <em>someone</em> has to promote a follower. If two followers both decide they're the new leader, both accept writes and the data splits into two histories. Kleppmann: "If there were multiple leaders, they could make inconsistent decisions … (a situation known as <dfn>split brain</dfn>)" (§7.1). Picking exactly one leader, even while machines crash and messages vanish, is an instance of <dfn>consensus</dfn>. The Raft site defines it: "Consensus involves multiple servers agreeing on values. Once they reach a decision on a value, that decision is final" (<a href="https://raft.github.io/">raft.github.io</a>).</p>
+<p>Raft, by Diego Ongaro and John Ousterhout, "is a consensus algorithm for managing a replicated log", designed to be easier to understand than Paxos, which came before it (<a href="https://raft.github.io/raft.pdf">"In Search of an Understandable Consensus Algorithm (Extended Version)"</a>). Its leader election rests on five rules, each quoted from §5.1–5.2 of the paper:</p>
+<ol>
+  <li><b>Terms number the leaderships.</b> Time is divided into terms, each starting with an election. "Terms act as a logical clock in Raft, and they allow servers to detect obsolete information such as stale leaders": Part 2's idea, used to order leaders.</li>
+  <li><b>A newer term always wins.</b> "If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state. If a server receives a request with a stale term number, it rejects the request."</li>
+  <li><b>Leaders send heartbeats.</b> "Leaders send periodic heartbeats (AppendEntries RPCs that carry no log entries) to all followers in order to maintain their authority." A follower that hears nothing for an <dfn>election timeout</dfn> becomes a candidate: it increments its term, votes for itself, and sends RequestVote to everyone.</li>
+  <li><b>One vote per term.</b> "Each server will vote for at most one candidate in a given term, on a first-come-first-served basis … The majority rule ensures that at most one candidate can win the election for a particular term."</li>
+  <li><b>Random timeouts break ties.</b> "To prevent split votes in the first place, election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms)."</li>
+</ol>
+<p>The program below implements exactly those five rules on five simulated nodes. Each message takes 2–10 ms of virtual time, a crashed node drops everything, and a partition cuts links. It replays one run with a crash, then attacks rule 4 with 2,000 random runs, once with correct voters and once with a voter that "forgets" its vote.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Election.kt</figcaption>
+<!--CODE:l57/Election.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Election.java</figcaption>
+<!--CODE:l57/Election.java--></figure>
+</div>
+<p>Both print exactly this (checked with <code>diff</code>), in about 3 s of real time for 4,000 simulated runs:</p>
+<pre class="out">== Seed 42: start, crash the leader at 600 ms, restart it at 1,200 ms
+   154 ms  n1 times out: candidate for term 1
+   158 ms  n3 votes for n1 in term 1
+   158 ms  n5 votes for n1 in term 1
+   161 ms  n2 votes for n1 in term 1
+   163 ms  n4 votes for n1 in term 1
+   168 ms  n1 is LEADER of term 1, votes from n1, n3, n5
+   600 ms  n1 CRASHES
+   775 ms  n3 times out: candidate for term 2
+   778 ms  n4 votes for n3 in term 2
+   781 ms  n5 votes for n3 in term 2
+   784 ms  n2 votes for n3 in term 2
+   784 ms  n3 is LEADER of term 2, votes from n3, n4, n5
+  1200 ms  n1 restarts as a follower, still in term 1
+leaders by term: term 1 -&gt; n1, term 2 -&gt; n3
+final terms: n1=2 n2=2 n3=2 n4=2 n5=2
+
+== Safety sweep: 2,000 seeds, random crashes and partitions for 3 s each
+  terms with no leader: 9181, one leader: 4696, two or more leaders: 0
+
+== The same sweep with a buggy voter that forgets whom it voted for
+  first violation: seed 4, term 1, leaders n1 and n2 and n5
+  terms with no leader: 9143, one leader: 4612, two or more leaders: 464</pre>
+<ul>
+  <li><b>The first election took 14 ms.</b> n1's random timeout (154 ms) expired first, so it asked before anyone else and got every vote. It became leader as soon as the third vote arrived: 3 of 5 is a majority, and it doesn't wait for the rest.</li>
+  <li><b>Failover is automatic.</b> 600 ms after start the leader crashed. Followers stopped hearing heartbeats, n3's timeout expired first at 775 ms, and it won term 2 within 9 ms. No operator promoted anyone.</li>
+  <li><b>The old leader rejoined safely.</b> n1 restarted "still in term 1" because Raft stores the term and the vote on disk ("Raft's RPCs typically require the recipient to persist information to stable storage", §5.6; L56's <code>fsync</code> is exactly that). The first heartbeat it received carried term 2, so it simply became a follower.</li>
+  <li><b>Rule 4 is the whole safety argument.</b> Across 2,000 chaotic runs, not one term had two leaders. Let a voter forget its vote and 464 terms did; in seed 4, three nodes all believed they led term 1. With honest voters it can't happen: two majorities of 5 always share a server (the warm-up's pigeonhole), and that server would have had to vote twice.</li>
+  <li><b>Most terms had no leader</b> (9,181 vs 4,696). Each partition leaves a minority that keeps timing out and starting elections it can never win, so its term number climbs. That's harmless for safety, but when such a node rejoins, its high term forces a needless new election. Production systems add extensions for exactly this.</li>
+</ul>
+
+<h3>From one leader to one log</h3>
+<p>A leader by itself isn't the goal. The goal is a <dfn>replicated log</dfn>: the same commands, in the same order, on every node, so each node's copy of the data (its <dfn>state machine</dfn>) ends up identical. Raft's leader appends each client command to its log and ships missing entries to each follower in the next AppendEntries, so a heartbeat doubles as replication. Three more rules from §5.3–5.4 make it safe:</p>
+<ul>
+  <li><b>Commit by majority.</b> "A log entry is committed once the leader that created the entry has replicated it on a majority of the servers." Only then is it applied, and only then may a client be told "done".</li>
+  <li><b>The consistency check.</b> "When sending an AppendEntries RPC, the leader includes the index and term of the entry in its log that immediately precedes the new entries. If the follower does not find an entry in its log with the same index and term, then it refuses the new entries." The paper calls this "an induction step" (L48's induction, holding a whole log in shape). On a refusal the leader steps back one entry and tries again; followers' conflicting, uncommitted entries get overwritten.</li>
+  <li><b>The election restriction.</b> A candidate can't win unless its log holds every committed entry: "the voter denies its vote if its own log is more up-to-date than that of the candidate", where "If the logs have last entries with different terms, then the log with the later term is more up-to-date. If the logs end with the same term, then whichever log is longer is more up-to-date."</li>
+</ul>
+<p>Together they give the two guarantees the final will test, both from the paper's Figure 3: <b>Election Safety</b>, "at most one leader can be elected in a given term", and <b>State Machine Safety</b>, "if a server has applied a log entry at a given index to its state machine, no other server will ever apply a different log entry for the same index." The widget below steps through the final's real run, event by event. Leave the box unticked to watch a healthy cluster, then tick it to split the network at 700 ms and compare.</p>
+
+<div class="raftviz" data-src="raft-demo"></div>
+<script type="application/json" id="raft-demo">{"healthy":[{"t":158,"note":"n5 times out: candidate for term 1","nodes":[{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":160,"note":"n3 votes for n5 in term 1","from":2,"to":4,"nodes":[{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":161,"note":"n1 votes for n5 in term 1","from":0,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":165,"note":"n2 votes for n5 in term 1","from":1,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":166,"note":"n4 votes for n5 in term 1","from":3,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":168,"note":"n5 is LEADER of term 1, votes from n3, n4, n5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"LEADER","term":1,"up":true,"commit":0,"log":[]}]},{"t":400,"note":"client -> n5: x=1 (index 1, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"LEADER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]}]},{"t":431,"note":"n5 commits up to index 1 (x=1), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"LEADER","term":1,"up":true,"commit":1,"log":[[1,"x=1"]]}]},{"t":450,"note":"client -> n5: x=2 (index 2, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"LEADER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":478,"note":"n5 commits up to index 2 (x=2), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":750,"note":"client -> n5: x=3 (index 3, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":777,"note":"n5 commits up to index 3 (x=3), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"LEADER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1300,"note":"client -> n5: x=4 (index 4, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"LEADER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]}]},{"t":1329,"note":"n5 commits up to index 4 (x=4), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":4,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]}]}],"split":[{"t":158,"note":"n5 times out: candidate for term 1","nodes":[{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":160,"note":"n3 votes for n5 in term 1","from":2,"to":4,"nodes":[{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":161,"note":"n1 votes for n5 in term 1","from":0,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":165,"note":"n2 votes for n5 in term 1","from":1,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":166,"note":"n4 votes for n5 in term 1","from":3,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":168,"note":"n5 is LEADER of term 1, votes from n3, n4, n5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"LEADER","term":1,"up":true,"commit":0,"log":[]}]},{"t":400,"note":"client -> n5: x=1 (index 1, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"LEADER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]}]},{"t":431,"note":"n5 commits up to index 1 (x=1), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"LEADER","term":1,"up":true,"commit":1,"log":[[1,"x=1"]]}]},{"t":450,"note":"client -> n5: x=2 (index 2, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"LEADER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":478,"note":"n5 commits up to index 2 (x=2), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":700,"note":"PARTITION {n1,n5} | {n2,n3,n4}","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":750,"note":"client -> n5: x=3 (index 3, term 1, not committed yet)","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":866,"note":"n4 times out: candidate for term 2","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"CANDIDATE","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":870,"note":"n3 votes for n4 in term 2","from":2,"to":3,"side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"CANDIDATE","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":871,"note":"n2 votes for n4 in term 2","from":1,"to":3,"side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"CANDIDATE","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":881,"note":"n4 is LEADER of term 2, votes from n2, n3, n4","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1300,"note":"client -> n4: x=4 (index 3, term 2, not committed yet)","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1347,"note":"n4 commits up to index 3 (x=4), stored on 3 of 5","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1800,"note":"partition HEALS","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1827,"note":"n5 steps down: saw term 2","from":1,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1835,"note":"n5 drops uncommitted [x=3]: conflicts with the leader","from":3,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":1841,"note":"n1 drops uncommitted [x=3]: conflicts with the leader","from":3,"to":0,"nodes":[{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]}]}]}</script>
+
+<p>Look for three moments in the partitioned run. At 750 ms the old leader n5 accepts <code>x=3</code> and copies it to n1, but with only 2 of 5 it can never commit. At 881 ms the majority side elects n4 in term 2 and commits <code>x=4</code>. After the heal, n5 sees term 2, steps down, and both n5 and n1 drop the uncommitted <code>x=3</code>. A client that was told "accepted" for <code>x=3</code> learns the hard way that only "committed" counts.</p>
+<p>The paper also states when this works at all: "broadcastTime ≪ electionTimeout ≪ MTBF". Messages must arrive well within a timeout, or followers start elections while the leader is still alive. And timeouts must be far shorter than the mean time between failures, because "When the leader crashes, the system will be unavailable for roughly the election timeout" (§5.6).</p>
+<p class="note">Bridge: you will almost never write Raft yourself, but you will depend on it. etcd is "Properly distributed via Raft protocol" (<a href="https://etcd.io/">etcd.io</a>), and Kubernetes uses etcd as its "Consistent and highly-available key value store used as Kubernetes' backing store for all cluster data" (<a href="https://kubernetes.io/docs/concepts/architecture/">Kubernetes architecture</a>). When a Spring Boot service runs on Kubernetes, every deployment and config change you make is a Raft log entry somewhere.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b><code>inner class Node</code></b> can read the enclosing <code>Sim</code>'s fields, the same as a Java non-static inner class. Kotlin makes you say <code>inner</code> on purpose; a plain nested class can't see the outer instance, which is the safer default (Java's equivalent is <code>static class</code>).</li>
+    <li><b>Default and named arguments.</b> <code>Sim(seed.toLong(), buggyVoter = buggy, tracing = false)</code> replaces Java's two constructors, where the long one takes seven positional arguments you must keep in order.</li>
+    <li><b>Lambdas as actions.</b> <code>schedule(delay) { … }</code> passes a <code>() -> Unit</code> with trailing-lambda syntax. Java passes a <code>Runnable</code>, and its lambda can only capture effectively final variables (L14).</li>
+    <li><b><code>sortedMapOf</code> and <code>getOrPut</code></b> replace <code>new TreeMap&lt;&gt;()</code> and <code>computeIfAbsent(…, t -> new TreeSet&lt;&gt;())</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: how random must the timeout be?</div>
+  <p>The paper's Figure 16 measured how long a cluster has no leader after the leader crashes, for different timeout ranges. Reproduce it with your <code>Sim</code>. For each range 150–150, 150–151, 150–155, 150–175, 150–200 and 150–300 ms, run 1,000 seeds with the heartbeat at half the minimum timeout, as the paper did. In each run, wait for a leader, let it settle for 500 ms, crash it at a random moment within one heartbeat interval, and measure the time until a new leader exists, giving up after 10 s. Print the median and the worst case. Put the new file next to <code>Election.kt</code>/<code>Election.java</code> so it can use <code>Sim</code>.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · ElectionTiming.kt</figcaption>
+<!--CODE:l57/ElectionTiming.kt--></figure>
+  <figure class="java"><figcaption>JAVA · ElectionTiming.java</figcaption>
+<!--CODE:l57/ElectionTiming.java--></figure>
+</div>
+<p>Compile the Kotlin version together with the simulator (<code>kotlinc Election.kt ElectionTiming.kt -include-runtime -d t.jar</code>, then <code>java -cp t.jar ElectionTimingKt</code>). Java finds <code>Election.java</code> next to it with the multi-file source launcher (<a href="https://openjdk.org/jeps/458">JEP 458</a>): <code>java ElectionTiming.java</code>. Both print:</p>
+<pre class="out">timeout          median    worst  over 10 s
+150-150 ms      10000 ms  10000 ms       1000
+150-151 ms       6874 ms  10000 ms        413
+150-155 ms        602 ms   9892 ms          0
+150-175 ms        154 ms    964 ms          0
+150-200 ms        148 ms    767 ms          0
+150-300 ms        159 ms    547 ms          0</pre>
+  <p>With no randomness, all 1,000 runs failed to elect a first leader within 10 s: every follower times out at the same moment, everyone votes for themselves, and the split repeats forever. One millisecond of randomness still loses most runs. Five milliseconds fixes it. The paper saw the same shape: "In the absence of randomness, leader election consistently took longer than 10 seconds in our tests due to many split votes. Adding just 5ms of randomness helps significantly, resulting in a median downtime of 287ms" (§9.3). The numbers differ, because our network delays and crash timing are not theirs, but the lesson is identical: a little randomness turns an endless tie into a quick election. Wider ranges mainly shrink the worst case. The paper recommends "a conservative election timeout such as 150–300ms".</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p3-1" data-group="Part 3" data-answer="1">
+  <p class="q">A 5-node Raft cluster is split into groups of 2 and 3. Where can a leader be elected?</p>
+  <div class="opts"><button>Only in the group of 2</button><button>Only in the group of 3</button><button>In both of the groups together</button><button>In neither of the two groups</button></div>
+  <p class="why">Winning needs votes from a majority of the <em>whole</em> cluster: 3 of 5. The group of 2 can never collect 3 votes, so it keeps timing out with rising terms. The group of 3 elects a leader and keeps working.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3" data-answer="3">
+  <p class="q">An old leader in the minority accepts a client's write after the partition. What happens to that entry?</p>
+  <div class="opts"><button>It commits once two nodes store it</button><button>It is merged into the new log</button><button>It is applied by the minority only</button><button>It is never committed, then later overwritten</button></div>
+  <p class="why">It can't reach a majority, so the old leader never commits it. After the heal the old leader sees a higher term, steps down, and the consistency check makes it (and any follower it copied the entry to) drop the conflicting entry. The widget shows <code>x=3</code> going exactly this way.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3" data-answer="0">
+  <p class="q">Why does each candidate pick a random election timeout?</p>
+  <div class="opts"><button>So one usually asks first</button><button>So heartbeats use less bandwidth</button><button>So terms never need numbers</button><button>So votes can count twice</button></div>
+  <p class="why">If every follower timed out together, they'd all vote for themselves and split the vote, over and over. Randomness spreads them out, so one candidate usually asks first and wins before the others wake up. The exercise measured it.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ PART 4 ═════════════════════════ -->
+<div class="part-label">Part 4</div>
+<div class="part-head" id="p4" data-title="Part 4"><h2>Two-phase commit vs sagas</h2><span class="t">~20 min</span></div>
+
+<p>L36's transactions were all-or-nothing inside <em>one</em> database. Now an order must be saved in <code>orders-db</code> and stock reserved in <code>stock-db</code>, two separate systems, and you want both or neither. "The most common algorithm to ensure atomic commitment across multiple nodes is the two-phase commit (2PC) protocol [Gray, 1978]" (Kleppmann, §6.1). A <dfn>coordinator</dfn> runs it in two phases:</p>
+<ol>
+  <li><b>Prepare.</b> The coordinator asks each participant "can you commit?". A participant that answers yes must make sure it <em>can</em> commit later, even after a crash, and keeps its locks until told the outcome.</li>
+  <li><b>Commit or abort.</b> If every vote was yes, the coordinator writes COMMIT to its own log and tells everyone; any no means ABORT.</li>
+</ol>
+<p>The catch is what happens between the phases. A prepared participant has given up the right to decide alone. Kleppmann: "The problem with two-phase commit is that the coordinator is a single point of failure", and the slide beside it adds, "Algorithm is blocked until coordinator recovers."</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · TwoPhase.kt</figcaption>
+<!--CODE:l57/TwoPhase.kt--></figure>
+  <figure class="java"><figcaption>JAVA · TwoPhase.java</figcaption>
+<!--CODE:l57/TwoPhase.java--></figure>
+</div>
+<p>Both print exactly this:</p>
+<pre class="out">== 1. Both participants can commit
+  votes orders-db=yes, stock-db=yes -&gt; coordinator logs COMMIT
+  orders-db=COMMITTED  stock-db=COMMITTED
+== 2. stock-db can't (out of stock)
+  votes orders-db=yes, stock-db=no -&gt; coordinator logs ABORT
+  orders-db=ABORTED  stock-db=ABORTED
+== 3. Both vote yes, then the coordinator crashes
+  votes orders-db=yes, stock-db=yes -&gt; coordinator logs COMMIT
+  coordinator CRASHES before phase 2
+  orders-db=PREPARED  stock-db=PREPARED
+  after 1s, a reader on orders-db: BLOCKED: row locked by an in-doubt transaction
+  after 60s, a reader on orders-db: BLOCKED: row locked by an in-doubt transaction
+  after 3600s, a reader on orders-db: BLOCKED: row locked by an in-doubt transaction
+  orders-db asks stock-db what to do: it is PREPARED too, so neither knows the decision
+  coordinator restarts, reads its log: COMMIT, tells everyone
+  orders-db=COMMITTED  stock-db=COMMITTED   reader: ok</pre>
+<p>Cases 1 and 2 are what 2PC is for: both databases committed, or both aborted. Case 3 is its price. Both participants voted yes, so neither may abort, and neither knows the decision, so neither may commit. The row stays locked for as long as the coordinator is down, an hour in this run, and every reader of that row waits. Real databases document this honestly. PostgreSQL's <code>PREPARE TRANSACTION</code> "prepares the current transaction for two-phase commit", and the manual warns: "It is unwise to leave transactions in the prepared state for a long time", because "the transaction continues to hold whatever locks it held". Its advice for applications is blunt: "Unless you're writing a transaction manager, you probably shouldn't be using PREPARE TRANSACTION". The feature is meant for external transaction managers, "some of which are covered by standards (such as X/Open XA)" (<a href="https://www.postgresql.org/docs/current/sql-prepare-transaction.html">PostgreSQL docs</a>).</p>
+<p>The cure for a coordinator that can crash is Part 3. If the votes go through a consensus log instead of one coordinator, any node can learn the outcome. Kleppmann's notes show "a fault-tolerant two-phase commit algorithm based on Paxos Commit [Gray and Lamport, 2006]" (§6.1). That's powerful and heavyweight, and most microservice systems choose something weaker.</p>
+
+<h3>Sagas: give up isolation, keep going</h3>
+<p>The saga pattern drops the global lock altogether: "Implement each business transaction that spans multiple services as a saga. A saga is a reliably coordinated sequence of local transactions" (<a href="https://microservices.io/patterns/data/saga.html">microservices.io: Saga</a>). Each step commits for real in its own service. If a later step fails, "the changes made by the completed steps are undone by compensating transactions": not a rollback, but a new action that cancels the old one.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Saga.kt</figcaption>
+<!--CODE:l57/Saga.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Saga.java</figcaption>
+<!--CODE:l57/Saga.java--></figure>
+</div>
+<pre class="out">== Ana's trip: every step succeeds
+  reserve flight: ok
+  reserve hotel: ok
+  charge card: ok
+  committed: true, seats=0 rooms=0 charged=450
+== Ben's trip: the card is declined, so earlier steps are compensated
+  reserve flight: ok
+  reserve hotel: ok
+  charge card: FAILED
+  compensate reserve hotel
+  compensate reserve flight
+  committed: false, seats=1 rooms=1 charged=0
+  meanwhile Cleo searched hotels between Ben's steps and saw: sold out
+  (no isolation: she saw a reservation that was later undone)</pre>
+<p>Ben's card was declined, so the hotel and flight reservations were cancelled in reverse order, and the books balance again. Nothing ever blocked. But look at Cleo: between Ben's steps she searched for a room and was told "sold out", because Ben's reservation was real for a moment. The pattern's own page lists this as the main drawback: "Lack of isolation (the "I" in ACID)", with a risk that concurrent sagas cause data anomalies. You design around it, for example by marking rows <em>pending</em> until the saga finishes.</p>
+<table class="vs">
+  <tr><th></th><th>Two-phase commit</th><th>Saga</th></tr>
+  <tr><td><b>Atomic?</b></td><td>Yes: all commit or all abort</td><td>Eventually: completed steps are compensated</td></tr>
+  <tr><td><b>Isolated?</b></td><td>Yes: locks held until the decision</td><td>No: others see the intermediate steps</td></tr>
+  <tr><td><b>On a coordinator crash</b></td><td>Participants block, holding locks</td><td>Resume or compensate once it's back</td></tr>
+  <tr><td><b>Undo is…</b></td><td>Automatic rollback</td><td>Code you write for every step</td></tr>
+  <tr><td><b>Typical home</b></td><td>A transaction manager over several databases (the X/Open XA standard)</td><td>Across services you own (orders, payments)</td></tr>
+</table>
+
+<h3>The outbox: one local transaction, then a queue</h3>
+<p>Every saga step has the same problem in miniature: save to my database <em>and</em> send a message to the next service. If you commit and then crash before sending, the message is lost. If you send and then the commit fails, you've announced something that never happened. The transactional outbox asks "How to atomically update the database and send messages to a message broker?" and answers: "The solution is for the service that sends the message to first store the message in the database as part of the transaction that updates the business entities" (<a href="https://microservices.io/patterns/data/transactional-outbox.html">microservices.io: Transactional outbox</a>). A separate relay then publishes the stored messages. Its honest caveat: "The Message relay might publish a message more than once. It might, for example, crash after publishing a message but before recording the fact that it has done so." That's L42's at-least-once delivery again, and the answer is the same: an idempotent consumer.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Function types.</b> A step's action is <code>(Inventory) -> Boolean</code> and its compensation <code>(Inventory) -> Unit</code>. Java needs two different interfaces, <code>Predicate&lt;Inventory&gt;</code> and <code>Consumer&lt;Inventory&gt;</code>, and calls them with <code>.test(…)</code> and <code>.accept(…)</code> (L14).</li>
+    <li><b>Default arguments.</b> <code>Coordinator(crashBeforePhase2 = true)</code> and <code>runSaga(…, afterEach = {})</code> replace Java's extra constructor and the explicit <code>name -> {}</code>.</li>
+    <li><b>Capturing a <code>var</code>.</b> Kotlin's lambda can assign <code>seenByCleo</code> directly. Java's lambda can't assign a local, hence the <code>String[] seenByCleo = {""}</code> one-element-array trick (L14).</li>
+    <li><b><code>use { }</code></b> closes each JDBC statement in the exercise, like Java's try-with-resources (L10).</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: an outbox on real SQLite</div>
+  <p>From a blank file, using <code>sqlite-jdbc</code> as in L36: create <code>orders</code> and an <code>outbox(id, payload, sent)</code> table. <code>placeOrder</code> inserts the order and its <code>OrderPlaced</code> message in <b>one</b> transaction. A relay reads unsent outbox rows in order, publishes each one to a broker (a list will do), then marks it sent. Place three orders, run the relay but crash it right after publishing message 2 (throw before the <code>UPDATE</code>), then run it again. Finally feed the broker to a consumer that sends one email per message, and make it idempotent.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Outbox.kt</figcaption>
+<!--CODE:l57/ex/Outbox.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Outbox.java</figcaption>
+<!--CODE:l57/ex/Outbox.java--></figure>
+</div>
+<p>Run with the driver on the classpath and native access enabled, as in L36: <code>java --enable-native-access=ALL-UNNAMED -cp sqlite-jdbc-3.53.4.0.jar Outbox.java</code>. Both print:</p>
+<pre class="out">== relay run 1 crashes after publishing #2, before marking it sent
+  relay published outbox #1
+  relay published outbox #2
+  relay crashed
+== relay run 2, after a restart
+  relay published outbox #2
+  relay published outbox #3
+== the consumer reads the broker: 4 messages for 3 orders
+  consumer: email for "OrderPlaced #1 lamp"
+  consumer: email for "OrderPlaced #2 desk"
+  consumer: #2 again, already handled, skip
+  consumer: email for "OrderPlaced #3 chair"
+emails sent: 3</pre>
+  <p>The crash left message 2 published but not marked sent, so the restarted relay published it again: 4 messages for 3 orders. No order lost its message, and no message announced an order that doesn't exist, because the two rows were committed together. The consumer's set of seen ids turned the duplicate into a no-op, so exactly 3 emails went out. In production that set is a <code>processed_messages</code> table, updated in the same transaction as the consumer's own work.</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p4-1" data-group="Part 4" data-answer="2">
+  <p class="q">In two-phase commit, a participant has voted yes and then loses contact with the coordinator. What may it do?</p>
+  <div class="opts"><button>Commit on its own</button><button>Abort on its own</button><button>Only wait, holding locks</button><button>Ask clients to decide</button></div>
+  <p class="why">A yes vote is a promise to commit if told to, so aborting alone could break atomicity. But the coordinator might have decided ABORT, so committing alone could break it too. It must wait, and its locks block everyone who needs those rows.</p>
+</div>
+<div class="quiz" data-id="p4-2" data-group="Part 4" data-answer="1">
+  <p class="q">An outbox relay crashes after publishing a message but before marking it sent. What does the consumer see?</p>
+  <div class="opts"><button>The message is lost forever</button><button>The same message twice over</button><button>The message out of order</button><button>An error from the broker</button></div>
+  <p class="why">On restart the relay finds the row still unsent and publishes it again. The outbox guarantees at-least-once delivery, never exactly-once, so the consumer must be idempotent (L42).</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Part 4 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p5" data-title="Final exercise"><h2>Raft through a partition</h2><span class="t">~25 min</span></div>
+
+<p>Extend Part 3's election simulator into a Raft that replicates a log, then prove it survives a partition. Start from a blank Gradle project (as in L11), Kotlin first and then Java, and don't look at the widget or the solution until you've rated yourself.</p>
+<div class="task">
+  <ol>
+    <li><b>Log entries.</b> Each node keeps <code>log</code> (entries of term + command), <code>commitIndex</code>, and an <code>applied</code> list as its state machine. A leader also keeps <code>nextIndex</code> and <code>matchIndex</code> per follower, reset when it wins.</li>
+    <li><b>RequestVote carries the candidate's last log index and term</b>, and a voter grants only if the candidate's log is at least as up-to-date as its own.</li>
+    <li><b>Every heartbeat is an AppendEntries</b> with <code>prevIndex</code>, <code>prevTerm</code>, the entries from <code>nextIndex</code> on, and <code>leaderCommit</code>. A follower refuses if it lacks <code>prevIndex</code> with <code>prevTerm</code>; otherwise it deletes conflicting entries, appends, and advances its <code>commitIndex</code>. On a refusal the leader decrements <code>nextIndex</code>.</li>
+    <li><b>Commit by majority</b>, counting only entries from the leader's current term, and apply committed entries in order on every node.</li>
+    <li><b><code>propose(id, command)</code></b> succeeds only on a leader and returns before anything is committed.</li>
+    <li><b>Tests</b> (at least these): one leader in a healthy cluster; at most one leader per term over 300 seeds of random crashes, restarts, partitions and proposals; no two nodes ever apply different commands at one index; after the chaos stops, every node's applied list is identical; a minority leader can't commit; the majority elects a higher-term leader; after a heal every log converges; a stale log can't win a vote; one seed always replays the same history.</li>
+    <li><b>The scripted run</b>, seed 7: propose <code>x=1</code> and <code>x=2</code>; at 700 ms put the leader and one other node on one side of a partition; at 750 ms propose <code>x=3</code> to the old leader; at 1,300 ms propose <code>x=4</code> to the new one; heal at 1,800 ms; print the history and every node's final log.</li>
+    <li><b>Prove your tests can fail.</b> Delete the up-to-date check from the vote and run them again.</li>
+  </ol>
+</div>
+<div class="rating-group">
+  <div class="rating" data-id="final-kt" data-label="Final: Raft with log replication (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-jv" data-label="Final: Raft with log replication (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-sf" data-label="Final: arguing why two leaders can't share a term"><span class="who">SAFETY</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+</div>
+<p><b>SAFETY task:</b> before opening the solution, write a few sentences arguing why two nodes can never both be leader of the same term. Name every rule your argument uses.</p>
+
+<details class="solution"><summary>Reference solutions and real output</summary>
+<p>The Gradle projects come from <code>gradle init</code> as in L11, with no extra dependencies. First the simulator. It's Part 3's <code>Sim</code> plus logs; the new parts are <code>onAppendEntries</code>, <code>onAppendReply</code> and <code>propose</code>.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · raft/Raft.kt</figcaption>
+<!--CODE:l57/gr_kotlin/app/src/main/kotlin/raft/Raft.kt--></figure>
+  <figure class="java"><figcaption>JAVA · raft/Sim.java</figcaption>
+<!--CODE:l57/gr_java/app/src/main/java/raft/Sim.java--></figure>
+</div>
+<p>The scripted run. <code>--json</code> prints the same run as frames for Part 3's widget, so the widget is this exact program's output.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · raft/App.kt</figcaption>
+<!--CODE:l57/gr_kotlin/app/src/main/kotlin/raft/App.kt--></figure>
+  <figure class="java"><figcaption>JAVA · raft/App.java</figcaption>
+<!--CODE:l57/gr_java/app/src/main/java/raft/App.java--></figure>
+</div>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · RaftTest.kt</figcaption>
+<!--CODE:l57/gr_kotlin/app/src/test/kotlin/raft/RaftTest.kt--></figure>
+  <figure class="java"><figcaption>JAVA · RaftTest.java</figcaption>
+<!--CODE:l57/gr_java/app/src/test/java/raft/RaftTest.java--></figure>
+</div>
+<p><code>./gradlew test</code>, 9 green tests in each language:</p>
+<div class="pair">
+<pre class="out">RaftTest &gt; after the chaos stops, every node ends with the same applied commands() PASSED
+RaftTest &gt; a leader cut off in the minority cannot commit() PASSED
+RaftTest &gt; after healing, the old leader steps down and every log converges() PASSED
+RaftTest &gt; no two nodes ever apply different commands at one index, across 300 chaotic seeds() PASSED
+RaftTest &gt; a healthy cluster elects one leader and everyone agrees on its term() PASSED
+RaftTest &gt; the majority side elects a new leader with a higher term() PASSED
+RaftTest &gt; at most one leader per term, across 300 chaotic seeds() PASSED
+RaftTest &gt; a voter refuses a candidate whose log is behind its own() PASSED
+RaftTest &gt; one seed always replays the same history() PASSED
+BUILD SUCCESSFUL in 1s</pre>
+<pre class="out">RaftTest &gt; afterTheChaosStopsEveryNodeEndsWithTheSameAppliedCommands() PASSED
+RaftTest &gt; aVoterRefusesACandidateWhoseLogIsBehindItsOwn() PASSED
+RaftTest &gt; oneSeedAlwaysReplaysTheSameHistory() PASSED
+RaftTest &gt; afterHealingTheOldLeaderStepsDownAndEveryLogConverges() PASSED
+RaftTest &gt; theMajoritySideElectsANewLeaderWithAHigherTerm() PASSED
+RaftTest &gt; atMostOneLeaderPerTermAcross300ChaoticSeeds() PASSED
+RaftTest &gt; noTwoNodesEverApplyDifferentCommandsAtOneIndex() PASSED
+RaftTest &gt; aHealthyClusterElectsOneLeaderAndEveryoneAgreesOnItsTerm() PASSED
+RaftTest &gt; aLeaderCutOffInTheMinorityCannotCommit() PASSED
+BUILD SUCCESSFUL in 1s</pre>
+</div>
+<p><code>./gradlew run</code> prints the same in both languages:</p>
+<pre class="out">== Seed 7: two writes, a partition at 700 ms, a write on each side, heal at 1,800 ms
+   158 ms  n5 times out: candidate for term 1
+   160 ms  n3 votes for n5 in term 1
+   161 ms  n1 votes for n5 in term 1
+   165 ms  n2 votes for n5 in term 1
+   166 ms  n4 votes for n5 in term 1
+   168 ms  n5 is LEADER of term 1, votes from n3, n4, n5
+   400 ms  client -&gt; n5: x=1 (index 1, term 1, not committed yet)
+   431 ms  n5 commits up to index 1 (x=1), stored on 3 of 5
+   450 ms  client -&gt; n5: x=2 (index 2, term 1, not committed yet)
+   478 ms  n5 commits up to index 2 (x=2), stored on 3 of 5
+   700 ms  PARTITION {n1,n5} | {n2,n3,n4}
+   750 ms  client -&gt; n5: x=3 (index 3, term 1, not committed yet)
+   866 ms  n4 times out: candidate for term 2
+   870 ms  n3 votes for n4 in term 2
+   871 ms  n2 votes for n4 in term 2
+   881 ms  n4 is LEADER of term 2, votes from n2, n3, n4
+  1300 ms  client -&gt; n4: x=4 (index 3, term 2, not committed yet)
+  1347 ms  n4 commits up to index 3 (x=4), stored on 3 of 5
+  1800 ms  partition HEALS
+  1827 ms  n5 steps down: saw term 2
+  1835 ms  n5 drops uncommitted [x=3]: conflicts with the leader
+  1841 ms  n1 drops uncommitted [x=3]: conflicts with the leader
+
+node term role      log (term:command)       commit applied
+n1   2    FOLLOWER  1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+n2   2    FOLLOWER  1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+n3   2    FOLLOWER  1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+n4   2    LEADER    1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+n5   2    FOLLOWER  1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+election safety: true, state machine safety: true</pre>
+<ul>
+  <li><b>Two histories never existed.</b> During the partition n5 still believed it led term 1 and accepted <code>x=3</code>, but stored on 2 of 5 it never committed. Meanwhile n4 won term 2 and committed <code>x=4</code> on the majority side. After the heal the first message n5 received from the majority side carried term 2, so it stepped down, and the consistency check made n5 and n1 drop <code>x=3</code>. Every node applied exactly <code>x=1, x=2, x=4</code>.</li>
+  <li><b>The chaos tests really exercise the hard paths.</b> Counted over their 300 seeds: 300 chaotic seeds: 963 elections won, 1574 step-downs, 276 conflicting-entry repairs (in 182 seeds). Elections, step-downs and log repairs all happen hundreds of times, not just in the happy path.</li>
+</ul>
+<p><b>The red run.</b> Deleting <code>&amp;&amp; node.isUpToDate(msg.lastIndex, msg.lastTerm)</code> from the vote lets a node with a stale log win an election and overwrite committed entries:</p>
+<pre class="err">RaftTest &gt; after the chaos stops, every node ends with the same applied commands() FAILED
+    org.opentest4j.AssertionFailedError: seed 1: [[c0, c1, c2, c3, c5, c6, c7, c8, c9], [c0, c1, c2, c3, c5, c6, c7, c8, c9], [c0, c1, c2, c4, c5, c6, c7, c8, c9], [c0, c1, c2, c3, c5, c6, c7, c8, c9], [c0, c1, c2, c3, c5, c6, c7, final]]
+        at app//raft.RaftTest.after the chaos stops, every node ends with the same applied commands(RaftTest.kt:54)
+RaftTest &gt; a leader cut off in the minority cannot commit() PASSED
+RaftTest &gt; after healing, the old leader steps down and every log converges() PASSED
+RaftTest &gt; no two nodes ever apply different commands at one index, across 300 chaotic seeds() FAILED
+    org.opentest4j.AssertionFailedError: seed 1
+        at app//raft.RaftTest.no two nodes ever apply different commands at one index, across 300 chaotic seeds(RaftTest.kt:47)
+RaftTest &gt; a healthy cluster elects one leader and everyone agrees on its term() PASSED
+RaftTest &gt; the majority side elects a new leader with a higher term() PASSED
+RaftTest &gt; at most one leader per term, across 300 chaotic seeds() PASSED
+RaftTest &gt; a voter refuses a candidate whose log is behind its own() PASSED
+RaftTest &gt; one seed always replays the same history() PASSED
+9 tests completed, 2 failed
+BUILD FAILED in 655ms</pre>
+<p>In seed 1, one node applied <code>c4</code> where the others applied <code>c3</code>, and another ended with a different tail: committed commands were rewritten. The unit test of <code>isUpToDate</code> still passed, because the function was fine. Only the end-to-end chaos tests noticed that nobody called it.</p>
+<p class="note">A harder bug to catch: deleting the "only count current-term entries" rule from the commit loop is the scenario of the paper's Figure 8. With that bug the 300-seed suite still passed. Widening the state-machine test to 5,000 seeds found it at <b>seed 1,962</b>. Random testing finds common bugs cheaply, and rare interleavings only with many more runs. That's why the Raft authors also wrote a formal specification and a proof, and why serious implementations are tested with tools that search interleavings systematically.</p>
+<p><b>SAFETY, a model answer.</b> (1) A node becomes leader of term T only after votes from a majority, more than n/2 nodes, all in term T. (2) Each node votes at most once per term, and stores that vote durably, so even a crash and restart can't make it vote again in T. (3) Any two majorities of the same n nodes overlap in at least one node, because together they have more than n members (pigeonhole, L48). So if two candidates both won term T, the shared node voted twice in T, contradicting (2). The buggy-voter sweep in Part 3 broke rule (2), and two leaders appeared at once.</p>
+</details>
+<label class="done"><input type="checkbox" class="part-done" data-part="p5"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="2">
+  <p class="q">L24 + L57: a Raft leader stops for a 2-second garbage-collection pause, with a 150–300 ms election timeout. What happens?</p>
+  <div class="opts"><button>Followers simply wait for it patiently</button><button>The whole cluster stops accepting writes</button><button>Another node wins a newer term</button><button>Two leaders commit two different writes</button></div>
+  <p class="why">No heartbeats for 2 s means followers time out and elect a new leader in a higher term. When the paused leader wakes, its first contact carries the newer term and it steps down. A stop-the-world pause (L24) looks exactly like a crash from outside, which is why long GC pauses matter in clustered systems.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="0">
+  <p class="q">L56 + L57: why must a Raft node save its term and vote to disk, with <code>fsync</code>, before replying to a RequestVote?</p>
+  <div class="opts"><button>So a restart can't vote twice</button><button>So replies travel the network faster</button><button>So followers can skip heartbeats safely</button><button>So the leader can read them</button></div>
+  <p class="why">If the vote lived only in memory, a node could vote, crash, restart with no memory of it, and vote for a second candidate in the same term. That breaks the one-vote rule the whole safety argument rests on. L56 showed that only <code>fsync</code> makes a write survive a crash.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="3">
+  <p class="q">L32 + L57: a client's write to the leader times out. The leader may or may not have committed it. What makes a retry safe?</p>
+  <div class="opts"><button>A longer timeout on the retry</button><button>Sending the retry to a follower</button><button>Waiting for the next election first</button><button>An idempotency key on the request</button></div>
+  <p class="why">A timeout tells you nothing about whether the write committed. With an idempotency key (L32), the service recognises the retry and returns the first result instead of applying it twice. The final's <code>x=3</code> shows the other half: "accepted" was never a promise.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="1">
+  <p class="q">L27 + L57: what do the Java memory model's happens-before and Lamport's happened-before have in common?</p>
+  <div class="opts"><button>Both are measured in real milliseconds</button><button>Both are partial orders from edges</button><button>Both need a shared global clock</button><button>Both order every pair of events</button></div>
+  <p class="why">Both start from program order, add edges (synchronization in the JMM, messages here), and close under transitivity. Neither orders every pair: events with no chain between them are concurrent, and neither uses physical time.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Name the two kinds of clock and the one job each is right for. Which one can jump backwards, and why?</li>
+    <li>Write Lamport's two clock rules from memory, then the vector-clock version of each.</li>
+    <li>Given [3,1,0] and [2,2,0], say whether one happened before the other, and how you know.</li>
+    <li>State Raft's five election rules. Which single rule does the safety argument depend on most?</li>
+    <li>When is a log entry committed? Why can't an old leader in the minority commit anything?</li>
+    <li>Draw 2PC's two phases, and mark where a coordinator crash leaves participants blocked. What does a saga give up instead?</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  Martin Kleppmann's free Cambridge lecture notes, <a href="https://www.cl.cam.ac.uk/teaching/2425/ConcDisSys/dist-sys-notes.pdf"><em>Distributed Systems</em></a>, cover this whole lesson in his clear style: physical and logical clocks (ch. 3), broadcast (ch. 4), two-phase commit (§6.1) and Raft (§7.2). Then read the Raft paper itself, <a href="https://raft.github.io/raft.pdf">"In Search of an Understandable Consensus Algorithm (Extended Version)"</a> by Ongaro and Ousterhout, especially §5 and Figure 2, and play with the visualisation on <a href="https://raft.github.io/">raft.github.io</a>. Lamport's <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">"Time, Clocks, and the Ordering of Events in a Distributed System"</a> (1978) is short and still readable. For depth, <em>Designing Data-Intensive Applications</em> (2nd ed.) covers unreliable clocks and consensus at production scale.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/system-design.html">System Design &amp; Caching</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "why can't the minority just elect a leader with 2 votes?", "is last write wins ever OK?", "should my services use 2PC or a saga?" or "what happens to a client request during an election?" are exactly the right kind. Paste in a trace from your simulator for a second opinion.</p>
+
+<div class="lesson-nav">
+  <a href="0043-trade-offs-and-resilience.html">← L43 · Trade-offs &amp; Resilience</a>
+  <a href="0044-a-worked-design.html">L44 · A Worked Design →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/raftviz.js"></script>
+</body>
+</html>

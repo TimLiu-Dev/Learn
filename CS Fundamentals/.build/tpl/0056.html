@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L56 · Storage Engines &amp; Other Data Models</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  .layers td:first-child { font-weight: 600; white-space: nowrap; }
+  .layers td { vertical-align: top; }
+  .layers td.y { color: var(--ok); font-weight: 600; }
+  .layers td.n { color: var(--accent); font-weight: 600; }
+</style>
+</head>
+<body data-lesson="l56">
+<main>
+
+<div class="kicker">Lesson 56 · Phase 10 Databases · <a href="../reference/roadmap.html#p10">roadmap</a></div>
+<h1>Storage Engines &amp; Other Data Models</h1>
+<p class="subtitle">L34–L36 used SQLite as a black box. This lesson opens the box. You'll build the two designs nearly every database storage engine descends from: a log with a hash index, and a log-structured merge tree. Then you'll kill them with <code>kill -9</code> to see what survives, measure what a durable write really costs, and finish with the data models that trade the relational table for documents, keys or graphs.</p>
+
+<div class="lesson-meta">
+  <span><b>~115–130 min</b> · warm-up + 4 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll write, test-first, a key-value store that a <code>kill -9</code> in the middle of writing can't break: every write it acknowledged is still there afterwards, a half-written record is detected by its checksum and cut off, and compaction swaps files with one atomic rename. One of your tests launches a second JVM and kills it.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · A log with a hash index</a><span class="t">25 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · What survives which crash</a><span class="t">25 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · LSM-trees, Bloom filters and B-trees</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">4 · Documents, keys and graphs</a><span class="t">15 min</span></li>
+  <li data-part="p5"><a href="#p5">Final exercise: a store that survives kill -9</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l56/</code>. Every output on this page was captured from real runs on Kotlin 2.4 and JDK 26, on my machine (an Apple M5 Max, macOS, an internal SSD). Timings will differ on yours, and disk timings differ more than most: the ratios are the point. The SQLite programs need the <code>sqlite-jdbc</code> jar from L36 on the classpath. One section is marked <span class="deep-tag">Optional deep dive</span>: skip it if the sitting is running long.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L19, L35, L36, L48 and L53</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Sketch <code>MyHashMap.get</code> from L19. Why is it O(1) on average, and what has to be true of the hash function for that? (L19)</li>
+    <li>What does SQLite write <em>before</em> it changes a page of the database file, and why? (L36)</li>
+    <li>Why does a range query like <code>WHERE due BETWEEN … AND …</code> want a B-tree rather than a hash index? (L35)</li>
+    <li>Which of <code>SIGTERM</code> and <code>SIGKILL</code> lets a JVM run its shutdown hooks, and what exit code does each give? (L53)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="0">
+  <p class="q">Before SQLite changes a database page in its default mode, its rollback journal saves… (L36)</p>
+  <div class="opts"><button>The page's original content</button><button>Only the new rows</button><button>A hash per page</button><button>The SQL statement text</button></div>
+  <p class="why">"Prior to making any changes to the database file, SQLite first creates a separate rollback journal file and writes into the rollback journal the original content of the database pages that are to be altered" (<a href="https://www.sqlite.org/atomiccommit.html">SQLite: Atomic Commit</a>). After a crash, the old pages go back. Part 2 builds the same idea, all-or-nothing records, into a log.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="2">
+  <p class="q">Why do databases default to B-tree indexes rather than hash tables? (L35)</p>
+  <div class="opts"><button>Hash tables cannot store strings</button><button>B-trees never need any rebalancing</button><button>Range queries walk sorted leaves</button><button>Hashing is slower than disk</button></div>
+  <p class="why">A hash sends neighbouring keys to unrelated buckets, so "everything between A and B" means checking every key. A B-tree keeps keys sorted and chains its leaves. Part 1's store has exactly this weakness, and Part 3 fixes it by sorting.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="1">
+  <p class="q">A JVM receives <code>kill -9</code>. Its shutdown hooks… (L53)</p>
+  <div class="opts"><button>Run before it exits</button><button>Never run at all</button><button>Run only on Linux</button><button>Run after a delay</button></div>
+  <p class="why">SIGKILL can't be caught: the kernel ends the process with no warning, so nothing in the JVM runs and the exit code is 128 + 9 = 137. Whatever a storage engine hasn't handed to the operating system by then is gone. Part 2 measures exactly how much.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="3">
+  <p class="q">Two independent checks each wrongly answer "yes" with probability 0.1. The chance that both do is… (L48)</p>
+  <div class="opts"><button><code>0.2</code></button><button><code>0.1</code></button><button><code>0.05</code></button><button><code>0.01</code></button></div>
+  <p class="why">Independent events multiply: 0.1 × 0.1 = 0.01. A Bloom filter (Part 3) is built on this: it checks <i>k</i> bits per key, and a false "yes" needs all <i>k</i> of them to be set by chance.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>A log with a hash index</h2><span class="t">~25 min</span></div>
+
+<p>Here is a complete database, in the shell from L53. Writing appends a line; reading takes the <em>last</em> line for the key, because later lines overrule earlier ones:</p>
+<pre class="term"><!--OUT:shelldb--></pre>
+<p>Writes are as fast as a file can grow: nothing is ever looked up or rewritten, just appended. But <code>grep</code> reads the whole file on every lookup, which is O(n) in the number of writes ever made (L16), and the file grows forever, because an overwrite leaves the old line behind. Every storage engine in this lesson is an answer to those two problems that keeps the fast append.</p>
+
+<h3>Bitcask: keep the log, add an index</h3>
+<p>The first answer is to keep a hash map in memory from each key to where its latest value sits in the file. That's the design of <dfn>Bitcask</dfn>, the storage engine Basho wrote for the Riak database. Its paper is six readable pages (<a href="https://riak.com/assets/bitcask-intro.pdf">Sheehy &amp; Smith, "Bitcask: A Log-Structured Hash Table for Fast Key/Value Data", 2010</a>):</p>
+<ul>
+  <li><b>Writes append.</b> "The active file is only written by appending, which means that sequential writes do not require disk seeking." A delete "is simply a write of a special tombstone value, which will be removed on the next merge."</li>
+  <li><b>An index in memory.</b> "After the append completes, an in-memory structure called a "keydir" is updated. A keydir is simply a hash table that maps every key in a Bitcask to a fixed-size structure giving the file, offset, and size of the most recently written entry for that key."</li>
+  <li><b>Reads seek once.</b> Reading "doesn't ever require more than a single disk seek. We look up the key in our keydir, and from there we read the data."</li>
+  <li><b>Merging removes garbage.</b> "The merge process iterates over all non-active (i.e. immutable) files in a Bitcask and produces as output a set of data files containing only the "live" or latest versions of each present key."</li>
+</ul>
+<p>The paper's figure shows each entry as <code>crc · tstamp · ksz · value_sz · key · value</code>: a checksum, a timestamp, the two lengths, then the bytes. Ours drops the timestamp:</p>
+<pre class="out">offset  0     4         8         12        12+keyLen
+        [crc ][keyLen  ][valLen  ][key bytes][value bytes]
+        CRC-32 of everything after it         valLen = -1 means "deleted" (a tombstone)</pre>
+<p>Fixed-size lengths in front let a reader find where each record ends without any separators, so keys and values can contain any bytes at all. The checksum is for Part 2. <code>java.util.zip.CRC32</code> is in the JDK: "A class that can be used to compute the CRC-32 of a data stream" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/zip/CRC32.html">CRC32</a>).</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LogKV.kt</figcaption>
+<!--CODE:l56/LogKV.kt--></figure>
+  <figure class="java"><figcaption>JAVA · LogKV.java</figcaption>
+<!--CODE:l56/LogKV.java--></figure>
+</div>
+<ul>
+  <li><b>Positional I/O.</b> <code>ch.write(buf, pos)</code> and <code>ch.read(buf, pos)</code> take an explicit file position, so reads anywhere in the file never disturb where the next append goes. One <code>FileChannel</code> does both. The loops around <code>write</code> exist because a single call may write fewer bytes than asked.</li>
+  <li><b><code>ByteBuffer</code></b> packs ints and bytes into one array. Its integers are big-endian unless you change it: "The initial order of a byte buffer is always BIG_ENDIAN" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/ByteBuffer.html">ByteBuffer</a>). L30's length prefixes were big-endian too.</li>
+  <li><b>Recovery is a scan.</b> Opening the file reads every record from the start and replays it into the index. Bitcask calls this out as a cost, and its fix is the <em>hint file</em>: "like the data files but instead of the values they contain the position and size of the values," so startup reads less.</li>
+</ul>
+<p>A demo, then a peek at the raw bytes, then 100,000 writes and a compaction:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LogDemo.kt</figcaption>
+<!--CODE:l56/LogDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · LogDemo.java</figcaption>
+<!--CODE:l56/LogDemo.java--></figure>
+</div>
+<pre class="term"><span class="p">$ </span>kotlinc LogKV.kt LogDemo.kt -include-runtime -d logdemo.jar &amp;&amp; java -cp logdemo.jar LogDemoKt</pre>
+<pre class="out"><!--OUT:LogDemo.kt--></pre>
+<p>Java prints the same, except a record prints as <code>Loc[offset=45, size=29]</code> instead of the data class's <code>Loc(offset=45, size=29)</code>. Run it with <code>java LogDemo.java</code>: since JDK 22 the source launcher finds <code>LogKV.java</code> in the same folder on its own (<a href="https://openjdk.org/jeps/458">JEP 458</a>). Reading the output:</p>
+<ul>
+  <li><b>Four writes, one live key.</b> The file holds 90 bytes, and 61 of them are garbage: the first <code>dune</code> (23 bytes), <code>emma</code> (22) and its tombstone (16). Only the second <code>dune</code> at offset 45 is live.</li>
+  <li><b>The bytes are exactly the layout.</b> <code>00 00 00 04</code> is the key length 4, <code>00 00 00 07</code> the value length 7, then ASCII <code>64 75 6e 65</code> is "dune" (L2). The first four bytes are the CRC.</li>
+  <li><b>Garbage dominates a busy log.</b> 100,000 writes over 1,000 keys make a 2.8 MB file that is 98% garbage. Compaction leaves 28 KB, one record per key.</li>
+</ul>
+
+<p><b>Step through it.</b> Each box is a record in the file, with its offset and size. Struck-through records are garbage, and ✝ marks a tombstone. The orange outline is the record the operation touched.</p>
+<div class="logviz" data-src="lz-log"></div>
+<script type="application/json" id="lz-log"><!--JSON:log--></script>
+
+<p><b>Compaction is crash-safe because of the rename.</b> It writes the live records to a new file, forces them to disk, and only then renames the new file over the old one. If the process dies before the rename, the old file is untouched and the half-written new one is just a stray file to delete next time. If it dies after, the new file is complete. There's no moment when the store is half old and half new. <code>ATOMIC_MOVE</code> asks for exactly that: "The move is performed as an atomic file system operation", and if it can't be, "then AtomicMoveNotSupportedException is thrown" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/file/Files.html#move(java.nio.file.Path,java.nio.file.Path,java.nio.file.CopyOption...)">Files.move</a>). The same docs warn that if the target exists, "it is implementation specific if the existing file is replaced". On macOS and Linux the JDK implements it with the <code>rename</code> system call (<a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/unix/classes/sun/nio/fs/UnixFileSystem.java#L799-L801">UnixFileSystem.java</a>, an implementation detail), and macOS's man page promises: "If new exists, it is first removed" and "The rename() system call guarantees that an instance of new will always exist, even if the system should crash in the middle of the operation" (<a href="https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/rename.2.html">rename(2)</a>).</p>
+
+<div class="callout"><b>The price of the hash index.</b> Bitcask's authors are upfront about it: "the keydir structure grows by a small amount with the number of keys and must fit entirely in RAM". Every key must fit in memory, and a hash map can't answer "every key between <code>m</code> and <code>p</code>" without visiting them all. Part 3 removes both limits by keeping the data sorted.</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>data class Loc(val offset: Long, val size: Int)</code> and Java's <code>record Loc(long offset, int size)</code> are the same idea (L7). Kotlin also gives the <code>Triple</code> that <code>readAt</code> returns and destructures with <code>val (key, value, size) = rec</code>. Java needs its own <code>Rec</code> record for that.</li>
+    <li><code>LogKV(file).use { db -> … }</code> closes the channel however the block ends: Java's try-with-resources, as an ordinary function (L10).</li>
+    <li><code>val keys: Int get() = index.size</code> is a computed property; Java writes a <code>keys()</code> method.</li>
+    <li><code>keyLen !in 0..MAX_LEN</code> reads like the rule it checks; Java spells out two comparisons.</li>
+    <li><code>toHexString(HexFormat { … })</code> is in Kotlin's standard library; Java has <code>java.util.HexFormat</code> (JDK 17).</li>
+    <li>No checked exceptions: every Java method touching the file declares <code>throws IOException</code>, and Kotlin's don't (L10).</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: compaction that runs itself</div>
+  <p>From a blank file, in both languages. Wrap <code>LogKV</code> in an <code>AutoKV</code> that compacts automatically after a write once garbage is more than half the file, but never while the file is under 64 KB (compacting a tiny file is pure overhead). Run the same 100,000 writes over 1,000 keys and print how many compactions ran and the largest the file ever got. Then answer: why a <em>ratio</em> rather than "every 10,000 writes"?</p>
+  <details class="solution"><summary>Solution</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · AutoCompact.kt</figcaption>
+<!--CODE:l56/AutoCompact.kt--></figure>
+      <figure class="java"><figcaption>JAVA · AutoCompact.java</figcaption>
+<!--CODE:l56/AutoCompact.java--></figure>
+    </div>
+<pre class="out"><!--OUT:AutoCompact.kt--></pre>
+    <p>Java prints the same line. The file never passed 64 KB, against 2.8 MB without compaction. <b>Why a ratio:</b> it bounds the space directly. Garbage can never be more than about the live data again, however the writes are spread. It also keeps the cost fair: each compaction copies the live data, and it only runs after at least that much garbage has been written, so the copying amortises to a constant per write. That's L16's doubling-array argument again. A fixed count would compact too often for a small store and not often enough for a busy one.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Log and hash index" data-answer="1">
+  <p class="q">In <code>LogKV</code>, what does <code>put("dune", "F. Herbert")</code> do to the earlier <code>dune</code> record on disk?</p>
+  <div class="opts"><button>Overwrites it in place</button><button>Leaves it as garbage</button><button>Deletes it right away</button><button>Copies it somewhere else</button></div>
+  <p class="why">Nothing is ever changed in place. A new record is appended and the index moves to it; the old one stays until compaction copies only live records. The widget's third step shows it.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Log and hash index" data-answer="3">
+  <p class="q">How many disk reads does <code>get</code> need in <code>LogKV</code>, however big the file is?</p>
+  <div class="opts"><button><code>O(n)</code></button><button><code>O(log n)</code></button><button><code>O(√n)</code></button><button><code>O(1)</code></button></div>
+  <p class="why">One hash lookup in memory (L19) gives the offset, then one read at that offset. Bitcask: reading "doesn't ever require more than a single disk seek". The shell version's <code>grep</code> was O(n).</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Log and hash index" data-answer="0">
+  <p class="q">Why is a delete written as a tombstone instead of just removing the key from the index?</p>
+  <div class="opts"><button>Reopening would resurrect the value</button><button>Hash maps cannot remove keys</button><button>Tombstones make reads much faster</button><button>The CRC requires a record</button></div>
+  <p class="why">The index lives in memory and is rebuilt by replaying the file. Without a tombstone on disk, the replay would find the old value and bring it back.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Log and hash index" data-answer="2">
+  <p class="q">Compaction dies just before <code>Files.move</code>. After a restart, the store has…</p>
+  <div class="opts"><button>Half the old records</button><button>Only the compacted file</button><button>The complete old file</button><button>No readable data left</button></div>
+  <p class="why">The old file isn't touched until the atomic rename, so it's complete. The final exercise also deletes the leftover <code>.compact</code> file on startup.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>What survives which crash</h2><span class="t">~25 min</span></div>
+
+<p>"The write returned" doesn't mean "the write is safe". A byte you write passes through several places, and each kind of crash wipes out different ones:</p>
+<div class="table-scroll"><table class="layers">
+  <tr><th>Where the bytes are</th><th>Process crash<br>(<code>kill -9</code>, exception)</th><th>OS crash or<br>power loss</th><th>How they get to the next layer</th></tr>
+  <tr><td>Your JVM's buffer</td><td class="n">lost</td><td class="n">lost</td><td><code>flush()</code>, or a direct <code>write</code></td></tr>
+  <tr><td>The OS page cache</td><td class="y">survive</td><td class="n">lost</td><td><code>fsync</code> / <code>FileChannel.force</code></td></tr>
+  <tr><td>The drive's own cache</td><td class="y">survive</td><td class="n">may be lost</td><td>a drive flush (<code>F_FULLFSYNC</code> on macOS)</td></tr>
+  <tr><td>Stable storage</td><td class="y">survive</td><td class="y">survive</td><td>—</td></tr>
+</table></div>
+<p>The page cache belongs to the kernel, not to your process (L22), which is why it outlives a <code>kill -9</code>. Let's prove the top two rows. The program starts a copy of itself as a child process. The child writes 20,000 records, prints <code>acked 20000</code>, and goes to sleep. The parent kills it the moment it reads that line, then counts what's in the file:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · KillDemo.kt</figcaption>
+<!--CODE:l56/KillDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · KillDemo.java</figcaption>
+<!--CODE:l56/KillDemo.java--></figure>
+</div>
+<pre class="term"><span class="p">$ </span>java -cp killdemo.jar KillDemoKt parent</pre>
+<pre class="out"><!--OUT:KillDemo.kt--></pre>
+<p>Java (<code>java KillDemo.java parent</code>) prints identical numbers. <code>validPrefix</code> comes from today's second exercise; it measures how many bytes at the start of the file are whole, valid records.</p>
+<ul>
+  <li><b>Buffered: 55 acknowledged writes vanished.</b> The child's <code>write</code> calls returned, so it said "acked", but the last 1,595 bytes were still in the <code>BufferedOutputStream</code>'s 8 KB array inside the JVM. SIGKILL gave nothing a chance to flush (L53: exit 137, 128 + 9).</li>
+  <li><b>Direct: every acknowledged write survived</b>, with no <code>fsync</code> at all. Each <code>LogKV.put</code> is a <code>write</code> system call, which hands the bytes to the kernel's page cache before it returns. A dead process can't take them back.</li>
+  <li><b>No torn record, even in buffered mode.</b> That's an implementation detail. When a write doesn't fit in the buffer, JDK 26's <code>BufferedOutputStream</code> flushes the buffer first and then copies the whole write: <code>if (len &gt; buf.length - count) { flushBuffer(); }</code> (<a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/share/classes/java/io/BufferedOutputStream.java#L187-L189">BufferedOutputStream.java</a>). So records never straddle a flush. Nothing promises that, and an OS crash or power cut can tear a record anyway, which is next.</li>
+</ul>
+
+<h3>Torn writes and garbage tails</h3>
+<p>If the power goes off in the middle of a write, the end of the file can hold part of a record, or worse. SQLite's designers assume the worst: "SQLite assumes that when a file grows in length that the new file space originally contains garbage and then later is filled in with the data actually written. In other words, SQLite assumes that the file size is updated before the file content" (<a href="https://www.sqlite.org/atomiccommit.html">SQLite: Atomic Commit</a>). The lengths and the CRC are how <code>LogKV</code> notices. Simulate every kind of damage on a file of three 16-byte records:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · TornDemo.kt</figcaption>
+<!--CODE:l56/TornDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · TornDemo.java</figcaption>
+<!--CODE:l56/TornDemo.java--></figure>
+</div>
+<pre class="out"><!--OUT:TornDemo.kt--></pre>
+<p>Both languages print the same thing (their <code>Random(56)</code> junk bytes differ, with the same outcome).</p>
+<ol>
+  <li><b>A cut anywhere inside the last record</b> (lengths 32 to 47) loses exactly that record. The length check stops at a record that runs past the end of the file.</li>
+  <li><b>Random garbage after the records</b> is rejected. The junk bytes parse as some header, but the CRC of what follows doesn't match. A random match would be a 1 in 2<sup>32</sup> chance (L48).</li>
+  <li><b>One flipped bit</b> fails record 2's CRC. <code>LogKV</code> stops scanning there, so record 3 is lost too, even though it's intact. For a crash at the end of a log, stopping is right. Corruption in the middle is a different failure (a bad disk, not a crash), and real systems report it rather than silently dropping data.</li>
+  <li><b>The bug.</b> After reopening the torn file, <code>put("k4")</code> works and <code>get</code> returns it. But the record was appended at offset 40, <em>after</em> the 8 torn bytes. On the next open the scan stops at the torn bytes and never reaches it. An acknowledged write is gone. The exercise fixes it.</li>
+</ol>
+<p>SQLite's own write-ahead log uses the same defence: "Checksums and counters attached to each frame are used to determine which frames within the WAL are valid and which are leftovers from prior checkpoints" (<a href="https://www.sqlite.org/fileformat2.html#walformat">SQLite file format, §4</a>).</p>
+
+<div class="exercise">
+  <div class="label">Exercise: never write after garbage</div>
+  <p>From a blank file, in both languages. Write <code>validPrefix(channel)</code>, which returns the length of the longest prefix of the file made of whole records with matching CRCs, and <code>repair(path)</code>, which truncates the file to that length and forces the change to disk. Then rerun step 4 with <code>repair</code> before reopening: <code>k4</code> must survive the second reopen.</p>
+  <details class="solution"><summary>Solution</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · TornFix.kt</figcaption>
+<!--CODE:l56/TornFix.kt--></figure>
+      <figure class="java"><figcaption>JAVA · TornFix.java</figcaption>
+<!--CODE:l56/TornFix.java--></figure>
+    </div>
+<pre class="out"><!--OUT:TornFix.kt--></pre>
+    <p>Java prints the same. <code>FileChannel.truncate</code> cuts the file; the <code>force(true)</code> after it makes the cut itself durable, so a second crash can't bring the torn bytes back. The final exercise builds this into the store's startup.</p>
+  </details>
+</div>
+
+<h3>What a durable write costs</h3>
+<p>To survive power loss, the bytes have to leave the page cache. <code>FileChannel.force</code> is how: "If this channel's file resides on a local storage device then when this method returns it is guaranteed that all changes made to the file since this channel was created, or since this method was last invoked, will have been written to that device. This is useful for ensuring that critical information is not lost in the event of a system crash" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/FileChannel.html#force(boolean)">FileChannel.force</a>). Bitcask offers it as a "sync on put" option, for a writer that "would prefer to sync the write file after every write operation". What does that cost?</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · FsyncCost.kt</figcaption>
+<!--CODE:l56/FsyncCost.kt--></figure>
+  <figure class="java"><figcaption>JAVA · FsyncCost.java</figcaption>
+<!--CODE:l56/FsyncCost.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:FsyncCost.kt--></pre>
+<pre class="out"><!--OUT:FsyncCost.java--></pre>
+</div>
+<p>Kotlin on the left, Java on the right. A forced write costs about 3.5 ms, roughly 2,000 times a write that stops in the page cache. That's the latency ladder from L22: memory is nanoseconds, a real trip to the drive is milliseconds. The middle rows show the standard escape, <dfn>group commit</dfn>. Write several records, force once, and only then acknowledge all of them. Ten writes per force cost a tenth as much each. The trade-off is that nothing is acknowledged until the batch's force returns, so each caller waits a little longer while the system as a whole does far more.</p>
+<p>Databases expose exactly this dial. SQLite's <code>PRAGMA synchronous</code>: "When synchronous is FULL (2), the SQLite database engine will use the xSync method of the VFS to ensure that all content is safely written to the disk surface prior to continuing" (<a href="https://www.sqlite.org/pragma.html#pragma_synchronous">SQLite pragmas</a>). And L36's batching measurement, where 10,000 inserts ran far faster inside one transaction than as 10,000 auto-commits, was group commit: one forced journal write instead of ten thousand.</p>
+
+<h3>Two kinds of sync on macOS <span class="deep-tag">Optional deep dive</span></h3>
+<p>Apple's <code>fsync</code> man page has an unusual warning: "while fsync() will flush all data from the host to the drive (i.e. the "permanent storage device"), the drive itself may not physically write the data to the platters for quite some time and it may be written in an out-of-order sequence." It goes on: "This is not a theoretical edge case. This scenario is easily reproduced with real world workloads and drive power failures," and the fix is that "Mac OS X provides the F_FULLFSYNC fcntl. The F_FULLFSYNC fcntl asks the drive to flush all buffered data to permanent storage" (<a href="https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html">fsync(2)</a>).</p>
+<p>The JDK has both. On macOS, <code>FileChannel.force</code> calls <code>fcntl(fd, F_FULLFSYNC)</code> (<a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/macosx/native/libnio/ch/FileDispatcherImpl.c#L51">FileDispatcherImpl.c</a>), while the older <code>FileDescriptor.sync()</code> is a plain <code>fsync</code> (<code>#define IO_Sync fsync</code> in <a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/unix/native/libjava/io_util_md.h#L62">io_util_md.h</a>). Both are implementation details, not guarantees. Measuring them:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · SyncKinds.kt</figcaption>
+<!--CODE:l56/SyncKinds.kt--></figure>
+  <figure class="java"><figcaption>JAVA · SyncKinds.java</figcaption>
+<!--CODE:l56/SyncKinds.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:SyncKinds.kt--></pre>
+<pre class="out"><!--OUT:SyncKinds.java--></pre>
+</div>
+<p>A plain <code>fsync</code> on this Mac is 100 to 170 times cheaper, because it doesn't wait for the drive. It survives a kernel crash but, per Apple, not necessarily a power cut. SQLite makes the same choice by default: its <code>fullfsync</code> flag "determines whether or not the F_FULLFSYNC syncing method is used on systems that support it. The default value of the fullfsync flag is off" (<a href="https://www.sqlite.org/pragma.html#pragma_fullfsync">SQLite pragmas</a>). "Durable" always means "durable against which failure?"</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>me.arguments().orElseThrow().dropLast(1)</code> turns a Java array into a list and trims it in one call. Java copies the array into a <code>List</code> and uses <code>subList</code>.</li>
+    <li><code>if (args.firstOrNull() == "child") return child(…)</code> returns <code>Unit</code> from <code>main</code> in one line, without crashing on empty <code>args</code>.</li>
+    <li><code>full.copyOf(40)</code>, <code>full + junk</code> and <code>.also { it[29] = … }</code> are standard-library array helpers; Java writes <code>Arrays.copyOf</code> and <code>System.arraycopy</code>.</li>
+    <li><code>(32..48).groupBy { … }</code> collects the lengths by outcome in one expression; Java uses <code>computeIfAbsent</code> on a <code>LinkedHashMap</code>.</li>
+    <li><code>measureTime { }</code> (L16) returns a <code>Duration</code>; Java subtracts two <code>System.nanoTime()</code> readings.</li>
+  </ul>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Crashes and durability" data-answer="2">
+  <p class="q">A program calls <code>FileChannel.write</code> (no <code>force</code>), then gets <code>kill -9</code>. The bytes it wrote…</p>
+  <div class="opts"><button>Are always lost</button><button>Are half written</button><button>Survive the crash</button><button>Need a restart</button></div>
+  <p class="why">They're in the kernel's page cache, which doesn't belong to the process. KillDemo's direct mode recovered 20,000 of 20,000. A power cut is a different story.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Crashes and durability" data-answer="0">
+  <p class="q">Why must recovery truncate a torn tail instead of just stopping the scan there?</p>
+  <div class="opts"><button>Later appends land after garbage</button><button>Truncating makes reads much faster</button><button>The CRC is stored there</button><button>The index needs the space</button></div>
+  <p class="why">New records go at the end of the file. With the garbage still there, the next scan stops at it and never reaches them: TornDemo step 4 lost <code>k4</code> that way.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Crashes and durability" data-answer="3">
+  <p class="q">One forced write costs 3.5 ms. Roughly how many writes per second does "force after every write" allow?</p>
+  <div class="opts"><button><code>3,500</code></button><button><code>35,000</code></button><button><code>3.5</code></button><button><code>285</code></button></div>
+  <p class="why">1 s ÷ 3.5 ms ≈ 285, and the measurement said 281. That ceiling is why databases batch commits: 100 writes per force reached about 23,000 per second.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Crashes and durability" data-answer="1">
+  <p class="q">With group commit, when may the store tell a caller "your write is durable"?</p>
+  <div class="opts"><button>When its write returns</button><button>After the batch's force</button><button>Before the batch starts</button><button>When the buffer fills</button></div>
+  <p class="why">The acknowledgement has to wait for the force that covers the record; otherwise it's the buffered child's promise again. Batching delays each caller slightly and multiplies throughput.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>LSM-trees, Bloom filters and B-trees</h2><span class="t">~25 min</span></div>
+
+<p>Bitcask's two limits, every key in memory and no ranges, both come from the hash index. Keep the data <em>sorted</em> and they go away, without giving up sequential writes. The trick is to sort in memory and write sorted files in one go:</p>
+<ul>
+  <li><b>Memtable.</b> Writes go into a sorted map in memory. RocksDB: "new writes are inserted into the memtable and are optionally written to the logfile (aka. Write Ahead Log(WAL))" and "The default implementation of the memtable for RocksDB is a skiplist" (<a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Overview">RocksDB Overview</a>). A skip list is a sorted map like L20's trees; the JDK has one, <code>ConcurrentSkipListMap</code>, "providing expected average log(n) time cost for the containsKey, get, put and remove operations" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentSkipListMap.html">ConcurrentSkipListMap</a>). Ours is a <code>TreeMap</code>.</li>
+  <li><b>SSTable.</b> When the memtable fills, it's written out in key order as an immutable <dfn>sorted string table</dfn>: "When the memtable fills up, it is flushed to a sstfile on storage and the corresponding logfile can be safely deleted. The data in an sstfile is sorted to facilitate easy lookup of keys."</li>
+  <li><b>Tombstones and merging.</b> LevelDB's design notes: each entry "is either a value for the key, or a deletion marker for the key. (Deletion markers are kept around to hide obsolete values present in older sorted tables)" (<a href="https://github.com/google/leveldb/blob/main/doc/impl.md">LevelDB implementation notes</a>). Merging sorted files, keeping the newest version of each key, is merge sort's merge step (L18).</li>
+</ul>
+<p>The design is the <dfn>log-structured merge tree</dfn>, published by O'Neil, Cheng, Gawlick and O'Neil as "<a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">The Log-Structured Merge-Tree (LSM-Tree)</a>" (1996). LevelDB, RocksDB and Cassandra use it: "The Cassandra storage engine is optimized for high performance, write-oriented workloads. The architecture is based on Log Structured Merge (LSM) trees, which utilize an append-only approach instead of the traditional relational database design with B-trees" (<a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html">Cassandra: Storage Engine</a>).</p>
+<div class="logviz" data-src="lz-lsm"></div>
+<script type="application/json" id="lz-lsm"><!--JSON:lsm--></script>
+
+<h3>Bloom filters: skip the files that can't have it</h3>
+<p>Reading a key that's in an old table, or in none, means checking table after table. A <dfn>Bloom filter</dfn> per table answers "definitely not here" without touching the disk. Broder and Mitzenmacher's survey defines it: "A Bloom filter for representing a set S = {x1, x2, …, xn} of n elements is described by an array of m bits, initially all set to 0. A Bloom filter uses k independent hash functions." Adding a key sets <i>k</i> bits; to check a key, "If not, then clearly y is not a member of S. If all hi(y) are set to 1, we assume that y is in S, although we are wrong with some probability" (<a href="https://www.eecs.harvard.edu/~michaelm/postscripts/im2005b.pdf">"Network Applications of Bloom Filters: A Survey", Internet Mathematics, 2004</a>). "No" is always right; "maybe" is sometimes wrong. The same survey derives the false-positive rate, f = (1 − e<sup>−kn/m</sup>)<sup>k</sup>, and that it's smallest when k = ln 2 · (m/n).</p>
+<p>You don't need <i>k</i> separate hash functions. Kirsch and Mitzenmacher showed that two are enough, combined "to simulate additional hash functions of the form g<sub>i</sub>(x) = h<sub>1</sub>(x) + ih<sub>2</sub>(x)" (<a href="https://www.eecs.harvard.edu/~michaelm/postscripts/rsa2008.pdf">"Less Hashing, Same Performance", 2008</a>). Ours takes both halves of one 64-bit hash: FNV-1a over the bytes, which loops "hash = hash xor octet_of_data; hash = hash * FNV_prime" (<a href="http://www.isthe.com/chongo/tech/comp/fnv/index.html">FNV hash</a>), then MurmurHash3's <code>fmix64</code> finaliser (<a href="https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp#L81-L90">MurmurHash3.cpp</a>) to spread the bits, as L19's <code>HashMap</code> spreads <code>hashCode</code>.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Bloom.kt</figcaption>
+<!--CODE:l56/Bloom.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Bloom.java</figcaption>
+<!--CODE:l56/Bloom.java--></figure>
+</div>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · BloomDemo.kt</figcaption>
+<!--CODE:l56/BloomDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · BloomDemo.java</figcaption>
+<!--CODE:l56/BloomDemo.java--></figure>
+</div>
+<pre class="out"><!--OUT:BloomDemo.kt--></pre>
+<p>Both languages print exactly this table, because the hash is the same bit for bit. The measurements land within a few hundredths of a percent of the formula. Ten bits per key, about 1.2 bytes, rules out 99.2% of absent keys, and the <code>check</code> confirms there's never a false "no". The fourth row is the same memory with <i>k</i> = 1: 9.5% wrong instead of 0.8%. Choosing <i>k</i> matters as much as choosing <i>m</i>.</p>
+
+<h3>The whole LSM tree</h3>
+<p>Each SSTable keeps two small things in memory: the Bloom filter, and a <dfn>sparse index</dfn> holding the first key of every 16-record block. A lookup checks the filter, finds the block with <code>TreeMap.floorEntry</code> (the entry version of the <code>floorKey</code> you met in L20), and reads at most 16 records. The records use Part 1's format, so <code>LogKV.encode</code> writes them.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Lsm.kt</figcaption>
+<!--CODE:l56/Lsm.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Lsm.java</figcaption>
+<!--CODE:l56/Lsm.java--></figure>
+</div>
+<p><code>compact</code> is a k-way merge: a min-heap (L20) holds the head record of every table, ordered by key and then by age, so for equal keys the newest comes out first and the older copies are skipped. Then 100,000 random writes over 50,000 possible keys, a memtable of 10,000, and lookups checked against a plain <code>HashMap</code> of the truth:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LsmDemo.kt</figcaption>
+<!--CODE:l56/LsmDemo.kt--></figure>
+  <figure class="java"><figcaption>JAVA · LsmDemo.java</figcaption>
+<!--CODE:l56/LsmDemo.java--></figure>
+</div>
+<pre class="out"><!--OUT:LsmDemo.kt--></pre>
+<p>That's Kotlin. Java's numbers agree to within a few hundredths, but it draws different random keys (<code>kotlin.random.Random</code> and <code>java.util.Random</code> are different generators), so its range lists other values.</p>
+<ul>
+  <li><b>Every answer is right</b> (<code>wrong 0</code>), including the deleted <code>user00042</code>: its tombstone in a newer table hides the older value.</li>
+  <li><b>Present keys cost about one block read</b>, because the Bloom filters skip on average 2.6 of the tables in front of the right one.</li>
+  <li><b>Absent keys: 0.08 block reads with filters, 9.00 without.</b> Every one of the 9 tables would otherwise be read. With filters, the only reads are false positives: 9 tables × about 0.8% ≈ 0.07.</li>
+  <li><b>Range queries work</b>, which Bitcask couldn't do: the tables are sorted, so <code>range</code> reads from the right block of each and stops at the end key.</li>
+  <li><b>Write amplification</b> is bytes written to SSTables divided by the bytes Part 1's plain log would have written. Flushing alone gave 0.90, because overwrites inside one memtable never reach the disk. Compaction rewrote everything once more: 1.33 in total. Real engines compact again and again as data moves down levels. Cassandra's docs call it out: "Every write of data in Cassandra is re-written multiple times, known as write amplification, and this adds background I/O to the database workload."</li>
+</ul>
+
+<h3>B-trees write pages, not records</h3>
+<p>For comparison, a B-tree database (L35) updates a page in place. With SQLite's write-ahead log, every changed page is appended to the WAL first: "Each frame consists of a 24-byte frame-header followed by a page-size bytes of page data" (<a href="https://www.sqlite.org/fileformat2.html#walformat">SQLite file format</a>), and "the default page size increased to 4096" (<a href="https://www.sqlite.org/pragma.html#pragma_page_size">PRAGMA page_size</a>). So a commit costs at least 4,120 bytes per changed page, however small the change. Measure it by switching off automatic checkpoints so the WAL keeps every frame:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · WalAmp.kt</figcaption>
+<!--CODE:l56/WalAmp.kt--></figure>
+  <figure class="java"><figcaption>JAVA · WalAmp.java</figcaption>
+<!--CODE:l56/WalAmp.java--></figure>
+</div>
+<pre class="out"><!--OUT:WalAmp.kt--></pre>
+<p>Java's run matches to within 1%. A one-row commit writes about 4.6 KB to the WAL for a row that takes about 25 bytes in Part 1's log: 180 times what a plain log writes, and that's before a checkpoint copies the same pages into the database file again. Batch 100 rows per commit and many of them share pages, and the ratio falls to 11. All 2,000 in one commit is barely more than a log. So "B-trees write more than LSM-trees" is true per small transaction, and mostly a statement about how you batch. The honest summary is a table of trade-offs:</p>
+<div class="table-scroll"><table>
+  <tr><th></th><th>Hash log (Bitcask)</th><th>LSM-tree</th><th>B-tree</th></tr>
+  <tr><td>Write</td><td>one append</td><td>memtable, then sequential flushes; compaction rewrites</td><td>rewrite the page in place, plus the journal or WAL</td></tr>
+  <tr><td>Point read</td><td>one seek</td><td>memtable, then tables newest first; Bloom filters skip most</td><td>one path from root to leaf, about 3–4 pages (L35)</td></tr>
+  <tr><td>Range read</td><td>no</td><td>yes: merge sorted tables</td><td>yes: walk the linked leaves</td></tr>
+  <tr><td>Keys in memory</td><td>all of them</td><td>sparse index and filters only</td><td>whatever pages are cached</td></tr>
+  <tr><td>Used by</td><td>Riak (Bitcask)</td><td>LevelDB, RocksDB, Cassandra</td><td>SQLite, PostgreSQL, MySQL's InnoDB</td></tr>
+</table></div>
+<p>RocksDB lets you tune the LSM side of this. Its leveled compaction optimises "disk footprint vs. logical database size (space amplification)", while universal compaction optimises "total bytes written to disk vs. logical database size (write amplification)" and "typically results in lower write-amplification but higher space- and read-amplification" (<a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Overview">RocksDB Overview</a>). Read, write and space amplification trade against each other: no engine minimises all three.</p>
+
+<div class="callout"><b>Bridge to Android.</b> "The Room persistence library provides an abstraction layer over SQLite to allow fluent database access while harnessing the full power of SQLite" (<a href="https://developer.android.com/training/data-storage/room">Android: Room</a>). And SQLite commits every statement that isn't already inside a transaction: "Any command that accesses the database (basically, any SQL command, except a few PRAGMA statements) will automatically start a transaction if one is not already in effect. Automatically started transactions are committed when the last SQL statement finishes" (<a href="https://www.sqlite.org/lang_transaction.html">SQLite: Transaction</a>). So an app that saves rows one at a time in a loop pays the 180× row above on every one. Wrapping the loop in one transaction is the fix you just measured.</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>The <code>sequence { }</code> builder</b> (L50) makes <code>SsTable.entries()</code> lazy: records are read only as the caller iterates, and <code>use</code> closes the file when the sequence ends. The Java version reads the whole table into a list, which is simpler to write but reads more than a range query needs.</li>
+    <li><code>compareBy&lt;Cursor&gt;({ it.head!!.key }, { it.age })</code> builds a two-key comparator; Java chains <code>Comparator.comparing(…).thenComparingInt(…)</code>.</li>
+    <li><code>val (found, value) = t.lookup(…)</code> destructures a <code>Pair</code>. Java declares a <code>Found</code> record.</li>
+    <li><code>0xcbf29ce484222325uL.toLong()</code> writes a 64-bit constant above <code>Long.MAX_VALUE</code> as an unsigned literal. Java's <code>0xcbf29ce484222325L</code> is allowed directly, because a Java hex literal may set the sign bit: <code>0xffff_ffff_ffff_ffffL</code> is <code>-1L</code> (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-3.html#jls-3.10.1">JLS §3.10.1</a>). Kotlin rejects the same literal with <code>error: value out of range</code>.</li>
+    <li><code>tables.asReversed()</code> is a reversed <i>view</i>, with no copy. Java 21 added <code>List.reversed()</code> (<a href="https://openjdk.org/jeps/431">JEP 431</a>), which is also a view.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: size a Bloom filter for a target error rate</div>
+  <p>From a blank file, in both languages. Using the survey's two results, k = ln 2 · (m/n) and, at that <i>k</i>, a false-positive rate of (1/2)<sup>k</sup>, derive how many bits per key a filter needs for a target rate <i>p</i>. Write <code>bitsPerKey(p)</code>, build filters for 10%, 1% and 0.1% over 100,000 keys, and measure them on 1,000,000 absent keys.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(1/2)<sup>k</sup> = p gives k = −log<sub>2</sub> p. Substituting k = ln 2 · (m/n): m/n = −log<sub>2</sub> p / ln 2 = −ln p / (ln 2)<sup>2</sup>. That's about 1.44 · log<sub>2</sub>(1/p) bits per key, and every tenfold improvement costs another 4.8 bits.</p>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · BloomSize.kt</figcaption>
+<!--CODE:l56/BloomSize.kt--></figure>
+      <figure class="java"><figcaption>JAVA · BloomSize.java</figcaption>
+<!--CODE:l56/BloomSize.java--></figure>
+    </div>
+<pre class="out"><!--OUT:BloomSize.kt--></pre>
+    <p>Java prints the same. 9.59 bits per key and k = 7 is the "about 1%" filter the SSTables use (they round up to 10 bits).</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · LSM, Bloom, B-tree" data-answer="1">
+  <p class="q">A Bloom filter says a key is <em>not</em> in a table. The key is…</p>
+  <div class="opts"><button>Probably not there</button><button>Definitely not there</button><button>Probably there anyway</button><button>In older tables</button></div>
+  <p class="why">A key that was added set all its <i>k</i> bits, and bits are never cleared, so a 0 among them proves absence. Only "maybe" can be wrong.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · LSM, Bloom, B-tree" data-answer="3">
+  <p class="q">An LSM tree reads a key. Why must it check the SSTables newest first?</p>
+  <div class="opts"><button>Newer files are always smaller</button><button>Older files have no indexes</button><button>Bloom filters require that order</button><button>The newest version must win</button></div>
+  <p class="why">A key can be in several tables. The newest copy, value or tombstone, is the truth, so the search stops at the first table that has the key.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · LSM, Bloom, B-tree" data-answer="0">
+  <p class="q">Compacting all SSTables into one, a key's newest entry is a tombstone. The merge…</p>
+  <div class="opts"><button>Drops the key entirely</button><button>Keeps the tombstone forever</button><button>Restores the older value</button><button>Throws an exception immediately</button></div>
+  <p class="why">When every table takes part, nothing older remains for the tombstone to hide, so both go. A partial merge has to keep it, which is why LevelDB keeps "deletion markers … around to hide obsolete values present in older sorted tables".</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · LSM, Bloom, B-tree" data-answer="2">
+  <p class="q">Why did one-row commits write about 4.6 KB of WAL per small row?</p>
+  <div class="opts"><button>SQLite never compresses rows</button><button>The CRC is huge</button><button>Whole pages are logged</button><button>JDBC adds extra padding</button></div>
+  <p class="why">The WAL records whole changed pages, 24 bytes of frame header plus 4,096 bytes of page, sometimes two pages when a leaf splits. Batching lets many rows share each logged page.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ PART 4 ═════════════════════════ -->
+<div class="part-label">Part 4</div>
+<div class="part-head" id="p4" data-title="Part 4"><h2>Documents, keys and graphs</h2><span class="t">~15 min</span></div>
+
+<p>A storage engine decides how bytes sit on disk. A <dfn>data model</dfn> decides what shape your data has when you think about it. L34 taught the relational model: tables of rows, related by keys, recombined with <code>JOIN</code>. Three other models are common, and SQLite can imitate each one closely enough to compare them in a single script:</p>
+<pre class="term"><span class="p">$ </span>/usr/bin/sqlite3 :memory: &lt; models.sql</pre>
+<figure><figcaption>SQL · models.sql</figcaption>
+<!--CODE:l56/models.sql--></figure>
+<pre class="out"><!--OUT:models--></pre>
+
+<h3>Documents: one record holds the whole thing</h3>
+<p>MongoDB stores JSON-like documents: "Embedded documents store related data in a single document structure. A document can contain arrays and sub-documents with related data. These denormalized data models allow applications to retrieve related data in a single database operation" (<a href="https://www.mongodb.com/docs/manual/data-modeling/embedding/">MongoDB: Embedded Data</a>). The first query is that win: a book and its authors come back together, with no join. SQLite's <code>-&gt;&gt;</code> operator pulls a field out, and it "returns an SQL TEXT, INTEGER, REAL, or NULL value that represents the selected subcomponent, or NULL if the subcomponent does not exist" (<a href="https://www.sqlite.org/json1.html#jptr">SQLite JSON functions</a>).</p>
+<p>Two prices show up in the output:</p>
+<ul>
+  <li><b>Schema-on-read.</b> <i>The Lathe of Heaven</i> has no year, and nothing complained: the query just got <code>NULL</code>. MongoDB calls this a feature: "Documents within a single collection are not required to have the same set of fields or data types" (<a href="https://www.mongodb.com/docs/manual/data-modeling/">MongoDB: Data Modeling</a>). The relational table refused the same insert: <code>NOT NULL constraint failed</code>. That's <dfn>schema-on-write</dfn>. A document store moves the check into every program that reads the data.</li>
+  <li><b>Duplicated relationships.</b> "Ursula K. Le Guin" is spelled out inside two documents. Counting her books meant unpacking every document's array with <code>json_each</code>, and renaming her means rewriting every document that mentions her. One-to-many data that's read together suits documents; many-to-many data (authors ↔ books, students ↔ courses) is what joins and normalisation (L35) are for.</li>
+</ul>
+
+<h3>Key-value and wide-column</h3>
+<p>Parts 1 and 3 built key-value stores: <code>get</code>, <code>put</code> and <code>delete</code> by key, with the value opaque to the database. That's the whole model, and it scales well because a key says exactly where its data lives (L42's sharding). <dfn>Wide-column</dfn> stores such as Cassandra add structure on top: rows grouped into partitions by a key, sorted inside each partition, all of it stored in an LSM tree. You design the tables backwards from the questions: "In Cassandra, data modeling is query-driven" (<a href="https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/intro.html">Cassandra: Data Modeling</a>).</p>
+
+<h3>Graphs: when the relationships are the data</h3>
+<p>"A Neo4j graph database stores data as nodes, relationships, and properties instead of in tables or documents" (<a href="https://neo4j.com/docs/getting-started/graph-database/">Neo4j: Graph database concepts</a>). Its strength is questions that follow edges an unknown number of times: friends of friends, the shortest route, everything a package depends on. SQL can do it too, with a recursive common table expression, and SQLite's docs describe how it runs: "Run the initial-select and add the results to a queue. While the queue is not empty: Extract a single row from the queue. Insert that single row into the recursive table. Pretend that the single row just extracted is the only row in the recursive table and run the recursive-select, adding all results to the queue" (<a href="https://www.sqlite.org/lang_with.html#recursive_common_table_expressions">SQLite: WITH</a>). A queue of frontier rows, expanded one at a time: that's L21's breadth-first search. Check it against a BFS written by hand:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Friends.kt</figcaption>
+<!--CODE:l56/Friends.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Friends.java</figcaption>
+<!--CODE:l56/Friends.java--></figure>
+</div>
+<pre class="out"><!--OUT:Friends.kt--></pre>
+<p>Both languages print the same, and SQL agrees with BFS at every depth. <code>UNION</code> rather than <code>UNION ALL</code> drops repeated rows ("only add rows to the queue if no identical row has been previously added"), and the <code>hops &lt; ?</code> limit is what stops a cycle from looping forever. <code>cai</code> is reachable two ways, through <code>ben</code> and through <code>eve</code>; <code>min(hops)</code> keeps the shorter.</p>
+
+<div class="table-scroll"><table>
+  <tr><th>Model</th><th>Reach for it when</th><th>It costs you</th></tr>
+  <tr><td>Relational</td><td>many-to-many data, ad hoc questions, constraints the database enforces</td><td>joins, and a schema to migrate</td></tr>
+  <tr><td>Document</td><td>self-contained records read whole (a profile, an order with its lines)</td><td>duplication, and checks in every reader</td></tr>
+  <tr><td>Key-value</td><td>lookup by one key at huge scale (sessions, caches, carts)</td><td>no queries beyond the key</td></tr>
+  <tr><td>Wide-column</td><td>huge write volumes, queries known in advance</td><td>one table per query pattern</td></tr>
+  <tr><td>Graph</td><td>paths through relationships of unknown depth</td><td>a separate query language (Cypher)</td></tr>
+</table></div>
+
+<div class="callout"><b>Bridge to Spring.</b> Spring Data covers all of these with one repository style: "Spring Data's mission is to provide a familiar and consistent, Spring-based programming model for data access while still retaining the special traits of the underlying data store." Its modules include Spring Data JPA for relational databases, Spring Data MongoDB ("object-document support"), Spring Data for Apache Cassandra, Spring Data Neo4j ("object-graph support") and Spring Data Redis (<a href="https://spring.io/projects/spring-data">Spring Data</a>). The repository interface looks the same; the trade-offs in this table don't go away.</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>edges.groupBy({ it.first }, { it.second })</code> builds the adjacency list in one call. Java loops with <code>computeIfAbsent</code>.</li>
+    <li><code>buildMap { while (rs.next()) put(…) }</code> builds a read-only map from a <code>ResultSet</code> loop.</li>
+    <li><code>"""…""".trimIndent()</code> strips the shared indentation from the SQL. Java's text blocks (<code>"""</code>, JDK 15) do the same automatically.</li>
+    <li><code>next[p].orEmpty()</code> turns a missing key into an empty list; Java writes <code>getOrDefault(p, List.of())</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: every prerequisite, however deep</div>
+  <p>In <code>/usr/bin/sqlite3</code>. A table <code>requires(course, needs)</code> says which course needs which: distributed needs networks and databases, networks needs os, databases and os both need datastructures, and datastructures needs programming. Write one recursive query that lists everything you must take before <code>distributed</code>, with how many levels back each one is (its longest chain). Is this graph a tree?</p>
+  <details class="solution"><summary>Solution</summary>
+    <figure><figcaption>SQL · prereqs.sql</figcaption>
+<!--CODE:l56/prereqs.sql--></figure>
+<pre class="out"><!--OUT:prereqs--></pre>
+    <p>It isn't a tree: <code>datastructures</code> is reached by two paths (through <code>databases</code> at depth 2 and through <code>networks</code> → <code>os</code> at depth 3). It's a DAG, L21's topological-sort shape, and <code>max(depth)</code> keeps the longest chain. Taking courses in descending <code>levels_back</code> order is a valid topological order.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p4-1" data-group="Part 4 · Data models" data-answer="2">
+  <p class="q">A document store accepts a book with no <code>year</code> field. Reading <code>year</code> later gives…</p>
+  <div class="opts"><button>Gives 0</button><button>Throws exception</button><button>Gives null</button><button>Compile error</button></div>
+  <p class="why">Schema-on-read: nothing checked the shape on the way in, so a missing field reads as absent, <code>NULL</code> in SQLite's <code>-&gt;&gt;</code>. The relational table rejected the same row at insert time.</p>
+</div>
+<div class="quiz" data-id="p4-2" data-group="Part 4 · Data models" data-answer="0">
+  <p class="q">SQLite runs a recursive CTE by repeatedly taking rows from a queue. That makes it…</p>
+  <div class="opts"><button>A breadth-first search</button><button>A depth-first search</button><button>A binary search</button><button>A merge sort</button></div>
+  <p class="why">A FIFO queue of frontier rows, each expanded once: BFS (L21). The Friends program confirms it against a hand-written BFS at every depth.</p>
+</div>
+<div class="quiz" data-id="p4-3" data-group="Part 4 · Data models" data-answer="1">
+  <p class="q">Which data most needs a relational model with joins?</p>
+  <div class="opts"><button>A single user's settings</button><button>Students and their courses</button><button>A shopping cart's items</button><button>A web session's state</button></div>
+  <p class="why">Students ↔ courses is many-to-many: embedding either side in the other duplicates data and makes updates touch many documents. The other three are self-contained, read whole by one key.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Part 4 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p5" data-title="Final exercise"><h2>A store that survives kill -9</h2><span class="t">~25 min</span></div>
+
+<p>Do this in a fresh Gradle project (L11), from blank files, test-first. Kotlin first, then Java. No peeking at the parts above until you've rated your attempt.</p>
+<div class="task">
+  <p><b>The spec.</b> A <code>LogStore</code> in package <code>katas</code>, opened with <code>LogStore.open(dir, sync)</code>, where <code>sync</code> is <code>Sync.EVERY_WRITE</code> (the default) or <code>Sync.NEVER</code>:</p>
+  <ul>
+    <li><code>put(key, value)</code>, <code>get(key)</code> (null if absent), <code>delete(key)</code>, <code>size</code>, <code>fileBytes</code>, <code>compact()</code> and <code>close()</code>. An empty key is an <code>IllegalArgumentException</code>.</li>
+    <li>One file, <code>data.log</code>, in Part 1's record format, CRC included. With <code>EVERY_WRITE</code>, <code>put</code> returns only after <code>force</code>.</li>
+    <li>On open: delete any leftover <code>data.log.compact</code>, rebuild the index, and <b>truncate</b> anything after the last valid record.</li>
+    <li><code>compact()</code> writes the live records to <code>data.log.compact</code>, forces it, and renames it over <code>data.log</code> with <code>ATOMIC_MOVE</code>.</li>
+  </ul>
+  <p><b>Tests to write, in this order:</b> an empty store has nothing → put then get → an overwrite keeps the latest → a delete survives reopening → reopening recovers 100 keys → a torn tail is cut at <em>every</em> length inside the last record, and a write after repair survives a second reopen → garbage after the last record is truncated → compaction shrinks the file and keeps the latest values → a leftover compaction file is ignored → an empty key is rejected → finally, <b>kill -9 loses no acknowledged write</b>.</p>
+  <p><b>The kill test.</b> Put a <code>main</code> in the test sources that opens a store and loops forever: <code>put("k$i", "v$i")</code>, then print <code>acked $i</code>. The test starts it as a separate JVM with the same <code>java</code> and classpath (<code>ProcessHandle.current().info().command()</code> and the <code>java.class.path</code> system property), reads lines until about 2,000 writes are acked, kills it with SIGKILL, and reads any acks still in the pipe. It asserts exit code 137, then reopens the store and checks every acked key. <code>Sync.NEVER</code> is enough here, because Part 2 showed the page cache survives a process crash. Power loss is the one failure a test can't produce.</p>
+  <p><code>./gradlew run</code> should print:</p>
+<pre class="out"><!--OUT:run_kotlin--></pre>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: LogStore (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: LogStore (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-durability" data-label="Explain what survives which crash, and why"><span class="who">DURABILITY</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+  <p><b>The DURABILITY row:</b> without looking, explain to yourself, or write in your katas repo, which of your store's guarantees hold after (a) an exception, (b) <code>kill -9</code>, (c) a kernel panic, (d) a power cut, for both <code>Sync</code> settings, and which line of code provides each one. Then open the model answer.</p>
+  <details class="solution"><summary>Model answer: what survives which crash</summary>
+    <ul>
+      <li><b>(a) An exception, and (b) <code>kill -9</code>:</b> every completed <code>put</code> survives with either setting, because <code>ch.write</code> has handed the bytes to the kernel. A crash in the middle of <code>compact()</code> leaves the old file intact (the rename hasn't happened), and the next open deletes the leftover file.</li>
+      <li><b>(c) A kernel panic:</b> with <code>NEVER</code>, writes still in the page cache are lost, possibly leaving a torn tail. Startup's CRC check and <code>truncate</code> remove it, so the store opens with a clean prefix of the writes. With <code>EVERY_WRITE</code>, every acknowledged write was forced, so nothing acknowledged is lost.</li>
+      <li><b>(d) A power cut:</b> the same as (c) on this Mac, because JDK 26's <code>force</code> uses <code>F_FULLFSYNC</code> and flushes the drive's cache too. With a plain <code>fsync</code>, Apple warns the drive may still lose or reorder recent writes.</li>
+      <li><b>One gap:</b> the rename itself is a change to the directory. A fully careful store also forces the directory after the rename, which is what SQLite's <code>synchronous=EXTRA</code> adds for its journal ("the directory containing a rollback journal is synced after that journal is unlinked").</li>
+    </ul>
+  </details>
+  <details class="solution"><summary>Reference solution: LogStore</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · app/src/main/kotlin/katas/LogStore.kt</figcaption>
+<!--CODE:l56/gr_kotlin/app/src/main/kotlin/katas/LogStore.kt--></figure>
+      <figure class="java"><figcaption>JAVA · app/src/main/java/katas/LogStore.java</figcaption>
+<!--CODE:l56/gr_java/app/src/main/java/katas/LogStore.java--></figure>
+    </div>
+    <p>Java also needs <code>Sync.java</code>, the one-line <code>public enum Sync { EVERY_WRITE, NEVER }</code>; Kotlin declares the enum at the top of <code>LogStore.kt</code>. The index stores only offsets now, since compaction is the only thing that needed sizes in Part 1.</p>
+  </details>
+  <details class="solution"><summary>Reference tests, two real red runs, and the green run</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · LogStoreTest.kt</figcaption>
+<!--CODE:l56/gr_kotlin/app/src/test/kotlin/katas/LogStoreTest.kt--></figure>
+      <figure class="java"><figcaption>JAVA · LogStoreTest.java</figcaption>
+<!--CODE:l56/gr_java/app/src/test/java/katas/LogStoreTest.java--></figure>
+    </div>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · KillChild.kt (test sources)</figcaption>
+<!--CODE:l56/gr_kotlin/app/src/test/kotlin/katas/KillChild.kt--></figure>
+      <figure class="java"><figcaption>JAVA · KillChild.java (test sources)</figcaption>
+<!--CODE:l56/gr_java/app/src/test/java/katas/KillChild.java--></figure>
+    </div>
+    <p><b>Red run 1: recovery without the truncate.</b> With the <code>truncate</code> line commented out, two tests catch Part 2's bug at once:</p>
+<pre class="err"><!--OUT:red_truncate_kotlin@30-31--></pre>
+<pre class="err"><!--OUT:red_truncate_kotlin@46-47--></pre>
+    <p><b>Red run 2: the kill test that killed its own pipe.</b> My first version killed the child with <code>child.destroyForcibly()</code> and then tried to read the remaining acks:</p>
+<pre class="err"><!--OUT:red_stream_kotlin@33-34--></pre>
+    <p><code>Process.destroyForcibly()</code> does send SIGKILL, but JDK 26's implementation then closes the parent's ends of the child's pipes: <code>try { stdout.close(); } catch (IOException ignored) {}</code> (<a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/unix/classes/java/lang/ProcessImpl.java#L476-L478">ProcessImpl.java</a>, an implementation detail). <code>child.toHandle().destroyForcibly()</code> sends the same signal through the <code>ProcessHandle</code> and leaves the pipe open, so the acks the child had already printed can still be read. Then the green run:</p>
+<pre class="term"><span class="p">$ </span>./gradlew test --rerun</pre>
+<pre class="out"><!--OUT:green_kotlin@15-37--></pre>
+    <p>The Java project's run shows the same 11 tests passing, under their camelCase names. Each run's kill test counts differently, because the kill lands at a random moment. On my Kotlin run the child acknowledged 2,035 writes and the store recovered 2,036: one more write had reached the file before the kill, but the child never got to print its ack. That's correct. A crash may keep a write you were never told about, but must never lose one you were.</p>
+  </details>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p5"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">Merging <i>k</i> sorted SSTables with a min-heap of their heads costs, for <i>n</i> records in total… (L18, L20)</p>
+  <div class="opts"><button><code>O(n·k)</code></button><button><code>O(n log k)</code></button><button><code>O(n²)</code></button><button><code>O(k log n)</code></button></div>
+  <p class="why">Each record is pushed and popped once, and each heap operation is O(log k) for a heap of <i>k</i> cursors. Merge sort's two-way merge is the case k = 2.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">L36 found 10,000 inserts far faster inside one transaction than as 10,000 auto-commits. Today's name for that is… (L36)</p>
+  <div class="opts"><button>Write amplification</button><button>Bloom filtering</button><button>Log compaction</button><button>Group commit</button></div>
+  <p class="why">One forced write covers many changes. FsyncCost showed the same thing with 1, 10 and 100 writes per force, and WalAmp with rows per commit.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">A CRC-32 check passes on 4 random garbage bytes by chance with probability about… (L48)</p>
+  <div class="opts"><button><code>1 / 2³²</code></button><button><code>1 / 32</code></button><button><code>1 / 2⁸</code></button><button><code>1 / 4</code></button></div>
+  <p class="why">Random bytes produce a random 32-bit value, so the chance it equals the stored CRC is 1 in 2<sup>32</sup>, about 1 in 4.3 billion. Rare, which is why it's good enough to tell a torn tail from a real record.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">A child JVM was killed with SIGKILL. <code>waitFor()</code> returns… (L53)</p>
+  <div class="opts"><button><code>0</code></button><button><code>143</code></button><button><code>137</code></button><button><code>9</code></button></div>
+  <p class="why">128 + 9. The final's kill test asserts exactly this, so it fails loudly if the child died some other way, such as a crash at startup.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Draw Part 1's record layout from memory. What does each field protect against, and how is a delete written?</li>
+    <li>Fill in the "what survives which crash" table for: a JVM buffer, the page cache, the drive's cache. Which call moves bytes from each layer to the next?</li>
+    <li>Write <code>validPrefix</code> from a blank file, then explain why recovery must truncate rather than just stop.</li>
+    <li>Explain an LSM read path for a key that exists only in the oldest SSTable, with and without Bloom filters. What is a tombstone doing in a newer table?</li>
+    <li>For each of: user profiles, a social graph, shopping carts, course enrolments, name the data model you'd pick and one thing it would cost you.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  Martin Kleppmann and Chris Riccomini, <em>Designing Data-Intensive Applications</em>, 2nd ed. (<a href="https://martin.kleppmann.com/2026/03/24/designing-data-intensive-applications-2e.html">O'Reilly, 2026</a>), chapter 4, "Storage and Retrieval", which walks from a log with a hash index to SSTables, LSM-trees, Bloom filters and B-trees, the same path as Parts 1 and 3. Chapter 3, "Data Models and Query Languages", is Part 4 in depth. Then the six-page <a href="https://riak.com/assets/bitcask-intro.pdf">Bitcask paper</a>, the clearest storage-engine design document there is, and SQLite's <a href="https://www.sqlite.org/atomiccommit.html">Atomic Commit</a> page for how a real database survives a power cut. For lectures, CMU's free <a href="https://15445.courses.cs.cmu.edu/">15-445 Database Systems</a> course covers storage, buffer pools, indexes and recovery.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/databases.html">Databases</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. "Why doesn't the page cache die with my process?", "when would I pick RocksDB over SQLite?" or "how do I size a Bloom filter for my data?" are exactly the right kind of question. Paste in your kill test's output or a red run you can't explain, and we'll work through it.</p>
+
+<div class="lesson-nav">
+  <a href="0036-transactions-and-jdbc.html">← L36 · Transactions &amp; JDBC</a>
+  <a href="0037-clean-code-and-refactoring.html">L37 · Clean Code &amp; Refactoring →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/logviz.js"></script>
+</body>
+</html>

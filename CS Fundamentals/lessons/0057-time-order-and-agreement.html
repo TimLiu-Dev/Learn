@@ -1,0 +1,2935 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L57 · Time, Order &amp; Agreement</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body data-lesson="l57">
+<main>
+
+<div class="kicker">Lesson 57 · Phase 12 System Design &amp; Caching · <a href="../reference/roadmap.html#p12">roadmap</a></div>
+<h1>Time, Order &amp; Agreement</h1>
+<p class="subtitle">L42 gave you a leader and its replicas, and L43 showed what happens when the network splits them. This lesson goes one level down, to the three questions every replicated system has to answer: whose clock do you trust, what happened before what, and who gets to be the leader when machines crash and messages are lost?</p>
+
+<div class="lesson-meta">
+  <span><b>~115–130 min</b> · warm-up + 4 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll build a working Raft cluster in a simulator you control completely: five nodes elect a leader, replicate a log and commit by majority. Then you'll cut the network in two, watch the old leader keep accepting a write that can never commit, and watch the whole cluster heal into one agreed history. Two tests prove it, and a one-line bug makes them fail.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Why clocks lie</a><span class="t">25 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · Logical clocks</a><span class="t">25 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · Leader election and consensus: Raft</a><span class="t">35 min</span></li>
+  <li data-part="p4"><a href="#p4">4 · Two-phase commit vs sagas</a><span class="t">20 min</span></li>
+  <li data-part="p5"><a href="#p5">Final exercise: Raft through a partition</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l57/</code>. Every output on this page comes from a real run: JDK 26.0.1 and Kotlin 2.4.20 on an Apple M5 Max. Most programs here are <b>simulations with virtual time</b>: "machines" are objects in one JVM, "the network" is a priority queue of messages with random delays, and nothing actually sleeps. That's how distributed-systems engineers test this kind of code: a seeded simulation replays the exact same history every time, so a bug you find once, you can find again. Kotlin and Java use the same <code>java.util.Random</code> with the same seed, so both print identical output.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L27, L36, L42, L43, L48 and L53</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>In L43's two-replica demo, last write wins threw away the lamp. Which write won, and where did the timestamps come from? (L43)</li>
+    <li>State the Java memory model's happens-before rule in one sentence, and name two kinds of edge that create it. (L27)</li>
+    <li>"Exactly-once delivery" isn't possible over an unreliable network. What do systems build instead, and from which two pieces? (L42)</li>
+    <li>Pick any 3 servers out of 5, then any other 3. Why must the two groups share at least one server? (L48)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="2">
+  <p class="q">L43's replicas resolved a conflict with last write wins. What happened to the other concurrent write? (L43)</p>
+  <div class="opts"><button>It was merged in automatically</button><button>It was retried until success</button><button>It was silently thrown away</button><button>It was rejected with 409</button></div>
+  <p class="why">Last write wins keeps the version with the bigger timestamp and discards the rest, with no error anywhere. L43 got its timestamps from one shared counter. Part 1 shows what happens when each machine uses its own clock instead.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="0">
+  <p class="q">Two groups of 3 are chosen from the same 5 servers. What must be true? (L48)</p>
+  <div class="opts"><button>They share at least one server</button><button>They share exactly two of them</button><button>They never share a single server</button><button>They always contain all five servers</button></div>
+  <p class="why">3 + 3 = 6 slots but only 5 servers, so by the pigeonhole principle (L48) some server is in both. That overlap is the whole reason a majority vote can't elect two leaders. Part 3 builds on it.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="3">
+  <p class="q">Which signal can a JVM's shutdown hook never react to? (L53)</p>
+  <div class="opts"><button><code>SIGTERM</code></button><button><code>SIGINT</code></button><button><code>SIGHUP</code></button><button><code>SIGKILL</code></button></div>
+  <p class="why">SIGKILL "cannot be caught or ignored" (L53): the process just stops. That's the crash model in this lesson's simulations. A node vanishes mid-step, and only what it had already saved survives.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="1">
+  <p class="q">Inside one database, what does a transaction's atomicity promise? (L36)</p>
+  <div class="opts"><button>Each statement runs on one core</button><button>All statements happen, or none do</button><button>Readers never wait for any writer</button><button>Every row gets its own lock</button></div>
+  <p class="why">One database can promise all-or-nothing because it controls every write. Part 4 asks how to get the same promise across <em>two</em> databases or services, and why that's much harder.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Why clocks lie</h2><span class="t">~25 min</span></div>
+
+<p>Every computer keeps time with a quartz crystal, and no two crystals tick at exactly the same rate. Martin Kleppmann's Cambridge lecture notes (free, and this lesson's best companion) put it plainly: "The rate by which a clock runs fast or slow is called <dfn>drift</dfn>", measured in parts per million, where "1 ppm = 1 microsecond/second = 86 ms/day = 32 s/year" (<a href="https://www.cl.cam.ac.uk/teaching/2425/ConcDisSys/dist-sys-notes.pdf">Kleppmann, <em>Distributed Systems</em> notes</a>, §3.1). The difference between two clocks at one moment is <dfn>clock skew</dfn>. To keep skew small, machines regularly ask a time server for the correct time. "The Network Time Protocol (NTP) is widely used to synchronize computer clocks in the Internet" (<a href="https://www.rfc-editor.org/rfc/rfc5905">RFC 5905</a>).</p>
+<p>Correcting a clock means changing it, sometimes by a jump. That's why the JVM gives you two different clocks. L32's time part showed them inside one program; here's why the difference matters across machines:</p>
+<table class="vs">
+  <tr><th>Clock</th><th>Kotlin / Java</th><th>Good for</th><th>Trap</th></tr>
+  <tr><td><b>Time-of-day</b></td><td><code>Clock.System.now()</code> · <code>System.currentTimeMillis()</code>, <code>Instant.now()</code></td><td>"What time is it?" Timestamps people read.</td><td>"When the NTP client steps the local clock, a time-of-day clock may jump" (Kleppmann, §3.2), even backwards.</td></tr>
+  <tr><td><b>Monotonic</b></td><td><code>TimeSource.Monotonic</code> · <code>System.nanoTime()</code></td><td>Durations, timeouts, benchmarks (L16).</td><td>Meaningless across machines: <code>nanoTime</code> "can only be used to measure elapsed time and is not related to any other notion of system or wall-clock time" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/System.html#nanoTime()">System.nanoTime</a>).</td></tr>
+</table>
+<p>Kotlin's own docs warn about the first row: with <code>Clock.System</code>, "Successive calls to now will not necessarily return increasing Instant values, and when they do, these increases will not necessarily correspond to the elapsed time" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.time/-clock/-system/">Clock.System</a>). Kleppmann sums up the second row: "nanoTime() is a monotonic clock, which is not affected by NTP stepping: it still counts seconds elapsed, but it always moves forward." Kotlin's <code>TimeSource.Monotonic</code> "returns its readings from a source of monotonic time when it is available in a target platform" (<a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.time/-time-source/-monotonic/">TimeSource.Monotonic</a>); on the JVM that source is <code>System.nanoTime()</code>.</p>
+
+<h3>Two bugs a skewed clock causes</h3>
+<p>The program below gives each simulated node its own clock: true time plus an offset. Only the simulation knows true time; the nodes never see it. First it replays L43's last-write-wins replicas, except that timestamps now come from each node's own clock, which is how real replicas get them. Then it measures a 5-second timeout with a time-of-day clock while NTP steps it.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Skew.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.time.TimeSource
+
+// Each node reads its OWN clock: true time plus an error (offset) in ms.
+// "True time" exists only inside this simulation; real nodes never see it.
+class Node(val name: String, var offsetMs: Long) {
+    fun now(trueMs: Long) = trueMs + offsetMs
+}
+
+data class Versioned(val value: String, val ts: Long, val node: String)
+
+// A last-write-wins register: keep whichever version has the bigger timestamp.
+class Replica(val node: Node) {
+    var current: Versioned? = null
+    fun write(value: String, trueMs: Long): Versioned {
+        val v = Versioned(value, node.now(trueMs), node.name)
+        receive(v)
+        return v
+    }
+    fun receive(v: Versioned) {
+        val mine = current
+        if (mine == null || v.ts &gt; mine.ts) current = v
+    }
+}
+
+// Two edits 'gapMs' apart, the second on the replica whose clock is 'skewMs' slow.
+fun lostUpdate(skewMs: Long, gapMs: Long): Boolean {
+    val a = Replica(Node("A", 0))
+    val b = Replica(Node("B", -skewMs))
+    val first = a.write("Ana", 1_000)
+    val second = b.write("Ana Lima", 1_000 + gapMs)
+    a.receive(second); b.receive(first)                 // replicate both ways
+    return a.current!!.value != "Ana Lima"
+}
+
+fun main() {
+    println("== Last write wins with a clock that is 300 ms slow")
+    val a = Replica(Node("A", 0))
+    val b = Replica(Node("B", -300))
+    val first = a.write("Ana", 1_000)
+    println("true 1000 ms  user saves name=Ana      on A, A's clock says ${first.ts}")
+    val second = b.write("Ana Lima", 1_100)
+    println("true 1100 ms  user saves name=Ana Lima on B, B's clock says ${second.ts}")
+    a.receive(second); b.receive(first)
+    println("after replication: A=${a.current!!.value}  B=${b.current!!.value}")
+    println("the later edit lost: ${second.ts} &lt; ${first.ts}, so LWW kept the older value")
+
+    println()
+    println("== Lost? (rows: clock skew, columns: gap between the two edits)")
+    val gaps = listOf(10L, 50L, 100L, 500L)
+    println("skew   " + gaps.joinToString("") { "%7s".format("${it}ms") })
+    for (skew in listOf(0L, 20L, 100L, 300L)) {
+        println("%4dms ".format(skew) + gaps.joinToString("") { gap -&gt;
+            "%7s".format(if (lostUpdate(skew, gap)) "LOST" else "ok")
+        })
+    }
+
+    println()
+    println("== A 5 s timeout measured with the time-of-day clock, while NTP steps it")
+    for (stepMs in listOf(-2_000L, +2_000L)) {
+        val node = Node("C", 0)
+        val start = node.now(0)
+        var t = 0L
+        while (true) {
+            t += 100
+            if (t == 1_000L) node.offsetMs += stepMs        // NTP corrects the clock at true 1 s
+            if (node.now(t) - start &gt;= 5_000) break
+        }
+        println("step %+d ms at 1 s: timeout fired after %.1f s of real time".format(stepMs, t / 1000.0))
+    }
+
+    println()
+    println("== The fix for durations: a monotonic clock (real run)")
+    val mark = TimeSource.Monotonic.markNow()
+    val t0 = System.nanoTime()
+    Thread.sleep(50)
+    println("TimeSource.Monotonic: slept 50 ms, measured ${mark.elapsedNow().inWholeMilliseconds} ms")
+    println("System.nanoTime():    slept 50 ms, measured ${(System.nanoTime() - t0) / 1_000_000} ms")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Skew.java</figcaption>
+<pre><code class="language-java">public class Skew {
+    // Each node reads its OWN clock: true time plus an error (offset) in ms.
+    // "True time" exists only inside this simulation; real nodes never see it.
+    static class Node {
+        final String name;
+        long offsetMs;
+        Node(String name, long offsetMs) { this.name = name; this.offsetMs = offsetMs; }
+        long now(long trueMs) { return trueMs + offsetMs; }
+    }
+
+    record Versioned(String value, long ts, String node) {}
+
+    // A last-write-wins register: keep whichever version has the bigger timestamp.
+    static class Replica {
+        final Node node;
+        Versioned current;
+        Replica(Node node) { this.node = node; }
+        Versioned write(String value, long trueMs) {
+            Versioned v = new Versioned(value, node.now(trueMs), node.name);
+            receive(v);
+            return v;
+        }
+        void receive(Versioned v) {
+            if (current == null || v.ts() &gt; current.ts()) current = v;
+        }
+    }
+
+    // Two edits 'gapMs' apart, the second on the replica whose clock is 'skewMs' slow.
+    static boolean lostUpdate(long skewMs, long gapMs) {
+        Replica a = new Replica(new Node("A", 0));
+        Replica b = new Replica(new Node("B", -skewMs));
+        Versioned first = a.write("Ana", 1_000);
+        Versioned second = b.write("Ana Lima", 1_000 + gapMs);
+        a.receive(second); b.receive(first);              // replicate both ways
+        return !a.current.value().equals("Ana Lima");
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("== Last write wins with a clock that is 300 ms slow");
+        Replica a = new Replica(new Node("A", 0));
+        Replica b = new Replica(new Node("B", -300));
+        Versioned first = a.write("Ana", 1_000);
+        System.out.println("true 1000 ms  user saves name=Ana      on A, A's clock says " + first.ts());
+        Versioned second = b.write("Ana Lima", 1_100);
+        System.out.println("true 1100 ms  user saves name=Ana Lima on B, B's clock says " + second.ts());
+        a.receive(second); b.receive(first);
+        System.out.println("after replication: A=" + a.current.value() + "  B=" + b.current.value());
+        System.out.println("the later edit lost: " + second.ts() + " &lt; " + first.ts() + ", so LWW kept the older value");
+
+        System.out.println();
+        System.out.println("== Lost? (rows: clock skew, columns: gap between the two edits)");
+        long[] gaps = {10, 50, 100, 500};
+        StringBuilder head = new StringBuilder("skew   ");
+        for (long g : gaps) head.append(String.format("%7s", g + "ms"));
+        System.out.println(head);
+        for (long skew : new long[]{0, 20, 100, 300}) {
+            StringBuilder row = new StringBuilder(String.format("%4dms ", skew));
+            for (long g : gaps) row.append(String.format("%7s", lostUpdate(skew, g) ? "LOST" : "ok"));
+            System.out.println(row);
+        }
+
+        System.out.println();
+        System.out.println("== A 5 s timeout measured with the time-of-day clock, while NTP steps it");
+        for (long stepMs : new long[]{-2_000, +2_000}) {
+            Node node = new Node("C", 0);
+            long start = node.now(0);
+            long t = 0;
+            while (true) {
+                t += 100;
+                if (t == 1_000) node.offsetMs += stepMs;        // NTP corrects the clock at true 1 s
+                if (node.now(t) - start &gt;= 5_000) break;
+            }
+            System.out.println(String.format("step %+d ms at 1 s: timeout fired after %.1f s of real time", stepMs, t / 1000.0));
+        }
+
+        System.out.println();
+        System.out.println("== The fix for durations: a monotonic clock (real run)");
+        long t0 = System.nanoTime();
+        Thread.sleep(50);
+        System.out.println("System.nanoTime():    slept 50 ms, measured " + (System.nanoTime() - t0) / 1_000_000 + " ms");
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">== Last write wins with a clock that is 300 ms slow
+true 1000 ms  user saves name=Ana      on A, A's clock says 1000
+true 1100 ms  user saves name=Ana Lima on B, B's clock says 800
+after replication: A=Ana  B=Ana
+the later edit lost: 800 &lt; 1000, so LWW kept the older value
+
+== Lost? (rows: clock skew, columns: gap between the two edits)
+skew      10ms   50ms  100ms  500ms
+   0ms      ok     ok     ok     ok
+  20ms    LOST     ok     ok     ok
+ 100ms    LOST   LOST   LOST     ok
+ 300ms    LOST   LOST   LOST     ok
+
+== A 5 s timeout measured with the time-of-day clock, while NTP steps it
+step -2000 ms at 1 s: timeout fired after 7.0 s of real time
+step +2000 ms at 1 s: timeout fired after 3.0 s of real time
+
+== The fix for durations: a monotonic clock (real run)
+TimeSource.Monotonic: slept 50 ms, measured 60 ms
+System.nanoTime():    slept 50 ms, measured 62 ms</pre>
+<p>Java prints the same, except that it has no <code>TimeSource</code> line. The two sleep timings are real and came out at 60–62 ms, not 50. <code>Thread.sleep</code> promises <em>at least</em> the time you ask for, and this machine was busy.</p>
+<ul>
+  <li><b>The user's latest edit vanished.</b> B's clock was 300 ms slow, so its later write carried an <em>earlier</em> timestamp, and last write wins kept the older value on both replicas. No error, no log line. Kleppmann describes the rule exactly: "the update with the greatest timestamp takes effect, and any concurrent updates with lower timestamps to the same key are discarded" (§5.1). With skewed clocks, "greatest timestamp" no longer means "latest".</li>
+  <li><b>The table is the real rule.</b> Last write wins is only safe when two writes are further apart than the clocks' skew. Two edits 10 ms apart lose one as soon as the skew passes 10 ms. L43 avoided this by sharing one counter between both replicas, a luxury that machines in different buildings don't have.</li>
+  <li><b>The timeout fired at 7 s or 3 s, never 5 s.</b> When NTP stepped the clock back 2 s, the elapsed time measured by the time-of-day clock shrank by 2 s. Stepping forward made it fire early. A lease, a lock expiry or a rate limiter (L43) built on <code>currentTimeMillis</code> inherits exactly this bug. Measure durations with a monotonic clock, always.</li>
+</ul>
+<p class="note">Bridge: on Android the user can set the phone's clock to anything they like. Never let a client's timestamp decide which write wins on your server: the server assigns the order, or you use Part 2's logical clocks.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Typed durations.</b> <code>TimeSource.Monotonic.markNow()</code> returns a mark, and <code>mark.elapsedNow()</code> returns a <code>Duration</code>. Java's <code>System.nanoTime()</code> returns a bare <code>long</code> of nanoseconds, so subtracting and dividing by 1,000,000 is your job, and so is remembering the unit.</li>
+    <li><b>Data class vs record.</b> <code>data class Versioned(…)</code> and <code>record Versioned(…)</code> both generate <code>equals</code>, <code>hashCode</code> and <code>toString</code> (L7).</li>
+    <li><b><code>!!</code> says "I know it's set".</b> <code>a.current!!.value</code> throws if <code>current</code> is null. Java's <code>a.current.value()</code> throws the same <code>NullPointerException</code>, but the type never warned you it could be null (L3).</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: how far apart can two synced clocks get?</div>
+  <p>Kleppmann's notes say most computer clocks stay within about 50 ppm. From a blank file, simulate two clocks in 1 ms steps for two hours: clock A gains 50 ppm and clock B loses 50 ppm, and both are reset to true time every <code>T</code> seconds. Print the worst skew you saw for <code>T</code> = 16, 64 and 1024 s, next to the formula 2 × ppm × T. (RFC 5905's table lists NTP poll intervals from a "minimum poll exponent (16 s)" to a "maximum poll exponent (36 h)".) Then decide: how far apart must two writes be for last write wins to be safe?</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · DriftBound.kt</figcaption>
+<pre><code class="language-kotlin">// Exercise: how far apart can two NTP-synced clocks get?
+// Clock A runs 50 ppm fast, clock B 50 ppm slow; both are reset to true time every syncSec seconds.
+
+fun worstSkewMs(syncSec: Int, hours: Int = 2, ppm: Double = 50.0): Double {
+    var a = 0.0; var b = 0.0                          // each clock's error, in ms
+    var worst = 0.0
+    for (ms in 1..hours * 3_600_000) {
+        a += ppm / 1_000_000                          // 50 ppm = 0.00005 ms gained per real ms
+        b -= ppm / 1_000_000
+        worst = maxOf(worst, a - b)
+        if (ms % (syncSec * 1_000) == 0) { a = 0.0; b = 0.0 }   // sync: both back to true time
+    }
+    return worst
+}
+
+fun main() {
+    println("%-10s %12s %12s".format("sync every", "simulated", "2 x ppm x T"))
+    for (s in listOf(16, 64, 1024)) {
+        println("%-10s %9.1f ms %9.1f ms".format("$s s", worstSkewMs(s), 2 * 50e-6 * s * 1000))
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · DriftBound.java</figcaption>
+<pre><code class="language-java">// Exercise: how far apart can two NTP-synced clocks get?
+// Clock A runs 50 ppm fast, clock B 50 ppm slow; both are reset to true time every syncSec seconds.
+public class DriftBound {
+    static double worstSkewMs(int syncSec, int hours, double ppm) {
+        double a = 0, b = 0;                          // each clock's error, in ms
+        double worst = 0;
+        for (int ms = 1; ms &lt;= hours * 3_600_000; ms++) {
+            a += ppm / 1_000_000;                     // 50 ppm = 0.00005 ms gained per real ms
+            b -= ppm / 1_000_000;
+            worst = Math.max(worst, a - b);
+            if (ms % (syncSec * 1_000) == 0) { a = 0; b = 0; }   // sync: both back to true time
+        }
+        return worst;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(String.format("%-10s %12s %12s", "sync every", "simulated", "2 x ppm x T"));
+        for (int s : new int[]{16, 64, 1024}) {
+            System.out.println(String.format("%-10s %9.1f ms %9.1f ms", s + " s", worstSkewMs(s, 2, 50.0), 2 * 50e-6 * s * 1000));
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">sync every    simulated  2 x ppm x T
+16 s             1.6 ms       1.6 ms
+64 s             6.4 ms       6.4 ms
+1024 s         102.4 ms     102.4 ms</pre>
+  <p>Both languages print this table. The simulation matches the formula exactly, because the worst moment is always just before a sync, when one clock has gained ppm × T and the other has lost the same. Syncing every 16 s keeps two good clocks within about 1.6 ms of each other; a machine that syncs every 17 minutes can be 100 ms out. That's only drift: real NTP adds its own error, and "the exact accuracy achieved in a particular system depends on the timing properties of the network between client and server" (Kleppmann, §3.2). So last write wins is safe only for writes further apart than drift <em>plus</em> NTP error, a number you rarely know. Two clicks a user makes 50 ms apart can easily fall inside it.</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p1-1" data-group="Part 1" data-answer="1">
+  <p class="q">A rate limiter refills tokens based on elapsed time. Which clock should measure that time?</p>
+  <div class="opts"><button><code>System.currentTimeMillis()</code></button><button><code>System.nanoTime()</code></button><button><code>Instant.now()</code></button><button><code>LocalDateTime.now()</code></button></div>
+  <p class="why">Elapsed time needs a monotonic clock, and <code>nanoTime</code> is the JVM's. The other three are time-of-day clocks that NTP can step, so a backwards step would stall the refill and a forward one would grant a burst. (L43's token bucket used an injected clock for testing; in production it should sit on a monotonic source.)</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1" data-answer="3">
+  <p class="q">Two replicas use last write wins. B's clock is 100 ms slow, and a user edits on A, then on B 50 ms later. Which value survives?</p>
+  <div class="opts"><button>The value from B</button><button>Both values, merged together</button><button>Neither value, both rejected</button><button>The value from A</button></div>
+  <p class="why">B stamps its write 50 − 100 = 50 ms <em>earlier</em> than A's, so last write wins keeps A's older value and drops the user's latest edit. That's the "100ms / 50ms" cell of the table: LOST.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>Logical clocks</h2><span class="t">~25 min</span></div>
+
+<p>If physical clocks can't tell you what happened first, what can? In 1978 Leslie Lamport answered with one of the most cited papers in computing, "Time, Clocks, and the Ordering of Events in a Distributed System". Its abstract: "The concept of one event happening before another in a distributed system is examined, and is shown to define a partial ordering of the events" (<a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Lamport, 1978</a>). He defines the <dfn>happened-before</dfn> relation, written →, as the smallest relation where:</p>
+<ol>
+  <li>"If a and b are events in the same process, and a comes before b, then a → b."</li>
+  <li>"If a is the sending of a message by one process and b is the receipt of the same message by another process, then a → b."</li>
+  <li>"If a → b and b → c then a → c."</li>
+</ol>
+<p>Two events where neither happened before the other are <dfn>concurrent</dfn>. This is the shape you met in L27. The Java memory model's happens-before is also built from program order plus extra edges (unlocks before locks, <code>volatile</code> writes before reads), closed under transitivity. There the edges are synchronization between threads; here they are messages between machines. Both say the same thing: <em>a could have influenced b only if there is a chain of edges from a to b</em>.</p>
+
+<h3>Lamport clocks</h3>
+<p>Lamport then gives every process a counter and two rules that make timestamps respect →:</p>
+<ul>
+  <li><b>IR1.</b> "Each process Pi increments Ci between any two successive events."</li>
+  <li><b>IR2.</b> "(a) If event a is the sending of a message m by process Pi, then the message m contains a timestamp Tm = Ci(a). (b) Upon receiving a message m, [the receiver] sets [its clock] greater than or equal to its present value and greater than Tm."</li>
+</ul>
+<p>Together they guarantee his <dfn>Clock Condition</dfn>: "For any events a, b: if a → b then C(a) &lt; C(b)." A <dfn>vector clock</dfn> goes further, and Part 2's program runs both over the same script. Kleppmann explains why you'd want the second one: "If we do want to detect when events are concurrent, we need a different type of logical time: a vector clock" (§3.4). Each node keeps one counter <em>per node</em>; "Whenever an event occurs at node Ni, it increments the i th entry (its own entry) in its vector clock", and a receiver takes the element-wise maximum of its vector and the message's before incrementing its own entry.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Clocks.kt</figcaption>
+<pre><code class="language-kotlin">// Lamport clocks and vector clocks, run over the same script of events.
+
+class Lamport {
+    var time = 0L
+        private set
+    fun tick(): Long { time++; return time }                     // IR1: count every event
+    fun receive(stamp: Long): Long {                             // IR2(b): jump past the stamp
+        time = maxOf(time, stamp) + 1
+        return time
+    }
+}
+
+class Vector(n: Int) {
+    private val v = IntArray(n)
+    fun tick(me: Int): IntArray { v[me]++; return v.copyOf() }
+    fun receive(me: Int, other: IntArray): IntArray {
+        for (i in v.indices) v[i] = maxOf(v[i], other[i])       // learn what the sender knew
+        return tick(me)
+    }
+}
+
+enum class Order { BEFORE, AFTER, EQUAL, CONCURRENT }
+
+fun compare(a: IntArray, b: IntArray): Order {
+    val le = a.indices.all { a[it] &lt;= b[it] }
+    val ge = a.indices.all { a[it] &gt;= b[it] }
+    return when {
+        le &amp;&amp; ge -&gt; Order.EQUAL
+        le -&gt; Order.BEFORE
+        ge -&gt; Order.AFTER
+        else -&gt; Order.CONCURRENT
+    }
+}
+
+// One step of the script: process p does a local event, sends msg, or receives msg.
+sealed interface Step { val p: Int; val name: String }
+data class Local(override val p: Int, override val name: String) : Step
+data class Send(override val p: Int, val msg: String) : Step { override val name = "send $msg" }
+data class Recv(override val p: Int, val msg: String) : Step { override val name = "recv $msg" }
+
+class Event(val id: String, val p: Int, val lamport: Long, val vector: IntArray)
+
+fun IntArray.show() = joinToString(",", "[", "]")
+
+fun main() {
+    val script = listOf(
+        Local(0, "a"), Send(0, "m1"),
+        Local(1, "b"), Recv(1, "m1"), Send(1, "m2"),
+        Local(2, "c"), Recv(2, "m2"),
+        Local(0, "d"),
+    )
+    val lamports = List(3) { Lamport() }
+    val vectors = List(3) { Vector(3) }
+    val inFlight = mutableMapOf&lt;String, Pair&lt;Long, IntArray&gt;&gt;()  // message -&gt; the stamps it carries
+    val events = mutableListOf&lt;Event&gt;()
+
+    for (s in script) {
+        val (l, v) = when (s) {
+            is Local -&gt; lamports[s.p].tick() to vectors[s.p].tick(s.p)
+            is Send -&gt; (lamports[s.p].tick() to vectors[s.p].tick(s.p)).also { inFlight[s.msg] = it }
+            is Recv -&gt; inFlight.getValue(s.msg).let { (ml, mv) -&gt;
+                lamports[s.p].receive(ml) to vectors[s.p].receive(s.p, mv)
+            }
+        }
+        events += Event("P${s.p + 1} ${s.name}", s.p, l, v)
+    }
+
+    println("== One run, two kinds of logical clock")
+    println("%-12s %7s  %s".format("event", "Lamport", "vector"))
+    for (e in events) println("%-12s %7d  %s".format(e.id, e.lamport, e.vector.show()))
+
+    println()
+    println("== What each clock can tell you about a pair of events")
+    val byId = events.associateBy { it.id }
+    val pairs = listOf("P1 send m1" to "P2 recv m1", "P1 a" to "P3 recv m2",
+                       "P2 b" to "P1 d", "P1 d" to "P3 recv m2", "P1 a" to "P3 c")
+    for ((x, y) in pairs) {
+        val a = byId.getValue(x); val b = byId.getValue(y)
+        val sign = if (a.lamport &lt; b.lamport) "&lt;" else if (a.lamport &gt; b.lamport) "&gt;" else "="
+        println("%-10s vs %-10s  Lamport %d %s %d   vector %s".format(
+            x, y, a.lamport, sign, b.lamport, compare(a.vector, b.vector)))
+    }
+
+    println()
+    println("== A total order: sort by (Lamport time, process number)")
+    println(events.sortedWith(compareBy({ it.lamport }, { it.p })).joinToString("  ") { "${it.id}@${it.lamport}" })
+
+    println()
+    println("== Version vectors on two cart replicas (entry 0 counts A's writes, entry 1 B's)")
+    val base = intArrayOf(1, 0)
+    val onA = intArrayOf(2, 0)                        // A adds lamp during the partition
+    val onB = intArrayOf(1, 1)                        // B adds pen during the partition
+    println("[book,lamp] ${onA.show()} vs [book,pen] ${onB.show()}: ${compare(onA, onB)} -&gt; keep both, merge")
+    val merged = IntArray(2) { maxOf(onA[it], onB[it]) }.also { it[1]++ }  // B writes the merge
+    println("[book,lamp,pen] ${merged.show()} vs [book,lamp] ${onA.show()}: ${compare(merged, onA)} -&gt; safe to overwrite")
+    println("[book] ${base.show()} vs [book,lamp,pen] ${merged.show()}: ${compare(base, merged)} -&gt; a stale write, ignore it")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Clocks.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+// Lamport clocks and vector clocks, run over the same script of events.
+public class Clocks {
+    static class Lamport {
+        private long time = 0;
+        long tick() { time++; return time; }                       // IR1: count every event
+        long receive(long stamp) {                                 // IR2(b): jump past the stamp
+            time = Math.max(time, stamp) + 1;
+            return time;
+        }
+    }
+
+    static class Vector {
+        private final int[] v;
+        Vector(int n) { v = new int[n]; }
+        int[] tick(int me) { v[me]++; return v.clone(); }
+        int[] receive(int me, int[] other) {
+            for (int i = 0; i &lt; v.length; i++) v[i] = Math.max(v[i], other[i]);   // learn what the sender knew
+            return tick(me);
+        }
+    }
+
+    enum Order { BEFORE, AFTER, EQUAL, CONCURRENT }
+
+    static Order compare(int[] a, int[] b) {
+        boolean le = true, ge = true;
+        for (int i = 0; i &lt; a.length; i++) {
+            if (a[i] &gt; b[i]) le = false;
+            if (a[i] &lt; b[i]) ge = false;
+        }
+        if (le &amp;&amp; ge) return Order.EQUAL;
+        if (le) return Order.BEFORE;
+        if (ge) return Order.AFTER;
+        return Order.CONCURRENT;
+    }
+
+    // One step of the script: process p does a local event, sends msg, or receives msg.
+    sealed interface Step permits Local, Send, Recv { int p(); String name(); }
+    record Local(int p, String name) implements Step {}
+    record Send(int p, String msg) implements Step { public String name() { return "send " + msg; } }
+    record Recv(int p, String msg) implements Step { public String name() { return "recv " + msg; } }
+
+    record Stamps(long lamport, int[] vector) {}
+    record Event(String id, int p, long lamport, int[] vector) {}
+
+    static String show(int[] v) {
+        return Arrays.stream(v).mapToObj(String::valueOf).collect(Collectors.joining(",", "[", "]"));
+    }
+
+    public static void main(String[] args) {
+        List&lt;Step&gt; script = List.of(
+            new Local(0, "a"), new Send(0, "m1"),
+            new Local(1, "b"), new Recv(1, "m1"), new Send(1, "m2"),
+            new Local(2, "c"), new Recv(2, "m2"),
+            new Local(0, "d"));
+        Lamport[] lamports = {new Lamport(), new Lamport(), new Lamport()};
+        Vector[] vectors = {new Vector(3), new Vector(3), new Vector(3)};
+        Map&lt;String, Stamps&gt; inFlight = new HashMap&lt;&gt;();              // message -&gt; the stamps it carries
+        List&lt;Event&gt; events = new ArrayList&lt;&gt;();
+
+        for (Step s : script) {
+            Stamps st = switch (s) {
+                case Local l -&gt; new Stamps(lamports[l.p()].tick(), vectors[l.p()].tick(l.p()));
+                case Send m -&gt; {
+                    Stamps sent = new Stamps(lamports[m.p()].tick(), vectors[m.p()].tick(m.p()));
+                    inFlight.put(m.msg(), sent);
+                    yield sent;
+                }
+                case Recv r -&gt; {
+                    Stamps got = inFlight.get(r.msg());
+                    yield new Stamps(lamports[r.p()].receive(got.lamport()), vectors[r.p()].receive(r.p(), got.vector()));
+                }
+            };
+            events.add(new Event("P" + (s.p() + 1) + " " + s.name(), s.p(), st.lamport(), st.vector()));
+        }
+
+        System.out.println("== One run, two kinds of logical clock");
+        System.out.println(String.format("%-12s %7s  %s", "event", "Lamport", "vector"));
+        for (Event e : events) System.out.println(String.format("%-12s %7d  %s", e.id(), e.lamport(), show(e.vector())));
+
+        System.out.println();
+        System.out.println("== What each clock can tell you about a pair of events");
+        Map&lt;String, Event&gt; byId = new HashMap&lt;&gt;();
+        for (Event e : events) byId.put(e.id(), e);
+        String[][] pairs = {{"P1 send m1", "P2 recv m1"}, {"P1 a", "P3 recv m2"},
+                            {"P2 b", "P1 d"}, {"P1 d", "P3 recv m2"}, {"P1 a", "P3 c"}};
+        for (String[] pair : pairs) {
+            Event a = byId.get(pair[0]), b = byId.get(pair[1]);
+            String sign = a.lamport() &lt; b.lamport() ? "&lt;" : a.lamport() &gt; b.lamport() ? "&gt;" : "=";
+            System.out.println(String.format("%-10s vs %-10s  Lamport %d %s %d   vector %s",
+                pair[0], pair[1], a.lamport(), sign, b.lamport(), compare(a.vector(), b.vector())));
+        }
+
+        System.out.println();
+        System.out.println("== A total order: sort by (Lamport time, process number)");
+        System.out.println(events.stream()
+            .sorted(Comparator.comparingLong(Event::lamport).thenComparingInt(Event::p))
+            .map(e -&gt; e.id() + "@" + e.lamport()).collect(Collectors.joining("  ")));
+
+        System.out.println();
+        System.out.println("== Version vectors on two cart replicas (entry 0 counts A's writes, entry 1 B's)");
+        int[] base = {1, 0};
+        int[] onA = {2, 0};                               // A adds lamp during the partition
+        int[] onB = {1, 1};                               // B adds pen during the partition
+        System.out.println("[book,lamp] " + show(onA) + " vs [book,pen] " + show(onB) + ": " + compare(onA, onB) + " -&gt; keep both, merge");
+        int[] merged = {Math.max(onA[0], onB[0]), Math.max(onA[1], onB[1]) + 1};   // B writes the merge
+        System.out.println("[book,lamp,pen] " + show(merged) + " vs [book,lamp] " + show(onA) + ": " + compare(merged, onA) + " -&gt; safe to overwrite");
+        System.out.println("[book] " + show(base) + " vs [book,lamp,pen] " + show(merged) + ": " + compare(base, merged) + " -&gt; a stale write, ignore it");
+    }
+}</code></pre></figure>
+</div>
+<p>Both print exactly this (checked with <code>diff</code>):</p>
+<pre class="out">== One run, two kinds of logical clock
+event        Lamport  vector
+P1 a               1  [1,0,0]
+P1 send m1         2  [2,0,0]
+P2 b               1  [0,1,0]
+P2 recv m1         3  [2,2,0]
+P2 send m2         4  [2,3,0]
+P3 c               1  [0,0,1]
+P3 recv m2         5  [2,3,2]
+P1 d               3  [3,0,0]
+
+== What each clock can tell you about a pair of events
+P1 send m1 vs P2 recv m1  Lamport 2 &lt; 3   vector BEFORE
+P1 a       vs P3 recv m2  Lamport 1 &lt; 5   vector BEFORE
+P2 b       vs P1 d        Lamport 1 &lt; 3   vector CONCURRENT
+P1 d       vs P3 recv m2  Lamport 3 &lt; 5   vector CONCURRENT
+P1 a       vs P3 c        Lamport 1 = 1   vector CONCURRENT
+
+== A total order: sort by (Lamport time, process number)
+P1 a@1  P2 b@1  P3 c@1  P1 send m1@2  P1 d@3  P2 recv m1@3  P2 send m2@4  P3 recv m2@5
+
+== Version vectors on two cart replicas (entry 0 counts A's writes, entry 1 B's)
+[book,lamp] [2,0] vs [book,pen] [1,1]: CONCURRENT -&gt; keep both, merge
+[book,lamp,pen] [2,2] vs [book,lamp] [2,0]: AFTER -&gt; safe to overwrite
+[book] [1,0] vs [book,lamp,pen] [2,2]: BEFORE -&gt; a stale write, ignore it</pre>
+<ul>
+  <li><b>Lamport clocks respect causality.</b> The send of m1 (2) comes before its receipt (3), and the chain a → send m1 → recv m1 → send m2 → recv m2 gives 1 &lt; 5.</li>
+  <li><b>They can't detect concurrency.</b> P2's b (1) and P1's d (3) never exchanged a message, yet Lamport gives them an order, 1 &lt; 3. Lamport says so himself: "Note that we cannot expect the converse condition to hold as well, since that would imply that any two concurrent events must occur at the same time." A smaller Lamport time means "maybe before", never "definitely before".</li>
+  <li><b>Vector clocks can.</b> <code>compare</code> returns BEFORE only when every entry is ≤ and one is &lt;; if each vector is ahead somewhere, the events are CONCURRENT. b's [0,1,0] and d's [3,0,0] are concurrent, which is the truth.</li>
+  <li><b>A total order is still useful.</b> Sorting by (Lamport time, process number) gives every node the same order of all events, consistent with causality. It's arbitrary for concurrent events, but it's the <em>same</em> arbitrary choice everywhere. Lamport's paper uses exactly this to build a distributed lock.</li>
+  <li><b>Version vectors fix L43's cart.</b> A vector per <em>replica</em> counts each replica's writes. [2,0] vs [1,1] is CONCURRENT, so instead of silently dropping one cart, the replica keeps both and merges. A merge written later dominates both parents, and a stale write is recognised as old. L43's exercise did this with parent pointers; Amazon's Dynamo paper, cited there, used vectors.</li>
+</ul>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Sealed interface + <code>when</code>.</b> <code>when (s) { is Local -> …; is Send -> …; is Recv -> … }</code> is checked for exhaustiveness and smart-casts <code>s</code> in each branch. Java 21's pattern-matching <code>switch</code> over a <code>sealed interface … permits</code> does the same (<a href="https://openjdk.org/jeps/441">JEP 441</a>), but needs the <code>permits</code> list and a <code>yield</code> inside block branches.</li>
+    <li><b>Pairs and destructuring.</b> <code>val (l, v) = … to …</code> returns two values without a class. Java declares <code>record Stamps(long lamport, int[] vector)</code> just to carry them.</li>
+    <li><b>Properties instead of getters.</b> <code>override val name = "send $msg"</code> inside a data class is a computed property. Java's record needs an explicit <code>public String name()</code> method.</li>
+    <li><b><code>compareBy({ … }, { … })</code></b> builds a multi-key comparator in one call; Java chains <code>comparingLong(…).thenComparingInt(…)</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: a chat that never answers before the question</div>
+  <p>In a group chat, Ana asks "Dinner at 7?", Bob replies "Yes, 7 works", and Cleo, who hasn't seen anything yet, posts something unrelated. The network delivers Bob's reply to Cleo <em>before</em> Ana's question. From a blank file, build members that attach a vector clock to every message they send, and only show a received message when it is <dfn>causally ready</dfn>: it is the next message from its sender (<code>vc[sender] == delivered[sender] + 1</code>), and the sender hadn't seen anything this member hasn't shown yet (<code>vc[k] ≤ delivered[k]</code> for every other k). Otherwise hold it back. Print each member's screen.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · CausalChat.kt</figcaption>
+<pre><code class="language-kotlin">// Exercise: a group chat that never shows a reply before the message it answers.
+// Each message carries a vector clock; a member holds a message back until everything
+// it depends on has been delivered (causal delivery).
+
+class Msg(val sender: Int, val text: String, val vc: IntArray)
+
+val names = listOf("Ana", "Bob", "Cleo")
+
+class Member(val id: Int, n: Int) {
+    private val delivered = IntArray(n)             // delivered[k] = how many of k's messages I've shown
+    private val waiting = mutableListOf&lt;Msg&gt;()
+    val screen = mutableListOf&lt;String&gt;()
+
+    fun send(text: String): Msg {
+        val vc = delivered.copyOf().also { it[id]++ }
+        val m = Msg(id, text, vc)
+        show(m)
+        return m
+    }
+
+    fun receive(m: Msg) {
+        waiting += m
+        while (true) {
+            val next = waiting.firstOrNull { ready(it) } ?: break
+            waiting -= next
+            show(next)
+        }
+        for (w in waiting) println("  ${names[id]} holds back ${names[w.sender]}: \"${w.text}\" (missing an earlier message)")
+    }
+
+    private fun ready(m: Msg) = m.vc[m.sender] == delivered[m.sender] + 1 &amp;&amp;
+        m.vc.indices.all { it == m.sender || m.vc[it] &lt;= delivered[it] }
+
+    private fun show(m: Msg) {
+        delivered[m.sender]++
+        screen += "${names[m.sender]}: ${m.text}"
+    }
+}
+
+fun main() {
+    val (ana, bob, cleo) = List(3) { Member(it, 3) }
+    val m1 = ana.send("Dinner at 7?")
+    bob.receive(m1)
+    val m2 = bob.send("Yes, 7 works")
+    val m3 = cleo.send("I'm running late today")      // Cleo hasn't seen anything yet: concurrent
+    // The network delivers in a bad order:
+    cleo.receive(m2)                                  // the reply overtakes the question
+    ana.receive(m3); ana.receive(m2)
+    cleo.receive(m1)
+    bob.receive(m3)
+    for (m in listOf(ana, bob, cleo)) {
+        println("${names[m.id]}'s screen:")
+        m.screen.forEach { println("    $it") }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · CausalChat.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+// Exercise: a group chat that never shows a reply before the message it answers.
+// Each message carries a vector clock; a member holds a message back until everything
+// it depends on has been delivered (causal delivery).
+public class CausalChat {
+    record Msg(int sender, String text, int[] vc) {}
+
+    static final List&lt;String&gt; NAMES = List.of("Ana", "Bob", "Cleo");
+
+    static class Member {
+        final int id;
+        private final int[] delivered;                // delivered[k] = how many of k's messages I've shown
+        private final List&lt;Msg&gt; waiting = new ArrayList&lt;&gt;();
+        final List&lt;String&gt; screen = new ArrayList&lt;&gt;();
+        Member(int id, int n) { this.id = id; this.delivered = new int[n]; }
+
+        Msg send(String text) {
+            int[] vc = delivered.clone();
+            vc[id]++;
+            Msg m = new Msg(id, text, vc);
+            show(m);
+            return m;
+        }
+
+        void receive(Msg m) {
+            waiting.add(m);
+            while (true) {
+                Msg next = waiting.stream().filter(this::ready).findFirst().orElse(null);
+                if (next == null) break;
+                waiting.remove(next);
+                show(next);
+            }
+            for (Msg w : waiting)
+                System.out.println("  " + NAMES.get(id) + " holds back " + NAMES.get(w.sender()) + ": \"" + w.text() + "\" (missing an earlier message)");
+        }
+
+        private boolean ready(Msg m) {
+            if (m.vc()[m.sender()] != delivered[m.sender()] + 1) return false;
+            for (int k = 0; k &lt; delivered.length; k++)
+                if (k != m.sender() &amp;&amp; m.vc()[k] &gt; delivered[k]) return false;
+            return true;
+        }
+
+        private void show(Msg m) {
+            delivered[m.sender()]++;
+            screen.add(NAMES.get(m.sender()) + ": " + m.text());
+        }
+    }
+
+    public static void main(String[] args) {
+        Member ana = new Member(0, 3), bob = new Member(1, 3), cleo = new Member(2, 3);
+        Msg m1 = ana.send("Dinner at 7?");
+        bob.receive(m1);
+        Msg m2 = bob.send("Yes, 7 works");
+        Msg m3 = cleo.send("I'm running late today");   // Cleo hasn't seen anything yet: concurrent
+        // The network delivers in a bad order:
+        cleo.receive(m2);                               // the reply overtakes the question
+        ana.receive(m3); ana.receive(m2);
+        cleo.receive(m1);
+        bob.receive(m3);
+        for (Member m : List.of(ana, bob, cleo)) {
+            System.out.println(NAMES.get(m.id) + "'s screen:");
+            m.screen.forEach(s -&gt; System.out.println("    " + s));
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">  Cleo holds back Bob: "Yes, 7 works" (missing an earlier message)
+Ana's screen:
+    Ana: Dinner at 7?
+    Cleo: I'm running late today
+    Bob: Yes, 7 works
+Bob's screen:
+    Ana: Dinner at 7?
+    Bob: Yes, 7 works
+    Cleo: I'm running late today
+Cleo's screen:
+    Cleo: I'm running late today
+    Ana: Dinner at 7?
+    Bob: Yes, 7 works</pre>
+  <p>Both languages print this. Cleo held Bob's reply until Ana's question arrived, so every screen shows the question before the answer. Cleo's own message lands in a different place on each screen, and that's fine: it's concurrent with the conversation, so no order is "wrong". This is <dfn>causal broadcast</dfn>, the subject of Kleppmann's §4; group chats and collaborative editors need exactly this guarantee.</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p2-1" data-group="Part 2" data-answer="2">
+  <p class="q">Event x has Lamport time 4 and event y has Lamport time 9. What do you know for certain?</p>
+  <div class="opts"><button>x certainly happened before y did</button><button>x and y were certainly concurrent</button><button>y did not happen before x</button><button>both ran on the same node</button></div>
+  <p class="why">The Clock Condition says if y → x then C(y) &lt; C(x). Here C(y) &gt; C(x), so y → x is impossible. But x → y isn't guaranteed either: they could be concurrent. Only a vector clock can tell those apart.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2" data-answer="0">
+  <p class="q">Compare the vector clocks [2,1,0] and [1,1,3]. What's the relation?</p>
+  <div class="opts"><button>The two are concurrent</button><button>The first came before</button><button>The second came before</button><button>The two are equal</button></div>
+  <p class="why">The first is ahead in entry 0 (2 &gt; 1), and the second is ahead in entry 2 (3 &gt; 0). Neither dominates, so neither event could have seen the other: concurrent.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>Leader election and consensus: Raft</h2><span class="t">~35 min</span></div>
+
+<p>L42's leader database had a weak spot you may have noticed: if the leader dies, <em>someone</em> has to promote a follower. If two followers both decide they're the new leader, both accept writes and the data splits into two histories. Kleppmann: "If there were multiple leaders, they could make inconsistent decisions … (a situation known as <dfn>split brain</dfn>)" (§7.1). Picking exactly one leader, even while machines crash and messages vanish, is an instance of <dfn>consensus</dfn>. The Raft site defines it: "Consensus involves multiple servers agreeing on values. Once they reach a decision on a value, that decision is final" (<a href="https://raft.github.io/">raft.github.io</a>).</p>
+<p>Raft, by Diego Ongaro and John Ousterhout, "is a consensus algorithm for managing a replicated log", designed to be easier to understand than Paxos, which came before it (<a href="https://raft.github.io/raft.pdf">"In Search of an Understandable Consensus Algorithm (Extended Version)"</a>). Its leader election rests on five rules, each quoted from §5.1–5.2 of the paper:</p>
+<ol>
+  <li><b>Terms number the leaderships.</b> Time is divided into terms, each starting with an election. "Terms act as a logical clock in Raft, and they allow servers to detect obsolete information such as stale leaders": Part 2's idea, used to order leaders.</li>
+  <li><b>A newer term always wins.</b> "If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state. If a server receives a request with a stale term number, it rejects the request."</li>
+  <li><b>Leaders send heartbeats.</b> "Leaders send periodic heartbeats (AppendEntries RPCs that carry no log entries) to all followers in order to maintain their authority." A follower that hears nothing for an <dfn>election timeout</dfn> becomes a candidate: it increments its term, votes for itself, and sends RequestVote to everyone.</li>
+  <li><b>One vote per term.</b> "Each server will vote for at most one candidate in a given term, on a first-come-first-served basis … The majority rule ensures that at most one candidate can win the election for a particular term."</li>
+  <li><b>Random timeouts break ties.</b> "To prevent split votes in the first place, election timeouts are chosen randomly from a fixed interval (e.g., 150–300ms)."</li>
+</ol>
+<p>The program below implements exactly those five rules on five simulated nodes. Each message takes 2–10 ms of virtual time, a crashed node drops everything, and a partition cuts links. It replays one run with a crash, then attacks rule 4 with 2,000 random runs, once with correct voters and once with a voter that "forgets" its vote.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Election.kt</figcaption>
+<pre><code class="language-kotlin">import java.util.PriorityQueue
+import java.util.Random
+
+// Raft leader election (§5.1–5.2 of the paper), simulated in one JVM.
+// Time is virtual: nothing sleeps, and one seed always replays the same history.
+
+enum class Role { FOLLOWER, CANDIDATE, LEADER }
+
+sealed interface Msg { val term: Long; val from: Int }
+data class RequestVote(override val term: Long, override val from: Int) : Msg
+data class VoteReply(override val term: Long, override val from: Int, val granted: Boolean) : Msg
+data class Heartbeat(override val term: Long, override val from: Int) : Msg        // AppendEntries, no entries
+data class HeartbeatReply(override val term: Long, override val from: Int) : Msg
+
+class Sim(
+    seed: Long,
+    val n: Int = 5,
+    val timeoutMin: Int = 150, val timeoutMax: Int = 300,   // election timeout range, ms
+    val heartbeatMs: Int = 50,
+    val buggyVoter: Boolean = false,                        // forgets whom it voted for
+    val tracing: Boolean = true,
+) {
+    val rnd = Random(seed)
+    var now = 0L
+        private set
+    private var seq = 0L
+    private class Ev(val at: Long, val seq: Long, val action: () -&gt; Unit)
+    private val queue = PriorityQueue&lt;Ev&gt;(compareBy&lt;Ev&gt;({ it.at }, { it.seq }))
+
+    inner class Node(val id: Int) {
+        var role = Role.FOLLOWER
+        var term = 0L                    // currentTerm
+        var votedFor: Int? = null        // votedFor, for the current term only
+        val votes = mutableSetOf&lt;Int&gt;()
+        var up = true
+        var timerEpoch = 0               // bumping it cancels the pending election timer
+        val name get() = "n${id + 1}"
+    }
+
+    val nodes = List(n) { Node(it) }
+    private val cut = mutableSetOf&lt;Pair&lt;Int, Int&gt;&gt;()        // links that drop every message
+    val leadersByTerm = sortedMapOf&lt;Long, MutableSet&lt;Int&gt;&gt;()   // for the safety check
+    val trace = mutableListOf&lt;String&gt;()
+
+    private fun log(text: String) { if (tracing) trace += "%6d ms  %s".format(now, text) }
+    private fun schedule(delayMs: Long, action: () -&gt; Unit) { queue += Ev(now + delayMs, seq++, action) }
+    private fun linkUp(a: Int, b: Int) = (a to b) !in cut
+
+    private fun send(from: Int, to: Int, msg: Msg) {
+        if (!linkUp(from, to)) return
+        schedule(2L + rnd.nextInt(9)) {                    // 2–10 ms on the wire
+            if (linkUp(from, to) &amp;&amp; nodes[to].up) deliver(nodes[to], msg)
+        }
+    }
+
+    private fun resetElectionTimer(node: Node) {
+        val epoch = ++node.timerEpoch
+        val timeout = timeoutMin + rnd.nextInt(timeoutMax - timeoutMin + 1)
+        schedule(timeout.toLong()) {
+            if (node.up &amp;&amp; node.timerEpoch == epoch &amp;&amp; node.role != Role.LEADER) startElection(node)
+        }
+    }
+
+    private fun startElection(node: Node) {
+        node.role = Role.CANDIDATE
+        node.term++
+        node.votedFor = node.id
+        node.votes.clear(); node.votes += node.id
+        log("${node.name} times out: candidate for term ${node.term}")
+        resetElectionTimer(node)                           // a split vote retries after a new timeout
+        for (peer in nodes) if (peer.id != node.id) send(node.id, peer.id, RequestVote(node.term, node.id))
+    }
+
+    private fun deliver(node: Node, msg: Msg) {
+        if (msg.term &gt; node.term) {                        // any newer term: adopt it, become a follower
+            if (node.role != Role.FOLLOWER) log("${node.name} steps down: saw term ${msg.term}")
+            node.term = msg.term; node.votedFor = null; node.role = Role.FOLLOWER
+        }
+        when (msg) {
+            is RequestVote -&gt; {
+                val free = node.votedFor == null || node.votedFor == msg.from || buggyVoter
+                val grant = msg.term == node.term &amp;&amp; free
+                if (grant) {
+                    node.votedFor = msg.from
+                    resetElectionTimer(node)
+                    log("${node.name} votes for n${msg.from + 1} in term ${msg.term}")
+                }
+                send(node.id, msg.from, VoteReply(node.term, node.id, grant))
+            }
+            is VoteReply -&gt; if (node.role == Role.CANDIDATE &amp;&amp; msg.term == node.term &amp;&amp; msg.granted) {
+                node.votes += msg.from
+                if (node.votes.size &gt; n / 2) becomeLeader(node)
+            }
+            is Heartbeat -&gt; {
+                if (msg.term == node.term) {
+                    if (node.role == Role.CANDIDATE) log("${node.name} hears leader n${msg.from + 1}: back to follower")
+                    node.role = Role.FOLLOWER
+                    resetElectionTimer(node)
+                }
+                send(node.id, msg.from, HeartbeatReply(node.term, node.id))   // a stale leader learns the new term
+            }
+            is HeartbeatReply -&gt; {}                        // the term check above already did the work
+        }
+    }
+
+    private fun becomeLeader(node: Node) {
+        node.role = Role.LEADER
+        leadersByTerm.getOrPut(node.term) { mutableSetOf() } += node.id
+        log("${node.name} is LEADER of term ${node.term}, votes from " +
+            node.votes.sorted().joinToString(", ") { "n${it + 1}" })
+        heartbeats(node, node.term)
+    }
+
+    private fun heartbeats(node: Node, term: Long) {
+        if (!node.up || node.role != Role.LEADER || node.term != term) return
+        for (peer in nodes) if (peer.id != node.id) send(node.id, peer.id, Heartbeat(term, node.id))
+        schedule(heartbeatMs.toLong()) { heartbeats(node, term) }
+    }
+
+    fun start() { for (node in nodes) resetElectionTimer(node) }
+    fun crash(id: Int) { nodes[id].up = false; log("${nodes[id].name} CRASHES") }
+    fun restart(id: Int) {                                 // term and votedFor survive: Raft persists them
+        val node = nodes[id]
+        node.up = true; node.role = Role.FOLLOWER
+        log("${node.name} restarts as a follower, still in term ${node.term}")
+        resetElectionTimer(node)
+    }
+    fun partition(side: Set&lt;Int&gt;) {
+        for (a in 0 until n) for (b in 0 until n) if ((a in side) != (b in side)) cut += a to b
+        log("PARTITION " + side.sorted().joinToString(",", "{", "}") { "n${it + 1}" } + " | " +
+            (0 until n).filter { it !in side }.joinToString(",", "{", "}") { "n${it + 1}" })
+    }
+    fun heal() { cut.clear(); log("partition HEALS") }
+    fun at(timeMs: Long, action: () -&gt; Unit) = schedule(timeMs - now, action)
+    fun runUntil(timeMs: Long) {
+        while (queue.isNotEmpty() &amp;&amp; queue.peek().at &lt;= timeMs) {
+            val ev = queue.poll(); now = ev.at; ev.action()
+        }
+        now = timeMs
+    }
+    fun leader(): Node? = nodes.firstOrNull { it.up &amp;&amp; it.role == Role.LEADER }
+}
+
+// Random crashes, restarts, partitions and heals every 300 ms for 3 s; count terms by number of leaders.
+fun sweep(seeds: Int, buggy: Boolean): IntArray {
+    val counts = IntArray(3)                               // terms with 0, 1, 2+ leaders
+    var reported = false
+    for (seed in 1..seeds) {
+        val sim = Sim(seed.toLong(), buggyVoter = buggy, tracing = false)
+        sim.start()
+        for (t in 300L..3_000L step 300) {
+            sim.runUntil(t)
+            val r = sim.rnd.nextInt(4)
+            val victim = sim.rnd.nextInt(sim.n)
+            when (r) {
+                0 -&gt; if (sim.nodes.count { !it.up } &lt; 2) sim.crash(victim)
+                1 -&gt; if (!sim.nodes[victim].up) sim.restart(victim)
+                2 -&gt; sim.partition((0 until sim.n).filter { sim.rnd.nextBoolean() }.toSet())
+                else -&gt; sim.heal()
+            }
+        }
+        sim.runUntil(3_500)
+        val maxTerm = sim.nodes.maxOf { it.term }
+        for (term in 1..maxTerm) {
+            val k = sim.leadersByTerm[term]?.size ?: 0
+            counts[minOf(k, 2)]++
+            if (k &gt;= 2 &amp;&amp; !reported) {
+                reported = true
+                println("  first violation: seed $seed, term $term, leaders " +
+                    sim.leadersByTerm.getValue(term).sorted().joinToString(" and ") { "n${it + 1}" })
+            }
+        }
+    }
+    return counts
+}
+
+fun main() {
+    println("== Seed 42: start, crash the leader at 600 ms, restart it at 1,200 ms")
+    val sim = Sim(42)
+    sim.start()
+    sim.runUntil(600)
+    val first = sim.leader()!!
+    sim.crash(first.id)
+    sim.at(1_200) { sim.restart(first.id) }
+    sim.runUntil(1_500)
+    sim.trace.forEach(::println)
+    println("leaders by term: " + sim.leadersByTerm.entries.joinToString(", ") { (t, ids) -&gt;
+        "term $t -&gt; " + ids.joinToString { "n${it + 1}" } })
+    println("final terms: " + sim.nodes.joinToString(" ") { "${it.name}=${it.term}" })
+
+    println()
+    println("== Safety sweep: 2,000 seeds, random crashes and partitions for 3 s each")
+    val ok = sweep(2_000, buggy = false)
+    println("  terms with no leader: ${ok[0]}, one leader: ${ok[1]}, two or more leaders: ${ok[2]}")
+
+    println()
+    println("== The same sweep with a buggy voter that forgets whom it voted for")
+    val bad = sweep(2_000, buggy = true)
+    println("  terms with no leader: ${bad[0]}, one leader: ${bad[1]}, two or more leaders: ${bad[2]}")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Election.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.PriorityQueue;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+// Raft leader election (§5.1–5.2 of the paper), simulated in one JVM.
+// Time is virtual: nothing sleeps, and one seed always replays the same history.
+public class Election {
+    enum Role { FOLLOWER, CANDIDATE, LEADER }
+
+    sealed interface Msg permits RequestVote, VoteReply, Heartbeat, HeartbeatReply { long term(); int from(); }
+    record RequestVote(long term, int from) implements Msg {}
+    record VoteReply(long term, int from, boolean granted) implements Msg {}
+    record Heartbeat(long term, int from) implements Msg {}             // AppendEntries, no entries
+    record HeartbeatReply(long term, int from) implements Msg {}
+
+    static String name(int id) { return "n" + (id + 1); }
+
+    static class Sim {
+        final int n, timeoutMin, timeoutMax, heartbeatMs;    // election timeout range and heartbeat, ms
+        final boolean buggyVoter, tracing;                   // buggyVoter forgets whom it voted for
+        final Random rnd;
+        long now = 0;
+        private long seq = 0;
+        private record Ev(long at, long seq, Runnable action) {}
+        private final PriorityQueue&lt;Ev&gt; queue =
+            new PriorityQueue&lt;&gt;(Comparator.comparingLong(Ev::at).thenComparingLong(Ev::seq));
+
+        class Node {
+            final int id;
+            Role role = Role.FOLLOWER;
+            long term = 0;                   // currentTerm
+            Integer votedFor = null;         // votedFor, for the current term only
+            final Set&lt;Integer&gt; votes = new HashSet&lt;&gt;();
+            boolean up = true;
+            int timerEpoch = 0;              // bumping it cancels the pending election timer
+            Node(int id) { this.id = id; }
+            String name() { return Election.name(id); }
+        }
+
+        final List&lt;Node&gt; nodes = new ArrayList&lt;&gt;();
+        private final Set&lt;List&lt;Integer&gt;&gt; cut = new HashSet&lt;&gt;();    // links that drop every message
+        final TreeMap&lt;Long, Set&lt;Integer&gt;&gt; leadersByTerm = new TreeMap&lt;&gt;();   // for the safety check
+        final List&lt;String&gt; trace = new ArrayList&lt;&gt;();
+
+        Sim(long seed, int n, int timeoutMin, int timeoutMax, int heartbeatMs, boolean buggyVoter, boolean tracing) {
+            this.rnd = new Random(seed);
+            this.n = n; this.timeoutMin = timeoutMin; this.timeoutMax = timeoutMax;
+            this.heartbeatMs = heartbeatMs; this.buggyVoter = buggyVoter; this.tracing = tracing;
+            for (int i = 0; i &lt; n; i++) nodes.add(new Node(i));
+        }
+        Sim(long seed) { this(seed, 5, 150, 300, 50, false, true); }
+
+        private void log(String text) { if (tracing) trace.add(String.format("%6d ms  %s", now, text)); }
+        private void schedule(long delayMs, Runnable action) { queue.add(new Ev(now + delayMs, seq++, action)); }
+        private boolean linkUp(int a, int b) { return !cut.contains(List.of(a, b)); }
+
+        private void send(int from, int to, Msg msg) {
+            if (!linkUp(from, to)) return;
+            schedule(2L + rnd.nextInt(9), () -&gt; {             // 2–10 ms on the wire
+                if (linkUp(from, to) &amp;&amp; nodes.get(to).up) deliver(nodes.get(to), msg);
+            });
+        }
+
+        private void resetElectionTimer(Node node) {
+            int epoch = ++node.timerEpoch;
+            int timeout = timeoutMin + rnd.nextInt(timeoutMax - timeoutMin + 1);
+            schedule(timeout, () -&gt; {
+                if (node.up &amp;&amp; node.timerEpoch == epoch &amp;&amp; node.role != Role.LEADER) startElection(node);
+            });
+        }
+
+        private void startElection(Node node) {
+            node.role = Role.CANDIDATE;
+            node.term++;
+            node.votedFor = node.id;
+            node.votes.clear(); node.votes.add(node.id);
+            log(node.name() + " times out: candidate for term " + node.term);
+            resetElectionTimer(node);                         // a split vote retries after a new timeout
+            for (Node peer : nodes) if (peer.id != node.id) send(node.id, peer.id, new RequestVote(node.term, node.id));
+        }
+
+        private void deliver(Node node, Msg msg) {
+            if (msg.term() &gt; node.term) {                     // any newer term: adopt it, become a follower
+                if (node.role != Role.FOLLOWER) log(node.name() + " steps down: saw term " + msg.term());
+                node.term = msg.term(); node.votedFor = null; node.role = Role.FOLLOWER;
+            }
+            switch (msg) {
+                case RequestVote rv -&gt; {
+                    boolean free = node.votedFor == null || node.votedFor == rv.from() || buggyVoter;
+                    boolean grant = rv.term() == node.term &amp;&amp; free;
+                    if (grant) {
+                        node.votedFor = rv.from();
+                        resetElectionTimer(node);
+                        log(node.name() + " votes for " + name(rv.from()) + " in term " + rv.term());
+                    }
+                    send(node.id, rv.from(), new VoteReply(node.term, node.id, grant));
+                }
+                case VoteReply vr -&gt; {
+                    if (node.role == Role.CANDIDATE &amp;&amp; vr.term() == node.term &amp;&amp; vr.granted()) {
+                        node.votes.add(vr.from());
+                        if (node.votes.size() &gt; n / 2) becomeLeader(node);
+                    }
+                }
+                case Heartbeat hb -&gt; {
+                    if (hb.term() == node.term) {
+                        if (node.role == Role.CANDIDATE) log(node.name() + " hears leader " + name(hb.from()) + ": back to follower");
+                        node.role = Role.FOLLOWER;
+                        resetElectionTimer(node);
+                    }
+                    send(node.id, hb.from(), new HeartbeatReply(node.term, node.id));   // a stale leader learns the new term
+                }
+                case HeartbeatReply hr -&gt; {}                  // the term check above already did the work
+            }
+        }
+
+        private void becomeLeader(Node node) {
+            node.role = Role.LEADER;
+            leadersByTerm.computeIfAbsent(node.term, t -&gt; new TreeSet&lt;&gt;()).add(node.id);
+            log(node.name() + " is LEADER of term " + node.term + ", votes from " +
+                node.votes.stream().sorted().map(Election::name).collect(Collectors.joining(", ")));
+            heartbeats(node, node.term);
+        }
+
+        private void heartbeats(Node node, long term) {
+            if (!node.up || node.role != Role.LEADER || node.term != term) return;
+            for (Node peer : nodes) if (peer.id != node.id) send(node.id, peer.id, new Heartbeat(term, node.id));
+            schedule(heartbeatMs, () -&gt; heartbeats(node, term));
+        }
+
+        void start() { for (Node node : nodes) resetElectionTimer(node); }
+        void crash(int id) { nodes.get(id).up = false; log(name(id) + " CRASHES"); }
+        void restart(int id) {                                // term and votedFor survive: Raft persists them
+            Node node = nodes.get(id);
+            node.up = true; node.role = Role.FOLLOWER;
+            log(node.name() + " restarts as a follower, still in term " + node.term);
+            resetElectionTimer(node);
+        }
+        void partition(Set&lt;Integer&gt; side) {
+            for (int a = 0; a &lt; n; a++) for (int b = 0; b &lt; n; b++)
+                if (side.contains(a) != side.contains(b)) cut.add(List.of(a, b));
+            String left = side.stream().sorted().map(Election::name).collect(Collectors.joining(",", "{", "}"));
+            String right = IntStream.range(0, n).filter(i -&gt; !side.contains(i)).mapToObj(Election::name)
+                .collect(Collectors.joining(",", "{", "}"));
+            log("PARTITION " + left + " | " + right);
+        }
+        void heal() { cut.clear(); log("partition HEALS"); }
+        void at(long timeMs, Runnable action) { schedule(timeMs - now, action); }
+        void runUntil(long timeMs) {
+            while (!queue.isEmpty() &amp;&amp; queue.peek().at() &lt;= timeMs) {
+                Ev ev = queue.poll(); now = ev.at(); ev.action().run();
+            }
+            now = timeMs;
+        }
+        Node leader() {
+            return nodes.stream().filter(x -&gt; x.up &amp;&amp; x.role == Role.LEADER).findFirst().orElse(null);
+        }
+    }
+
+    // Random crashes, restarts, partitions and heals every 300 ms for 3 s; count terms by number of leaders.
+    static int[] sweep(int seeds, boolean buggy) {
+        int[] counts = new int[3];                            // terms with 0, 1, 2+ leaders
+        boolean reported = false;
+        for (int seed = 1; seed &lt;= seeds; seed++) {
+            Sim sim = new Sim(seed, 5, 150, 300, 50, buggy, false);
+            sim.start();
+            for (long t = 300; t &lt;= 3_000; t += 300) {
+                sim.runUntil(t);
+                int r = sim.rnd.nextInt(4);
+                int victim = sim.rnd.nextInt(sim.n);
+                switch (r) {
+                    case 0 -&gt; { if (sim.nodes.stream().filter(x -&gt; !x.up).count() &lt; 2) sim.crash(victim); }
+                    case 1 -&gt; { if (!sim.nodes.get(victim).up) sim.restart(victim); }
+                    case 2 -&gt; {
+                        Set&lt;Integer&gt; side = new HashSet&lt;&gt;();
+                        for (int i = 0; i &lt; sim.n; i++) if (sim.rnd.nextBoolean()) side.add(i);
+                        sim.partition(side);
+                    }
+                    default -&gt; sim.heal();
+                }
+            }
+            sim.runUntil(3_500);
+            long maxTerm = sim.nodes.stream().mapToLong(x -&gt; x.term).max().orElse(0);
+            for (long term = 1; term &lt;= maxTerm; term++) {
+                Set&lt;Integer&gt; ids = sim.leadersByTerm.get(term);
+                int k = ids == null ? 0 : ids.size();
+                counts[Math.min(k, 2)]++;
+                if (k &gt;= 2 &amp;&amp; !reported) {
+                    reported = true;
+                    System.out.println("  first violation: seed " + seed + ", term " + term + ", leaders " +
+                        ids.stream().map(Election::name).collect(Collectors.joining(" and ")));
+                }
+            }
+        }
+        return counts;
+    }
+
+    public static void main(String[] args) {
+        System.out.println("== Seed 42: start, crash the leader at 600 ms, restart it at 1,200 ms");
+        Sim sim = new Sim(42);
+        sim.start();
+        sim.runUntil(600);
+        Sim.Node first = sim.leader();
+        sim.crash(first.id);
+        sim.at(1_200, () -&gt; sim.restart(first.id));
+        sim.runUntil(1_500);
+        sim.trace.forEach(System.out::println);
+        System.out.println("leaders by term: " + sim.leadersByTerm.entrySet().stream()
+            .map(e -&gt; "term " + e.getKey() + " -&gt; " + e.getValue().stream().map(Election::name).collect(Collectors.joining(", ")))
+            .collect(Collectors.joining(", ")));
+        System.out.println("final terms: " + sim.nodes.stream().map(x -&gt; x.name() + "=" + x.term).collect(Collectors.joining(" ")));
+
+        System.out.println();
+        System.out.println("== Safety sweep: 2,000 seeds, random crashes and partitions for 3 s each");
+        int[] ok = sweep(2_000, false);
+        System.out.println("  terms with no leader: " + ok[0] + ", one leader: " + ok[1] + ", two or more leaders: " + ok[2]);
+
+        System.out.println();
+        System.out.println("== The same sweep with a buggy voter that forgets whom it voted for");
+        int[] bad = sweep(2_000, true);
+        System.out.println("  terms with no leader: " + bad[0] + ", one leader: " + bad[1] + ", two or more leaders: " + bad[2]);
+    }
+}</code></pre></figure>
+</div>
+<p>Both print exactly this (checked with <code>diff</code>), in about 3 s of real time for 4,000 simulated runs:</p>
+<pre class="out">== Seed 42: start, crash the leader at 600 ms, restart it at 1,200 ms
+   154 ms  n1 times out: candidate for term 1
+   158 ms  n3 votes for n1 in term 1
+   158 ms  n5 votes for n1 in term 1
+   161 ms  n2 votes for n1 in term 1
+   163 ms  n4 votes for n1 in term 1
+   168 ms  n1 is LEADER of term 1, votes from n1, n3, n5
+   600 ms  n1 CRASHES
+   775 ms  n3 times out: candidate for term 2
+   778 ms  n4 votes for n3 in term 2
+   781 ms  n5 votes for n3 in term 2
+   784 ms  n2 votes for n3 in term 2
+   784 ms  n3 is LEADER of term 2, votes from n3, n4, n5
+  1200 ms  n1 restarts as a follower, still in term 1
+leaders by term: term 1 -&gt; n1, term 2 -&gt; n3
+final terms: n1=2 n2=2 n3=2 n4=2 n5=2
+
+== Safety sweep: 2,000 seeds, random crashes and partitions for 3 s each
+  terms with no leader: 9181, one leader: 4696, two or more leaders: 0
+
+== The same sweep with a buggy voter that forgets whom it voted for
+  first violation: seed 4, term 1, leaders n1 and n2 and n5
+  terms with no leader: 9143, one leader: 4612, two or more leaders: 464</pre>
+<ul>
+  <li><b>The first election took 14 ms.</b> n1's random timeout (154 ms) expired first, so it asked before anyone else and got every vote. It became leader as soon as the third vote arrived: 3 of 5 is a majority, and it doesn't wait for the rest.</li>
+  <li><b>Failover is automatic.</b> 600 ms after start the leader crashed. Followers stopped hearing heartbeats, n3's timeout expired first at 775 ms, and it won term 2 within 9 ms. No operator promoted anyone.</li>
+  <li><b>The old leader rejoined safely.</b> n1 restarted "still in term 1" because Raft stores the term and the vote on disk ("Raft's RPCs typically require the recipient to persist information to stable storage", §5.6; L56's <code>fsync</code> is exactly that). The first heartbeat it received carried term 2, so it simply became a follower.</li>
+  <li><b>Rule 4 is the whole safety argument.</b> Across 2,000 chaotic runs, not one term had two leaders. Let a voter forget its vote and 464 terms did; in seed 4, three nodes all believed they led term 1. With honest voters it can't happen: two majorities of 5 always share a server (the warm-up's pigeonhole), and that server would have had to vote twice.</li>
+  <li><b>Most terms had no leader</b> (9,181 vs 4,696). Each partition leaves a minority that keeps timing out and starting elections it can never win, so its term number climbs. That's harmless for safety, but when such a node rejoins, its high term forces a needless new election. Production systems add extensions for exactly this.</li>
+</ul>
+
+<h3>From one leader to one log</h3>
+<p>A leader by itself isn't the goal. The goal is a <dfn>replicated log</dfn>: the same commands, in the same order, on every node, so each node's copy of the data (its <dfn>state machine</dfn>) ends up identical. Raft's leader appends each client command to its log and ships missing entries to each follower in the next AppendEntries, so a heartbeat doubles as replication. Three more rules from §5.3–5.4 make it safe:</p>
+<ul>
+  <li><b>Commit by majority.</b> "A log entry is committed once the leader that created the entry has replicated it on a majority of the servers." Only then is it applied, and only then may a client be told "done".</li>
+  <li><b>The consistency check.</b> "When sending an AppendEntries RPC, the leader includes the index and term of the entry in its log that immediately precedes the new entries. If the follower does not find an entry in its log with the same index and term, then it refuses the new entries." The paper calls this "an induction step" (L48's induction, holding a whole log in shape). On a refusal the leader steps back one entry and tries again; followers' conflicting, uncommitted entries get overwritten.</li>
+  <li><b>The election restriction.</b> A candidate can't win unless its log holds every committed entry: "the voter denies its vote if its own log is more up-to-date than that of the candidate", where "If the logs have last entries with different terms, then the log with the later term is more up-to-date. If the logs end with the same term, then whichever log is longer is more up-to-date."</li>
+</ul>
+<p>Together they give the two guarantees the final will test, both from the paper's Figure 3: <b>Election Safety</b>, "at most one leader can be elected in a given term", and <b>State Machine Safety</b>, "if a server has applied a log entry at a given index to its state machine, no other server will ever apply a different log entry for the same index." The widget below steps through the final's real run, event by event. Leave the box unticked to watch a healthy cluster, then tick it to split the network at 700 ms and compare.</p>
+
+<div class="raftviz" data-src="raft-demo"></div>
+<script type="application/json" id="raft-demo">{"healthy":[{"t":158,"note":"n5 times out: candidate for term 1","nodes":[{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":160,"note":"n3 votes for n5 in term 1","from":2,"to":4,"nodes":[{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":161,"note":"n1 votes for n5 in term 1","from":0,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":165,"note":"n2 votes for n5 in term 1","from":1,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":166,"note":"n4 votes for n5 in term 1","from":3,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":168,"note":"n5 is LEADER of term 1, votes from n3, n4, n5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"LEADER","term":1,"up":true,"commit":0,"log":[]}]},{"t":400,"note":"client -> n5: x=1 (index 1, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"LEADER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]}]},{"t":431,"note":"n5 commits up to index 1 (x=1), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"LEADER","term":1,"up":true,"commit":1,"log":[[1,"x=1"]]}]},{"t":450,"note":"client -> n5: x=2 (index 2, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"LEADER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":478,"note":"n5 commits up to index 2 (x=2), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":750,"note":"client -> n5: x=3 (index 3, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":777,"note":"n5 commits up to index 3 (x=3), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"LEADER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1300,"note":"client -> n5: x=4 (index 4, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"LEADER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]}]},{"t":1329,"note":"n5 commits up to index 4 (x=4), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":4,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"],[1,"x=4"]]}]}],"split":[{"t":158,"note":"n5 times out: candidate for term 1","nodes":[{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":160,"note":"n3 votes for n5 in term 1","from":2,"to":4,"nodes":[{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":161,"note":"n1 votes for n5 in term 1","from":0,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":165,"note":"n2 votes for n5 in term 1","from":1,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":0,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":166,"note":"n4 votes for n5 in term 1","from":3,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"CANDIDATE","term":1,"up":true,"commit":0,"log":[]}]},{"t":168,"note":"n5 is LEADER of term 1, votes from n3, n4, n5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"LEADER","term":1,"up":true,"commit":0,"log":[]}]},{"t":400,"note":"client -> n5: x=1 (index 1, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[]},{"role":"LEADER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]}]},{"t":431,"note":"n5 commits up to index 1 (x=1), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"LEADER","term":1,"up":true,"commit":1,"log":[[1,"x=1"]]}]},{"t":450,"note":"client -> n5: x=2 (index 2, term 1, not committed yet)","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":0,"log":[[1,"x=1"]]},{"role":"LEADER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":478,"note":"n5 commits up to index 2 (x=2), stored on 3 of 5","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":1,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":700,"note":"PARTITION {n1,n5} | {n2,n3,n4}","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":750,"note":"client -> n5: x=3 (index 3, term 1, not committed yet)","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":866,"note":"n4 times out: candidate for term 2","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"CANDIDATE","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":870,"note":"n3 votes for n4 in term 2","from":2,"to":3,"side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"CANDIDATE","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":871,"note":"n2 votes for n4 in term 2","from":1,"to":3,"side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"CANDIDATE","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":881,"note":"n4 is LEADER of term 2, votes from n2, n3, n4","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1300,"note":"client -> n4: x=4 (index 3, term 2, not committed yet)","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"LEADER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1347,"note":"n4 commits up to index 3 (x=4), stored on 3 of 5","side":[0,4],"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1800,"note":"partition HEALS","nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1827,"note":"n5 steps down: saw term 2","from":1,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]}]},{"t":1835,"note":"n5 drops uncommitted [x=3]: conflicts with the leader","from":3,"to":4,"nodes":[{"role":"FOLLOWER","term":1,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"],[1,"x=3"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]}]},{"t":1841,"note":"n1 drops uncommitted [x=3]: conflicts with the leader","from":3,"to":0,"nodes":[{"role":"FOLLOWER","term":2,"up":true,"commit":2,"log":[[1,"x=1"],[1,"x=2"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"LEADER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]},{"role":"FOLLOWER","term":2,"up":true,"commit":3,"log":[[1,"x=1"],[1,"x=2"],[2,"x=4"]]}]}]}</script>
+
+<p>Look for three moments in the partitioned run. At 750 ms the old leader n5 accepts <code>x=3</code> and copies it to n1, but with only 2 of 5 it can never commit. At 881 ms the majority side elects n4 in term 2 and commits <code>x=4</code>. After the heal, n5 sees term 2, steps down, and both n5 and n1 drop the uncommitted <code>x=3</code>. A client that was told "accepted" for <code>x=3</code> learns the hard way that only "committed" counts.</p>
+<p>The paper also states when this works at all: "broadcastTime ≪ electionTimeout ≪ MTBF". Messages must arrive well within a timeout, or followers start elections while the leader is still alive. And timeouts must be far shorter than the mean time between failures, because "When the leader crashes, the system will be unavailable for roughly the election timeout" (§5.6).</p>
+<p class="note">Bridge: you will almost never write Raft yourself, but you will depend on it. etcd is "Properly distributed via Raft protocol" (<a href="https://etcd.io/">etcd.io</a>), and Kubernetes uses etcd as its "Consistent and highly-available key value store used as Kubernetes' backing store for all cluster data" (<a href="https://kubernetes.io/docs/concepts/architecture/">Kubernetes architecture</a>). When a Spring Boot service runs on Kubernetes, every deployment and config change you make is a Raft log entry somewhere.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b><code>inner class Node</code></b> can read the enclosing <code>Sim</code>'s fields, the same as a Java non-static inner class. Kotlin makes you say <code>inner</code> on purpose; a plain nested class can't see the outer instance, which is the safer default (Java's equivalent is <code>static class</code>).</li>
+    <li><b>Default and named arguments.</b> <code>Sim(seed.toLong(), buggyVoter = buggy, tracing = false)</code> replaces Java's two constructors, where the long one takes seven positional arguments you must keep in order.</li>
+    <li><b>Lambdas as actions.</b> <code>schedule(delay) { … }</code> passes a <code>() -> Unit</code> with trailing-lambda syntax. Java passes a <code>Runnable</code>, and its lambda can only capture effectively final variables (L14).</li>
+    <li><b><code>sortedMapOf</code> and <code>getOrPut</code></b> replace <code>new TreeMap&lt;&gt;()</code> and <code>computeIfAbsent(…, t -> new TreeSet&lt;&gt;())</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: how random must the timeout be?</div>
+  <p>The paper's Figure 16 measured how long a cluster has no leader after the leader crashes, for different timeout ranges. Reproduce it with your <code>Sim</code>. For each range 150–150, 150–151, 150–155, 150–175, 150–200 and 150–300 ms, run 1,000 seeds with the heartbeat at half the minimum timeout, as the paper did. In each run, wait for a leader, let it settle for 500 ms, crash it at a random moment within one heartbeat interval, and measure the time until a new leader exists, giving up after 10 s. Print the median and the worst case. Put the new file next to <code>Election.kt</code>/<code>Election.java</code> so it can use <code>Sim</code>.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · ElectionTiming.kt</figcaption>
+<pre><code class="language-kotlin">// Exercise: how much randomness does the election timeout need? (compile with Election.kt)
+// Like the Raft paper's Figure 16: crash the leader at a random point in its heartbeat
+// interval, then measure how long the cluster has no leader.
+
+fun downtime(seed: Long, min: Int, max: Int): Long {
+    val sim = Sim(seed, timeoutMin = min, timeoutMax = max, heartbeatMs = min / 2, tracing = false)
+    sim.start()
+    while (sim.leader() == null &amp;&amp; sim.now &lt; 10_000) sim.runUntil(sim.now + 1)
+    if (sim.leader() == null) return 10_000                // never elected a first leader in 10 s
+    sim.runUntil(sim.now + 500)                            // let it settle
+    sim.runUntil(sim.now + sim.rnd.nextInt(min / 2))
+    val old = sim.leader()!!                               // a healthy cluster keeps its leader
+    sim.crash(old.id)
+    val crashedAt = sim.now
+    while (sim.now &lt; crashedAt + 10_000) {
+        sim.runUntil(sim.now + 1)
+        if (sim.leader() != null) return sim.now - crashedAt
+    }
+    return 10_000                                          // gave up: still no leader after 10 s
+}
+
+fun main() {
+    println("%-14s %8s %8s %10s".format("timeout", "median", "worst", "over 10 s"))
+    for ((min, max) in listOf(150 to 150, 150 to 151, 150 to 155, 150 to 175, 150 to 200, 150 to 300)) {
+        val times = (1L..1_000L).map { downtime(it, min, max) }.sorted()
+        println("%-14s %6d ms %6d ms %10d".format("$min-$max ms", times[times.size / 2], times.last(),
+            times.count { it &gt;= 10_000 }))
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · ElectionTiming.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+// Exercise: how much randomness does the election timeout need? (Election.java must sit beside it)
+// Like the Raft paper's Figure 16: crash the leader at a random point in its heartbeat
+// interval, then measure how long the cluster has no leader.
+public class ElectionTiming {
+    static long downtime(long seed, int min, int max) {
+        Election.Sim sim = new Election.Sim(seed, 5, min, max, min / 2, false, false);
+        sim.start();
+        while (sim.leader() == null &amp;&amp; sim.now &lt; 10_000) sim.runUntil(sim.now + 1);
+        if (sim.leader() == null) return 10_000;             // never elected a first leader in 10 s
+        sim.runUntil(sim.now + 500);                         // let it settle
+        sim.runUntil(sim.now + sim.rnd.nextInt(min / 2));
+        Election.Sim.Node old = sim.leader();                // a healthy cluster keeps its leader
+        sim.crash(old.id);
+        long crashedAt = sim.now;
+        while (sim.now &lt; crashedAt + 10_000) {
+            sim.runUntil(sim.now + 1);
+            if (sim.leader() != null) return sim.now - crashedAt;
+        }
+        return 10_000;                                      // gave up: still no leader after 10 s
+    }
+
+    public static void main(String[] args) {
+        System.out.println(String.format("%-14s %8s %8s %10s", "timeout", "median", "worst", "over 10 s"));
+        int[][] ranges = {{150, 150}, {150, 151}, {150, 155}, {150, 175}, {150, 200}, {150, 300}};
+        for (int[] r : ranges) {
+            List&lt;Long&gt; times = new ArrayList&lt;&gt;();
+            for (long seed = 1; seed &lt;= 1_000; seed++) {
+                times.add(downtime(seed, r[0], r[1]));
+            }
+            Collections.sort(times);
+            long over = times.stream().filter(t -&gt; t &gt;= 10_000).count();
+            System.out.println(String.format("%-14s %6d ms %6d ms %10d", r[0] + "-" + r[1] + " ms",
+                times.get(times.size() / 2), times.get(times.size() - 1), over));
+        }
+    }
+}</code></pre></figure>
+</div>
+<p>Compile the Kotlin version together with the simulator (<code>kotlinc Election.kt ElectionTiming.kt -include-runtime -d t.jar</code>, then <code>java -cp t.jar ElectionTimingKt</code>). Java finds <code>Election.java</code> next to it with the multi-file source launcher (<a href="https://openjdk.org/jeps/458">JEP 458</a>): <code>java ElectionTiming.java</code>. Both print:</p>
+<pre class="out">timeout          median    worst  over 10 s
+150-150 ms      10000 ms  10000 ms       1000
+150-151 ms       6874 ms  10000 ms        413
+150-155 ms        602 ms   9892 ms          0
+150-175 ms        154 ms    964 ms          0
+150-200 ms        148 ms    767 ms          0
+150-300 ms        159 ms    547 ms          0</pre>
+  <p>With no randomness, all 1,000 runs failed to elect a first leader within 10 s: every follower times out at the same moment, everyone votes for themselves, and the split repeats forever. One millisecond of randomness still loses most runs. Five milliseconds fixes it. The paper saw the same shape: "In the absence of randomness, leader election consistently took longer than 10 seconds in our tests due to many split votes. Adding just 5ms of randomness helps significantly, resulting in a median downtime of 287ms" (§9.3). The numbers differ, because our network delays and crash timing are not theirs, but the lesson is identical: a little randomness turns an endless tie into a quick election. Wider ranges mainly shrink the worst case. The paper recommends "a conservative election timeout such as 150–300ms".</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p3-1" data-group="Part 3" data-answer="1">
+  <p class="q">A 5-node Raft cluster is split into groups of 2 and 3. Where can a leader be elected?</p>
+  <div class="opts"><button>Only in the group of 2</button><button>Only in the group of 3</button><button>In both of the groups together</button><button>In neither of the two groups</button></div>
+  <p class="why">Winning needs votes from a majority of the <em>whole</em> cluster: 3 of 5. The group of 2 can never collect 3 votes, so it keeps timing out with rising terms. The group of 3 elects a leader and keeps working.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3" data-answer="3">
+  <p class="q">An old leader in the minority accepts a client's write after the partition. What happens to that entry?</p>
+  <div class="opts"><button>It commits once two nodes store it</button><button>It is merged into the new log</button><button>It is applied by the minority only</button><button>It is never committed, then later overwritten</button></div>
+  <p class="why">It can't reach a majority, so the old leader never commits it. After the heal the old leader sees a higher term, steps down, and the consistency check makes it (and any follower it copied the entry to) drop the conflicting entry. The widget shows <code>x=3</code> going exactly this way.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3" data-answer="0">
+  <p class="q">Why does each candidate pick a random election timeout?</p>
+  <div class="opts"><button>So one usually asks first</button><button>So heartbeats use less bandwidth</button><button>So terms never need numbers</button><button>So votes can count twice</button></div>
+  <p class="why">If every follower timed out together, they'd all vote for themselves and split the vote, over and over. Randomness spreads them out, so one candidate usually asks first and wins before the others wake up. The exercise measured it.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ PART 4 ═════════════════════════ -->
+<div class="part-label">Part 4</div>
+<div class="part-head" id="p4" data-title="Part 4"><h2>Two-phase commit vs sagas</h2><span class="t">~20 min</span></div>
+
+<p>L36's transactions were all-or-nothing inside <em>one</em> database. Now an order must be saved in <code>orders-db</code> and stock reserved in <code>stock-db</code>, two separate systems, and you want both or neither. "The most common algorithm to ensure atomic commitment across multiple nodes is the two-phase commit (2PC) protocol [Gray, 1978]" (Kleppmann, §6.1). A <dfn>coordinator</dfn> runs it in two phases:</p>
+<ol>
+  <li><b>Prepare.</b> The coordinator asks each participant "can you commit?". A participant that answers yes must make sure it <em>can</em> commit later, even after a crash, and keeps its locks until told the outcome.</li>
+  <li><b>Commit or abort.</b> If every vote was yes, the coordinator writes COMMIT to its own log and tells everyone; any no means ABORT.</li>
+</ol>
+<p>The catch is what happens between the phases. A prepared participant has given up the right to decide alone. Kleppmann: "The problem with two-phase commit is that the coordinator is a single point of failure", and the slide beside it adds, "Algorithm is blocked until coordinator recovers."</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · TwoPhase.kt</figcaption>
+<pre><code class="language-kotlin">// Two-phase commit: one coordinator, two participants, simulated in one JVM.
+
+enum class TxState { WORKING, PREPARED, COMMITTED, ABORTED }
+
+class Participant(val name: String, private val canCommit: Boolean) {
+    var state = TxState.WORKING
+        private set
+    val holdsLocks get() = state == TxState.WORKING || state == TxState.PREPARED
+
+    fun prepare(): Boolean {                     // phase 1: promise to commit if asked, keep the locks
+        state = if (canCommit) TxState.PREPARED else TxState.ABORTED
+        return canCommit
+    }
+    fun finish(commit: Boolean) { state = if (commit) TxState.COMMITTED else TxState.ABORTED }
+    // Once PREPARED, a participant may neither commit nor abort on its own.
+    fun read() = if (holdsLocks) "BLOCKED: row locked by an in-doubt transaction" else "ok"
+}
+
+class Coordinator(private val crashBeforePhase2: Boolean = false) {
+    val log = mutableListOf&lt;String&gt;()            // its durable decision log
+
+    fun run(tx: String, parts: List&lt;Participant&gt;) {
+        val votes = parts.map { it.prepare() }   // a real coordinator would also time out silent participants
+        val commit = votes.all { it }
+        log += "$tx ${if (commit) "COMMIT" else "ABORT"}"
+        println("  votes ${parts.zip(votes).joinToString { (p, v) -&gt; "${p.name}=${if (v) "yes" else "no"}" }}" +
+            " -&gt; coordinator logs ${if (commit) "COMMIT" else "ABORT"}")
+        if (crashBeforePhase2) { println("  coordinator CRASHES before phase 2"); return }
+        parts.forEach { it.finish(commit) }
+    }
+
+    fun recover(tx: String, parts: List&lt;Participant&gt;) {
+        val commit = log.last { it.startsWith(tx) }.endsWith("COMMIT")
+        println("  coordinator restarts, reads its log: ${if (commit) "COMMIT" else "ABORT"}, tells everyone")
+        parts.forEach { it.finish(commit) }
+    }
+}
+
+fun show(parts: List&lt;Participant&gt;) = parts.joinToString("  ") { "${it.name}=${it.state}" }
+
+fun main() {
+    println("== 1. Both participants can commit")
+    val ok = listOf(Participant("orders-db", true), Participant("stock-db", true))
+    Coordinator().run("tx1", ok)
+    println("  ${show(ok)}")
+
+    println("== 2. stock-db can't (out of stock)")
+    val no = listOf(Participant("orders-db", true), Participant("stock-db", false))
+    Coordinator().run("tx2", no)
+    println("  ${show(no)}")
+
+    println("== 3. Both vote yes, then the coordinator crashes")
+    val stuck = listOf(Participant("orders-db", true), Participant("stock-db", true))
+    val coord = Coordinator(crashBeforePhase2 = true)
+    coord.run("tx3", stuck)
+    println("  ${show(stuck)}")
+    for (s in listOf(1, 60, 3_600)) println("  after ${s}s, a reader on orders-db: ${stuck[0].read()}")
+    println("  orders-db asks stock-db what to do: it is ${stuck[1].state} too, so neither knows the decision")
+    coord.recover("tx3", stuck)
+    println("  ${show(stuck)}   reader: ${stuck[0].read()}")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · TwoPhase.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+// Two-phase commit: one coordinator, two participants, simulated in one JVM.
+public class TwoPhase {
+    enum TxState { WORKING, PREPARED, COMMITTED, ABORTED }
+
+    static class Participant {
+        final String name;
+        private final boolean canCommit;
+        private TxState state = TxState.WORKING;
+        Participant(String name, boolean canCommit) { this.name = name; this.canCommit = canCommit; }
+        TxState state() { return state; }
+        boolean holdsLocks() { return state == TxState.WORKING || state == TxState.PREPARED; }
+
+        boolean prepare() {                       // phase 1: promise to commit if asked, keep the locks
+            state = canCommit ? TxState.PREPARED : TxState.ABORTED;
+            return canCommit;
+        }
+        void finish(boolean commit) { state = commit ? TxState.COMMITTED : TxState.ABORTED; }
+        // Once PREPARED, a participant may neither commit nor abort on its own.
+        String read() { return holdsLocks() ? "BLOCKED: row locked by an in-doubt transaction" : "ok"; }
+    }
+
+    static class Coordinator {
+        final List&lt;String&gt; log = new ArrayList&lt;&gt;();   // its durable decision log
+        private final boolean crashBeforePhase2;
+        Coordinator(boolean crashBeforePhase2) { this.crashBeforePhase2 = crashBeforePhase2; }
+        Coordinator() { this(false); }
+
+        void run(String tx, List&lt;Participant&gt; parts) {
+            List&lt;Boolean&gt; votes = parts.stream().map(Participant::prepare).toList();   // real ones also time out silent participants
+            boolean commit = votes.stream().allMatch(v -&gt; v);
+            log.add(tx + " " + (commit ? "COMMIT" : "ABORT"));
+            String shown = IntStream.range(0, parts.size())
+                .mapToObj(i -&gt; parts.get(i).name + "=" + (votes.get(i) ? "yes" : "no")).collect(Collectors.joining(", "));
+            System.out.println("  votes " + shown + " -&gt; coordinator logs " + (commit ? "COMMIT" : "ABORT"));
+            if (crashBeforePhase2) { System.out.println("  coordinator CRASHES before phase 2"); return; }
+            parts.forEach(p -&gt; p.finish(commit));
+        }
+
+        void recover(String tx, List&lt;Participant&gt; parts) {
+            String decision = log.stream().filter(l -&gt; l.startsWith(tx)).reduce((a, b) -&gt; b).orElseThrow();
+            boolean commit = decision.endsWith("COMMIT");
+            System.out.println("  coordinator restarts, reads its log: " + (commit ? "COMMIT" : "ABORT") + ", tells everyone");
+            parts.forEach(p -&gt; p.finish(commit));
+        }
+    }
+
+    static String show(List&lt;Participant&gt; parts) {
+        return parts.stream().map(p -&gt; p.name + "=" + p.state()).collect(Collectors.joining("  "));
+    }
+
+    public static void main(String[] args) {
+        System.out.println("== 1. Both participants can commit");
+        List&lt;Participant&gt; ok = List.of(new Participant("orders-db", true), new Participant("stock-db", true));
+        new Coordinator().run("tx1", ok);
+        System.out.println("  " + show(ok));
+
+        System.out.println("== 2. stock-db can't (out of stock)");
+        List&lt;Participant&gt; no = List.of(new Participant("orders-db", true), new Participant("stock-db", false));
+        new Coordinator().run("tx2", no);
+        System.out.println("  " + show(no));
+
+        System.out.println("== 3. Both vote yes, then the coordinator crashes");
+        List&lt;Participant&gt; stuck = List.of(new Participant("orders-db", true), new Participant("stock-db", true));
+        Coordinator coord = new Coordinator(true);
+        coord.run("tx3", stuck);
+        System.out.println("  " + show(stuck));
+        for (int s : new int[]{1, 60, 3_600}) System.out.println("  after " + s + "s, a reader on orders-db: " + stuck.get(0).read());
+        System.out.println("  orders-db asks stock-db what to do: it is " + stuck.get(1).state() + " too, so neither knows the decision");
+        coord.recover("tx3", stuck);
+        System.out.println("  " + show(stuck) + "   reader: " + stuck.get(0).read());
+    }
+}</code></pre></figure>
+</div>
+<p>Both print exactly this:</p>
+<pre class="out">== 1. Both participants can commit
+  votes orders-db=yes, stock-db=yes -&gt; coordinator logs COMMIT
+  orders-db=COMMITTED  stock-db=COMMITTED
+== 2. stock-db can't (out of stock)
+  votes orders-db=yes, stock-db=no -&gt; coordinator logs ABORT
+  orders-db=ABORTED  stock-db=ABORTED
+== 3. Both vote yes, then the coordinator crashes
+  votes orders-db=yes, stock-db=yes -&gt; coordinator logs COMMIT
+  coordinator CRASHES before phase 2
+  orders-db=PREPARED  stock-db=PREPARED
+  after 1s, a reader on orders-db: BLOCKED: row locked by an in-doubt transaction
+  after 60s, a reader on orders-db: BLOCKED: row locked by an in-doubt transaction
+  after 3600s, a reader on orders-db: BLOCKED: row locked by an in-doubt transaction
+  orders-db asks stock-db what to do: it is PREPARED too, so neither knows the decision
+  coordinator restarts, reads its log: COMMIT, tells everyone
+  orders-db=COMMITTED  stock-db=COMMITTED   reader: ok</pre>
+<p>Cases 1 and 2 are what 2PC is for: both databases committed, or both aborted. Case 3 is its price. Both participants voted yes, so neither may abort, and neither knows the decision, so neither may commit. The row stays locked for as long as the coordinator is down, an hour in this run, and every reader of that row waits. Real databases document this honestly. PostgreSQL's <code>PREPARE TRANSACTION</code> "prepares the current transaction for two-phase commit", and the manual warns: "It is unwise to leave transactions in the prepared state for a long time", because "the transaction continues to hold whatever locks it held". Its advice for applications is blunt: "Unless you're writing a transaction manager, you probably shouldn't be using PREPARE TRANSACTION". The feature is meant for external transaction managers, "some of which are covered by standards (such as X/Open XA)" (<a href="https://www.postgresql.org/docs/current/sql-prepare-transaction.html">PostgreSQL docs</a>).</p>
+<p>The cure for a coordinator that can crash is Part 3. If the votes go through a consensus log instead of one coordinator, any node can learn the outcome. Kleppmann's notes show "a fault-tolerant two-phase commit algorithm based on Paxos Commit [Gray and Lamport, 2006]" (§6.1). That's powerful and heavyweight, and most microservice systems choose something weaker.</p>
+
+<h3>Sagas: give up isolation, keep going</h3>
+<p>The saga pattern drops the global lock altogether: "Implement each business transaction that spans multiple services as a saga. A saga is a reliably coordinated sequence of local transactions" (<a href="https://microservices.io/patterns/data/saga.html">microservices.io: Saga</a>). Each step commits for real in its own service. If a later step fails, "the changes made by the completed steps are undone by compensating transactions": not a rollback, but a new action that cancels the old one.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Saga.kt</figcaption>
+<pre><code class="language-kotlin">// A saga: a sequence of local transactions, each with a compensating action that undoes it.
+
+class Inventory(var seats: Int, var rooms: Int, var charged: Int = 0)
+
+class Step(val name: String, val action: (Inventory) -&gt; Boolean, val compensate: (Inventory) -&gt; Unit)
+
+fun runSaga(inv: Inventory, steps: List&lt;Step&gt;, afterEach: (String) -&gt; Unit = {}): Boolean {
+    val done = ArrayDeque&lt;Step&gt;()
+    for (step in steps) {
+        if (!step.action(inv)) {
+            println("  ${step.name}: FAILED")
+            while (done.isNotEmpty()) {                       // undo in reverse order
+                val undo = done.removeLast()
+                undo.compensate(inv)
+                println("  compensate ${undo.name}")
+            }
+            return false
+        }
+        done.addLast(step)
+        println("  ${step.name}: ok")
+        afterEach(step.name)
+    }
+    return true
+}
+
+fun trip(cardWorks: Boolean) = listOf(
+    Step("reserve flight", { if (it.seats &gt; 0) { it.seats--; true } else false }, { it.seats++ }),
+    Step("reserve hotel", { if (it.rooms &gt; 0) { it.rooms--; true } else false }, { it.rooms++ }),
+    Step("charge card", { if (cardWorks) { it.charged += 450; true } else false }, { it.charged -= 450 }),
+)
+
+fun main() {
+    println("== Ana's trip: every step succeeds")
+    val inv1 = Inventory(seats = 1, rooms = 1)
+    println("  committed: ${runSaga(inv1, trip(cardWorks = true))}, seats=${inv1.seats} rooms=${inv1.rooms} charged=${inv1.charged}")
+
+    println("== Ben's trip: the card is declined, so earlier steps are compensated")
+    val inv2 = Inventory(seats = 1, rooms = 1)
+    var seenByCleo = ""
+    val ok = runSaga(inv2, trip(cardWorks = false)) { name -&gt;
+        if (name == "reserve hotel") seenByCleo = if (inv2.rooms == 0) "sold out" else "available"
+    }
+    println("  committed: $ok, seats=${inv2.seats} rooms=${inv2.rooms} charged=${inv2.charged}")
+    println("  meanwhile Cleo searched hotels between Ben's steps and saw: $seenByCleo")
+    println("  (no isolation: she saw a reservation that was later undone)")
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Saga.java</figcaption>
+<pre><code class="language-java">import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+
+// A saga: a sequence of local transactions, each with a compensating action that undoes it.
+public class Saga {
+    static class Inventory {
+        int seats, rooms, charged;
+        Inventory(int seats, int rooms) { this.seats = seats; this.rooms = rooms; }
+    }
+
+    record Step(String name, Predicate&lt;Inventory&gt; action, Consumer&lt;Inventory&gt; compensate) {}
+
+    static boolean runSaga(Inventory inv, List&lt;Step&gt; steps, Consumer&lt;String&gt; afterEach) {
+        Deque&lt;Step&gt; done = new ArrayDeque&lt;&gt;();
+        for (Step step : steps) {
+            if (!step.action().test(inv)) {
+                System.out.println("  " + step.name() + ": FAILED");
+                while (!done.isEmpty()) {                      // undo in reverse order
+                    Step undo = done.removeLast();
+                    undo.compensate().accept(inv);
+                    System.out.println("  compensate " + undo.name());
+                }
+                return false;
+            }
+            done.addLast(step);
+            System.out.println("  " + step.name() + ": ok");
+            afterEach.accept(step.name());
+        }
+        return true;
+    }
+
+    static List&lt;Step&gt; trip(boolean cardWorks) {
+        return List.of(
+            new Step("reserve flight", i -&gt; { if (i.seats &gt; 0) { i.seats--; return true; } return false; }, i -&gt; i.seats++),
+            new Step("reserve hotel", i -&gt; { if (i.rooms &gt; 0) { i.rooms--; return true; } return false; }, i -&gt; i.rooms++),
+            new Step("charge card", i -&gt; { if (cardWorks) { i.charged += 450; return true; } return false; }, i -&gt; i.charged -= 450));
+    }
+
+    public static void main(String[] args) {
+        System.out.println("== Ana's trip: every step succeeds");
+        Inventory inv1 = new Inventory(1, 1);
+        boolean ok1 = runSaga(inv1, trip(true), name -&gt; {});
+        System.out.println("  committed: " + ok1 + ", seats=" + inv1.seats + " rooms=" + inv1.rooms + " charged=" + inv1.charged);
+
+        System.out.println("== Ben's trip: the card is declined, so earlier steps are compensated");
+        Inventory inv2 = new Inventory(1, 1);
+        String[] seenByCleo = {""};
+        boolean ok2 = runSaga(inv2, trip(false), name -&gt; {
+            if (name.equals("reserve hotel")) seenByCleo[0] = inv2.rooms == 0 ? "sold out" : "available";
+        });
+        System.out.println("  committed: " + ok2 + ", seats=" + inv2.seats + " rooms=" + inv2.rooms + " charged=" + inv2.charged);
+        System.out.println("  meanwhile Cleo searched hotels between Ben's steps and saw: " + seenByCleo[0]);
+        System.out.println("  (no isolation: she saw a reservation that was later undone)");
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">== Ana's trip: every step succeeds
+  reserve flight: ok
+  reserve hotel: ok
+  charge card: ok
+  committed: true, seats=0 rooms=0 charged=450
+== Ben's trip: the card is declined, so earlier steps are compensated
+  reserve flight: ok
+  reserve hotel: ok
+  charge card: FAILED
+  compensate reserve hotel
+  compensate reserve flight
+  committed: false, seats=1 rooms=1 charged=0
+  meanwhile Cleo searched hotels between Ben's steps and saw: sold out
+  (no isolation: she saw a reservation that was later undone)</pre>
+<p>Ben's card was declined, so the hotel and flight reservations were cancelled in reverse order, and the books balance again. Nothing ever blocked. But look at Cleo: between Ben's steps she searched for a room and was told "sold out", because Ben's reservation was real for a moment. The pattern's own page lists this as the main drawback: "Lack of isolation (the "I" in ACID)", with a risk that concurrent sagas cause data anomalies. You design around it, for example by marking rows <em>pending</em> until the saga finishes.</p>
+<table class="vs">
+  <tr><th></th><th>Two-phase commit</th><th>Saga</th></tr>
+  <tr><td><b>Atomic?</b></td><td>Yes: all commit or all abort</td><td>Eventually: completed steps are compensated</td></tr>
+  <tr><td><b>Isolated?</b></td><td>Yes: locks held until the decision</td><td>No: others see the intermediate steps</td></tr>
+  <tr><td><b>On a coordinator crash</b></td><td>Participants block, holding locks</td><td>Resume or compensate once it's back</td></tr>
+  <tr><td><b>Undo is…</b></td><td>Automatic rollback</td><td>Code you write for every step</td></tr>
+  <tr><td><b>Typical home</b></td><td>A transaction manager over several databases (the X/Open XA standard)</td><td>Across services you own (orders, payments)</td></tr>
+</table>
+
+<h3>The outbox: one local transaction, then a queue</h3>
+<p>Every saga step has the same problem in miniature: save to my database <em>and</em> send a message to the next service. If you commit and then crash before sending, the message is lost. If you send and then the commit fails, you've announced something that never happened. The transactional outbox asks "How to atomically update the database and send messages to a message broker?" and answers: "The solution is for the service that sends the message to first store the message in the database as part of the transaction that updates the business entities" (<a href="https://microservices.io/patterns/data/transactional-outbox.html">microservices.io: Transactional outbox</a>). A separate relay then publishes the stored messages. Its honest caveat: "The Message relay might publish a message more than once. It might, for example, crash after publishing a message but before recording the fact that it has done so." That's L42's at-least-once delivery again, and the answer is the same: an idempotent consumer.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>Function types.</b> A step's action is <code>(Inventory) -> Boolean</code> and its compensation <code>(Inventory) -> Unit</code>. Java needs two different interfaces, <code>Predicate&lt;Inventory&gt;</code> and <code>Consumer&lt;Inventory&gt;</code>, and calls them with <code>.test(…)</code> and <code>.accept(…)</code> (L14).</li>
+    <li><b>Default arguments.</b> <code>Coordinator(crashBeforePhase2 = true)</code> and <code>runSaga(…, afterEach = {})</code> replace Java's extra constructor and the explicit <code>name -> {}</code>.</li>
+    <li><b>Capturing a <code>var</code>.</b> Kotlin's lambda can assign <code>seenByCleo</code> directly. Java's lambda can't assign a local, hence the <code>String[] seenByCleo = {""}</code> one-element-array trick (L14).</li>
+    <li><b><code>use { }</code></b> closes each JDBC statement in the exercise, like Java's try-with-resources (L10).</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: an outbox on real SQLite</div>
+  <p>From a blank file, using <code>sqlite-jdbc</code> as in L36: create <code>orders</code> and an <code>outbox(id, payload, sent)</code> table. <code>placeOrder</code> inserts the order and its <code>OrderPlaced</code> message in <b>one</b> transaction. A relay reads unsent outbox rows in order, publishes each one to a broker (a list will do), then marks it sent. Place three orders, run the relay but crash it right after publishing message 2 (throw before the <code>UPDATE</code>), then run it again. Finally feed the broker to a consumer that sends one email per message, and make it idempotent.</p>
+  <details class="solution"><summary>Reference solution and real output</summary>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Outbox.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.sql.Connection
+import java.sql.DriverManager
+
+// Exercise: the transactional outbox, on a real SQLite file.
+// The order row and its "OrderPlaced" message commit in ONE local transaction;
+// a relay publishes messages afterwards, and the consumer ignores duplicates.
+
+class RelayCrash : RuntimeException("relay crashed")
+
+fun placeOrder(db: Connection, item: String) {
+    db.autoCommit = false
+    db.prepareStatement("INSERT INTO orders(item) VALUES (?)").use { it.setString(1, item); it.executeUpdate() }
+    val id = db.createStatement().use { it.executeQuery("SELECT last_insert_rowid()").run { next(); getLong(1) } }
+    db.prepareStatement("INSERT INTO outbox(payload) VALUES (?)").use { it.setString(1, "OrderPlaced #$id $item"); it.executeUpdate() }
+    db.commit()                                       // both rows, or neither
+    db.autoCommit = true
+}
+
+fun relay(db: Connection, broker: MutableList&lt;Pair&lt;Long, String&gt;&gt;, crashAfterPublishing: Long? = null) {
+    val pending = db.createStatement().use { st -&gt;
+        st.executeQuery("SELECT id, payload FROM outbox WHERE sent = 0 ORDER BY id").use { rs -&gt;
+            buildList { while (rs.next()) add(rs.getLong(1) to rs.getString(2)) }
+        }
+    }
+    for ((id, payload) in pending) {
+        broker += id to payload                       // 1. publish
+        println("  relay published outbox #$id")
+        if (id == crashAfterPublishing) throw RelayCrash()
+        db.prepareStatement("UPDATE outbox SET sent = 1 WHERE id = ?").use { it.setLong(1, id); it.executeUpdate() }   // 2. mark sent
+    }
+}
+
+class EmailConsumer {
+    private val seen = mutableSetOf&lt;Long&gt;()           // in production: a processed_messages table
+    var emails = 0
+    fun handle(id: Long, payload: String) {
+        if (!seen.add(id)) { println("  consumer: #$id again, already handled, skip"); return }
+        emails++
+        println("  consumer: email for \"$payload\"")
+    }
+}
+
+fun main() {
+    val file = Files.createTempFile("outbox", ".db")
+    DriverManager.getConnection("jdbc:sqlite:$file").use { db -&gt;
+        db.createStatement().use {
+            it.executeUpdate("CREATE TABLE orders(id INTEGER PRIMARY KEY, item TEXT NOT NULL)")
+            it.executeUpdate("CREATE TABLE outbox(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0)")
+        }
+        listOf("lamp", "desk", "chair").forEach { placeOrder(db, it) }
+        val broker = mutableListOf&lt;Pair&lt;Long, String&gt;&gt;()
+        println("== relay run 1 crashes after publishing #2, before marking it sent")
+        try { relay(db, broker, crashAfterPublishing = 2) } catch (e: RelayCrash) { println("  ${e.message}") }
+        println("== relay run 2, after a restart")
+        relay(db, broker)
+        println("== the consumer reads the broker: ${broker.size} messages for 3 orders")
+        val consumer = EmailConsumer()
+        broker.forEach { (id, p) -&gt; consumer.handle(id, p) }
+        println("emails sent: ${consumer.emails}")
+    }
+    Files.delete(file)
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Outbox.java</figcaption>
+<pre><code class="language-java">import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+// Exercise: the transactional outbox, on a real SQLite file.
+// The order row and its "OrderPlaced" message commit in ONE local transaction;
+// a relay publishes messages afterwards, and the consumer ignores duplicates.
+public class Outbox {
+    static class RelayCrash extends RuntimeException { RelayCrash() { super("relay crashed"); } }
+    record Message(long id, String payload) {}
+
+    static void placeOrder(Connection db, String item) throws SQLException {
+        db.setAutoCommit(false);
+        try (PreparedStatement ps = db.prepareStatement("INSERT INTO orders(item) VALUES (?)")) {
+            ps.setString(1, item); ps.executeUpdate();
+        }
+        long id;
+        try (Statement st = db.createStatement(); ResultSet rs = st.executeQuery("SELECT last_insert_rowid()")) {
+            rs.next(); id = rs.getLong(1);
+        }
+        try (PreparedStatement ps = db.prepareStatement("INSERT INTO outbox(payload) VALUES (?)")) {
+            ps.setString(1, "OrderPlaced #" + id + " " + item); ps.executeUpdate();
+        }
+        db.commit();                                    // both rows, or neither
+        db.setAutoCommit(true);
+    }
+
+    static void relay(Connection db, List&lt;Message&gt; broker, Long crashAfterPublishing) throws SQLException {
+        List&lt;Message&gt; pending = new ArrayList&lt;&gt;();
+        try (Statement st = db.createStatement();
+             ResultSet rs = st.executeQuery("SELECT id, payload FROM outbox WHERE sent = 0 ORDER BY id")) {
+            while (rs.next()) pending.add(new Message(rs.getLong(1), rs.getString(2)));
+        }
+        for (Message m : pending) {
+            broker.add(m);                              // 1. publish
+            System.out.println("  relay published outbox #" + m.id());
+            if (crashAfterPublishing != null &amp;&amp; m.id() == crashAfterPublishing) throw new RelayCrash();
+            try (PreparedStatement ps = db.prepareStatement("UPDATE outbox SET sent = 1 WHERE id = ?")) {
+                ps.setLong(1, m.id()); ps.executeUpdate();   // 2. mark sent
+            }
+        }
+    }
+
+    static class EmailConsumer {
+        private final Set&lt;Long&gt; seen = new HashSet&lt;&gt;();   // in production: a processed_messages table
+        int emails = 0;
+        void handle(Message m) {
+            if (!seen.add(m.id())) { System.out.println("  consumer: #" + m.id() + " again, already handled, skip"); return; }
+            emails++;
+            System.out.println("  consumer: email for \"" + m.payload() + "\"");
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path file = Files.createTempFile("outbox", ".db");
+        try (Connection db = DriverManager.getConnection("jdbc:sqlite:" + file)) {
+            try (Statement st = db.createStatement()) {
+                st.executeUpdate("CREATE TABLE orders(id INTEGER PRIMARY KEY, item TEXT NOT NULL)");
+                st.executeUpdate("CREATE TABLE outbox(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0)");
+            }
+            for (String item : List.of("lamp", "desk", "chair")) placeOrder(db, item);
+            List&lt;Message&gt; broker = new ArrayList&lt;&gt;();
+            System.out.println("== relay run 1 crashes after publishing #2, before marking it sent");
+            try { relay(db, broker, 2L); } catch (RelayCrash e) { System.out.println("  " + e.getMessage()); }
+            System.out.println("== relay run 2, after a restart");
+            relay(db, broker, null);
+            System.out.println("== the consumer reads the broker: " + broker.size() + " messages for 3 orders");
+            EmailConsumer consumer = new EmailConsumer();
+            broker.forEach(consumer::handle);
+            System.out.println("emails sent: " + consumer.emails);
+        }
+        Files.delete(file);
+    }
+}</code></pre></figure>
+</div>
+<p>Run with the driver on the classpath and native access enabled, as in L36: <code>java --enable-native-access=ALL-UNNAMED -cp sqlite-jdbc-3.53.4.0.jar Outbox.java</code>. Both print:</p>
+<pre class="out">== relay run 1 crashes after publishing #2, before marking it sent
+  relay published outbox #1
+  relay published outbox #2
+  relay crashed
+== relay run 2, after a restart
+  relay published outbox #2
+  relay published outbox #3
+== the consumer reads the broker: 4 messages for 3 orders
+  consumer: email for "OrderPlaced #1 lamp"
+  consumer: email for "OrderPlaced #2 desk"
+  consumer: #2 again, already handled, skip
+  consumer: email for "OrderPlaced #3 chair"
+emails sent: 3</pre>
+  <p>The crash left message 2 published but not marked sent, so the restarted relay published it again: 4 messages for 3 orders. No order lost its message, and no message announced an order that doesn't exist, because the two rows were committed together. The consumer's set of seen ids turned the duplicate into a no-op, so exactly 3 emails went out. In production that set is a <code>processed_messages</code> table, updated in the same transaction as the consumer's own work.</p>
+  </details>
+</div>
+
+<div class="quiz" data-id="p4-1" data-group="Part 4" data-answer="2">
+  <p class="q">In two-phase commit, a participant has voted yes and then loses contact with the coordinator. What may it do?</p>
+  <div class="opts"><button>Commit on its own</button><button>Abort on its own</button><button>Only wait, holding locks</button><button>Ask clients to decide</button></div>
+  <p class="why">A yes vote is a promise to commit if told to, so aborting alone could break atomicity. But the coordinator might have decided ABORT, so committing alone could break it too. It must wait, and its locks block everyone who needs those rows.</p>
+</div>
+<div class="quiz" data-id="p4-2" data-group="Part 4" data-answer="1">
+  <p class="q">An outbox relay crashes after publishing a message but before marking it sent. What does the consumer see?</p>
+  <div class="opts"><button>The message is lost forever</button><button>The same message twice over</button><button>The message out of order</button><button>An error from the broker</button></div>
+  <p class="why">On restart the relay finds the row still unsent and publishes it again. The outbox guarantees at-least-once delivery, never exactly-once, so the consumer must be idempotent (L42).</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Part 4 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p5" data-title="Final exercise"><h2>Raft through a partition</h2><span class="t">~25 min</span></div>
+
+<p>Extend Part 3's election simulator into a Raft that replicates a log, then prove it survives a partition. Start from a blank Gradle project (as in L11), Kotlin first and then Java, and don't look at the widget or the solution until you've rated yourself.</p>
+<div class="task">
+  <ol>
+    <li><b>Log entries.</b> Each node keeps <code>log</code> (entries of term + command), <code>commitIndex</code>, and an <code>applied</code> list as its state machine. A leader also keeps <code>nextIndex</code> and <code>matchIndex</code> per follower, reset when it wins.</li>
+    <li><b>RequestVote carries the candidate's last log index and term</b>, and a voter grants only if the candidate's log is at least as up-to-date as its own.</li>
+    <li><b>Every heartbeat is an AppendEntries</b> with <code>prevIndex</code>, <code>prevTerm</code>, the entries from <code>nextIndex</code> on, and <code>leaderCommit</code>. A follower refuses if it lacks <code>prevIndex</code> with <code>prevTerm</code>; otherwise it deletes conflicting entries, appends, and advances its <code>commitIndex</code>. On a refusal the leader decrements <code>nextIndex</code>.</li>
+    <li><b>Commit by majority</b>, counting only entries from the leader's current term, and apply committed entries in order on every node.</li>
+    <li><b><code>propose(id, command)</code></b> succeeds only on a leader and returns before anything is committed.</li>
+    <li><b>Tests</b> (at least these): one leader in a healthy cluster; at most one leader per term over 300 seeds of random crashes, restarts, partitions and proposals; no two nodes ever apply different commands at one index; after the chaos stops, every node's applied list is identical; a minority leader can't commit; the majority elects a higher-term leader; after a heal every log converges; a stale log can't win a vote; one seed always replays the same history.</li>
+    <li><b>The scripted run</b>, seed 7: propose <code>x=1</code> and <code>x=2</code>; at 700 ms put the leader and one other node on one side of a partition; at 750 ms propose <code>x=3</code> to the old leader; at 1,300 ms propose <code>x=4</code> to the new one; heal at 1,800 ms; print the history and every node's final log.</li>
+    <li><b>Prove your tests can fail.</b> Delete the up-to-date check from the vote and run them again.</li>
+  </ol>
+</div>
+<div class="rating-group">
+  <div class="rating" data-id="final-kt" data-label="Final: Raft with log replication (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-jv" data-label="Final: Raft with log replication (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  <div class="rating" data-id="final-sf" data-label="Final: arguing why two leaders can't share a term"><span class="who">SAFETY</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+</div>
+<p><b>SAFETY task:</b> before opening the solution, write a few sentences arguing why two nodes can never both be leader of the same term. Name every rule your argument uses.</p>
+
+<details class="solution"><summary>Reference solutions and real output</summary>
+<p>The Gradle projects come from <code>gradle init</code> as in L11, with no extra dependencies. First the simulator. It's Part 3's <code>Sim</code> plus logs; the new parts are <code>onAppendEntries</code>, <code>onAppendReply</code> and <code>propose</code>.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · raft/Raft.kt</figcaption>
+<pre><code class="language-kotlin">package raft
+
+import java.util.PriorityQueue
+import java.util.Random
+
+// Raft (election + log replication, §5 of the paper) in a deterministic simulation.
+// Left out: persistence to disk, snapshots and membership changes.
+
+enum class Role { FOLLOWER, CANDIDATE, LEADER }
+
+data class Entry(val term: Long, val command: String)
+
+sealed interface Msg { val term: Long; val from: Int }
+data class RequestVote(override val term: Long, override val from: Int, val lastIndex: Int, val lastTerm: Long) : Msg
+data class VoteReply(override val term: Long, override val from: Int, val granted: Boolean) : Msg
+data class AppendEntries(
+    override val term: Long, override val from: Int,
+    val prevIndex: Int, val prevTerm: Long, val entries: List&lt;Entry&gt;, val leaderCommit: Int,
+) : Msg
+data class AppendReply(override val term: Long, override val from: Int, val success: Boolean, val matchIndex: Int) : Msg
+
+/** One line of history, plus who sent the message that caused it (for the widget). */
+data class Event(val at: Long, val text: String, val from: Int? = null, val to: Int? = null)
+
+class Sim(seed: Long, val n: Int = 5, val heartbeatMs: Int = 50) {
+    val rnd = Random(seed)
+    var now = 0L
+        private set
+    private var seq = 0L
+    private class Ev(val at: Long, val seq: Long, val action: () -&gt; Unit)
+    private val queue = PriorityQueue&lt;Ev&gt;(compareBy&lt;Ev&gt;({ it.at }, { it.seq }))
+
+    inner class Node(val id: Int) {
+        val name = "n${id + 1}"
+        var role = Role.FOLLOWER
+        var term = 0L                           // persistent: currentTerm
+        var votedFor: Int? = null               // persistent: votedFor
+        val log = mutableListOf&lt;Entry&gt;()        // persistent: log[i - 1] holds index i
+        var commitIndex = 0                     // volatile
+        val applied = mutableListOf&lt;String&gt;()   // the state machine: commands applied, in order
+        val votes = mutableSetOf&lt;Int&gt;()
+        val nextIndex = IntArray(n)             // leader only
+        val matchIndex = IntArray(n)            // leader only
+        var up = true
+        var timerEpoch = 0
+
+        fun lastIndex() = log.size
+        fun lastTerm() = log.lastOrNull()?.term ?: 0L
+        fun termAt(index: Int) = if (index == 0) 0L else log[index - 1].term
+        /** The election restriction (§5.4.1): is a candidate's log at least as up-to-date as mine? */
+        fun isUpToDate(lastIndex: Int, lastTerm: Long) =
+            lastTerm &gt; lastTerm() || (lastTerm == lastTerm() &amp;&amp; lastIndex &gt;= lastIndex())
+    }
+
+    val nodes = List(n) { Node(it) }
+    private val cut = mutableSetOf&lt;Pair&lt;Int, Int&gt;&gt;()
+    var side: Set&lt;Int&gt;? = null                  // one side of the current partition, if any
+        private set
+    val leadersByTerm = sortedMapOf&lt;Long, MutableSet&lt;Int&gt;&gt;()
+    val history = mutableListOf&lt;Event&gt;()
+    var onEvent: (Event) -&gt; Unit = {}
+
+    private fun log(text: String, from: Int? = null, to: Int? = null) {
+        val e = Event(now, text, from, to)
+        history += e
+        onEvent(e)
+    }
+    private fun schedule(delayMs: Long, action: () -&gt; Unit) { queue += Ev(now + delayMs, seq++, action) }
+    private fun linkUp(a: Int, b: Int) = (a to b) !in cut
+
+    private fun send(from: Int, to: Int, msg: Msg) {
+        if (!linkUp(from, to)) return
+        schedule(2L + rnd.nextInt(9)) { if (linkUp(from, to) &amp;&amp; nodes[to].up) deliver(nodes[to], msg) }
+    }
+
+    private fun resetElectionTimer(node: Node) {
+        val epoch = ++node.timerEpoch
+        schedule(150L + rnd.nextInt(151)) {
+            if (node.up &amp;&amp; node.timerEpoch == epoch &amp;&amp; node.role != Role.LEADER) startElection(node)
+        }
+    }
+
+    private fun startElection(node: Node) {
+        node.role = Role.CANDIDATE
+        node.term++
+        node.votedFor = node.id
+        node.votes.clear(); node.votes += node.id
+        log("${node.name} times out: candidate for term ${node.term}")
+        resetElectionTimer(node)
+        val rv = RequestVote(node.term, node.id, node.lastIndex(), node.lastTerm())
+        for (peer in nodes) if (peer.id != node.id) send(node.id, peer.id, rv)
+    }
+
+    private fun deliver(node: Node, msg: Msg) {
+        if (msg.term &gt; node.term) {
+            if (node.role != Role.FOLLOWER) log("${node.name} steps down: saw term ${msg.term}", msg.from, node.id)
+            node.term = msg.term; node.votedFor = null; node.role = Role.FOLLOWER
+        }
+        when (msg) {
+            is RequestVote -&gt; {
+                val grant = msg.term == node.term &amp;&amp;
+                    (node.votedFor == null || node.votedFor == msg.from) &amp;&amp;
+                    node.isUpToDate(msg.lastIndex, msg.lastTerm)
+                if (grant) {
+                    node.votedFor = msg.from
+                    resetElectionTimer(node)
+                    log("${node.name} votes for n${msg.from + 1} in term ${msg.term}", node.id, msg.from)
+                }
+                send(node.id, msg.from, VoteReply(node.term, node.id, grant))
+            }
+            is VoteReply -&gt; if (node.role == Role.CANDIDATE &amp;&amp; msg.term == node.term &amp;&amp; msg.granted) {
+                node.votes += msg.from
+                if (node.votes.size &gt; n / 2) becomeLeader(node)
+            }
+            is AppendEntries -&gt; onAppendEntries(node, msg)
+            is AppendReply -&gt; if (node.role == Role.LEADER &amp;&amp; msg.term == node.term) onAppendReply(node, msg)
+        }
+    }
+
+    private fun onAppendEntries(node: Node, msg: AppendEntries) {
+        if (msg.term &lt; node.term) { send(node.id, msg.from, AppendReply(node.term, node.id, false, 0)); return }
+        if (node.role == Role.CANDIDATE) log("${node.name} hears leader n${msg.from + 1}: back to follower", msg.from, node.id)
+        node.role = Role.FOLLOWER
+        resetElectionTimer(node)
+        // Consistency check: my log must hold the entry just before the new ones.
+        if (msg.prevIndex &gt; node.lastIndex() || node.termAt(msg.prevIndex) != msg.prevTerm) {
+            send(node.id, msg.from, AppendReply(node.term, node.id, false, 0)); return
+        }
+        var index = msg.prevIndex
+        for (entry in msg.entries) {
+            index++
+            if (index &lt;= node.lastIndex() &amp;&amp; node.termAt(index) != entry.term) {
+                val dropped = node.log.subList(index - 1, node.log.size).joinToString { it.command }
+                while (node.log.size &gt;= index) node.log.removeAt(node.log.size - 1)
+                log("${node.name} drops uncommitted [$dropped]: conflicts with the leader", msg.from, node.id)
+            }
+            if (index &gt; node.lastIndex()) node.log += entry
+        }
+        if (msg.leaderCommit &gt; node.commitIndex) {
+            node.commitIndex = minOf(msg.leaderCommit, msg.prevIndex + msg.entries.size)
+            apply(node)
+        }
+        send(node.id, msg.from, AppendReply(node.term, node.id, true, msg.prevIndex + msg.entries.size))
+    }
+
+    private fun onAppendReply(leader: Node, msg: AppendReply) {
+        if (!msg.success) { leader.nextIndex[msg.from] = maxOf(1, leader.nextIndex[msg.from] - 1); return }
+        leader.matchIndex[msg.from] = maxOf(leader.matchIndex[msg.from], msg.matchIndex)
+        leader.nextIndex[msg.from] = leader.matchIndex[msg.from] + 1
+        // Commit the highest index stored on a majority, but only by counting entries of the current term (§5.4.2).
+        for (index in leader.lastIndex() downTo leader.commitIndex + 1) {
+            val copies = leader.matchIndex.count { it &gt;= index }
+            if (leader.termAt(index) == leader.term &amp;&amp; copies &gt; n / 2) {
+                leader.commitIndex = index
+                log("${leader.name} commits up to index $index (${leader.log[index - 1].command}), stored on $copies of $n")
+                apply(leader)
+                break
+            }
+        }
+    }
+
+    private fun apply(node: Node) {
+        while (node.applied.size &lt; node.commitIndex) node.applied += node.log[node.applied.size].command
+    }
+
+    private fun becomeLeader(node: Node) {
+        node.role = Role.LEADER
+        leadersByTerm.getOrPut(node.term) { mutableSetOf() } += node.id
+        node.nextIndex.fill(node.lastIndex() + 1)
+        node.matchIndex.fill(0)
+        node.matchIndex[node.id] = node.lastIndex()
+        log("${node.name} is LEADER of term ${node.term}, votes from " +
+            node.votes.sorted().joinToString(", ") { "n${it + 1}" })
+        heartbeats(node, node.term)
+    }
+
+    // Each heartbeat is an AppendEntries carrying whatever that follower is missing.
+    private fun heartbeats(node: Node, term: Long) {
+        if (!node.up || node.role != Role.LEADER || node.term != term) return
+        for (peer in nodes) if (peer.id != node.id) {
+            val prev = node.nextIndex[peer.id] - 1
+            val entries = node.log.subList(prev, node.log.size).toList()
+            send(node.id, peer.id, AppendEntries(term, node.id, prev, node.termAt(prev), entries, node.commitIndex))
+        }
+        schedule(heartbeatMs.toLong()) { heartbeats(node, term) }
+    }
+
+    /** A client asks [id] to run [command]. Only a leader accepts; acceptance is not commitment. */
+    fun propose(id: Int, command: String): Boolean {
+        val node = nodes[id]
+        if (!node.up || node.role != Role.LEADER) return false
+        node.log += Entry(node.term, command)
+        node.matchIndex[node.id] = node.lastIndex()
+        log("client -&gt; ${node.name}: $command (index ${node.lastIndex()}, term ${node.term}, not committed yet)")
+        return true
+    }
+
+    fun start() { for (node in nodes) resetElectionTimer(node) }
+    fun crash(id: Int) { nodes[id].up = false; log("${nodes[id].name} CRASHES") }
+    fun restart(id: Int) {                       // term, votedFor and log are persistent; the rest is rebuilt
+        val node = nodes[id]
+        node.up = true; node.role = Role.FOLLOWER
+        node.commitIndex = 0; node.applied.clear()
+        log("${node.name} restarts")
+        resetElectionTimer(node)
+    }
+    fun partition(side: Set&lt;Int&gt;) {
+        for (a in 0 until n) for (b in 0 until n) if ((a in side) != (b in side)) cut += a to b
+        this.side = side
+        log("PARTITION " + group(side) + " | " + group((0 until n).filter { it !in side }.toSet()))
+    }
+    fun heal() { cut.clear(); side = null; log("partition HEALS") }
+    fun at(timeMs: Long, action: () -&gt; Unit) = schedule(timeMs - now, action)
+    fun runUntil(timeMs: Long) {
+        while (queue.isNotEmpty() &amp;&amp; queue.peek().at &lt;= timeMs) {
+            val ev = queue.poll(); now = ev.at; ev.action()
+        }
+        now = timeMs
+    }
+    fun leader(): Node? = nodes.filter { it.up &amp;&amp; it.role == Role.LEADER }.maxByOrNull { it.term }
+
+    /** Election Safety: at most one leader per term. */
+    fun electionSafe() = leadersByTerm.values.all { it.size &lt;= 1 }
+    /** State Machine Safety: no two nodes applied different commands at the same index. */
+    fun stateMachineSafe() = nodes.all { a -&gt; nodes.all { b -&gt;
+        (0 until minOf(a.applied.size, b.applied.size)).all { a.applied[it] == b.applied[it] } } }
+
+    private fun group(ids: Set&lt;Int&gt;) = ids.sorted().joinToString(",", "{", "}") { "n${it + 1}" }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · raft/Sim.java</figcaption>
+<pre><code class="language-java">package raft;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.PriorityQueue;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+// Raft (election + log replication, §5 of the paper) in a deterministic simulation.
+// Left out: persistence to disk, snapshots and membership changes.
+public class Sim {
+    public enum Role { FOLLOWER, CANDIDATE, LEADER }
+
+    public record Entry(long term, String command) {}
+
+    sealed interface Msg permits RequestVote, VoteReply, AppendEntries, AppendReply { long term(); int from(); }
+    record RequestVote(long term, int from, int lastIndex, long lastTerm) implements Msg {}
+    record VoteReply(long term, int from, boolean granted) implements Msg {}
+    record AppendEntries(long term, int from, int prevIndex, long prevTerm, List&lt;Entry&gt; entries, int leaderCommit) implements Msg {}
+    record AppendReply(long term, int from, boolean success, int matchIndex) implements Msg {}
+
+    /** One line of history, plus who sent the message that caused it (for the widget). */
+    public record Event(long at, String text, Integer from, Integer to) {}
+
+    public final int n, heartbeatMs;
+    public final Random rnd;
+    private long now = 0;
+    private long seq = 0;
+    private record Ev(long at, long seq, Runnable action) {}
+    private final PriorityQueue&lt;Ev&gt; queue =
+        new PriorityQueue&lt;&gt;(Comparator.comparingLong(Ev::at).thenComparingLong(Ev::seq));
+
+    public class Node {
+        public final int id;
+        public final String name;
+        public Role role = Role.FOLLOWER;
+        public long term = 0;                        // persistent: currentTerm
+        public Integer votedFor = null;              // persistent: votedFor
+        public final List&lt;Entry&gt; log = new ArrayList&lt;&gt;();      // persistent: log.get(i - 1) holds index i
+        public int commitIndex = 0;                  // volatile
+        public final List&lt;String&gt; applied = new ArrayList&lt;&gt;(); // the state machine: commands applied, in order
+        final Set&lt;Integer&gt; votes = new HashSet&lt;&gt;();
+        final int[] nextIndex = new int[n];          // leader only
+        final int[] matchIndex = new int[n];         // leader only
+        public boolean up = true;
+        int timerEpoch = 0;
+
+        Node(int id) { this.id = id; this.name = "n" + (id + 1); }
+        int lastIndex() { return log.size(); }
+        long lastTerm() { return log.isEmpty() ? 0 : log.get(log.size() - 1).term(); }
+        long termAt(int index) { return index == 0 ? 0 : log.get(index - 1).term(); }
+        /** The election restriction (§5.4.1): is a candidate's log at least as up-to-date as mine? */
+        public boolean isUpToDate(int lastIndex, long lastTerm) {
+            return lastTerm &gt; lastTerm() || (lastTerm == lastTerm() &amp;&amp; lastIndex &gt;= lastIndex());
+        }
+    }
+
+    public final List&lt;Node&gt; nodes = new ArrayList&lt;&gt;();
+    private final Set&lt;List&lt;Integer&gt;&gt; cut = new HashSet&lt;&gt;();
+    private Set&lt;Integer&gt; side = null;                // one side of the current partition, if any
+    final TreeMap&lt;Long, Set&lt;Integer&gt;&gt; leadersByTerm = new TreeMap&lt;&gt;();
+    public final List&lt;Event&gt; history = new ArrayList&lt;&gt;();
+    public Consumer&lt;Event&gt; onEvent = e -&gt; {};
+
+    public Sim(long seed, int n, int heartbeatMs) {
+        this.rnd = new Random(seed); this.n = n; this.heartbeatMs = heartbeatMs;
+        for (int i = 0; i &lt; n; i++) nodes.add(new Node(i));
+    }
+    public Sim(long seed) { this(seed, 5, 50); }
+
+    public long now() { return now; }
+    public Set&lt;Integer&gt; side() { return side; }
+
+    private void log(String text, Integer from, Integer to) {
+        Event e = new Event(now, text, from, to);
+        history.add(e);
+        onEvent.accept(e);
+    }
+    private void log(String text) { log(text, null, null); }
+    private void schedule(long delayMs, Runnable action) { queue.add(new Ev(now + delayMs, seq++, action)); }
+    private boolean linkUp(int a, int b) { return !cut.contains(List.of(a, b)); }
+
+    private void send(int from, int to, Msg msg) {
+        if (!linkUp(from, to)) return;
+        schedule(2L + rnd.nextInt(9), () -&gt; { if (linkUp(from, to) &amp;&amp; nodes.get(to).up) deliver(nodes.get(to), msg); });
+    }
+
+    private void resetElectionTimer(Node node) {
+        int epoch = ++node.timerEpoch;
+        schedule(150L + rnd.nextInt(151), () -&gt; {
+            if (node.up &amp;&amp; node.timerEpoch == epoch &amp;&amp; node.role != Role.LEADER) startElection(node);
+        });
+    }
+
+    private void startElection(Node node) {
+        node.role = Role.CANDIDATE;
+        node.term++;
+        node.votedFor = node.id;
+        node.votes.clear(); node.votes.add(node.id);
+        log(node.name + " times out: candidate for term " + node.term);
+        resetElectionTimer(node);
+        RequestVote rv = new RequestVote(node.term, node.id, node.lastIndex(), node.lastTerm());
+        for (Node peer : nodes) if (peer.id != node.id) send(node.id, peer.id, rv);
+    }
+
+    private void deliver(Node node, Msg msg) {
+        if (msg.term() &gt; node.term) {
+            if (node.role != Role.FOLLOWER) log(node.name + " steps down: saw term " + msg.term(), msg.from(), node.id);
+            node.term = msg.term(); node.votedFor = null; node.role = Role.FOLLOWER;
+        }
+        switch (msg) {
+            case RequestVote rv -&gt; {
+                boolean grant = rv.term() == node.term &amp;&amp;
+                    (node.votedFor == null || node.votedFor == rv.from()) &amp;&amp;
+                    node.isUpToDate(rv.lastIndex(), rv.lastTerm());
+                if (grant) {
+                    node.votedFor = rv.from();
+                    resetElectionTimer(node);
+                    log(node.name + " votes for n" + (rv.from() + 1) + " in term " + rv.term(), node.id, rv.from());
+                }
+                send(node.id, rv.from(), new VoteReply(node.term, node.id, grant));
+            }
+            case VoteReply vr -&gt; {
+                if (node.role == Role.CANDIDATE &amp;&amp; vr.term() == node.term &amp;&amp; vr.granted()) {
+                    node.votes.add(vr.from());
+                    if (node.votes.size() &gt; n / 2) becomeLeader(node);
+                }
+            }
+            case AppendEntries ae -&gt; onAppendEntries(node, ae);
+            case AppendReply ar -&gt; { if (node.role == Role.LEADER &amp;&amp; ar.term() == node.term) onAppendReply(node, ar); }
+        }
+    }
+
+    private void onAppendEntries(Node node, AppendEntries msg) {
+        if (msg.term() &lt; node.term) { send(node.id, msg.from(), new AppendReply(node.term, node.id, false, 0)); return; }
+        if (node.role == Role.CANDIDATE) log(node.name + " hears leader n" + (msg.from() + 1) + ": back to follower", msg.from(), node.id);
+        node.role = Role.FOLLOWER;
+        resetElectionTimer(node);
+        // Consistency check: my log must hold the entry just before the new ones.
+        if (msg.prevIndex() &gt; node.lastIndex() || node.termAt(msg.prevIndex()) != msg.prevTerm()) {
+            send(node.id, msg.from(), new AppendReply(node.term, node.id, false, 0)); return;
+        }
+        int index = msg.prevIndex();
+        for (Entry entry : msg.entries()) {
+            index++;
+            if (index &lt;= node.lastIndex() &amp;&amp; node.termAt(index) != entry.term()) {
+                String dropped = node.log.subList(index - 1, node.log.size()).stream()
+                    .map(Entry::command).collect(Collectors.joining(", "));
+                while (node.log.size() &gt;= index) node.log.remove(node.log.size() - 1);
+                log(node.name + " drops uncommitted [" + dropped + "]: conflicts with the leader", msg.from(), node.id);
+            }
+            if (index &gt; node.lastIndex()) node.log.add(entry);
+        }
+        if (msg.leaderCommit() &gt; node.commitIndex) {
+            node.commitIndex = Math.min(msg.leaderCommit(), msg.prevIndex() + msg.entries().size());
+            apply(node);
+        }
+        send(node.id, msg.from(), new AppendReply(node.term, node.id, true, msg.prevIndex() + msg.entries().size()));
+    }
+
+    private void onAppendReply(Node leader, AppendReply msg) {
+        if (!msg.success()) { leader.nextIndex[msg.from()] = Math.max(1, leader.nextIndex[msg.from()] - 1); return; }
+        leader.matchIndex[msg.from()] = Math.max(leader.matchIndex[msg.from()], msg.matchIndex());
+        leader.nextIndex[msg.from()] = leader.matchIndex[msg.from()] + 1;
+        // Commit the highest index stored on a majority, but only by counting entries of the current term (§5.4.2).
+        for (int index = leader.lastIndex(); index &gt; leader.commitIndex; index--) {
+            final int i = index;
+            long copies = Arrays.stream(leader.matchIndex).filter(m -&gt; m &gt;= i).count();
+            if (leader.termAt(index) == leader.term &amp;&amp; copies &gt; n / 2) {
+                leader.commitIndex = index;
+                log(leader.name + " commits up to index " + index + " (" + leader.log.get(index - 1).command() + "), stored on " + copies + " of " + n);
+                apply(leader);
+                break;
+            }
+        }
+    }
+
+    private void apply(Node node) {
+        while (node.applied.size() &lt; node.commitIndex) node.applied.add(node.log.get(node.applied.size()).command());
+    }
+
+    private void becomeLeader(Node node) {
+        node.role = Role.LEADER;
+        leadersByTerm.computeIfAbsent(node.term, t -&gt; new TreeSet&lt;&gt;()).add(node.id);
+        Arrays.fill(node.nextIndex, node.lastIndex() + 1);
+        Arrays.fill(node.matchIndex, 0);
+        node.matchIndex[node.id] = node.lastIndex();
+        log(node.name + " is LEADER of term " + node.term + ", votes from " +
+            node.votes.stream().sorted().map(i -&gt; "n" + (i + 1)).collect(Collectors.joining(", ")));
+        heartbeats(node, node.term);
+    }
+
+    // Each heartbeat is an AppendEntries carrying whatever that follower is missing.
+    private void heartbeats(Node node, long term) {
+        if (!node.up || node.role != Role.LEADER || node.term != term) return;
+        for (Node peer : nodes) if (peer.id != node.id) {
+            int prev = node.nextIndex[peer.id] - 1;
+            List&lt;Entry&gt; entries = List.copyOf(node.log.subList(prev, node.log.size()));
+            send(node.id, peer.id, new AppendEntries(term, node.id, prev, node.termAt(prev), entries, node.commitIndex));
+        }
+        schedule(heartbeatMs, () -&gt; heartbeats(node, term));
+    }
+
+    /** A client asks node id to run a command. Only a leader accepts; acceptance is not commitment. */
+    public boolean propose(int id, String command) {
+        Node node = nodes.get(id);
+        if (!node.up || node.role != Role.LEADER) return false;
+        node.log.add(new Entry(node.term, command));
+        node.matchIndex[node.id] = node.lastIndex();
+        log("client -&gt; " + node.name + ": " + command + " (index " + node.lastIndex() + ", term " + node.term + ", not committed yet)");
+        return true;
+    }
+
+    public void start() { for (Node node : nodes) resetElectionTimer(node); }
+    public void crash(int id) { nodes.get(id).up = false; log(nodes.get(id).name + " CRASHES"); }
+    public void restart(int id) {                    // term, votedFor and log are persistent; the rest is rebuilt
+        Node node = nodes.get(id);
+        node.up = true; node.role = Role.FOLLOWER;
+        node.commitIndex = 0; node.applied.clear();
+        log(node.name + " restarts");
+        resetElectionTimer(node);
+    }
+    public void partition(Set&lt;Integer&gt; side) {
+        for (int a = 0; a &lt; n; a++) for (int b = 0; b &lt; n; b++)
+            if (side.contains(a) != side.contains(b)) cut.add(List.of(a, b));
+        this.side = side;
+        Set&lt;Integer&gt; other = IntStream.range(0, n).filter(i -&gt; !side.contains(i)).boxed().collect(Collectors.toSet());
+        log("PARTITION " + group(side) + " | " + group(other));
+    }
+    public void heal() { cut.clear(); side = null; log("partition HEALS"); }
+    public void at(long timeMs, Runnable action) { schedule(timeMs - now, action); }
+    public void runUntil(long timeMs) {
+        while (!queue.isEmpty() &amp;&amp; queue.peek().at() &lt;= timeMs) {
+            Ev ev = queue.poll(); now = ev.at(); ev.action().run();
+        }
+        now = timeMs;
+    }
+    public Node leader() {
+        return nodes.stream().filter(x -&gt; x.up &amp;&amp; x.role == Role.LEADER)
+            .max(Comparator.comparingLong(x -&gt; x.term)).orElse(null);
+    }
+
+    /** Election Safety: at most one leader per term. */
+    public boolean electionSafe() { return leadersByTerm.values().stream().allMatch(s -&gt; s.size() &lt;= 1); }
+    /** State Machine Safety: no two nodes applied different commands at the same index. */
+    public boolean stateMachineSafe() {
+        for (Node a : nodes) for (Node b : nodes)
+            for (int i = 0; i &lt; Math.min(a.applied.size(), b.applied.size()); i++)
+                if (!a.applied.get(i).equals(b.applied.get(i))) return false;
+        return true;
+    }
+
+    private static String group(Set&lt;Integer&gt; ids) {
+        return ids.stream().sorted().map(i -&gt; "n" + (i + 1)).collect(Collectors.joining(",", "{", "}"));
+    }
+}</code></pre></figure>
+</div>
+<p>The scripted run. <code>--json</code> prints the same run as frames for Part 3's widget, so the widget is this exact program's output.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · raft/App.kt</figcaption>
+<pre><code class="language-kotlin">package raft
+
+// The final's scripted run: commit two writes, split the cluster, write on both sides, heal.
+fun scenario(seed: Long, split: Boolean, sim: Sim = Sim(seed)): Sim {
+    sim.start()
+    sim.runUntil(400)
+    val first = sim.leader()!!.id
+    sim.propose(first, "x=1")
+    sim.runUntil(450)
+    sim.propose(first, "x=2")
+    sim.runUntil(700)
+    if (split) sim.partition(setOf(first, (0 until sim.n).first { it != first }))
+    sim.runUntil(750)
+    sim.propose(first, "x=3")                     // the client still believes 'first' is the leader
+    sim.runUntil(1_300)
+    sim.propose(sim.leader()!!.id, "x=4")
+    sim.runUntil(1_800)
+    if (split) sim.heal()
+    sim.runUntil(2_300)
+    return sim
+}
+
+fun printRun(sim: Sim) {
+    for (e in sim.history) println("%6d ms  %s".format(e.at, e.text))
+    println()
+    println("%-4s %-4s %-9s %-24s %-6s %s".format("node", "term", "role", "log (term:command)", "commit", "applied"))
+    for (node in sim.nodes) {
+        println("%-4s %-4d %-9s %-24s %-6d %s".format(node.name, node.term, node.role,
+            node.log.joinToString(" ") { "${it.term}:${it.command}" }, node.commitIndex, node.applied.joinToString(", ")))
+    }
+    println("election safety: ${sim.electionSafe()}, state machine safety: ${sim.stateMachineSafe()}")
+}
+
+// One frame per event, for the lesson's widget.
+fun frames(seed: Long, split: Boolean): String {
+    val out = StringBuilder()
+    val sim = Sim(seed)
+    sim.onEvent = { e -&gt;
+        if (out.isNotEmpty()) out.append(",\n")
+        out.append("{\"t\":${e.at},\"note\":\"${e.text.replace("\"", "\\\"")}\"")
+        if (e.from != null) out.append(",\"from\":${e.from},\"to\":${e.to}")
+        sim.side?.let { s -&gt; out.append(",\"side\":[${s.sorted().joinToString(",")}]") }
+        out.append(",\"nodes\":[")
+        out.append(sim.nodes.joinToString(",") { nd -&gt;
+            "{\"role\":\"${nd.role}\",\"term\":${nd.term},\"up\":${nd.up},\"commit\":${nd.commitIndex}," +
+                "\"log\":[${nd.log.joinToString(",") { "[${it.term},\"${it.command}\"]" }}]}"
+        })
+        out.append("]}")
+    }
+    scenario(seed, split, sim)
+    return "[\n$out\n]"
+}
+
+const val SEED = 7L
+
+fun main(args: Array&lt;String&gt;) {
+    if (args.firstOrNull() == "--json") {
+        println("{\"healthy\":${frames(SEED, false)},\n\"split\":${frames(SEED, true)}}")
+        return
+    }
+    println("== Seed $SEED: two writes, a partition at 700 ms, a write on each side, heal at 1,800 ms")
+    printRun(scenario(SEED, split = true))
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · raft/App.java</figcaption>
+<pre><code class="language-java">package raft;
+
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+public class App {
+    static final long SEED = 7;
+
+    // The final's scripted run: commit two writes, split the cluster, write on both sides, heal.
+    static Sim scenario(long seed, boolean split, Sim sim) {
+        sim.start();
+        sim.runUntil(400);
+        int first = sim.leader().id;
+        sim.propose(first, "x=1");
+        sim.runUntil(450);
+        sim.propose(first, "x=2");
+        sim.runUntil(700);
+        if (split) sim.partition(Set.of(first, IntStream.range(0, sim.n).filter(i -&gt; i != first).findFirst().orElseThrow()));
+        sim.runUntil(750);
+        sim.propose(first, "x=3");                      // the client still believes 'first' is the leader
+        sim.runUntil(1_300);
+        sim.propose(sim.leader().id, "x=4");
+        sim.runUntil(1_800);
+        if (split) sim.heal();
+        sim.runUntil(2_300);
+        return sim;
+    }
+    static Sim scenario(long seed, boolean split) { return scenario(seed, split, new Sim(seed)); }
+
+    static void printRun(Sim sim) {
+        for (Sim.Event e : sim.history) System.out.println(String.format("%6d ms  %s", e.at(), e.text()));
+        System.out.println();
+        System.out.println(String.format("%-4s %-4s %-9s %-24s %-6s %s", "node", "term", "role", "log (term:command)", "commit", "applied"));
+        for (Sim.Node node : sim.nodes) {
+            String log = node.log.stream().map(en -&gt; en.term() + ":" + en.command()).collect(Collectors.joining(" "));
+            System.out.println(String.format("%-4s %-4d %-9s %-24s %-6d %s", node.name, node.term, node.role,
+                log, node.commitIndex, String.join(", ", node.applied)));
+        }
+        System.out.println("election safety: " + sim.electionSafe() + ", state machine safety: " + sim.stateMachineSafe());
+    }
+
+    // One frame per event, for the lesson's widget.
+    static String frames(long seed, boolean split) {
+        StringBuilder out = new StringBuilder();
+        Sim sim = new Sim(seed);
+        sim.onEvent = e -&gt; {
+            if (!out.isEmpty()) out.append(",\n");
+            out.append("{\"t\":").append(e.at()).append(",\"note\":\"").append(e.text().replace("\"", "\\\"")).append("\"");
+            if (e.from() != null) out.append(",\"from\":").append(e.from()).append(",\"to\":").append(e.to());
+            if (sim.side() != null)
+                out.append(",\"side\":[").append(sim.side().stream().sorted().map(String::valueOf).collect(Collectors.joining(","))).append("]");
+            out.append(",\"nodes\":[");
+            out.append(sim.nodes.stream().map(nd -&gt; "{\"role\":\"" + nd.role + "\",\"term\":" + nd.term + ",\"up\":" + nd.up +
+                ",\"commit\":" + nd.commitIndex + ",\"log\":[" +
+                nd.log.stream().map(en -&gt; "[" + en.term() + ",\"" + en.command() + "\"]").collect(Collectors.joining(",")) + "]}")
+                .collect(Collectors.joining(",")));
+            out.append("]}");
+        };
+        scenario(seed, split, sim);
+        return "[\n" + out + "\n]";
+    }
+
+    public static void main(String[] args) {
+        if (args.length &gt; 0 &amp;&amp; args[0].equals("--json")) {
+            System.out.println("{\"healthy\":" + frames(SEED, false) + ",\n\"split\":" + frames(SEED, true) + "}");
+            return;
+        }
+        System.out.println("== Seed " + SEED + ": two writes, a partition at 700 ms, a write on each side, heal at 1,800 ms");
+        printRun(scenario(SEED, true));
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · RaftTest.kt</figcaption>
+<pre><code class="language-kotlin">package raft
+
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+
+class RaftTest {
+    private fun stable(seed: Long) = Sim(seed).apply { start(); runUntil(1_000) }
+
+    // Every 100 ms for 3 s: propose, crash, restart, partition or heal at random. Then heal, restart all, settle.
+    private fun chaos(seed: Long): Sim {
+        val sim = Sim(seed)
+        sim.start()
+        var k = 0
+        for (t in 100L..3_000L step 100) {
+            sim.runUntil(t)
+            val victim = sim.rnd.nextInt(sim.n)
+            when (sim.rnd.nextInt(5)) {
+                0, 1 -&gt; sim.leader()?.let { sim.propose(it.id, "c${k++}") }
+                2 -&gt; if (sim.nodes.count { !it.up } &lt; 2 &amp;&amp; sim.nodes[victim].up) sim.crash(victim) else if (!sim.nodes[victim].up) sim.restart(victim)
+                3 -&gt; sim.partition((0 until sim.n).filter { sim.rnd.nextBoolean() }.toSet())
+                else -&gt; sim.heal()
+            }
+        }
+        sim.heal()
+        for (node in sim.nodes) if (!node.up) sim.restart(node.id)
+        sim.runUntil(3_500)
+        sim.leader()?.let { sim.propose(it.id, "final") }        // a current-term entry commits everything before it
+        sim.runUntil(5_000)
+        return sim
+    }
+
+    @Test fun `a healthy cluster elects one leader and everyone agrees on its term`() {
+        val sim = stable(1)
+        val leader = assertNotNull(sim.leader())
+        assertEquals(1, sim.nodes.count { it.role == Role.LEADER })
+        assertTrue(sim.nodes.all { it.term == leader.term })
+    }
+
+    @Test fun `at most one leader per term, across 300 chaotic seeds`() {
+        for (seed in 1L..300L) assertTrue(chaos(seed).electionSafe(), "seed $seed")
+    }
+
+    @Test fun `no two nodes ever apply different commands at one index, across 300 chaotic seeds`() {
+        for (seed in 1L..300L) assertTrue(chaos(seed).stateMachineSafe(), "seed $seed")
+    }
+
+    @Test fun `after the chaos stops, every node ends with the same applied commands`() {
+        for (seed in 1L..300L) {
+            val sim = chaos(seed)
+            val first = sim.nodes[0].applied
+            assertTrue(sim.nodes.all { it.applied == first }, "seed $seed: ${sim.nodes.map { it.applied }}")
+        }
+    }
+
+    @Test fun `a leader cut off in the minority cannot commit`() {
+        val sim = stable(7)
+        val old = sim.leader()!!
+        sim.partition(setOf(old.id, (0 until sim.n).first { it != old.id }))
+        val before = old.commitIndex
+        assertTrue(sim.propose(old.id, "lost?"))                 // accepted...
+        sim.runUntil(2_000)
+        assertEquals(before, old.commitIndex)                    // ...but never committed
+    }
+
+    @Test fun `the majority side elects a new leader with a higher term`() {
+        val sim = stable(7)
+        val old = sim.leader()!!
+        sim.partition(setOf(old.id, (0 until sim.n).first { it != old.id }))
+        sim.runUntil(2_000)
+        val fresh = assertNotNull(sim.leader())
+        assertTrue(fresh.id != old.id &amp;&amp; fresh.term &gt; old.term)
+    }
+
+    @Test fun `after healing, the old leader steps down and every log converges`() {
+        val sim = scenario(SEED, split = true)
+        assertEquals(1, sim.nodes.count { it.role == Role.LEADER })
+        for (node in sim.nodes) {
+            assertEquals(listOf("x=1", "x=2", "x=4"), node.log.map { it.command }, node.name)
+            assertEquals(listOf("x=1", "x=2", "x=4"), node.applied, node.name)
+        }
+    }
+
+    @Test fun `a voter refuses a candidate whose log is behind its own`() {
+        val voter = Sim(1).nodes[0]
+        voter.log += Entry(1, "a"); voter.log += Entry(2, "b")
+        assertFalse(voter.isUpToDate(lastIndex = 5, lastTerm = 1))   // longer, but an older last term
+        assertFalse(voter.isUpToDate(lastIndex = 1, lastTerm = 2))   // same last term, shorter
+        assertTrue(voter.isUpToDate(lastIndex = 2, lastTerm = 2))
+        assertTrue(voter.isUpToDate(lastIndex = 1, lastTerm = 3))
+    }
+
+    @Test fun `one seed always replays the same history`() {
+        assertEquals(scenario(3, split = true).history, scenario(3, split = true).history)
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · RaftTest.java</figcaption>
+<pre><code class="language-java">package raft;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+class RaftTest {
+    private Sim stable(long seed) { Sim sim = new Sim(seed); sim.start(); sim.runUntil(1_000); return sim; }
+
+    // Every 100 ms for 3 s: propose, crash, restart, partition or heal at random. Then heal, restart all, settle.
+    private Sim chaos(long seed) {
+        Sim sim = new Sim(seed);
+        sim.start();
+        int k = 0;
+        for (long t = 100; t &lt;= 3_000; t += 100) {
+            sim.runUntil(t);
+            int victim = sim.rnd.nextInt(sim.n);
+            switch (sim.rnd.nextInt(5)) {
+                case 0, 1 -&gt; { Sim.Node l = sim.leader(); if (l != null) sim.propose(l.id, "c" + k++); }
+                case 2 -&gt; {
+                    long down = sim.nodes.stream().filter(x -&gt; !x.up).count();
+                    if (down &lt; 2 &amp;&amp; sim.nodes.get(victim).up) sim.crash(victim);
+                    else if (!sim.nodes.get(victim).up) sim.restart(victim);
+                }
+                case 3 -&gt; {
+                    Set&lt;Integer&gt; side = new HashSet&lt;&gt;();
+                    for (int i = 0; i &lt; sim.n; i++) if (sim.rnd.nextBoolean()) side.add(i);
+                    sim.partition(side);
+                }
+                default -&gt; sim.heal();
+            }
+        }
+        sim.heal();
+        for (Sim.Node node : sim.nodes) if (!node.up) sim.restart(node.id);
+        sim.runUntil(3_500);
+        Sim.Node l = sim.leader();
+        if (l != null) sim.propose(l.id, "final");          // a current-term entry commits everything before it
+        sim.runUntil(5_000);
+        return sim;
+    }
+
+    @Test void aHealthyClusterElectsOneLeaderAndEveryoneAgreesOnItsTerm() {
+        Sim sim = stable(1);
+        Sim.Node leader = sim.leader();
+        assertNotNull(leader);
+        assertEquals(1, sim.nodes.stream().filter(x -&gt; x.role == Sim.Role.LEADER).count());
+        assertTrue(sim.nodes.stream().allMatch(x -&gt; x.term == leader.term));
+    }
+
+    @Test void atMostOneLeaderPerTermAcross300ChaoticSeeds() {
+        for (long seed = 1; seed &lt;= 300; seed++) assertTrue(chaos(seed).electionSafe(), "seed " + seed);
+    }
+
+    @Test void noTwoNodesEverApplyDifferentCommandsAtOneIndex() {
+        for (long seed = 1; seed &lt;= 300; seed++) assertTrue(chaos(seed).stateMachineSafe(), "seed " + seed);
+    }
+
+    @Test void afterTheChaosStopsEveryNodeEndsWithTheSameAppliedCommands() {
+        for (long seed = 1; seed &lt;= 300; seed++) {
+            Sim sim = chaos(seed);
+            List&lt;String&gt; first = sim.nodes.get(0).applied;
+            assertTrue(sim.nodes.stream().allMatch(x -&gt; x.applied.equals(first)), "seed " + seed);
+        }
+    }
+
+    @Test void aLeaderCutOffInTheMinorityCannotCommit() {
+        Sim sim = stable(7);
+        Sim.Node old = sim.leader();
+        sim.partition(Set.of(old.id, old.id == 0 ? 1 : 0));
+        int before = old.commitIndex;
+        assertTrue(sim.propose(old.id, "lost?"));             // accepted...
+        sim.runUntil(2_000);
+        assertEquals(before, old.commitIndex);                // ...but never committed
+    }
+
+    @Test void theMajoritySideElectsANewLeaderWithAHigherTerm() {
+        Sim sim = stable(7);
+        Sim.Node old = sim.leader();
+        sim.partition(Set.of(old.id, old.id == 0 ? 1 : 0));
+        sim.runUntil(2_000);
+        Sim.Node fresh = sim.leader();
+        assertNotNull(fresh);
+        assertTrue(fresh.id != old.id &amp;&amp; fresh.term &gt; old.term);
+    }
+
+    @Test void afterHealingTheOldLeaderStepsDownAndEveryLogConverges() {
+        Sim sim = App.scenario(App.SEED, true);
+        assertEquals(1, sim.nodes.stream().filter(x -&gt; x.role == Sim.Role.LEADER).count());
+        for (Sim.Node node : sim.nodes) {
+            assertEquals(List.of("x=1", "x=2", "x=4"), node.log.stream().map(Sim.Entry::command).toList(), node.name);
+            assertEquals(List.of("x=1", "x=2", "x=4"), node.applied, node.name);
+        }
+    }
+
+    @Test void aVoterRefusesACandidateWhoseLogIsBehindItsOwn() {
+        Sim.Node voter = new Sim(1).nodes.get(0);
+        voter.log.add(new Sim.Entry(1, "a")); voter.log.add(new Sim.Entry(2, "b"));
+        assertFalse(voter.isUpToDate(5, 1));                  // longer, but an older last term
+        assertFalse(voter.isUpToDate(1, 2));                  // same last term, shorter
+        assertTrue(voter.isUpToDate(2, 2));
+        assertTrue(voter.isUpToDate(1, 3));
+    }
+
+    @Test void oneSeedAlwaysReplaysTheSameHistory() {
+        assertEquals(App.scenario(3, true).history, App.scenario(3, true).history);
+    }
+}</code></pre></figure>
+</div>
+<p><code>./gradlew test</code>, 9 green tests in each language:</p>
+<div class="pair">
+<pre class="out">RaftTest &gt; after the chaos stops, every node ends with the same applied commands() PASSED
+RaftTest &gt; a leader cut off in the minority cannot commit() PASSED
+RaftTest &gt; after healing, the old leader steps down and every log converges() PASSED
+RaftTest &gt; no two nodes ever apply different commands at one index, across 300 chaotic seeds() PASSED
+RaftTest &gt; a healthy cluster elects one leader and everyone agrees on its term() PASSED
+RaftTest &gt; the majority side elects a new leader with a higher term() PASSED
+RaftTest &gt; at most one leader per term, across 300 chaotic seeds() PASSED
+RaftTest &gt; a voter refuses a candidate whose log is behind its own() PASSED
+RaftTest &gt; one seed always replays the same history() PASSED
+BUILD SUCCESSFUL in 1s</pre>
+<pre class="out">RaftTest &gt; afterTheChaosStopsEveryNodeEndsWithTheSameAppliedCommands() PASSED
+RaftTest &gt; aVoterRefusesACandidateWhoseLogIsBehindItsOwn() PASSED
+RaftTest &gt; oneSeedAlwaysReplaysTheSameHistory() PASSED
+RaftTest &gt; afterHealingTheOldLeaderStepsDownAndEveryLogConverges() PASSED
+RaftTest &gt; theMajoritySideElectsANewLeaderWithAHigherTerm() PASSED
+RaftTest &gt; atMostOneLeaderPerTermAcross300ChaoticSeeds() PASSED
+RaftTest &gt; noTwoNodesEverApplyDifferentCommandsAtOneIndex() PASSED
+RaftTest &gt; aHealthyClusterElectsOneLeaderAndEveryoneAgreesOnItsTerm() PASSED
+RaftTest &gt; aLeaderCutOffInTheMinorityCannotCommit() PASSED
+BUILD SUCCESSFUL in 1s</pre>
+</div>
+<p><code>./gradlew run</code> prints the same in both languages:</p>
+<pre class="out">== Seed 7: two writes, a partition at 700 ms, a write on each side, heal at 1,800 ms
+   158 ms  n5 times out: candidate for term 1
+   160 ms  n3 votes for n5 in term 1
+   161 ms  n1 votes for n5 in term 1
+   165 ms  n2 votes for n5 in term 1
+   166 ms  n4 votes for n5 in term 1
+   168 ms  n5 is LEADER of term 1, votes from n3, n4, n5
+   400 ms  client -&gt; n5: x=1 (index 1, term 1, not committed yet)
+   431 ms  n5 commits up to index 1 (x=1), stored on 3 of 5
+   450 ms  client -&gt; n5: x=2 (index 2, term 1, not committed yet)
+   478 ms  n5 commits up to index 2 (x=2), stored on 3 of 5
+   700 ms  PARTITION {n1,n5} | {n2,n3,n4}
+   750 ms  client -&gt; n5: x=3 (index 3, term 1, not committed yet)
+   866 ms  n4 times out: candidate for term 2
+   870 ms  n3 votes for n4 in term 2
+   871 ms  n2 votes for n4 in term 2
+   881 ms  n4 is LEADER of term 2, votes from n2, n3, n4
+  1300 ms  client -&gt; n4: x=4 (index 3, term 2, not committed yet)
+  1347 ms  n4 commits up to index 3 (x=4), stored on 3 of 5
+  1800 ms  partition HEALS
+  1827 ms  n5 steps down: saw term 2
+  1835 ms  n5 drops uncommitted [x=3]: conflicts with the leader
+  1841 ms  n1 drops uncommitted [x=3]: conflicts with the leader
+
+node term role      log (term:command)       commit applied
+n1   2    FOLLOWER  1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+n2   2    FOLLOWER  1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+n3   2    FOLLOWER  1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+n4   2    LEADER    1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+n5   2    FOLLOWER  1:x=1 1:x=2 2:x=4        3      x=1, x=2, x=4
+election safety: true, state machine safety: true</pre>
+<ul>
+  <li><b>Two histories never existed.</b> During the partition n5 still believed it led term 1 and accepted <code>x=3</code>, but stored on 2 of 5 it never committed. Meanwhile n4 won term 2 and committed <code>x=4</code> on the majority side. After the heal the first message n5 received from the majority side carried term 2, so it stepped down, and the consistency check made n5 and n1 drop <code>x=3</code>. Every node applied exactly <code>x=1, x=2, x=4</code>.</li>
+  <li><b>The chaos tests really exercise the hard paths.</b> Counted over their 300 seeds: 300 chaotic seeds: 963 elections won, 1574 step-downs, 276 conflicting-entry repairs (in 182 seeds). Elections, step-downs and log repairs all happen hundreds of times, not just in the happy path.</li>
+</ul>
+<p><b>The red run.</b> Deleting <code>&amp;&amp; node.isUpToDate(msg.lastIndex, msg.lastTerm)</code> from the vote lets a node with a stale log win an election and overwrite committed entries:</p>
+<pre class="err">RaftTest &gt; after the chaos stops, every node ends with the same applied commands() FAILED
+    org.opentest4j.AssertionFailedError: seed 1: [[c0, c1, c2, c3, c5, c6, c7, c8, c9], [c0, c1, c2, c3, c5, c6, c7, c8, c9], [c0, c1, c2, c4, c5, c6, c7, c8, c9], [c0, c1, c2, c3, c5, c6, c7, c8, c9], [c0, c1, c2, c3, c5, c6, c7, final]]
+        at app//raft.RaftTest.after the chaos stops, every node ends with the same applied commands(RaftTest.kt:54)
+RaftTest &gt; a leader cut off in the minority cannot commit() PASSED
+RaftTest &gt; after healing, the old leader steps down and every log converges() PASSED
+RaftTest &gt; no two nodes ever apply different commands at one index, across 300 chaotic seeds() FAILED
+    org.opentest4j.AssertionFailedError: seed 1
+        at app//raft.RaftTest.no two nodes ever apply different commands at one index, across 300 chaotic seeds(RaftTest.kt:47)
+RaftTest &gt; a healthy cluster elects one leader and everyone agrees on its term() PASSED
+RaftTest &gt; the majority side elects a new leader with a higher term() PASSED
+RaftTest &gt; at most one leader per term, across 300 chaotic seeds() PASSED
+RaftTest &gt; a voter refuses a candidate whose log is behind its own() PASSED
+RaftTest &gt; one seed always replays the same history() PASSED
+9 tests completed, 2 failed
+BUILD FAILED in 655ms</pre>
+<p>In seed 1, one node applied <code>c4</code> where the others applied <code>c3</code>, and another ended with a different tail: committed commands were rewritten. The unit test of <code>isUpToDate</code> still passed, because the function was fine. Only the end-to-end chaos tests noticed that nobody called it.</p>
+<p class="note">A harder bug to catch: deleting the "only count current-term entries" rule from the commit loop is the scenario of the paper's Figure 8. With that bug the 300-seed suite still passed. Widening the state-machine test to 5,000 seeds found it at <b>seed 1,962</b>. Random testing finds common bugs cheaply, and rare interleavings only with many more runs. That's why the Raft authors also wrote a formal specification and a proof, and why serious implementations are tested with tools that search interleavings systematically.</p>
+<p><b>SAFETY, a model answer.</b> (1) A node becomes leader of term T only after votes from a majority, more than n/2 nodes, all in term T. (2) Each node votes at most once per term, and stores that vote durably, so even a crash and restart can't make it vote again in T. (3) Any two majorities of the same n nodes overlap in at least one node, because together they have more than n members (pigeonhole, L48). So if two candidates both won term T, the shared node voted twice in T, contradicting (2). The buggy-voter sweep in Part 3 broke rule (2), and two leaders appeared at once.</p>
+</details>
+<label class="done"><input type="checkbox" class="part-done" data-part="p5"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="2">
+  <p class="q">L24 + L57: a Raft leader stops for a 2-second garbage-collection pause, with a 150–300 ms election timeout. What happens?</p>
+  <div class="opts"><button>Followers simply wait for it patiently</button><button>The whole cluster stops accepting writes</button><button>Another node wins a newer term</button><button>Two leaders commit two different writes</button></div>
+  <p class="why">No heartbeats for 2 s means followers time out and elect a new leader in a higher term. When the paused leader wakes, its first contact carries the newer term and it steps down. A stop-the-world pause (L24) looks exactly like a crash from outside, which is why long GC pauses matter in clustered systems.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="0">
+  <p class="q">L56 + L57: why must a Raft node save its term and vote to disk, with <code>fsync</code>, before replying to a RequestVote?</p>
+  <div class="opts"><button>So a restart can't vote twice</button><button>So replies travel the network faster</button><button>So followers can skip heartbeats safely</button><button>So the leader can read them</button></div>
+  <p class="why">If the vote lived only in memory, a node could vote, crash, restart with no memory of it, and vote for a second candidate in the same term. That breaks the one-vote rule the whole safety argument rests on. L56 showed that only <code>fsync</code> makes a write survive a crash.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="3">
+  <p class="q">L32 + L57: a client's write to the leader times out. The leader may or may not have committed it. What makes a retry safe?</p>
+  <div class="opts"><button>A longer timeout on the retry</button><button>Sending the retry to a follower</button><button>Waiting for the next election first</button><button>An idempotency key on the request</button></div>
+  <p class="why">A timeout tells you nothing about whether the write committed. With an idempotency key (L32), the service recognises the retry and returns the first result instead of applying it twice. The final's <code>x=3</code> shows the other half: "accepted" was never a promise.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="1">
+  <p class="q">L27 + L57: what do the Java memory model's happens-before and Lamport's happened-before have in common?</p>
+  <div class="opts"><button>Both are measured in real milliseconds</button><button>Both are partial orders from edges</button><button>Both need a shared global clock</button><button>Both order every pair of events</button></div>
+  <p class="why">Both start from program order, add edges (synchronization in the JMM, messages here), and close under transitivity. Neither orders every pair: events with no chain between them are concurrent, and neither uses physical time.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Name the two kinds of clock and the one job each is right for. Which one can jump backwards, and why?</li>
+    <li>Write Lamport's two clock rules from memory, then the vector-clock version of each.</li>
+    <li>Given [3,1,0] and [2,2,0], say whether one happened before the other, and how you know.</li>
+    <li>State Raft's five election rules. Which single rule does the safety argument depend on most?</li>
+    <li>When is a log entry committed? Why can't an old leader in the minority commit anything?</li>
+    <li>Draw 2PC's two phases, and mark where a coordinator crash leaves participants blocked. What does a saga give up instead?</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  Martin Kleppmann's free Cambridge lecture notes, <a href="https://www.cl.cam.ac.uk/teaching/2425/ConcDisSys/dist-sys-notes.pdf"><em>Distributed Systems</em></a>, cover this whole lesson in his clear style: physical and logical clocks (ch. 3), broadcast (ch. 4), two-phase commit (§6.1) and Raft (§7.2). Then read the Raft paper itself, <a href="https://raft.github.io/raft.pdf">"In Search of an Understandable Consensus Algorithm (Extended Version)"</a> by Ongaro and Ousterhout, especially §5 and Figure 2, and play with the visualisation on <a href="https://raft.github.io/">raft.github.io</a>. Lamport's <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">"Time, Clocks, and the Ordering of Events in a Distributed System"</a> (1978) is short and still readable. For depth, <em>Designing Data-Intensive Applications</em> (2nd ed.) covers unreliable clocks and consensus at production scale.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/system-design.html">System Design &amp; Caching</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. Questions like "why can't the minority just elect a leader with 2 votes?", "is last write wins ever OK?", "should my services use 2PC or a saga?" or "what happens to a client request during an election?" are exactly the right kind. Paste in a trace from your simulator for a second opinion.</p>
+
+<div class="lesson-nav">
+  <a href="0043-trade-offs-and-resilience.html">← L43 · Trade-offs &amp; Resilience</a>
+  <a href="0044-a-worked-design.html">L44 · A Worked Design →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/raftviz.js"></script>
+</body>
+</html>

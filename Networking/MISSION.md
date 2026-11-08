@@ -1,24 +1,24 @@
-# Mission: Computer Networking
+# Mission: Computer Networking Master Curriculum
 
 ## Why
-Understand how data moves between computers well enough to build, debug, and reason about networked software — and to answer networking questions confidently in software engineering interviews.
+Master how data moves across computer networks from physical packets and hardware switching to high-concurrency developer sockets, enterprise BGP routing, and modern cloud/Kubernetes software-defined infrastructure. Grounding knowledge in deep physical and protocol realities eliminates guesswork when designing, deploying, and debugging distributed software.
 
 ## Success looks like
-- Explain "what happens when I type a URL and press Enter" from DNS lookup down to packets on the wire, and back up to the rendered response
-- Open a Wireshark capture and point out a TCP handshake, a DNS query, a TLS handshake, and an HTTP request
-- Diagnose a broken connection (DNS failure vs. refused vs. timeout vs. reset vs. TLS error) using ping, traceroute, dig, curl, and netstat/lsof
-- Write a TCP and UDP client/server in Kotlin or Java and explain what each socket call does on the network
-- Build a working HTTP/1.1 server from raw sockets, and explain what a web framework does on top of that
-- Choose between TCP/UDP, HTTP/1.1/2/3, polling/WebSockets, L4/L7 load balancing — and justify the choice
+- Confidently answer any networking question across software engineering, systems design, network engineering, and cloud architecture interviews.
+- Dissect any Wireshark capture and identify TCP handshakes, window drops, DNS resolutions, TLS 1.3 exchanges, 802.1Q tags, and HTTP/3 streams.
+- Write high-performance TCP/UDP clients and servers in Kotlin/Java, including building an HTTP/1.1 server from raw sockets.
+- Architect and troubleshoot enterprise network fabrics: VLANs, Spanning Tree, OSPF routing, BGP peering, and stateful firewalls.
+- Design resilient cloud networks: AWS/GCP VPCs, subnets, route tables, Transit Gateways, ALBs/NLBs, PrivateLink, and Kubernetes CNI/eBPF.
+- Diagnose live production failures (connection refused vs timeout vs reset vs TLS error vs MTU black hole) with surgical precision using CLI tools (`ping`, `traceroute`, `dig`, `curl`, `netstat`, `lsof`, `tcpdump`).
+- Deliver the definitive, end-to-end technical explanation of "what happens when you type a URL and hit Enter."
 
 ## Constraints
-- CS-student level with basic programming experience
-- Code in Kotlin and Java; working on macOS (JDK 26, IntelliJ, curl, dig, tcpdump, traceroute available; Wireshark not yet installed)
-- One concept per session; a mixed review session at the end of each section
-- Hands-on with real tools wherever possible; "why" before "how"
-- No exercise answers unless asked
+- CS student / professional software engineer perspective: prioritize conceptual depth, protocol mechanics, and diagnostic causality over vendor memorization.
+- Hands-on terminal tools on macOS (curl, dig, ping, traceroute, netstat, lsof, tcpdump, Wireshark).
+- Code implementations in Kotlin and modern Java (JDK 26).
+- One concept per session; mixed review sessions at the end of every module.
+- Never give exercise answers directly unless requested; foster active retrieval.
 
-## Out of scope (proposed — confirm)
-- Network-engineer operations: configuring routers/switches, CCNA-style material, BGP/OSPF internals beyond the concept
-- Physical layer and radio details (signal encoding, Wi-Fi physics)
-- Email protocols (SMTP/IMAP), FTP, and other legacy application protocols
+## Out of scope
+- Deep electrical engineering of physical transceivers (quantum optoelectronics, radio wave propagation physics).
+- Legacy obsolete protocols (Token Ring, AppleTalk, IPX/SPX, Telnet, FTP) except as historical context.

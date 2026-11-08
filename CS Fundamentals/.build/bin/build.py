@@ -25,6 +25,69 @@ def code_block(rel):
     return f'<pre><code class="language-{lang}">{html.escape(src(rel), quote=False)}</code></pre>'
 
 
+def practice_block(rel):
+    """<!--PRACTICE:l8/practice/p1--> -> runnable practice widget (assets/playground.js) from that folder:
+    task.html (first line = title), Starter.kt, Tests.kt (JUnit 4, hidden while running), Solution.kt,
+    Starter.java, Solution.java (self-checking main), hints.html (hints split by lines of ---), answer.html.
+    A folder with setup.sql is an SQL practice instead (see sql_practice).
+    Verify the folder with .build/bin/pg_check.py before building."""
+    d = ROOT / rel
+    esc = lambda f: html.escape((d / f).read_text().strip("\n"), quote=False)
+    title, _, task = (d / "task.html").read_text().strip().partition("\n")
+    hints = [h.strip() for h in re.split(r"(?m)^---\s*$", (d / "hints.html").read_text()) if h.strip()]
+    pid = rel.rstrip("/").split("/")[-1]
+    hint_html = "\n".join(
+        f'  <details class="hint"><summary>Hint {i} of {len(hints)}</summary>\n{h}\n  </details>'
+        for i, h in enumerate(hints, 1))
+    if (d / "setup.sql").exists():
+        return sql_practice(d, pid, title, task, hint_html, esc)
+    return f"""<div class="practice" data-id="{pid}">
+  <div class="label">Practice · {title.strip()}</div>
+{task.strip()}
+  <pre class="pg-src"><code class="language-kotlin">{esc("Starter.kt")}</code></pre>
+  <div class="pg-bar"><button type="button" class="btn pg-run">▶ Run the checks</button> <span class="pg-status">Kotlin runs here (online, via the Kotlin Playground).</span></div>
+  <details class="pg-checks"><summary>See the checks the button runs</summary>
+  <pre><code class="language-kotlin">{esc("Tests.kt")}</code></pre>
+  </details>
+  <details class="pg-java"><summary>Java version: run it in IntelliJ</summary>
+  <p>Paste this into IntelliJ as <code>Practice.java</code> and do the same task in Java. Then run it: every line should start with <code>PASS</code>.</p>
+  <pre><code class="language-java">{esc("Starter.java")}</code></pre>
+  </details>
+{hint_html}
+  <details class="answer"><summary>Final answer</summary>
+  <div class="pair">
+    <figure class="kotlin"><figcaption>KOTLIN · solution</figcaption>
+<pre><code class="language-kotlin">{esc("Solution.kt")}</code></pre></figure>
+    <figure class="java"><figcaption>JAVA · solution</figcaption>
+<pre><code class="language-java">{esc("Solution.java")}</code></pre></figure>
+  </div>
+{(d / "answer.html").read_text().strip()}
+  </details>
+</div>"""
+
+
+def sql_practice(d, pid, title, task, hint_html, esc):
+    """SQL variant (runs in the browser with sql.js): setup.sql, Starter.sql, Solution.sql, optional check.sql
+    (a query run after the learner's statements, for tasks that change data), hints.html, answer.html."""
+    check = (f'\n  <pre class="sql-check" hidden>{esc("check.sql")}</pre>' if (d / "check.sql").exists() else "")
+    rows = max(4, (d / "Starter.sql").read_text().strip().count("\n") + 2)
+    return f"""<div class="practice" data-id="{pid}" data-lang="sql">
+  <div class="label">Practice · {title.strip()}</div>
+{task.strip()}
+  <details class="pg-setup"><summary>The tables you're querying</summary>
+  <pre class="sql-setup"><code class="language-sql">{esc("setup.sql")}</code></pre>
+  </details>
+  <textarea class="sql-src" spellcheck="false" rows="{rows}">{esc("Starter.sql")}</textarea>
+  <div class="pg-bar"><button type="button" class="btn pg-run">▶ Run and check</button> <span class="pg-status">SQL runs here, in your browser (SQLite). ⌘/Ctrl + Enter runs too.</span></div>
+  <div class="sql-out"></div>{check}
+{hint_html}
+  <details class="answer"><summary>Final answer</summary>
+  <pre class="sql-solution"><code class="language-sql">{esc("Solution.sql")}</code></pre>
+{(d / "answer.html").read_text().strip()}
+  </details>
+</div>"""
+
+
 from vizlib import S, D  # noqa: E402
 
 
@@ -190,10 +253,25 @@ def build(template, out):
     text = Path(template).read_text()
     text = re.sub(r"<!--CODE:([\w/.]+)-->", lambda m: code_block(m.group(1)), text)
     text = re.sub(r"<!--VIZ:(\w+)-->", lambda m: viz_block(m.group(1)), text)
-    assert "<!--CODE:" not in text and "<!--VIZ:" not in text
+    text = re.sub(r"<!--PRACTICE:([\w/.]+)-->", lambda m: practice_block(m.group(1)), text)
+    assert "<!--CODE:" not in text and "<!--VIZ:" not in text and "<!--PRACTICE:" not in text
     Path(out).write_text(text)
     print("built", out)
 
 
+def inplace(page):
+    """For hand-written lessons (L1–L3) with no template: refresh every
+    <!--CODE:x-->…<!--/CODE:x--> and <!--PRACTICE:x-->…<!--/PRACTICE:x--> region in place."""
+    text = Path(page).read_text()
+    for tag, fn in (("CODE", code_block), ("PRACTICE", practice_block)):
+        text = re.sub(rf"<!--{tag}:([\w/.]+)-->.*?<!--/{tag}:\1-->",
+                      lambda m: f"<!--{tag}:{m.group(1)}-->{fn(m.group(1))}<!--/{tag}:{m.group(1)}-->", text, flags=re.S)
+    Path(page).write_text(text)
+    print("refreshed", page)
+
+
 if __name__ == "__main__":
-    build(sys.argv[1], sys.argv[2])
+    if sys.argv[1] == "--inplace":
+        inplace(sys.argv[2])
+    else:
+        build(sys.argv[1], sys.argv[2])

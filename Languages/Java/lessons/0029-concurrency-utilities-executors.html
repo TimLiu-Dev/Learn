@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0029: Thread Pools, Bounded Queues, Backpressure &amp; Executor Sizing</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0028-synchronization-and-locks.html">&larr; Lesson 0028</a></div>
+      <div class="lesson-nav-center"><a href="0001-master-plan-and-curriculum.html">&#128203; Course Hub</a> &bull; <a href="../reference/0029-executors-and-pools.html">&#128214; 0029 Reference</a></div>
+      <div><a href="0030-concurrent-collections-and-contention.html">Lesson 0030 &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Phase 1 &bull; Stage 5 &bull; Lesson 0029</div>
+      <h1>Thread Pools, Bounded Queues, Backpressure &amp; Executor Sizing</h1>
+      <p class="lesson-subtitle">
+        Dissecting <code>ThreadPoolExecutor</code> internals: why <code>Executors</code> convenience factories crash production JVMs, bounded queue memory mechanics, the <code>CallerRunsPolicy</code> event-loop trap, and Little&rsquo;s Law pool sizing.
+      </p>
+    </header>
+
+    <section>
+      <h2>Why <code>Executors</code> Convenience Factories Cause Production OOMs</h2>
+      <p>
+        Decoupling task submission from OS thread creation via <code>ExecutorService</code> is foundational in Java, yet two of the most common factory methods in <code>java.util.concurrent.Executors</code> hide unbounded capacities that routinely trigger cascading outages under downstream degradation:
+      </p>
+      <ul>
+        <li><strong><code>Executors.newFixedThreadPool(n)</code> &amp; <code>newSingleThreadExecutor()</code>:</strong> Internally wire an <strong>unbounded</strong> <code>new LinkedBlockingQueue&lt;Runnable&gt;()</code> with default capacity <code>Integer.MAX_VALUE</code> (2,147,483,647 tasks). When a downstream database slows from 5 ms to 2 seconds, worker threads stall while incoming HTTP tasks pile up in the heap-allocated linked queue—retaining request DTOs and closures until the JVM dies with <code>OutOfMemoryError: Java heap space</code>.</li>
+        <li><strong><code>Executors.newCachedThreadPool()</code>:</strong> Internally wires a zero-capacity <code>SynchronousQueue</code> with <code>maximumPoolSize = Integer.MAX_VALUE</code>. Every burst submission that finds no idle worker immediately spawns a brand-new OS platform thread (~1 MB native stack memory outside <code>-Xmx</code>), exhausting kernel PID limits and crashing with <code>OutOfMemoryError: unable to create native thread</code>.</li>
+      </ul>
+
+      <pre><code>import java.util.concurrent.*;
+
+public class NaiveExecutorTraps {
+    // TRAP 1: Hidden LinkedBlockingQueue(Integer.MAX_VALUE) -> Heap OOM under slow DB!
+    private final ExecutorService fixedTrap = Executors.newFixedThreadPool(16);
+
+    // TRAP 2: Hidden maximumPoolSize = Integer.MAX_VALUE -> Native OS thread exhaustion!
+    private final ExecutorService cachedTrap = Executors.newCachedThreadPool();
+
+    public void ingestPayload(byte[] twoMegabytePayload) {
+        // Under a traffic spike, 4,000 queued lambdas retain 8 GB of byte[] on the heap!
+        fixedTrap.submit(() -&gt; sendToSlowDownstream(twoMegabytePayload));
+    }
+
+    private void sendToSlowDownstream(byte[] payload) {
+        try { Thread.sleep(5_000); } catch (InterruptedException ignored) {}
+    }
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>Under the Hood: <code>ThreadPoolExecutor.execute()</code> Dispatch Mechanics</h2>
+      <p>
+        <code>ThreadPoolExecutor</code> packs both its lifecycle state (<code>RUNNING</code>, <code>SHUTDOWN</code>, <code>STOP</code>, <code>TIDYING</code>, <code>TERMINATED</code> in the upper 3 bits) and active <code>workerCount</code> (lower 29 bits, up to ~536 million) into a single <code>AtomicInteger ctl</code> to perform lock-free state checks on the hot submission path.
+      </p>
+      <p>
+        A classic senior interview and production tuning trap is misunderstanding <strong>when non-core threads (up to <code>maximumPoolSize</code>) are actually spawned</strong>. <code>ThreadPoolExecutor.execute(Runnable)</code> follows a strict 4-step sequence—it fills the <em>entire</em> work queue before creating a single extra thread beyond <code>corePoolSize</code>:
+      </p>
+
+      <pre><code>// Simplified JDK 21 java.util.concurrent.ThreadPoolExecutor#execute(Runnable)
+public void execute(Runnable command) {
+    if (command == null) throw new NullPointerException();
+    int c = ctl.get();
+
+    // Step 1: Fewer than corePoolSize workers? Spawn a new core Worker immediately
+    // (even if other existing core threads are currently idle!).
+    if (workerCountOf(c) &lt; corePoolSize) {
+        if (addWorker(command, true)) return;
+        c = ctl.get();
+    }
+
+    // Step 2: Core pool is full -> try enqueuing into workQueue FIRST!
+    // CRITICAL: Non-core burst threads are NOT created while workQueue accepts tasks!
+    if (isRunning(c) &amp;&amp; workQueue.offer(command)) {
+        int recheck = ctl.get();
+        if (!isRunning(recheck) &amp;&amp; remove(command))
+            reject(command);
+        else if (workerCountOf(recheck) == 0)
+            addWorker(null, false);
+    }
+    // Step 3: Queue is FULL! Now scale worker count up toward maximumPoolSize.
+    else if (!addWorker(command, false)) {
+        // Step 4: Both workQueue AND maximumPoolSize are saturated -> trigger policy!
+        reject(command);
+    }
+}</code></pre>
+
+      <p>
+        Notice two subtle architectural consequences of Step 2:
+      </p>
+      <ol>
+        <li>If you configure <code>corePoolSize = 8</code>, <code>maximumPoolSize = 64</code>, and pass an unbounded <code>new LinkedBlockingQueue&lt;&gt;()</code>, <code>workQueue.offer()</code> <strong>never returns <code>false</code></strong>—meaning <code>maximumPoolSize = 64</code> is completely dead configuration and the pool never scales past 8 threads!</li>
+        <li>Prefer <code>new ArrayBlockingQueue&lt;&gt;(capacity)</code> over <code>LinkedBlockingQueue</code> for bounded pools: <code>ArrayBlockingQueue</code> pre-allocates a single contiguous circular <code>Object[]</code> ring buffer with zero heap allocation per task, whereas <code>LinkedBlockingQueue</code> allocates a fresh <code>Node&lt;E&gt;</code> wrapper object on every <code>offer()</code>, amplifying Young Gen GC pressure during traffic bursts.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Backpressure Policies, The Event-Loop Trap &amp; Pool Sizing</h2>
+      <p>
+        When both the bounded queue and <code>maximumPoolSize</code> saturate, your <code>RejectedExecutionHandler</code> defines how the service degrades:
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Rejection Policy</th>
+            <th>Runtime Behavior</th>
+            <th>Production Architectural Fit</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>AbortPolicy</code> <em>(Default)</em></td>
+            <td>Throws unchecked <code>RejectedExecutionException</code> immediately.</td>
+            <td><strong>Best for low-latency RPC/REST APIs:</strong> Map to HTTP <code>503 Service Unavailable</code> or fallback so callers fail fast instead of queueing past their SLA timeout.</td>
+          </tr>
+          <tr>
+            <td><code>CallerRunsPolicy</code></td>
+            <td>Executes the task synchronously on the submitting caller thread.</td>
+            <td><strong>Safe ONLY for dedicated batch/Kafka consumer loops</strong> where stalling the producer naturally throttles ingestion. Deadly on NIO event loops!</td>
+          </tr>
+          <tr>
+            <td><code>DiscardPolicy</code></td>
+            <td>Silently drops the submitted task without throwing.</td>
+            <td>Acceptable only for best-effort UDP-style telemetry sampling; dangerous for business events and futures (<code>submit()</code> hangs forever on <code>Future.get()</code>!).</td>
+          </tr>
+          <tr>
+            <td><code>DiscardOldestPolicy</code></td>
+            <td>Polls head (oldest stale task) from queue and retries <code>execute()</code>.</td>
+            <td>Useful for latest-state market tick snapshots; breaks <code>Future.get()</code> callers if the evicted task was a <code>FutureTask</code> (never completes!).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout danger">
+        <div class="callout-title">&#9888; Production Incident Pattern: Never Use <code>CallerRunsPolicy</code> on NIO Event Loops</div>
+        <p style="margin-bottom: 0;">
+          Frameworks like Netty, Spring WebFlux, gRPC, and Vert.x multiplex thousands of concurrent sockets onto a tiny number of non-blocking NIO event-loop threads (often <code>1&times;</code> to <code>2&times;</code> CPU cores). If an event-loop thread offloads a 300 ms blocking task to a saturated <code>ThreadPoolExecutor</code> configured with <code>CallerRunsPolicy</code>, the <strong>NIO event-loop thread itself executes the 300 ms task synchronously</strong>—freezing heartbeats, TLS handshakes, and reads for <em>every</em> client sharing that event loop! Also beware <code>DiscardPolicy</code> / <code>DiscardOldestPolicy</code> when callers use <code>pool.submit(callable)</code>: discarding an uncancelled <code>FutureTask</code> leaves any thread waiting on untimed <code>future.get()</code> blocked forever.
+        </p>
+      </div>
+
+      <h3>Mathematical Pool Sizing: CPU-Bound vs. Blocking I/O</h3>
+      <p>
+        Apply Brian Goetz&rsquo;s sizing equation (derived from Little&rsquo;s Law) alongside hardware realities:
+      </p>
+      <ul>
+        <li><strong>CPU-Bound Workloads</strong> (cryptography, regex/JSON parsing, compression, in-memory sorting): Size to <code>N<sub>cpu</sub> = Runtime.getRuntime().availableProcessors()</code> (or <code>N<sub>cpu</sub> + 1</code>). Adding 64 threads onto an 8-vCPU Kubernetes pod cannot increase instruction throughput; it only triggers involuntary kernel context switches and L1/L2 CPU cache thrashing.</li>
+        <li><strong>Blocking I/O on Platform Threads:</strong> <code>N<sub>threads</sub> = N<sub>cpu</sub> &times; U<sub>cpu</sub> &times; (1 + W / C)</code>, where <code>U<sub>cpu</sub></code> is target utilization (<code>0 &lt; U<sub>cpu</sub> &le; 1</code>), <code>W</code> is mean I/O wait time, and <code>C</code> is mean CPU compute time. For example, on 8 cores with 45 ms DB wait and 5 ms compute (<code>W / C = 9</code>) targeting 80% utilization: <code>8 &times; 0.8 &times; (1 + 9) = 64</code> threads—provided your downstream HikariCP database pool and DB max connections can actually sustain 64 concurrent queries! (In Java 21+, prefer <strong>Virtual Threads + a <code>Semaphore</code> bulkhead</strong> for high-<code>W/C</code> workloads, covered in Lesson 0032.)</li>
+      </ul>
+
+      <pre><code>import java.util.concurrent.*;
+import java.util.concurrent.atomic.LongAdder;
+
+public final class ProductionExecutors {
+    private final LongAdder rejectedCounter = new LongAdder();
+    private final ThreadPoolExecutor computePool;
+
+    public ProductionExecutors() {
+        int cores = Runtime.getRuntime().availableProcessors();
+
+        // Java 21 Thread.Builder gives clear names in jcmd Thread.print &amp; JFR flame graphs
+        ThreadFactory namedFactory = Thread.ofPlatform()
+                .name("pricing-worker-", 0)
+                .daemon(false)
+                .uncaughtExceptionHandler((t, ex) -&gt;
+                        System.err.printf("[%s] Uncaught error: %s%n", t.getName(), ex))
+                .factory();
+
+        this.computePool = new ThreadPoolExecutor(
+                cores,                          // corePoolSize
+                cores * 2,                      // maximumPoolSize for short bursts
+                60L, TimeUnit.SECONDS,          // reclaim burst threads when idle
+                new ArrayBlockingQueue&lt;&gt;(512),  // pre-allocated bounded ring buffer
+                namedFactory,
+                (task, pool) -&gt; {               // observable fail-fast load shedding
+                    rejectedCounter.increment();
+                    throw new RejectedExecutionException(
+                            "Pool saturated (active=" + pool.getActiveCount()
+                            + ", queued=" + pool.getQueue().size() + ")");
+                }
+        );
+    }
+
+    public void closeGracefully() {
+        computePool.shutdown(); // Stop accepting new work; drain queued tasks
+        try {
+            if (!computePool.awaitTermination(10, TimeUnit.SECONDS)) {
+                computePool.shutdownNow(); // Interrupt stalled workers
+            }
+        } catch (InterruptedException ie) {
+            computePool.shutdownNow();
+            Thread.currentThread().interrupt(); // Always restore interrupt flag!
+        }
+    }
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>Hands-On Practice: Production Executor Engineering</h2>
+      <p>
+        Complete both drills below to build muscle memory for explicit bounded pools and safe NIO offload backpressure.
+      </p>
+
+      <h3>Drill 1: Bounded Named <code>ThreadPoolExecutor</code> &amp; Two-Phase Shutdown</h3>
+      <div id="ex-1" class="workbench-container"></div>
+
+      <h3>Drill 2: Fix Unbounded OOM &amp; Event-Loop Blocking Hazard</h3>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>Knowledge Check: Executor Internals &amp; Sizing</h2>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <p>
+        Study the authoritative JDK 21 specification of queuing strategies, thread creation rules, and hook methods (`beforeExecute`/`afterExecute`) directly in the OpenJDK API documentation:
+      </p>
+      <ul>
+        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html" target="_blank" rel="noopener"><strong>Java 21 Javadoc: <code>java.util.concurrent.ThreadPoolExecutor</code></strong></a></li>
+        <li><a href="https://dev.java/learn/concurrency/" target="_blank" rel="noopener"><strong>Dev.java: Concurrency &amp; Executor Services Guide</strong></a></li>
+      </ul>
+
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> &ldquo;Suppose a Kubernetes pod has <code>limits.cpu: 2000m</code> on a 64-core host node. What does <code>Runtime.getRuntime().availableProcessors()</code> return in Java 21 with cgroups v2, and how does CPU throttling interact with a <code>ThreadPoolExecutor</code> sized too aggressively?&rdquo;
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0028-synchronization-and-locks.html">&larr; Prev: Lesson 0028</a></div>
+      <div><a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a> &bull; <a href="../reference/0029-executors-and-pools.html">&#128214; 0029 Cheat Sheet</a></div>
+      <div><a href="0030-concurrent-collections-and-contention.html">Next: Lesson 0030 &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+{
+  "exercises": [
+    {
+      "id": "ex-1",
+      "filename": "BoundedOrderExecutor.java",
+      "badge": "Implementation Drill",
+      "instructions": "<p>Implement a production-grade bounded worker pool and graceful shutdown routine:</p><ol><li>In <code>buildPool(int cores, int queueCap)</code>, construct a <code>new ThreadPoolExecutor(...)</code> with <code>corePoolSize = cores</code>, <code>maximumPoolSize = cores * 2</code>, keep-alive <code>60L, TimeUnit.SECONDS</code>, a bounded <code>new ArrayBlockingQueue&lt;&gt;(queueCap)</code>, a Java 21 named platform factory <code>Thread.ofPlatform().name(\"order-exec-\", 0).factory()</code>, and <code>new ThreadPoolExecutor.AbortPolicy()</code>.</li><li>In <code>shutdownPool(ExecutorService pool)</code>, call <code>pool.shutdown()</code>, wait up to <code>5</code> seconds via <code>pool.awaitTermination(5, TimeUnit.SECONDS)</code>, call <code>pool.shutdownNow()</code> if it times out, and restore <code>Thread.currentThread().interrupt()</code> inside <code>catch (InterruptedException e)</code>.</li></ol>",
+      "initialCode": "import java.util.concurrent.*;\n\npublic class BoundedOrderExecutor {\n\n    public static ThreadPoolExecutor buildPool(int cores, int queueCap) {\n        // TODO: Construct a bounded ThreadPoolExecutor with ArrayBlockingQueue,\n        // Thread.ofPlatform().name(\"order-exec-\", 0).factory(), and AbortPolicy\n        return null;\n    }\n\n    public static void shutdownPool(ExecutorService pool) {\n        // TODO: Implement two-phase shutdown() -> awaitTermination(5s) -> shutdownNow()\n        // and preserve interrupt status on InterruptedException\n    }\n\n    public static void main(String[] args) throws Exception {\n        ThreadPoolExecutor pool = buildPool(2, 16);\n        Future<String> res = pool.submit(() -> Thread.currentThread().getName() + \":OK\");\n        System.out.println(res.get(1, TimeUnit.SECONDS));\n        shutdownPool(pool);\n    }\n}\n",
+      "solution": "import java.util.concurrent.*;\n\npublic class BoundedOrderExecutor {\n\n    public static ThreadPoolExecutor buildPool(int cores, int queueCap) {\n        ThreadFactory factory = Thread.ofPlatform()\n                .name(\"order-exec-\", 0)\n                .factory();\n        return new ThreadPoolExecutor(\n                cores,\n                cores * 2,\n                60L, TimeUnit.SECONDS,\n                new ArrayBlockingQueue<>(queueCap),\n                factory,\n                new ThreadPoolExecutor.AbortPolicy()\n        );\n    }\n\n    public static void shutdownPool(ExecutorService pool) {\n        pool.shutdown();\n        try {\n            if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {\n                pool.shutdownNow();\n            }\n        } catch (InterruptedException e) {\n            pool.shutdownNow();\n            Thread.currentThread().interrupt();\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        ThreadPoolExecutor pool = buildPool(2, 16);\n        Future<String> res = pool.submit(() -> Thread.currentThread().getName() + \":OK\");\n        System.out.println(res.get(1, TimeUnit.SECONDS));\n        shutdownPool(pool);\n    }\n}\n",
+      "solutionExplanation": "ArrayBlockingQueue pre-allocates a fixed ring buffer so heap footprint stays strictly O(queueCap) with zero Node churn. Naming threads via Thread.ofPlatform().name(...) makes thread dumps immediately attributable, AbortPolicy sheds excess load cleanly, and two-phase shutdown drains in-flight work before interrupting stuck threads while preserving the caller's interrupt flag.",
+      "hints": [
+        "Use <code>Thread.ofPlatform().name(\"order-exec-\", 0).factory()</code> to create the Java 21 <code>ThreadFactory</code>.",
+        "Pass <code>cores, cores * 2, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue&lt;&gt;(queueCap), factory, new ThreadPoolExecutor.AbortPolicy()</code> to <code>new ThreadPoolExecutor(...)</code>.",
+        "In <code>shutdownPool</code>, call <code>pool.shutdown()</code>; inside <code>try</code> check <code>if (!pool.awaitTermination(5, TimeUnit.SECONDS)) pool.shutdownNow();</code>, and in <code>catch (InterruptedException e)</code> call both <code>pool.shutdownNow()</code> and <code>Thread.currentThread().interrupt()</code>."
+      ],
+      "tests": [
+        {
+          "name": "Uses bounded ArrayBlockingQueue inside ThreadPoolExecutor",
+          "regex": "new\\s+ThreadPoolExecutor\\s*\\([\\s\\S]*?new\\s+ArrayBlockingQueue\\s*<(?:Runnable)?>\\s*\\(\\s*queueCap\\s*\\)",
+          "flags": "m",
+          "mustNotMatch": "Executors\\.newFixedThreadPool|Executors\\.newCachedThreadPool",
+          "passMessage": "Constructs explicit ThreadPoolExecutor backed by bounded ArrayBlockingQueue.",
+          "failMessage": "Construct a new ThreadPoolExecutor backed by new ArrayBlockingQueue<>(queueCap)."
+        },
+        {
+          "name": "Uses Java 21 Thread.ofPlatform() named factory",
+          "regex": "Thread\\.ofPlatform\\s*\\(\\s*\\)[\\s\\S]*?\\.name\\s*\\(\\s*\"order-exec-\"\\s*,\\s*0\\s*\\)[\\s\\S]*?\\.factory\\s*\\(\\s*\\)",
+          "flags": "m",
+          "passMessage": "Configures descriptive worker names via Thread.ofPlatform().name(\"order-exec-\", 0).factory().",
+          "failMessage": "Use Thread.ofPlatform().name(\"order-exec-\", 0).factory() for diagnostic thread naming."
+        },
+        {
+          "name": "Configures explicit AbortPolicy",
+          "regex": "AbortPolicy\\s*\\(\\s*\\)",
+          "flags": "m",
+          "passMessage": "Configures fail-fast AbortPolicy saturation handling.",
+          "failMessage": "Pass new ThreadPoolExecutor.AbortPolicy() as the rejection handler."
+        },
+        {
+          "name": "Implements two-phase shutdown and restores interrupt status",
+          "regex": "pool\\.shutdown\\s*\\(\\s*\\)[\\s\\S]*?pool\\.awaitTermination\\s*\\([\\s\\S]*?pool\\.shutdownNow\\s*\\(\\s*\\)[\\s\\S]*?Thread\\.currentThread\\s*\\(\\s*\\)\\.interrupt\\s*\\(\\s*\\)",
+          "flags": "m",
+          "passMessage": "Drains gracefully with awaitTermination, escalates to shutdownNow, and restores interrupt flag.",
+          "failMessage": "Call shutdown(), awaitTermination(...), shutdownNow(), and Thread.currentThread().interrupt() on InterruptedException."
+        }
+      ],
+      "simulatedOutput": "order-exec-0:OK\n[JVM] Pool drained cleanly: isTerminated=true, rejectedTasks=0"
+    },
+    {
+      "id": "ex-2",
+      "filename": "NettyOffloadGateway.java",
+      "badge": "Bug-Fix Challenge",
+      "instructions": "<p>A payment gateway offloads fraud checks from a non-blocking Netty NIO event loop onto <code>fraudPool</code>. Diagnose and repair <strong>three production bugs</strong> in the code below:</p><ol><li>Replace the unbounded <code>LinkedBlockingQueue&lt;&gt;()</code> (heap OOM risk!) with a bounded <code>new ArrayBlockingQueue&lt;&gt;(256)</code>.</li><li>Replace <code>CallerRunsPolicy</code> (which freezes the calling Netty NIO event-loop thread during overload!) with <code>AbortPolicy</code> so <code>dispatchFromEventLoop</code> catches <code>RejectedExecutionException</code> and returns HTTP <code>503</code> fast.</li><li>Replace <code>DiscardPolicy</code> / swallowed interrupt in <code>close()</code> by restoring <code>Thread.currentThread().interrupt()</code> inside the <code>InterruptedException</code> catch block.</li></ol>",
+      "initialCode": "import java.util.concurrent.*;\n\npublic class NettyOffloadGateway {\n    // BUG 1 & 2: Unbounded LinkedBlockingQueue + CallerRunsPolicy on an NIO caller!\n    private final ThreadPoolExecutor fraudPool = new ThreadPoolExecutor(\n            8,\n            8,\n            0L, TimeUnit.MILLISECONDS,\n            new LinkedBlockingQueue<>(),\n            Thread.ofPlatform().name(\"fraud-worker-\", 0).factory(),\n            new ThreadPoolExecutor.CallerRunsPolicy()\n    );\n\n    // Called directly on a non-blocking Netty NIO event-loop thread!\n    public int dispatchFromEventLoop(Runnable fraudCheck) {\n        try {\n            fraudPool.execute(fraudCheck);\n            return 202;\n        } catch (RejectedExecutionException ex) {\n            return 503; // Fast load shedding\n        }\n    }\n\n    public void close() {\n        fraudPool.shutdown();\n        try {\n            if (!fraudPool.awaitTermination(3, TimeUnit.SECONDS)) {\n                fraudPool.shutdownNow();\n            }\n        } catch (InterruptedException e) {\n            fraudPool.shutdownNow();\n            // BUG 3: Swallowed InterruptedException clears thread interrupt status!\n        }\n    }\n}\n",
+      "solution": "import java.util.concurrent.*;\n\npublic class NettyOffloadGateway {\n    private final ThreadPoolExecutor fraudPool = new ThreadPoolExecutor(\n            8,\n            16,\n            60L, TimeUnit.SECONDS,\n            new ArrayBlockingQueue<>(256),\n            Thread.ofPlatform().name(\"fraud-worker-\", 0).factory(),\n            new ThreadPoolExecutor.AbortPolicy()\n    );\n\n    // Called directly on a non-blocking Netty NIO event-loop thread!\n    public int dispatchFromEventLoop(Runnable fraudCheck) {\n        try {\n            fraudPool.execute(fraudCheck);\n            return 202;\n        } catch (RejectedExecutionException ex) {\n            return 503; // Fast load shedding without stalling NIO event loop\n        }\n    }\n\n    public void close() {\n        fraudPool.shutdown();\n        try {\n            if (!fraudPool.awaitTermination(3, TimeUnit.SECONDS)) {\n                fraudPool.shutdownNow();\n            }\n        } catch (InterruptedException e) {\n            fraudPool.shutdownNow();\n            Thread.currentThread().interrupt();\n        }\n    }\n}\n",
+      "solutionExplanation": "Bounding the queue with ArrayBlockingQueue<>(256) caps memory usage and enables RejectedExecutionHandler to engage. Switching CallerRunsPolicy to AbortPolicy prevents a saturated worker pool from hijacking the Netty NIO event loop thread, returning an immediate 503 load-shedding status instead. Finally, Thread.currentThread().interrupt() preserves cooperative cancellation up the call stack.",
+      "hints": [
+        "Swap <code>new LinkedBlockingQueue&lt;&gt;()</code> for <code>new ArrayBlockingQueue&lt;&gt;(256)</code> so the backlog has a strict upper bound.",
+        "Swap <code>new ThreadPoolExecutor.CallerRunsPolicy()</code> for <code>new ThreadPoolExecutor.AbortPolicy()</code> so saturation throws <code>RejectedExecutionException</code> into your <code>503</code> handler instead of blocking the Netty event loop.",
+        "Add <code>Thread.currentThread().interrupt();</code> inside the <code>catch (InterruptedException e)</code> block in <code>close()</code>."
+      ],
+      "tests": [
+        {
+          "name": "Replaces unbounded LinkedBlockingQueue with bounded ArrayBlockingQueue(256)",
+          "regex": "new\\s+ArrayBlockingQueue\\s*<(?:Runnable)?>\\s*\\(\\s*256\\s*\\)",
+          "flags": "m",
+          "mustNotMatch": "new\\s+LinkedBlockingQueue\\s*<[^>]*>\\s*\\(\\s*\\)",
+          "passMessage": "Uses bounded ArrayBlockingQueue(256) to prevent heap exhaustion.",
+          "failMessage": "Replace unbounded new LinkedBlockingQueue<>() with new ArrayBlockingQueue<>(256)."
+        },
+        {
+          "name": "Eliminates CallerRunsPolicy in favor of AbortPolicy for NIO caller safety",
+          "regex": "AbortPolicy\\s*\\(\\s*\\)",
+          "flags": "m",
+          "mustNotMatch": "CallerRunsPolicy",
+          "passMessage": "Uses AbortPolicy so NIO event-loop threads never block executing overflow work.",
+          "failMessage": "Replace CallerRunsPolicy with AbortPolicy to protect the Netty event loop."
+        },
+        {
+          "name": "Restores interrupt flag in close()",
+          "regex": "catch\\s*\\(\\s*InterruptedException\\s+\\w+\\s*\\)\\s*\\{[\\s\\S]*?Thread\\.currentThread\\s*\\(\\s*\\)\\.interrupt\\s*\\(\\s*\\)",
+          "flags": "m",
+          "passMessage": "Properly restores Thread.currentThread().interrupt() on InterruptedException.",
+          "failMessage": "Call Thread.currentThread().interrupt() inside catch (InterruptedException e)."
+        }
+      ],
+      "simulatedOutput": "[NettyEventLoop-1-1] Accepted 264 burst tasks -> HTTP 202\n[NettyEventLoop-1-1] Task #265 shed in 0.02ms -> HTTP 503 (event loop non-blocking!)\n[Shutdown] Pool terminated cleanly."
+    }
+  ],
+  "quiz": {
+    "id": "quiz-main",
+    "questions": [
+      {
+        "question": "1. Suppose this pool starts completely idle (`0` active threads) and receives `10` slow `5-second` tasks simultaneously. How many worker threads exist immediately after all `10` submissions return?",
+        "code": "ThreadPoolExecutor pool = new ThreadPoolExecutor(\n    4, 12, 60L, TimeUnit.SECONDS,\n    new ArrayBlockingQueue<>(20)\n);",
+        "correctIndex": 1,
+        "options": [
+          {
+            "text": "Ten threads, because `maximumPoolSize` scales up immediately before queueing.",
+            "explanation": "Incorrect. `ThreadPoolExecutor` only spawns threads beyond `corePoolSize` AFTER `workQueue.offer(task)` returns `false` (when the queue is completely full)."
+          },
+          {
+            "text": "Four core threads, with the remaining six tasks waiting in `ArrayBlockingQueue`.",
+            "explanation": "Correct! Tasks 1-4 spawn the 4 core threads (`workerCount < corePoolSize`); tasks 5-10 succeed on `workQueue.offer()` into the 20-slot queue, so zero non-core burst threads are spawned."
+          },
+          {
+            "text": "Twelve threads, because `ThreadPoolExecutor` prestarts `maximumPoolSize` workers eagerly.",
+            "explanation": "Incorrect. Workers are created lazily on task arrival (unless `prestartAllCoreThreads()` is called, which still only starts `corePoolSize = 4` threads)."
+          },
+          {
+            "text": "One thread, because core workers only spawn when queues overflow.",
+            "explanation": "Incorrect. While `workerCount < corePoolSize`, `execute()` always creates a new core worker for each incoming task before attempting to enqueue."
+          }
+        ]
+      },
+      {
+        "question": "2. Why did the production code below cause a complete cluster-wide HTTP freeze during a brief downstream database spike?",
+        "code": "// Invoked directly inside a Netty NIO event-loop handler (4 event-loop threads total)\ndbWorkerPool.execute(() -> jdbcRepo.runSlowQuery()); // dbWorkerPool uses CallerRunsPolicy!",
+        "correctIndex": 3,
+        "options": [
+          {
+            "text": "`CallerRunsPolicy` silently discards `Runnable` instances whenever `ArrayBlockingQueue` reaches capacity.",
+            "explanation": "Incorrect. `DiscardPolicy` drops tasks silently; `CallerRunsPolicy` never drops tasks when the pool is still running—it executes them on the caller thread."
+          },
+          {
+            "text": "`CallerRunsPolicy` spawns unbounded daemon threads that exhaust container native memory.",
+            "explanation": "Incorrect. `CallerRunsPolicy` allocates zero new threads; unbounded thread creation is the failure mode of `Executors.newCachedThreadPool()`."
+          },
+          {
+            "text": "`CallerRunsPolicy` throws `RejectedExecutionException` that terminates the Netty JVM process.",
+            "explanation": "Incorrect. `AbortPolicy` throws `RejectedExecutionException`, whereas `CallerRunsPolicy` runs `r.run()` directly inside `rejectedExecution`."
+          },
+          {
+            "text": "Saturated `CallerRunsPolicy` executes blocking SQL directly on Netty event-loop threads.",
+            "explanation": "Correct! When `dbWorkerPool` and its queue fill up, `CallerRunsPolicy` runs `jdbcRepo.runSlowQuery()` synchronously on the Netty NIO event-loop thread, freezing thousands of multiplexed sockets."
+          }
+        ]
+      },
+      {
+        "question": "3. Using Goetz's formula on an `8-vCPU` pod (`100%` target CPU) running pure in-memory SHA-256 hashing (`0 ms` I/O wait), what pool size is optimal?",
+        "code": "// Workload: 100% CPU-bound cryptographic hashing on byte[] buffers (Wait Time W = 0)",
+        "correctIndex": 0,
+        "options": [
+          {
+            "text": "Eight (or nine) threads, matching physical vCPU cores to minimize context switching.",
+            "explanation": "Correct! With `W = 0`, `N = 8 * 1.0 * (1 + 0) = 8` (or `N_cpu + 1 = 9`). Additional threads compete for identical ALUs, inflating kernel scheduler overhead and L1/L2 cache misses."
+          },
+          {
+            "text": "Sixty-four threads, giving eight worker threads per core to overlap pipelines.",
+            "explanation": "Incorrect. Oversubscribing pure CPU tasks by `8x` forces constant OS time-slicing, degrading throughput through register save/restore overhead and cache invalidation."
+          },
+          {
+            "text": "`Executors.newCachedThreadPool()` so thread count scales dynamically with incoming request rate.",
+            "explanation": "Incorrect. Spawning hundreds of CPU-bound threads under burst load causes catastrophic CPU thrashing and risks native stack OOM."
+          },
+          {
+            "text": "Virtual threads via `newVirtualThreadPerTaskExecutor()` to run hashing eight times faster.",
+            "explanation": "Incorrect. Virtual threads improve scalability ONLY when tasks block on I/O (`W >> C`); they still run on `N_cpu` carrier threads and never make pure CPU math faster."
+          }
+        ]
+      }
+    ]
+  }
+}
+  </script>
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/workbench.js"></script>
+</body>
+</html>

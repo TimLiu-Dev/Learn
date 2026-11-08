@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Session 71: Outage Autopsy: MTU Black Holes &amp; Silent TCP Freezes — Computer Networking</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<article class="page">
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 6 — Capstones · Session 71</p>
+  <h1>Outage Autopsy: MTU Black Holes &amp; Silent TCP Freezes</h1>
+  <p class="subtitle">The anatomy of the most perplexing network failure in systems engineering: why ping and DNS work perfectly, small API calls fly, yet large TLS handshakes and file transfers hang forever.</p>
+  <div class="meta"><span>~25 minutes</span><span>Tools: <code>ping -D -s</code>, PMTUD, MSS Clamping</span><span class="badge prod">⚡ outage autopsy</span><span class="badge interview">★ interview</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>You'll diagnose silent TCP freezes caused by tunnel encapsulation overhead and dropped ICMP Type 3 Code 4 packets, binary-search exact Path MTU on macOS using <code>ping -D -s</code>, and apply the three production fixes (ICMP firewall policy, TCP MSS clamping, and PLPMTUD).</p>
+  </div>
+
+  <h2>The Symptom: The "Almost Working" Network</h2>
+  <p>You deploy a new service across a VPN, cloud VPC, or SD-WAN tunnel. The junior engineer tests the connection and reports complete success: <code>ping api.service.internal</code> returns sub-millisecond replies with zero packet loss, <code>curl http://api.service.internal/health</code> returns <code>200 OK</code> in 4&nbsp;ms, and DNS resolves instantly.</p>
+  <p>Ten minutes later, production deploys. Customer reports flood in immediately: users can log in, but viewing order histories hangs indefinitely; SSH sessions connect and allow typing <code>pwd</code>, but executing <code>ls -la</code> or <code>cat config.json</code> freezes the terminal; TLS connections hang during the initial handshake without ever reaching application code.</p>
+  <p>This is the classic signature of an <strong>MTU Black Hole</strong>. It is one of the most widespread, time-consuming diagnostic traps in computer networking.</p>
+</section>
+
+<section>
+  <h2>The Mechanics: Path MTU Discovery (PMTUD)</h2>
+  <p>Standard Ethernet has a Maximum Transmission Unit (<strong>MTU</strong>) of <strong>1,500 bytes</strong>. A standard TCP/IPv4 segment consumes 20 bytes of IP header and 20 bytes of TCP header, leaving a Maximum Segment Size (<strong>MSS</strong>) of <strong>1,460 bytes</strong>.</p>
+  <p>To avoid the performance degradation of router IP fragmentation (which burdens router CPUs and causes entire packets to be discarded if a single fragment is lost), modern operating systems set the <strong>Don't Fragment (DF=1)</strong> bit in the IPv4 header of all outgoing TCP packets.</p>
+  <p>When packets traverse encapsulation tunnels (such as IPsec, WireGuard, GRE, PPPoE, or AWS VPC Geneve/VXLAN overlay networks), tunnel headers are prepended to the packet. This shrinks the effective payload MTU of the intermediate link from 1500 bytes down to <strong>1420 or 1360 bytes</strong>.</p>
+
+  <figure class="fullwidth" style="max-width:46rem">
+    <svg viewBox="0 0 760 380" class="dia" role="img" aria-label="Path MTU Black Hole Anatomy: Client sends 1500B DF=1 packet, VPN router with MTU 1420 drops it and emits ICMP Type 3 Code 4, firewall drops ICMP, causing silent TCP freeze.">
+      <defs>
+        <marker id="arr71" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 1 L 10 5 L 0 9 z" style="fill:var(--accent)"/>
+        </marker>
+      </defs>
+      <rect x="10" y="10" width="740" height="360" rx="8" style="fill:var(--panel); stroke:var(--rule); stroke-width:1.5"/>
+      <text x="30" y="38" style="font-family:var(--mono); font-size:14px; font-weight:700">Path MTU Black Hole Anatomy (RFC 1191)</text>
+
+      <!-- Host A -->
+      <rect x="30" y="60" width="130" height="80" rx="6" style="fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.5"/>
+      <text x="50" y="90" style="font-size:12px; font-weight:700; fill:var(--accent)">Client Host A</text>
+      <text x="45" y="112" style="font-family:var(--mono); font-size:11px">MTU = 1500</text>
+      <text x="45" y="128" style="font-family:var(--mono); font-size:10px; fill:var(--accent)">DF=1 (Don't Frag)</text>
+
+      <!-- Packet 1500 -->
+      <path d="M 160 100 L 258 100" style="stroke:var(--accent); stroke-width:2; fill:none" marker-end="url(#arr71)"/>
+      <rect x="170" y="75" width="80" height="20" rx="3" style="fill:var(--bg); stroke:var(--accent)"/>
+      <text x="210" y="89" text-anchor="middle" style="font-family:var(--mono); font-size:9px; fill:var(--accent)">1500B (DF=1)</text>
+
+      <!-- Intermediate Router / VPN -->
+      <rect x="260" y="60" width="140" height="80" rx="6" style="fill:var(--bg); stroke:var(--layer-link); stroke-width:1.5"/>
+      <text x="272" y="88" style="font-size:11px; font-weight:700; fill:var(--layer-link)">VPN Tunnel Router</text>
+      <text x="272" y="106" style="font-family:var(--mono); font-size:10px">Tunnel MTU=1420</text>
+      <text x="272" y="124" style="font-size:10px; fill:var(--bad)">&times; Packet too big!</text>
+
+      <!-- Dropped Red Cross -->
+      <line x1="395" y1="90" x2="415" y2="110" style="stroke:var(--bad); stroke-width:3"/>
+      <line x1="415" y1="90" x2="395" y2="110" style="stroke:var(--bad); stroke-width:3"/>
+
+      <!-- ICMP Path back -->
+      <path d="M 280 140 L 280 180 L 120 180" style="stroke:var(--bad); stroke-width:2; fill:none" stroke-dasharray="4,4"/>
+      <rect x="140" y="165" width="135" height="26" rx="3" style="fill:var(--bad-soft); stroke:var(--bad)"/>
+      <text x="207" y="182" text-anchor="middle" style="font-family:var(--mono); font-size:10px; fill:var(--bad)">ICMP Type 3 Code 4</text>
+
+      <!-- The Black Hole Firewall -->
+      <rect x="80" y="160" width="40" height="70" rx="4" style="fill:var(--bad); stroke:var(--bad)"/>
+      <text x="98" y="195" text-anchor="middle" class="on-fill" style="font-size:10px; font-weight:700" transform="rotate(-90 98 195)">FIREWALL</text>
+
+      <!-- Blocked ICMP -->
+      <line x1="125" y1="170" x2="135" y2="190" style="stroke:var(--bad); stroke-width:3"/>
+      <line x1="135" y1="170" x2="125" y2="190" style="stroke:var(--bad); stroke-width:3"/>
+      <text x="25" y="245" style="font-size:11px; font-weight:700; fill:var(--bad)">FIREWALL DROPS ALL ICMP!</text>
+      <text x="25" y="260" class="muted" style="font-size:10px">"Security Best Practice" dogma</text>
+      <text x="25" y="275" class="muted" style="font-size:10px">discards ICMP Type 3 Code 4.</text>
+
+      <!-- Destination Server -->
+      <rect x="580" y="60" width="130" height="80" rx="6" style="fill:var(--bg); stroke:var(--rule); stroke-width:1.5"/>
+      <text x="600" y="90" style="font-size:12px; font-weight:700">Server Host B</text>
+      <text x="600" y="112" style="font-family:var(--mono); font-size:11px">MTU = 1500</text>
+      <text x="590" y="130" class="muted" style="font-size:10px">Awaiting data bytes...</text>
+
+      <!-- Bottom Timeline Summary -->
+      <rect x="30" y="295" width="700" height="55" rx="6" style="fill:var(--bg); stroke:var(--rule)"/>
+      <text x="45" y="318" style="font-family:var(--mono); font-size:11px">SYN (64B) &check; &rarr; SYN-ACK (64B) &check; &rarr; ACK (64B) &check; &rarr; GET / (120B) &check; &rarr; 200 OK Small (200B) &check;</text>
+      <text x="45" y="338" style="font-family:var(--mono); font-size:11px; fill:var(--bad)">&times; Large Payload / TLS Certificate (1500B with DF=1) &rarr; DROPPED &rarr; ICMP DROPPED &rarr; SILENT FREEZE!</text>
+    </svg>
+    <figcaption>The MTU Black Hole: The router drops the oversized packet and generates ICMP Type 3 Code 4, but a firewall drops the ICMP reply. Host A never learns to reduce packet size and hangs indefinitely.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Why Small Packets Work While Large Packets Freeze</h2>
+  <p>The deceptive nature of an MTU Black Hole arises because TCP handshakes and basic health checks consist of tiny packets:</p>
+  <ul>
+    <li><strong>TCP 3-Way Handshake:</strong> SYN, SYN-ACK, and ACK packets contain only protocol headers and options (~40 to 64 bytes). They pass through the 1420-byte tunnel without issue.</li>
+    <li><strong>HTTP Health Checks:</strong> <code>GET /health</code> is ~100 bytes; the response <code>{"status":"UP"}</code> is ~150 bytes. Both easily fit inside any intermediate MTU.</li>
+    <li><strong>ICMP Ping:</strong> Default ping sends 56 or 64 bytes of payload. It easily traverses the link.</li>
+    <li><strong>Large Payloads &amp; TLS Handshakes:</strong> When the server transmits a TLS certificate chain (often 3,000 to 5,000 bytes) or returns a JSON API response larger than 1,420 bytes, TCP segments the data into full 1,500-byte frames with <code>DF=1</code>. The tunnel router cannot transmit them across the 1420-byte link, drops them, and generates an ICMP packet. When the firewall drops that ICMP notification, the connection enters an infinite silent retransmission loop.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Hands-On: Terminal Reproduction &amp; Diagnosis</h2>
+  <p>You can identify the exact Path MTU to any remote host using <code>ping</code> by setting the Don't Fragment bit and testing payload sizes.</p>
+
+  <ol class="steps" data-key="0071-mtu-cli">
+    <li>Test with a standard 1,500-byte packet on macOS (1,472 bytes ICMP payload + 8 bytes ICMP header + 20 bytes IPv4 header = 1,500 bytes):
+      <pre><code><span class="prompt">$ </span>ping -D -c 3 -s 1472 1.1.1.1
+<span class="out"># (Linux equivalent: ping -M do -c 3 -s 1472 1.1.1.1)</span></code></pre>
+      If the path supports a full 1,500-byte MTU, pings succeed. Now test 1 byte larger (<code>-s 1473</code>) and observe your kernel reject it immediately with <code>ping: sendto: Message too long</code>!
+    </li>
+    <li>If a VPN or tunnel hangs silently without response at <code>1472</code>, binary-search downward until replies succeed:
+      <pre><code><span class="prompt">$ </span>ping -D -c 3 -s 1392 1.1.1.1   <span class="out"># 1392 + 28 = 1420 bytes (WireGuard / IPsec MTU)</span></code></pre>
+      Add 28 bytes (IPv4 + ICMP headers) to the largest working <code>-s</code> value to find your exact Path MTU.
+    </li>
+    <li>Check your active macOS interface MTUs (compare physical <code>en0</code> against any active <code>utun*</code> VPN interfaces):
+      <pre><code><span class="prompt">$ </span>ifconfig | grep -E '^[a-z0-9]+:|mtu'
+<span class="out"># (On a Linux container/VM, you can also run: tracepath example.com)</span></code></pre>
+    </li>
+  </ol>
+</section>
+
+<section>
+  <h2>Three Production Solutions</h2>
+
+  <h3>Solution 1: Fix the Firewall (Permit PMTUD ICMP)</h3>
+  <p>The cleanest fix according to RFC 1191 and RFC 4821 is to stop dropping necessary ICMP control packets. Update security groups and firewalls to permit:</p>
+  <ul>
+    <li><strong>IPv4:</strong> ICMP Type 3, Code 4 (<em>Destination Unreachable: Fragmentation Needed and DF Set</em>).</li>
+    <li><strong>IPv6:</strong> ICMPv6 Type 2 (<em>Packet Too Big</em>). Note that IPv6 routers <strong>never fragment</strong> packets; Path MTU Discovery is mandatory in IPv6. Blocking ICMPv6 Type 2 breaks IPv6 traffic completely!</li>
+  </ul>
+
+  <h3>Solution 2: TCP MSS Clamping on Routers</h3>
+  <p>When you do not control external firewalls or intermediate networks, border routers can perform <strong>TCP MSS Clamping</strong>. The router inspects all passing TCP SYN packets, checks the advertised MSS option, and rewrites it to match the tunnel path:</p>
+  <pre><code># Linux iptables MSS Clamping:
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+# Or explicitly clamp to 1360 (for 1400 MTU):
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360
+
+# Cisco IOS:
+interface Tunnel0
+ ip tcp adjust-mss 1360</code></pre>
+  <p>Because both endpoints now believe the maximum segment size is 1,360 bytes, neither host ever transmits a packet larger than 1,400 bytes, completely bypassing the MTU bottleneck!</p>
+
+  <h3>Solution 3: OS-Level Black Hole Detection (PLPMTUD)</h3>
+  <p>RFC 4821 defines Packetization Layer Path MTU Discovery (PLPMTUD). The Linux kernel can automatically detect MTU black holes when TCP experiences repeated retransmissions, dynamically shrinking its segment size without relying on ICMP:</p>
+  <pre><code># Enable TCP MTU Probing in Linux sysctl:
+sudo sysctl -w net.ipv4.tcp_mtu_probing=1</code></pre>
+</section>
+
+
+  <h2>Code Implementation: Java &amp; Kotlin</h2>
+  <div class="code-tabs">
+    <div class="tab-buttons">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <div class="code-block-header">
+        <span class="code-lang-label">Java 25</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// PMTUD Black Hole &amp; MSS Clamp in Java
+public class PmtudEngine {
+    public static boolean detectBlackHole(int size, int mtu, boolean df, boolean icmpBlocked) {
+        return size &gt; mtu &amp;&amp; df &amp;&amp; icmpBlocked;
+    }
+
+    public static int clampMss(int mtu) {
+        return mtu - 40; // 20 bytes IP + 20 bytes TCP
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <div class="code-block-header">
+        <span class="code-lang-label">Kotlin</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// PMTUD Black Hole &amp; MSS Clamp in Kotlin
+fun detectBlackHole(size: Int, mtu: Int, df: Boolean, icmpBlocked: Boolean): Boolean =
+    size &gt; mtu &amp;&amp; df &amp;&amp; icmpBlocked
+
+fun clampMss(mtu: Int): Int = mtu - 40</code></pre>
+    </div>
+  </div>
+
+  <h2>Interactive Code Practice: PMTUD Black Hole Detector & MSS Clamp Calculator</h2>
+  <div class="code-practice" data-key="0071-pmtud-mss-clamp">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Detect Path MTU Discovery (PMTUD) black holes and calculate TCP MSS clamping: 1) isBlackHole(packetSize, pathMtu, dfBit, icmpBlocked): drops into black hole if packetSize > pathMtu AND dfBit == true AND icmpBlocked == true; 2) calculateClampedMss(tunnelMtu): returns tunnelMtu - 40 (20-byte IP header + 20-byte TCP header).</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">public class Solution {
+    // 1. Returns true if packet silently vanishes without ICMP error
+    public static boolean isBlackHole(int packetSize, int pathMtu, boolean dfBit, boolean icmpBlocked) {
+        // TODO: implement
+        return false;
+    }
+
+    // 2. Returns clamped TCP MSS (pathMtu - 40 bytes)
+    public static int calculateClampedMss(int pathMtu) {
+        // TODO: implement
+        return 0;
+    }
+}</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">public class Solution {
+    // 1. Returns true if packet silently vanishes without ICMP error
+    public static boolean isBlackHole(int packetSize, int pathMtu, boolean dfBit, boolean icmpBlocked) {
+        // TODO: implement
+        return false;
+    }
+
+    // 2. Returns clamped TCP MSS (pathMtu - 40 bytes)
+    public static int calculateClampedMss(int pathMtu) {
+        // TODO: implement
+        return 0;
+    }
+}</script>
+    <script type="text/plain" class="test-harness">
+// __STUDENT_CODE__
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0;
+        int total = 3;
+
+        // Test 1: 1500-byte packet over 1420 VPN tunnel with DF=true and ICMP blocked -> BLACK HOLE
+        boolean bh = Solution.isBlackHole(1500, 1420, true, true);
+        if (bh) {
+            passed++;
+        } else {
+            System.err.println("Test 1 failed: expected black hole for 1500 byte packet");
+        }
+
+        // Test 2: ICMP allowed enables normal PMTUD (no silent black hole)
+        boolean noBh = Solution.isBlackHole(1500, 1420, true, false);
+        if (!noBh) {
+            passed++;
+        } else {
+            System.err.println("Test 2 failed: expected false when ICMP is unblocked");
+        }
+
+        // Test 3: MSS Clamping calculation for 1420 MTU tunnel (1420 - 40 = 1380)
+        int mss = Solution.calculateClampedMss(1420);
+        if (mss == 1380) {
+            passed++;
+        } else {
+            System.err.println("Test 3 failed: expected clamped MSS 1380, got " + mss);
+        }
+
+        System.out.printf("Passed %d of %d tests.%n", passed, total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">public class Solution {
+    public static boolean isBlackHole(int packetSize, int pathMtu, boolean dfBit, boolean icmpBlocked) {
+        return (packetSize > pathMtu) && dfBit && icmpBlocked;
+    }
+
+    public static int calculateClampedMss(int pathMtu) {
+        return pathMtu - 40;
+    }
+}</script>
+    <script type="application/json" class="hints-data">["A black hole occurs when packet size exceeds path MTU, DF bit forbids fragmentation, and firewalls block ICMP Destination Unreachable Type 3 Code 4 messages.", "TCP MSS clamp = `pathMtu - 40` (subtracting 20-byte IPv4 and 20-byte TCP headers).", "WireGuard/Geneve overlays typically clamp MSS to 1380 or 1410."]</script>
+  </div>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0071-pmtud-blackhole">
+    <p class="r-prompt">Explain why a server can successfully complete a TCP handshake and return small HTTP responses, yet hang indefinitely when returning a 5 KB JSON payload across a VPN tunnel.</p>
+    <div class="keypoints">
+      <ul>
+        <li>TCP handshakes and small HTTP payloads fit comfortably within the reduced tunnel MTU (e.g. 1420 bytes).</li>
+        <li>The 5 KB payload causes TCP to segment data into full 1500-byte packets with the Don't Fragment (DF=1) bit set.</li>
+        <li>The tunnel router drops the oversized packet and generates an ICMP Type 3 Code 4 (Fragmentation Needed) packet.</li>
+        <li>A firewall or security group drops the inbound ICMP packet, creating an MTU Black Hole.</li>
+        <li>The server never learns why its packet was lost, endlessly retransmitting the 1500-byte segment until socket timeout.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Interactive Knowledge Check</h2>
+  <div class="quiz" data-quiz-id="quiz-71">
+    <div class="q" data-answer="2">
+      <p class="q-prompt">What exact ICMP message must be permitted through firewalls to allow IPv4 Path MTU Discovery to function?</p>
+      <ol class="options">
+        <li data-why="Incorrect: PMTUD does not query local DNS servers for network MTU values.">ICMP Type 8 Code 0 (Echo Request)</li>
+        <li data-why="Correct! The sender sets the DF (Don't Fragment) bit on packets. If a packet exceeds an intermediate router's MTU, the router drops it and returns an ICMP Type 3 Code 4 message ('Fragmentation Needed, Next-Hop MTU = X'), allowing the sender to lower its packet size.">ICMP Type 0 Code 0 (Echo Reply)</li>
+        <li data-why="Incorrect: Intermediate routers do not fragment packets when the DF bit is set; they drop them.">ICMP Type 3 Code 4 (Destination Unreachable: Fragmentation Needed and DF Set)</li>
+        <li data-why="Incorrect: PMTUD does not negotiate MTU via BGP keepalives.">ICMP Type 11 Code 0 (Time to Live Exceeded in Transit)</li>
+      </ol>
+      <div class="q-explain">RFC 1191 specifies that routers notify senders of MTU bottlenecks using ICMP Type 3 Code 4 containing the next-hop MTU.</div>
+    </div>
+    <div class="q" data-answer="1">
+      <p class="q-prompt">How does TCP MSS Clamping on a border router eliminate MTU Black Hole issues without modifying end-user clients?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Small TCP handshakes (SYN, SYN-ACK) fit well under 1400 bytes, allowing connections to establish cleanly.">It fragments all incoming UDP packets at the physical Layer 1 transceiver</li>
+        <li data-why="Correct! Small packets (handshake, small requests) pass through without issue. When large response packets exceeding the tunnel MTU are sent with DF=1, the intermediate router drops them and sends ICMP Type 3 Code 4. If firewalls drop that ICMP message, the sender never knows, hanging forever.">It rewrites the MSS option inside TCP SYN packets to force endpoints to send smaller segments</li>
+        <li data-why="Incorrect: TCP connection timeouts are caused by silent packet drops, not window scaling bugs.">It automatically converts all IPv4 packets into IPv6 jumbo frames</li>
+        <li data-why="Incorrect: PMTUD black holes occur due to ICMP filtering, not TLS certificate revocation.">It caches entire HTTP responses in router RAM before compressing them with gzip</li>
+      </ol>
+      <div class="q-explain">MSS Clamping rewrites the MSS option in the TCP SYN handshake so the hosts negotiate smaller segments that fit inside tunnel encapsulation headers.</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">Why is blocking ICMPv6 Type 2 (Packet Too Big) even more destructive in IPv6 networks than in IPv4?</p>
+      <ol class="options">
+        <li data-why="Incorrect: MSS clamping does not enable IP fragmentation; it prevents packets from ever exceeding MTU.">IPv6 routers do not perform packet fragmentation; PMTUD is the sole mechanism to adapt packet size</li>
+        <li data-why="Correct! Firewalls/routers on VPN and tunnel boundaries rewrite the Maximum Segment Size (MSS) option in passing TCP SYN packets (typically clamping MSS to `tunnel_mtu - 40`), forcing endpoints to send smaller packets that never exceed the tunnel MTU.">IPv6 switches automatically disable port duplex when ICMP is dropped</li>
+        <li data-why="Incorrect: Disabling the DF bit relies on slow, fragile Layer 3 fragmentation which causes packet loss.">IPv6 addresses cannot be translated without ICMP type 2 translation tables</li>
+        <li data-why="Incorrect: MSS clamping operates dynamically on TCP handshakes without requiring MTU 9000 jumbo frames.">IPv6 BGP peering sessions instantly drop when MTU falls below 4096 bytes</li>
+      </ol>
+      <div class="q-explain">In IPv6, intermediate routers are strictly forbidden from fragmenting packets; senders must perform PMTUD, making ICMPv6 Packet Too Big indispensable.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://www.rfc-editor.org/rfc/rfc1191.html">RFC 1191: Path MTU Discovery</a>. The foundational specification.</p>
+    <p><a href="https://www.rfc-editor.org/rfc/rfc4821.html">RFC 4821: Packetization Layer Path MTU Discovery</a> (PLPMTUD).</p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>Questions about TCP MSS Clamping, encapsulation tunnel overheads, or ICMP firewall policies? Ask your teacher in chat.</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0070-outage-autopsy-facebook-2021.html"><small>Previous · Session 70</small>Outage autopsy: Facebook global BGP collapse</a>
+  <a class="next" href="0072-final-master-challenge.html"><small>Next · Session 72</small>The final master challenge</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>62 · Kubernetes Services &amp; kube-proxy</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<article class="page">
+
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 5 — Track C: Cloud &amp; Infra · Session 62</p>
+  <h1>Kubernetes Services &amp; kube-proxy: Ghost IPs &amp; iptables</h1>
+  <p class="subtitle">ClusterIP, NodePort, LoadBalancer, the ghost IP mystery, and iptables vs IPVS scaling</p>
+  <div class="meta"><span>~25 minutes</span><span>Tools: <code>iptables -t nat</code> &amp; CoreDNS</span><span class="badge interview">★★ interview</span><span class="badge prod">⚡ production</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>You'll understand how Kubernetes creates stable network identities for dynamic, ephemeral Pods, solve the mystery of why a "ClusterIP" is a ghost IP that cannot be pinged, and dissect the low-level iptables NAT rules programmed by kube-proxy.</p>
+  </div>
+
+  <div class="warmup">
+    <span class="box-label">Warm-up · from earlier sessions</span>
+    <p>Two minutes, from memory, before you read on:</p>
+    <div class="recall" data-key="0062-warmup-nat-dnat">
+      <p class="r-prompt">What is Destination NAT (DNAT), and how does it alter a packet header?</p>
+      <div class="keypoints">
+        Destination NAT rewrites the destination IP address (and optionally destination port) in the packet header before routing, transparently redirecting traffic to an internal target server.
+      </div>
+    </div>
+  </div>
+
+  <h2>The Ephemeral Pod Dilemma</h2>
+  <p class="lede">In Kubernetes, Pods are mortal. They crash, autoscale, and get rescheduled across nodes during deployments. When a Pod restarts, it receives a completely brand-new IP address.<span class="sn"></span><span class="sidenote">Kubernetes Documentation: <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Services, Load Balancing, and Networking</a>.</span></p>
+
+  <p>If your frontend application hardcodes the IP address of the backend database Pod, the frontend collapses the moment the database Pod restarts. Kubernetes solves this by introducing the <strong class="term">Service</strong>: a permanent, stable abstraction with a static virtual IP and DNS name that load-balances traffic across an elastic set of healthy Pod endpoints.</p>
+
+  <h2>The Three Core Service Types</h2>
+  <table class="session-table" style="margin: 1.2rem 0;">
+    <thead>
+      <tr><th>Service Type</th><th>Accessibility Scope</th><th>Port / Address Model</th><th>Primary Use Case</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong class="term">ClusterIP</strong> (Default)</td><td><strong>Internal to cluster only</strong></td><td>Stable Virtual ClusterIP (e.g. <code>10.96.0.10</code>)</td><td>Internal microservice-to-microservice calls</td></tr>
+      <tr><td><strong class="term">NodePort</strong></td><td>External to cluster via Node IPs</td><td>Static high port (<code>30000–32767</code>) on <em>every node</em></td><td>Direct external access without cloud load balancers</td></tr>
+      <tr><td><strong class="term">LoadBalancer</strong></td><td>Public Internet or private VPC</td><td>Provisions an external cloud LB (AWS NLB/ALB)</td><td>Production customer-facing ingress traffic</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The Mystery: Why ClusterIP is a "Ghost IP"</h2>
+  <p>If you create a Service, Kubernetes assigns it a ClusterIP (e.g. <code>10.96.0.150</code>). But if you log into a worker node and run:</p>
+  <pre><code><span class="prompt">$ </span>ping 10.96.0.150
+PING 10.96.0.150 (10.96.0.150): 56 data bytes
+Request timeout for icmp_seq 0...</code></pre>
+  <p>It will <strong>never respond to a ping!</strong> If you run <code>ip addr show</code> or <code>ifconfig</code>, you will find that <code>10.96.0.150</code> does not exist on any physical or virtual network interface on any node in the cluster!</p>
+
+  <p><strong>A ClusterIP is a ghost IP.</strong> There is no network card, no container, and no listening socket bound to that address. How, then, does <code>curl http://10.96.0.150:80</code> reach your backend Pods? The answer is <strong class="term">kube-proxy</strong>.</p>
+
+  <h2>How kube-proxy Works: The iptables Engine</h2>
+  <p><strong class="term">kube-proxy</strong> runs as a DaemonSet on every worker node in the cluster. It constantly watches the Kubernetes API server for Service and EndpointSlice changes, and programs the Linux kernel's <strong class="term">Netfilter / iptables</strong> subsystem:</p>
+
+  <figure class="fullwidth" style="max-width:37rem">
+    <svg class="dia" viewBox="0 0 600 230" role="img" aria-label="kube-proxy iptables flow: Packet to ClusterIP hits iptables PREROUTING chain, is rewritten via DNAT with random probability to Pod A or Pod B IP address.">
+      <!-- Packet Arriving -->
+      <rect class="box" x="20" y="85" width="110" height="45" rx="3"/><text x="75" y="105" text-anchor="middle" style="font-size:9px; font-weight:600">Client Pod</text>
+      <text x="75" y="120" text-anchor="middle" class="muted" style="font-size:8px">Sends to 10.96.0.150</text>
+
+      <line class="line" x1="130" y1="107" x2="200" y2="107" style="stroke-width:2.5; stroke:var(--accent);"/>
+
+      <!-- Linux Kernel Netfilter -->
+      <rect x="200" y="30" width="200" height="155" rx="4" style="fill:var(--panel); stroke:var(--accent); stroke-width:1.5;"/>
+      <text x="300" y="52" text-anchor="middle" style="font-weight:700; fill:var(--accent); font-size:11px">Linux Kernel Netfilter</text>
+      <text x="300" y="68" text-anchor="middle" class="muted" style="font-size:9px">PREROUTING / OUTPUT Chains</text>
+
+      <!-- iptables rules -->
+      <rect x="215" y="80" width="170" height="40" rx="2" style="fill:var(--bg); stroke:var(--rule);"/>
+      <text x="300" y="98" text-anchor="middle" style="font-size:9px; font-family:var(--mono);">Match: 10.96.0.150:80</text>
+      <text x="300" y="112" text-anchor="middle" style="font-size:8px; font-weight:700; fill:var(--ok)">Statistic Mode Random (50%)</text>
+
+      <!-- Pod Targets -->
+      <line class="line" x1="385" y1="90" x2="470" y2="55" style="stroke-width:2; stroke:var(--ok);"/>
+      <rect x="470" y="35" width="110" height="40" rx="3" style="fill:var(--ok);"/>
+      <text x="525" y="55" text-anchor="middle" class="on-fill" style="font-size:9px; font-weight:600">Pod 1 (10.244.1.5)</text>
+      <text x="525" y="68" text-anchor="middle" class="on-fill" style="font-size:7px">DNAT Applied</text>
+
+      <line class="line" x1="385" y1="110" x2="470" y2="145" style="stroke-width:2; stroke:var(--ok);"/>
+      <rect x="470" y="125" width="110" height="40" rx="3" style="fill:var(--ok);"/>
+      <text x="525" y="145" text-anchor="middle" class="on-fill" style="font-size:9px; font-weight:600">Pod 2 (10.244.2.8)</text>
+      <text x="525" y="158" text-anchor="middle" class="on-fill" style="font-size:7px">DNAT Applied</text>
+    </svg>
+    <figcaption>How kube-proxy implements Services: Arriving packets matching the virtual ClusterIP are rewritten via in-kernel Destination NAT (DNAT) to a healthy Pod IP.</figcaption>
+  </figure>
+
+  <h3>The Step-by-Step Packet Interception</h3>
+  <ol>
+    <li>A container sends a SYN packet to destination <code>10.96.0.150:80</code>.</li>
+    <li>Before the packet exits the node, the Linux kernel passes it through the Netfilter <code>NAT</code> table.</li>
+    <li>The packet matches the <code>KUBE-SERVICES</code> chain, which points to <code>KUBE-SVC-XXX</code>.</li>
+    <li>Inside <code>KUBE-SVC-XXX</code>, iptables uses the <strong class="term">statistic module</strong> to perform probabilistic load balancing:
+      <ul>
+        <li>50% probability: jump to Endpoint 1 (<code>KUBE-SEP-1</code>) &rarr; execute <strong class="term">DNAT</strong> rewriting the destination IP to <code>10.244.1.5:8080</code>!</li>
+        <li>Remaining 50%: jump to Endpoint 2 (<code>KUBE-SEP-2</code>) &rarr; execute <strong class="term">DNAT</strong> rewriting destination to <code>10.244.2.8:8080</code>!</li>
+      </ul>
+    </li>
+    <li>By the time the packet leaves the network stack, the destination is no longer the ghost ClusterIP; it is the real IP of a living Pod!</li>
+  </ol>
+
+  <h2>The iptables Scaling Collapse vs IPVS</h2>
+  <p>In small clusters, iptables works fine. But in large enterprise clusters, iptables hits a scaling wall:<span class="sn"></span><span class="sidenote">Kubernetes Enhancement Proposal (KEP): IPVS-Based In-Cluster Service Load Balancing.</span></p>
+  <ul>
+    <li>iptables is a flat, sequential list of rules: evaluating a packet requires sequential <var>O</var>(<var>N</var>) traversal.</li>
+    <li>In a cluster with 5,000 Services and 40,000 Pods, the kernel must traverse over <strong>100,000 sequential iptables rules</strong> for every single packet!</li>
+    <li>Furthermore, adding or deleting a single Pod requires rewriting the entire iptables ruleset, triggering kernel locks that spike node CPU to 100%.</li>
+    <li><strong class="term">The Solution: IPVS Mode:</strong> Modern clusters run kube-proxy in <strong class="term">IPVS (IP Virtual Server)</strong> mode. IPVS uses in-kernel hash tables, providing <strong class="term"><var>O</var>(1) constant-time lookups</strong> regardless of whether your cluster has 10 services or 100,000 services!</li>
+  </ul>
+
+  <!-- Interactive Fill-In Drill -->
+  <h3>Practice: Kubernetes Service Dynamics</h3>
+  <div class="widget fill-in">
+    <ol style="margin:.4rem 0; padding-left:1.3rem;">
+      <li style="margin-bottom:.8rem;">
+        What component runs as a DaemonSet on every node to program Service NAT rules into the Linux kernel?<br>
+        Component Name = <input class="blank" data-answer="kube-proxy|kubeproxy" size="10" aria-label="Component">
+      </li>
+      <li style="margin-bottom:.8rem;">
+        What NAT operation does kube-proxy perform to rewrite a virtual ClusterIP into a real Pod IP?<br>
+        NAT Type = <input class="blank" data-answer="DNAT|Destination NAT|dnat" size="5" aria-label="NAT Type">
+      </li>
+      <li>
+        What in-kernel hash-table technology replaces iptables to provide O(1) constant-time service lookups?<br>
+        Technology = <input class="blank" data-answer="IPVS|ipvs" size="5" aria-label="Technology">
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>Hands-on: Inspecting iptables service chains and CoreDNS</h2>
+  <p>On macOS with a local <code>kind</code> cluster (<code>kind create cluster</code>), run <code>kubectl</code> from your Mac terminal for step 1, and shell into the Linux node container (<code>docker exec -it kind-control-plane bash</code>) for steps 2–3 where Linux <code>iptables</code> and cluster DNS are reachable.</p>
+  <ol class="steps" data-key="0062-services-cli">
+    <li>View the active Kubernetes Services in your cluster:
+      <pre><code><span class="prompt">$ </span>kubectl get services</code></pre>
+      Look for: <code>NAME: kubernetes</code>, <code>TYPE: ClusterIP</code>, <code>CLUSTER-IP: 10.96.0.1</code>, and <code>PORT(S): 443/TCP</code>.
+    </li>
+    <li>Inspect the low-level iptables NAT rules programmed by kube-proxy on a worker node:
+      <pre><code><span class="prompt">$ </span>sudo iptables -t nat -L KUBE-SERVICES -n -v | head -n 25</code></pre>
+      Observe the matching chains targeting virtual ClusterIPs!
+    </li>
+    <li>Query internal CoreDNS to resolve a Service hostname:
+      <pre><code><span class="prompt">$ </span>dig +short @10.96.0.10 my-service.default.svc.cluster.local</code></pre>
+      Verify that CoreDNS returns the virtual ClusterIP address!
+    </li>
+  </ol>
+</section>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0062-recall">
+    <p class="r-prompt">From memory: why does a Kubernetes ClusterIP not respond to ICMP ping? How does kube-proxy route traffic to backend Pods?</p>
+    <div class="keypoints">
+      <p><strong>Key points to compare against:</strong></p>
+      <ul>
+        <li><strong>Why ClusterIP cannot be pinged:</strong> A ClusterIP is a purely virtual "ghost IP." It does not exist on any physical or virtual network interface on any node; there is no ARP responder or ICMP echo reply stack attached to it.</li>
+        <li><strong>How kube-proxy routes traffic:</strong> kube-proxy programs Netfilter/iptables rules in the node's Linux kernel. When a client sends a packet to the ClusterIP, the kernel intercepts it in the PREROUTING/OUTPUT chains, applies probabilistic DNAT to rewrite the destination to a living Pod IP from the EndpointSlice, and forwards the packet natively to that Pod.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+
+  <h2>Code Implementation: Java &amp; Kotlin</h2>
+  <div class="code-tabs">
+    <div class="tab-buttons">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <div class="code-block-header">
+        <span class="code-lang-label">Java 25</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// kube-proxy iptables Random DNAT selection in Java
+import java.util.*;
+
+public class KubeProxyDnat {
+    public static String route(List&lt;String&gt; endpoints, double r) {
+        if (endpoints.isEmpty()) return null;
+        int idx = Math.min((int)(r * endpoints.size()), endpoints.size() - 1);
+        return endpoints.get(idx);
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <div class="code-block-header">
+        <span class="code-lang-label">Kotlin</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// kube-proxy iptables Random DNAT selection in Kotlin
+fun selectKubeEndpoint(endpoints: List&lt;String&gt;, r: Double): String? {
+    if (endpoints.isEmpty()) return null
+    val idx = (r * endpoints.size).toInt().coerceIn(0, endpoints.lastIndex)
+    return endpoints[idx]
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Interactive Code Practice: kube-proxy iptables Random DNAT Balancer</h2>
+  <div class="code-practice" data-key="0062-kubeproxy-dnat">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Simulate kube-proxy iptables DNAT service routing. In iptables mode, kube-proxy chains endpoints using statistic mode random with probability 1/N, 1/(N-1)... 1.0. Given a list of pod endpoint IPs and a pseudo-random value r (0.0 <= r < 1.0), select the target pod endpoint according to equal distribution.</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">import java.util.*;
+
+public class Solution {
+    // Selects pod endpoint uniformly at random using value r (0.0 <= r < 1.0)
+    public static String selectEndpoint(List<String> endpoints, double r) {
+        // TODO: Calculate endpoint index = (int)(r * endpoints.size())
+        // Return selected endpoint
+        return null;
+    }
+}</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">import java.util.*;
+
+public class Solution {
+    // Selects pod endpoint uniformly at random using value r (0.0 <= r < 1.0)
+    public static String selectEndpoint(List<String> endpoints, double r) {
+        // TODO: Calculate endpoint index = (int)(r * endpoints.size())
+        // Return selected endpoint
+        return null;
+    }
+}</script>
+    <script type="text/plain" class="test-harness">
+// __STUDENT_CODE__
+
+import java.util.*;
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0;
+        int total = 3;
+
+        List<String> eps = Arrays.asList("10.244.1.5:8080", "10.244.2.8:8080", "10.244.3.12:8080");
+
+        // Test 1: r = 0.1 -> index 0
+        String e1 = Solution.selectEndpoint(eps, 0.1);
+        if ("10.244.1.5:8080".equals(e1)) {
+            passed++;
+        } else {
+            System.err.println("Test 1 failed: expected index 0, got " + e1);
+        }
+
+        // Test 2: r = 0.5 -> index 1
+        String e2 = Solution.selectEndpoint(eps, 0.5);
+        if ("10.244.2.8:8080".equals(e2)) {
+            passed++;
+        } else {
+            System.err.println("Test 2 failed: expected index 1, got " + e2);
+        }
+
+        // Test 3: r = 0.9 -> index 2
+        String e3 = Solution.selectEndpoint(eps, 0.9);
+        if ("10.244.3.12:8080".equals(e3)) {
+            passed++;
+        } else {
+            System.err.println("Test 3 failed: expected index 2, got " + e3);
+        }
+
+        System.out.printf("Passed %d of %d tests.%n", passed, total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">import java.util.*;
+
+public class Solution {
+    public static String selectEndpoint(List<String> endpoints, double r) {
+        if (endpoints == null || endpoints.isEmpty()) return null;
+        int idx = (int) (r * endpoints.size());
+        if (idx >= endpoints.size()) idx = endpoints.size() - 1;
+        return endpoints.get(idx);
+    }
+}</script>
+    <script type="application/json" class="hints-data">["Scale r by the size of the endpoints list: `int idx = (int)(r * endpoints.size())`.", "Guard against edge cases where r == 1.0 by clamping to `endpoints.size() - 1`.", "Return `endpoints.get(idx)`."]</script>
+  </div>
+
+<section>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="q" data-answer="1">
+      <p class="q-prompt">What causes iptables-based kube-proxy to suffer performance degradation in massive clusters?</p>
+      <ol class="options">
+        <li data-why="Incorrect: A ClusterIP is not bound to any physical or virtual network interface.">iptables flushes all active TCP conntrack entries on every DNS query</li>
+        <li data-why="Correct! A ClusterIP is a virtual 'ghost' IP address that does not exist on any physical interface or Pod. It exists purely as routing and translation rules inside the Linux kernel (iptables, IPVS, or eBPF).">iptables is a flat sequential list requiring O(N) packet evaluation time</li>
+        <li data-why="Incorrect: ClusterIPs are internal virtual IPs and are not routable on the public Internet.">iptables duplicates every packet across all worker nodes via broadcast</li>
+        <li data-why="Incorrect: The host bridge (cbr0) carries Pod network traffic, not ClusterIP bindings.">it converts all incoming HTTP requests into uncompressed UDP broadcasts</li>
+      </ol>
+      <div class="q-explain">iptables evaluates rules sequentially in O(N) time; as services multiply to thousands, rule evaluation causes high latency and CPU thrashing.</div>
+    </div>
+    <div class="q" data-answer="2">
+      <p class="q-prompt">What occurs when a packet matches a KUBE-SVC rule inside the Linux kernel Netfilter table?</p>
+      <ol class="options">
+        <li data-why="Incorrect: iptables is a packet filter and NAT utility; it does not manage BGP peering sessions.">the packet is encrypted using a temporary Curve25519 public key</li>
+        <li data-why="Correct! In iptables mode, kube-proxy creates chains using the 'statistic mode random' module with probabilities $1/N, 1/(N-1), \dots, 1.0$ to randomly DNAT destination packets to pod endpoints.">the packet is dropped and an ICMP Port Unreachable error is returned</li>
+        <li data-why="Incorrect: Round-robin state is maintained in user space or IPVS; iptables uses random probability chains.">Destination NAT (DNAT) rewrites the virtual IP to a healthy Pod endpoint IP</li>
+        <li data-why="Incorrect: DNS lookups resolve service names, but the ClusterIP-to-Pod translation is handled by iptables in the datapath.">the packet is transmitted out the physical serial console management port</li>
+      </ol>
+      <div class="q-explain">The Netfilter rule executes Destination NAT (DNAT), rewriting the virtual ClusterIP to a selected Pod IP from the EndpointSlice.</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">Which Service type exposes a port across the 30000–32767 range on every worker node's external IP?</p>
+      <ol class="options">
+        <li data-why="Incorrect: IPVS and iptables are both software kernel mechanisms.">NodePort Service</li>
+        <li data-why="Correct! iptables evaluates rules sequentially ($O(N)$ complexity), causing high CPU consumption and packet latency as services scale to thousands. IPVS uses kernel hash tables ($O(1)$ complexity), providing constant-time lookups.">ClusterIP Service</li>
+        <li data-why="Incorrect: IPVS operates within the Linux network stack and does not bypass the kernel.">ExternalName Service</li>
+        <li data-why="Incorrect: IPVS is a transport load balancer; it does not perform TLS certificate caching.">Headless Service</li>
+      </ol>
+      <div class="q-explain">A NodePort service allocates a static port from range 30000-32767 across all cluster nodes, routing external traffic to backend pods.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://kubernetes.io/docs/concepts/services-networking/service/">Kubernetes Official Documentation: Service and kube-proxy Mechanics</a>.</p>
+    <p>Performance engineering: <a href="https://kubernetes.io/blog/2018/07/09/ipvs-based-in-cluster-service-load-balancing/">Kubernetes Blog: IPVS-Based In-Cluster Service Load Balancing</a>.</p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>Anything unclear, or anything here you think is wrong: ask your teacher in chat. Bring your <code>iptables -t nat</code> rules or Service debugging questions; I'll give you feedback on your reasoning.</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0061-kubernetes-cni-plugins.html"><small>Previous · Session 61</small>Container Network Interfaces (CNI)</a>
+  <a class="next" href="0063-ebpf-networking-and-cilium.html"><small>Next · Session 63</small>eBPF modern networking &amp; Cilium</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

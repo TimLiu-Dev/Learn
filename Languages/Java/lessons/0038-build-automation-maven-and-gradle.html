@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0038: Enterprise Build Engineering: Maven &amp; Gradle Dependency Resolution &amp; BOMs</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0037-classloading-reflection-annotations.html">&larr; Prev: Lesson 0037</a></div>
+      <div class="lesson-nav-center"><a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan &amp; Curriculum</a></div>
+      <div><a href="../reference/0038-build-automation-maven-and-gradle.html">&#128214; Reference 0038</a> &bull; <a href="0039-modern-unit-testing-junit5-mockito.html">Next: Lesson 0039 &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Phase 1 &bull; Stage 6 &bull; Lesson 0038</div>
+      <h1>Enterprise Build Engineering: Maven &amp; Gradle Dependency Resolution &amp; BOMs</h1>
+      <p class="lesson-subtitle">
+        Why transitive version conflicts cause production <code>NoSuchMethodError</code> crashes, Maven nearest-wins vs. Gradle highest-version-wins mediation, Bill of Materials (BOM) alignment, and reproducible CI wrappers.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. The Production Trap: Silent Transitive Downgrades &amp; <code>NoSuchMethodError</code></h2>
+      <p>
+        A Java compiler only checks the types directly referenced by your source code, while the JVM classloader resolves a flat list of JARs at runtime—loading the first matching class definition on the classpath. When two libraries pull incompatible versions of a shared transitive dependency (such as Jackson, Netty, or Guava), Maven and Gradle apply fundamentally opposite graph mediation algorithms:
+      </p>
+      <ul>
+        <li><strong>Maven (Nearest-Wins / Breadth-First Mediation):</strong> Maven picks the version sitting at the <em>shortest path depth</em> from your root <code>pom.xml</code>. If two paths have equal depth, the one declared earlier in <code>pom.xml</code> wins—<strong>even if it is years older!</strong></li>
+        <li><strong>Gradle (Highest-Version-Wins / Capability-Aware Mediation):</strong> Gradle inspects all requested versions across the entire dependency graph and upgrades every consumer to the <em>highest requested semantic version</em> unless constrained by <code>strictly()</code>.</li>
+      </ul>
+
+      <pre><code>&lt;!-- NAIVE POM: Silent Transitive Downgrade in Maven --&gt;
+&lt;dependencies&gt;
+  &lt;!-- Path A (Depth 2): legacy-metrics-sdk:1.4 -&gt; jackson-databind:2.13.4 --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.acme.telemetry&lt;/groupId&gt;
+    &lt;artifactId&gt;legacy-metrics-sdk&lt;/artifactId&gt;
+    &lt;version&gt;1.4.0&lt;/version&gt;
+  &lt;/dependency&gt;
+
+  &lt;!-- Path B (Depth 3): auth-client:4.2 -&gt; oauth-core:2.1 -&gt; jackson-databind:2.17.2 --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.acme.security&lt;/groupId&gt;
+    &lt;artifactId&gt;auth-client&lt;/artifactId&gt;
+    &lt;version&gt;4.2.0&lt;/version&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;
+
+&lt;!-- RESULT AT RUNTIME IN MAVEN:
+     Depth 2 beats Depth 3 -&gt; jackson-databind:2.13.4 is packaged into target/app.jar!
+     Code compiles cleanly, unit tests without auth pass, and production crashes on login:
+     java.lang.NoSuchMethodError: 'com.fasterxml.jackson.core.StreamReadConstraints ...' --&gt;</code></pre>
+
+      <div class="callout danger">
+        <div class="callout-title">&#9888; Binary Incompatibility Happens After Compilation Succeeds</div>
+        <p>
+          <code>javac</code> succeeded because your service never called <code>StreamReadConstraints</code> directly—<code>oauth-core:2.1</code> did! Because <code>oauth-core</code> was already compiled into bytecode against Jackson <code>2.17.2</code>, the broken linkage remains invisible until the JVM executes that exact code path at runtime and throws <code>LinkageError</code> / <code>NoSuchMethodError</code>.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Under the Hood: Dependency Graph Inspection &amp; Classpath Scopes</h2>
+      <p>
+        Before pinning versions blindly, senior engineers inspect the resolved dependency graph directly from the build tool to identify which transitive path introduced the conflicting coordinate:
+      </p>
+
+      <pre><code># 1. Maven: Inspect verbose transitive mediation (shows losers &amp; winning depths)
+$ mvn dependency:tree -Dverbose -Dincludes=com.fasterxml.jackson.core:jackson-databind
+
+[INFO] com.acme:order-service:jar:1.0.0
+[INFO] +- com.acme.telemetry:legacy-metrics-sdk:jar:1.4.0:compile
+[INFO] |  \- com.fasterxml.jackson.core:jackson-databind:jar:2.13.4:compile
+[INFO] \- com.acme.security:auth-client:jar:4.2.0:compile
+[INFO]    \- com.acme.security:oauth-core:jar:2.1.0:compile
+[INFO]       \- (com.fasterxml.jackson.core:jackson-databind:jar:2.17.2:compile - omitted for conflict with 2.13.4)
+
+# 2. Gradle: Trace why a specific version won on runtimeClasspath
+$ ./gradlew dependencyInsight --configuration runtimeClasspath --dependency jackson-databind
+
+com.fasterxml.jackson.core:jackson-databind:2.17.2 (by conflict resolution: between versions 2.17.2 and 2.13.4)
+  variant "runtimeElements" [
+    org.gradle.jvm.version = 8
+    org.gradle.usage       = java-runtime
+  ]</code></pre>
+
+      <p>
+        Controlling transitive leakage also requires choosing the narrowest dependency scope or configuration. In Gradle's <code>java-library</code> plugin, preferring <code>implementation</code> over <code>api</code> keeps internal dependencies off downstream consumers' compile classpaths, dramatically accelerating incremental compilation across multi-module monorepos:
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Maven Scope</th>
+            <th>Gradle Configuration</th>
+            <th>Compile Classpath</th>
+            <th>Runtime JAR</th>
+            <th>Leaks to Consumer Compile?</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>compile</code> (default)</td>
+            <td><code>api</code> (<code>java-library</code>)</td>
+            <td>Yes</td>
+            <td>Yes</td>
+            <td><strong>Yes</strong> (Public ABI types)</td>
+          </tr>
+          <tr>
+            <td><em>(No strict equivalent)</em></td>
+            <td><code>implementation</code></td>
+            <td>Yes</td>
+            <td>Yes</td>
+            <td><strong>No</strong> (Encapsulated internals)</td>
+          </tr>
+          <tr>
+            <td><code>provided</code></td>
+            <td><code>compileOnly</code></td>
+            <td>Yes</td>
+            <td><strong>No</strong></td>
+            <td>No (Servlet container APIs, annotations)</td>
+          </tr>
+          <tr>
+            <td><code>runtime</code></td>
+            <td><code>runtimeOnly</code></td>
+            <td><strong>No</strong></td>
+            <td>Yes</td>
+            <td>No (PostgreSQL JDBC driver, Logback)</td>
+          </tr>
+          <tr>
+            <td><code>test</code></td>
+            <td><code>testImplementation</code></td>
+            <td>Test only</td>
+            <td><strong>No</strong></td>
+            <td>No (JUnit 5, AssertJ, Mockito)</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>3. Idiomatic Java 21 Build Setup: BOMs, Enforcer Rules &amp; Wrapper Integrity</h2>
+      <p>
+        Multi-artifact ecosystems like Jackson, Netty, JUnit 5, Spring Boot, and OpenTelemetry publish a <strong>Bill of Materials (BOM)</strong>—a metadata-only POM listing tested, mutually compatible versions across dozens of sibling modules. Importing a BOM aligns every direct and transitive module to the exact same version without downloading unused JARs.
+      </p>
+      <p>
+        Pair BOM imports with <strong>Java Toolchains</strong> (decoupling the JDK running Maven/Gradle from the target JDK 21 compiler), <strong>Maven Enforcer <code>requireUpperBoundDeps</code></strong> (converting silent transitive downgrades into immediate CI failures), and pinned <strong>Wrapper checksums</strong>:
+      </p>
+
+      <pre><code>// build.gradle.kts — Idiomatic Java 21 Enterprise Build Configuration
+plugins {
+    `java-library`
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+        vendor = JvmVendorSpec.ADOPTIUM
+    }
+}
+
+dependencies {
+    // 1. Import BOMs via platform(): aligns all Jackson &amp; JUnit artifacts without downloading them all
+    implementation(platform("com.fasterxml.jackson:jackson-bom:2.17.2"))
+    testImplementation(platform("org.junit:junit-bom:5.11.0"))
+
+    // 2. Omit version strings — governed atomically by the imported BOMs
+    implementation("com.fasterxml.jackson.core:jackson-databind")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")
+    runtimeOnly("org.postgresql:postgresql:42.7.4")
+
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+tasks.test {
+    useJUnitPlatform()
+}
+
+/* Equivalent Maven BOM + Upper-Bound Protection in pom.xml:
+   &lt;dependencyManagement&gt;
+     &lt;dependencies&gt;
+       &lt;dependency&gt;
+         &lt;groupId&gt;com.fasterxml.jackson&lt;/groupId&gt;
+         &lt;artifactId&gt;jackson-bom&lt;/artifactId&gt;
+         &lt;version&gt;2.17.2&lt;/version&gt;
+         &lt;type&gt;pom&lt;/type&gt;
+         &lt;scope&gt;import&lt;/scope&gt;
+       &lt;/dependency&gt;
+     &lt;/dependencies&gt;
+   &lt;/dependencyManagement&gt;
+   Plus maven-enforcer-plugin with &lt;requireUpperBoundDeps/&gt; in &lt;build&gt;&lt;plugins&gt;! */</code></pre>
+
+      <div class="callout tip">
+        <div class="callout-title">&#128274; Reproducible Builds with <code>./gradlew</code> &amp; <code>./mvnw</code></div>
+        <p>
+          Never rely on whatever global <code>gradle</code> or <code>mvn</code> binary happens to be installed on a developer laptop or CI runner. Commit <code>gradlew</code>, <code>gradle/wrapper/gradle-wrapper.properties</code>, and set <code>distributionSha256Sum</code> so every build verifies the exact Gradle distribution binary cryptographically before executing a single task.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>4. Interactive Practice Workbench</h2>
+      <p>
+        Build and debug the exact graph mediation algorithms behind Maven's breadth-first nearest-wins resolver, Gradle's highest-version selector, and Maven Enforcer's upper-bound check in Java 21.
+      </p>
+
+      <div id="ex-1" class="workbench-container"></div>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>5. Senior Architecture &amp; Code Quiz</h2>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <p>
+        Review the official <a href="https://docs.gradle.org/current/userguide/dependency_resolution.html" target="_blank" rel="noopener">Gradle User Manual: How Gradle Resolves Dependencies</a> alongside the <a href="https://maven.apache.org/guides/introduction/introduction-to-dependency-mechanism.html" target="_blank" rel="noopener">Apache Maven Introduction to the Dependency Mechanism</a> for full BOM and mediation rules.
+      </p>
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> &ldquo;In a 40-module Gradle or Maven monorepo, when should we publish our own internal platform BOM versus using Gradle Version Catalogs (<code>libs.versions.toml</code>), and how do they interact when publishing libraries to Maven Central?&rdquo;
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0037-classloading-reflection-annotations.html">&larr; Prev: Lesson 0037</a></div>
+      <div><a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a> &bull; <a href="../reference/0038-build-automation-maven-and-gradle.html">&#128214; Reference 0038</a></div>
+      <div><a href="0039-modern-unit-testing-junit5-mockito.html">Next: Lesson 0039 &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+  {
+    "exercises": [
+      {
+        "id": "ex-1",
+        "filename": "DependencyResolver.java",
+        "badge": "Implementation Drill",
+        "instructions": "<p>Implement a dependency graph mediator modeling both Maven and Gradle conflict resolution:</p><ol><li>In <code>resolveMavenNearest</code>, perform a Breadth-First Search (BFS) using an <code>ArrayDeque&lt;DepNode&gt;</code> (<code>addLast</code> / <code>pollFirst</code>) and return the <code>SemVer</code> of the <strong>first</strong> node whose <code>artifact()</code> matches <code>targetArtifact</code>.</li><li>In <code>resolveGradleHighest</code>, traverse the entire tree and return the <strong>maximum</strong> <code>SemVer</code> (using <code>compareTo</code>) among all nodes matching <code>targetArtifact</code>.</li></ol>",
+        "initialCode": "import java.util.ArrayDeque;\nimport java.util.List;\n\nrecord SemVer(int major, int minor, int patch) implements Comparable<SemVer> {\n    @Override\n    public int compareTo(SemVer o) {\n        int c = Integer.compare(major, o.major);\n        if (c != 0) return c;\n        c = Integer.compare(minor, o.minor);\n        return c != 0 ? c : Integer.compare(patch, o.patch);\n    }\n    @Override public String toString() { return major + \".\" + minor + \".\" + patch; }\n}\n\nrecord DepNode(String artifact, SemVer version, List<DepNode> children) {}\n\npublic class DependencyResolver {\n\n    public static SemVer resolveMavenNearest(DepNode root, String targetArtifact) {\n        // TODO: Traverse level-by-level with ArrayDeque BFS and return first match\n        return null;\n    }\n\n    public static SemVer resolveGradleHighest(DepNode root, String targetArtifact) {\n        // TODO: Traverse all reachable nodes and return highest SemVer for targetArtifact\n        return null;\n    }\n\n    public static void main(String[] args) {\n        DepNode graph = new DepNode(\"order-service\", new SemVer(1, 0, 0), List.of(\n            new DepNode(\"legacy-metrics-sdk\", new SemVer(1, 4, 0), List.of(\n                new DepNode(\"jackson-databind\", new SemVer(2, 13, 4), List.of())\n            )),\n            new DepNode(\"auth-client\", new SemVer(4, 2, 0), List.of(\n                new DepNode(\"oauth-core\", new SemVer(2, 1, 0), List.of(\n                    new DepNode(\"jackson-databind\", new SemVer(2, 17, 2), List.of())\n                ))\n            ))\n        ));\n        System.out.println(\"Maven Nearest : \" + resolveMavenNearest(graph, \"jackson-databind\"));\n        System.out.println(\"Gradle Highest: \" + resolveGradleHighest(graph, \"jackson-databind\"));\n    }\n}\n",
+        "solution": "import java.util.ArrayDeque;\nimport java.util.List;\n\nrecord SemVer(int major, int minor, int patch) implements Comparable<SemVer> {\n    @Override\n    public int compareTo(SemVer o) {\n        int c = Integer.compare(major, o.major);\n        if (c != 0) return c;\n        c = Integer.compare(minor, o.minor);\n        return c != 0 ? c : Integer.compare(patch, o.patch);\n    }\n    @Override public String toString() { return major + \".\" + minor + \".\" + patch; }\n}\n\nrecord DepNode(String artifact, SemVer version, List<DepNode> children) {}\n\npublic class DependencyResolver {\n\n    public static SemVer resolveMavenNearest(DepNode root, String targetArtifact) {\n        ArrayDeque<DepNode> queue = new ArrayDeque<>();\n        queue.addLast(root);\n        while (!queue.isEmpty()) {\n            DepNode current = queue.pollFirst();\n            if (current.artifact().equals(targetArtifact)) {\n                return current.version();\n            }\n            for (DepNode child : current.children()) {\n                queue.addLast(child);\n            }\n        }\n        return null;\n    }\n\n    public static SemVer resolveGradleHighest(DepNode root, String targetArtifact) {\n        ArrayDeque<DepNode> queue = new ArrayDeque<>();\n        queue.addLast(root);\n        SemVer best = null;\n        while (!queue.isEmpty()) {\n            DepNode current = queue.pollFirst();\n            if (current.artifact().equals(targetArtifact)) {\n                if (best == null || current.version().compareTo(best) > 0) {\n                    best = current.version();\n                }\n            }\n            for (DepNode child : current.children()) {\n                queue.addLast(child);\n            }\n        }\n        return best;\n    }\n\n    public static void main(String[] args) {\n        DepNode graph = new DepNode(\"order-service\", new SemVer(1, 0, 0), List.of(\n            new DepNode(\"legacy-metrics-sdk\", new SemVer(1, 4, 0), List.of(\n                new DepNode(\"jackson-databind\", new SemVer(2, 13, 4), List.of())\n            )),\n            new DepNode(\"auth-client\", new SemVer(4, 2, 0), List.of(\n                new DepNode(\"oauth-core\", new SemVer(2, 1, 0), List.of(\n                    new DepNode(\"jackson-databind\", new SemVer(2, 17, 2), List.of())\n                ))\n            ))\n        ));\n        System.out.println(\"Maven Nearest : \" + resolveMavenNearest(graph, \"jackson-databind\"));\n        System.out.println(\"Gradle Highest: \" + resolveGradleHighest(graph, \"jackson-databind\"));\n    }\n}\n",
+        "solutionExplanation": "BFS with ArrayDeque visits dependencies strictly in increasing depth order and declaration order, reproducing Maven's nearest-wins mediation (2.13.4 at depth 2), whereas exhaustive scanning with SemVer.compareTo selects the highest semantic version across all paths like Gradle (2.17.2).",
+        "hints": [
+          "Initialize <code>ArrayDeque&lt;DepNode&gt; queue = new ArrayDeque&lt;&gt;();</code> and enqueue <code>root</code> with <code>queue.addLast(root)</code>.",
+          "In <code>resolveMavenNearest</code>, the first node dequeued via <code>queue.pollFirst()</code> matching <code>targetArtifact</code> is guaranteed to have minimal depth and declaration priority.",
+          "In <code>resolveGradleHighest</code>, do not return early—update <code>best</code> whenever <code>best == null || current.version().compareTo(best) &gt; 0</code>."
+        ],
+        "tests": [
+          {
+            "name": "Uses ArrayDeque FIFO queue for BFS mediation",
+            "regex": "new\\s+ArrayDeque[\\s\\S]*?pollFirst\\s*\\(",
+            "flags": "m",
+            "passMessage": "Uses ArrayDeque with pollFirst() for breadth-first level traversal.",
+            "failMessage": "Use ArrayDeque and pollFirst() so shallower dependencies are inspected before deeper ones."
+          },
+          {
+            "name": "Maven resolver returns first shortest-depth match",
+            "regex": "if\\s*\\(\\s*\\w+\\.artifact\\(\\)\\.equals\\(\\s*targetArtifact\\s*\\)\\s*\\)\\s*\\{\\s*return\\s+\\w+\\.version\\(\\)",
+            "flags": "m",
+            "passMessage": "Returns immediately on the nearest breadth-first match.",
+            "failMessage": "In resolveMavenNearest, return current.version() as soon as current.artifact().equals(targetArtifact)."
+          },
+          {
+            "name": "Gradle resolver compares versions via compareTo",
+            "regex": "\\.compareTo\\s*\\(\\s*\\w+\\s*\\)\\s*>\\s*0",
+            "flags": "m",
+            "mustNotMatch": "//\\s*TODO",
+            "passMessage": "Tracks the highest semantic version across the full dependency graph.",
+            "failMessage": "Compare candidate versions with compareTo(...) > 0 and remove all TODO placeholders."
+          }
+        ],
+        "simulatedOutput": "Maven Nearest : 2.13.4\nGradle Highest: 2.17.2"
+      },
+      {
+        "id": "ex-2",
+        "filename": "UpperBoundEnforcer.java",
+        "badge": "Bug-Fix Challenge",
+        "instructions": "<p>This internal CI checker mimics Maven Enforcer's <code>requireUpperBoundDeps</code> rule, but two bugs let broken builds slip into production:</p><ol><li><strong>Bug 1 (Lexicographical Version Trap):</strong> <code>Version.compareTo</code> compares raw strings (so <code>\"2.9.0\".compareTo(\"2.17.2\") &gt; 0</code> falsely treats <code>2.9.0</code> as newer than <code>2.17.2</code> because <code>'9' &gt; '1'</code>!). Parse major, minor, and patch integers and compare numerically with <code>Integer.compare</code>.</li><li><strong>Bug 2 (LIFO Stack Instead of BFS Queue):</strong> <code>findMavenSelected</code> calls <code>queue.pollLast()</code> (depth-first LIFO) instead of <code>queue.pollFirst()</code> (breadth-first FIFO), picking the wrong Maven winner. Fix both bugs!</li></ol>",
+        "initialCode": "import java.util.ArrayDeque;\nimport java.util.List;\n\nrecord Version(String raw) implements Comparable<Version> {\n    @Override\n    public int compareTo(Version other) {\n        // BUG 1: String comparison treats \"2.9.0\" > \"2.17.2\"!\n        return this.raw.compareTo(other.raw);\n    }\n}\n\nrecord Node(String artifact, Version version, List<Node> deps) {}\n\npublic class UpperBoundEnforcer {\n\n    public static void enforceUpperBound(Node root, String artifact) {\n        Version selected = findMavenSelected(root, artifact);\n        Version upperBound = findMaxVersion(root, artifact);\n        if (selected != null && upperBound != null && selected.compareTo(upperBound) < 0) {\n            throw new IllegalStateException(\n                \"UpperBound violation for \" + artifact + \": selected \" + selected.raw() + \" < required \" + upperBound.raw()\n            );\n        }\n    }\n\n    private static Version findMavenSelected(Node root, String artifact) {\n        ArrayDeque<Node> queue = new ArrayDeque<>();\n        queue.addLast(root);\n        while (!queue.isEmpty()) {\n            // BUG 2: pollLast() performs LIFO depth-first traversal instead of Maven BFS!\n            Node cur = queue.pollLast();\n            if (cur.artifact().equals(artifact)) return cur.version();\n            for (Node d : cur.deps()) queue.addLast(d);\n        }\n        return null;\n    }\n\n    private static Version findMaxVersion(Node root, String artifact) {\n        Version max = root.artifact().equals(artifact) ? root.version() : null;\n        for (Node d : root.deps()) {\n            Version childMax = findMaxVersion(d, artifact);\n            if (childMax != null && (max == null || childMax.compareTo(max) > 0)) {\n                max = childMax;\n            }\n        }\n        return max;\n    }\n}\n",
+        "solution": "import java.util.ArrayDeque;\nimport java.util.List;\n\nrecord Version(String raw) implements Comparable<Version> {\n    @Override\n    public int compareTo(Version other) {\n        String[] a = this.raw.split(\"\\\\.\");\n        String[] b = other.raw.split(\"\\\\.\");\n        int len = Math.max(a.length, b.length);\n        for (int i = 0; i < len; i++) {\n            int va = i < a.length ? Integer.parseInt(a[i]) : 0;\n            int vb = i < b.length ? Integer.parseInt(b[i]) : 0;\n            int cmp = Integer.compare(va, vb);\n            if (cmp != 0) {\n                return cmp;\n            }\n        }\n        return 0;\n    }\n}\n\nrecord Node(String artifact, Version version, List<Node> deps) {}\n\npublic class UpperBoundEnforcer {\n\n    public static void enforceUpperBound(Node root, String artifact) {\n        Version selected = findMavenSelected(root, artifact);\n        Version upperBound = findMaxVersion(root, artifact);\n        if (selected != null && upperBound != null && selected.compareTo(upperBound) < 0) {\n            throw new IllegalStateException(\n                \"UpperBound violation for \" + artifact + \": selected \" + selected.raw() + \" < required \" + upperBound.raw()\n            );\n        }\n    }\n\n    private static Version findMavenSelected(Node root, String artifact) {\n        ArrayDeque<Node> queue = new ArrayDeque<>();\n        queue.addLast(root);\n        while (!queue.isEmpty()) {\n            Node cur = queue.pollFirst();\n            if (cur.artifact().equals(artifact)) return cur.version();\n            for (Node d : cur.deps()) queue.addLast(d);\n        }\n        return null;\n    }\n\n    private static Version findMaxVersion(Node root, String artifact) {\n        Version max = root.artifact().equals(artifact) ? root.version() : null;\n        for (Node d : root.deps()) {\n            Version childMax = findMaxVersion(d, artifact);\n            if (childMax != null && (max == null || childMax.compareTo(max) > 0)) {\n                max = childMax;\n            }\n        }\n        return max;\n    }\n}\n",
+        "solutionExplanation": "Splitting dot-delimited coordinates with split(\"\\\\.\") and comparing parsed integers via Integer.compare prevents ASCII ordering bugs ('9' > '1'), while pollFirst() ensures FIFO breadth-first order matching Maven's nearest-wins mediation.",
+        "hints": [
+          "Split <code>this.raw</code> and <code>other.raw</code> using <code>split(\"\\\\.\")</code> (escaped dot regex!) and parse each segment with <code>Integer.parseInt</code>.",
+          "Compare each numeric segment using <code>Integer.compare(va, vb)</code>, returning immediately on the first non-zero difference.",
+          "Change <code>queue.pollLast()</code> to <code>queue.pollFirst()</code> inside <code>findMavenSelected</code> so level 2 nodes are processed before level 3 nodes."
+        ],
+        "tests": [
+          {
+            "name": "Parses numeric segments with Integer.parseInt and Integer.compare",
+            "regex": "Integer\\.parseInt[\\s\\S]*?Integer\\.compare\\s*\\(",
+            "flags": "m",
+            "mustNotMatch": "this\\.raw\\.compareTo\\s*\\(\\s*other\\.raw\\s*\\)",
+            "passMessage": "Compares version segments numerically rather than ASCII lexicographically.",
+            "failMessage": "Replace raw String.compareTo with Integer.parseInt + Integer.compare on split(\"\\\\.\") segments."
+          },
+          {
+            "name": "Splits version coordinates on literal dot",
+            "regex": "\\.split\\s*\\(\\s*\"\\\\\\\\\\.\"",
+            "flags": "m",
+            "passMessage": "Correctly escapes literal dot regex when splitting version strings.",
+            "failMessage": "Split version strings on literal dots using .split(\"\\\\.\") (remember split('.') without escaping matches any character!)."
+          },
+          {
+            "name": "Uses pollFirst() for FIFO breadth-first Maven selection",
+            "regex": "queue\\.pollFirst\\s*\\(\\s*\\)",
+            "flags": "m",
+            "mustNotMatch": "queue\\.pollLast\\s*\\(\\s*\\)",
+            "passMessage": "Uses pollFirst() to match Maven's breadth-first nearest-wins mediation.",
+            "failMessage": "Replace queue.pollLast() with queue.pollFirst() in findMavenSelected."
+          }
+        ],
+        "simulatedOutput": "[ENFORCER PASS] Caught downgrade: UpperBound violation for jackson-databind: selected 2.9.0 < required 2.17.2\nAll semantic upper-bound verification checks succeeded."
+      }
+    ],
+    "quiz": {
+      "id": "quiz-main",
+      "questions": [
+        {
+          "question": "Given a service with two dependencies (Depth 2 requests `netty-buffer:4.1.90` and Depth 3 requests `netty-buffer:4.1.112`), how do Maven and Gradle resolve `netty-buffer` by default?",
+          "code": "// Root Service\n//  ├── cache-sdk:1.0 -> netty-buffer:4.1.90          (Depth 2)\n//  └── grpc-sdk:2.4  -> grpc-netty -> netty-buffer:4.1.112 (Depth 3)",
+          "correctIndex": 1,
+          "options": [
+            {
+              "text": "Maven selects 4.1.112 by version; Gradle selects 4.1.90 by depth.",
+              "explanation": "This reverses the two build tools: Maven ignores which version is newer and mediates strictly by graph depth, whereas Gradle upgrades to the highest version."
+            },
+            {
+              "text": "Maven selects 4.1.90 by shortest depth; Gradle selects 4.1.112 highest.",
+              "explanation": "Maven's nearest-wins mediation picks depth-2 `4.1.90` (risking `NoSuchMethodError` in `grpc-netty`), whereas Gradle's conflict resolver upgrades the graph to `4.1.112`."
+            },
+            {
+              "text": "Both Maven and Gradle fail compilation immediately upon version conflict.",
+              "explanation": "Neither tool fails by default on transitive version skew unless you explicitly configure Maven Enforcer `requireUpperBoundDeps` or Gradle `failOnVersionConflict()`."
+            },
+            {
+              "text": "Both Maven and Gradle bundle both JARs using isolated classloaders.",
+              "explanation": "Standard JVM application classpaths are flat; only one version of a GAV coordinate is placed on the runtime classpath by Maven or Gradle."
+            }
+          ]
+        },
+        {
+          "question": "What is the exact effect of declaring `implementation(platform(\"com.fasterxml.jackson:jackson-bom:2.17.2\"))` inside a Gradle `java-library` module?",
+          "code": "dependencies {\n    implementation(platform(\"com.fasterxml.jackson:jackson-bom:2.17.2\"))\n    implementation(\"com.fasterxml.jackson.core:jackson-databind\")\n}",
+          "correctIndex": 2,
+          "options": [
+            {
+              "text": "It downloads every library inside jackson-bom onto the runtime classpath.",
+              "explanation": "A BOM (`platform(...)` or Maven `scope=import`) publishes dependency constraints only; JARs are fetched only for artifacts actually declared or pulled transitively."
+            },
+            {
+              "text": "It exposes Jackson types transitively on every downstream compile classpath.",
+              "explanation": "Because `implementation` (not `api`) was used, Jackson types remain encapsulated inside this module's runtime classpath and do not leak to consumers' compile classpaths."
+            },
+            {
+              "text": "It constrains Jackson versions without adding dependencies until explicitly declared.",
+              "explanation": "`platform(...)` imports the BOM's version constraints so `jackson-databind` and its transitive `jackson-core`/`jackson-annotations` align to `2.17.2` without pulling unused Jackson modules."
+            },
+            {
+              "text": "It forces Gradle to use Maven nearest-wins breadth-first conflict mediation.",
+              "explanation": "Importing a platform BOM contributes version constraints into Gradle's resolution engine; it never switches Gradle to Maven's breadth-first nearest-wins algorithm."
+            }
+          ]
+        },
+        {
+          "question": "Which Maven configuration automatically fails CI builds whenever nearest-wins mediation silently downgrades a deeper transitive dependency?",
+          "correctIndex": 0,
+          "options": [
+            {
+              "text": "Enable Maven Enforcer requireUpperBoundDeps to fail builds on transitive downgrades.",
+              "explanation": "The `maven-enforcer-plugin` rule `requireUpperBoundDeps` verifies that every resolved version on the classpath is greater than or equal to all transitive versions requested."
+            },
+            {
+              "text": "Change every dependency scope to provided inside the root pom.xml.",
+              "explanation": "`provided` omits dependencies from the packaged runtime archive (`ClassNotFoundException` in standalone apps) rather than mediating transitive version conflicts."
+            },
+            {
+              "text": "Run mvn clean install with skipTests enabled on CI pipelines.",
+              "explanation": "Skipping tests hides runtime `NoSuchMethodError` linkage crashes until production deployment rather than detecting transitive version downgrades."
+            },
+            {
+              "text": "Replace fixed versions with RELEASE or LATEST dynamic version markers.",
+              "explanation": "Dynamic version markers destroy build reproducibility across commits and have been deprecated in Maven 3+ for non-plugin dependencies."
+            }
+          ]
+        }
+      ]
+    }
+  }
+  </script>
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/workbench.js"></script>
+</body>
+</html>

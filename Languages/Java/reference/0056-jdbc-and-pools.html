@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reference 0056: JDBC Batching, PreparedStatement &amp; HikariCP</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="../lessons/0056-jdbc-and-connection-pooling-mechanics.html">&larr; Back to Lesson 0056</a></div>
+      <div class="lesson-nav-center"><a href="../lessons/0001-master-plan-and-curriculum.html">&#128203; Master Plan</a></div>
+      <div><a href="../lessons/0057-jpa-hibernate-entity-lifecycle.html">Next Lesson &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Quick Reference &bull; Sheet 0056</div>
+      <h1>JDBC Batching &amp; HikariCP Pool Sizing Cheat Sheet</h1>
+      <p class="lesson-subtitle">Wire-level driver flags, HikariCP sizing math, timeout hierarchy, and atomic batch templates.</p>
+    </header>
+
+    <section>
+      <h2>1. HikariCP &amp; JDBC Timeout Hierarchy Matrix</h2>
+      <p>
+        Core sizing rule: <code>connections = (core_count * 2) + effective_spindle_count</code> (approx. <code>17–20</code> total active queries for an 8-vCPU SSD database, divided across application replicas).
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>Layer / Knob</th>
+            <th>Property Name</th>
+            <th>Recommended Range</th>
+            <th>What It Bounds</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Pool Borrow Wait</td>
+            <td><code>spring.datasource.hikari.connection-timeout</code></td>
+            <td><code>1500ms – 3000ms</code></td>
+            <td>Max time a thread blocks in <code>getConnection()</code> before failing fast.</td>
+          </tr>
+          <tr>
+            <td>Socket Lifecycle</td>
+            <td><code>spring.datasource.hikari.max-lifetime</code></td>
+            <td><code>600000ms – 1740000ms</code></td>
+            <td>Must be <code>30s–60s</code> shorter than NAT/RDS Proxy/LB idle TCP timeout.</td>
+          </tr>
+          <tr>
+            <td>Idle Probe</td>
+            <td><code>spring.datasource.hikari.keepalive-time</code></td>
+            <td><code>60000ms – 120000ms</code></td>
+            <td>Pings idle connections periodically so firewalls do not silently drop sockets.</td>
+          </tr>
+          <tr>
+            <td>Leak Diagnostics</td>
+            <td><code>spring.datasource.hikari.leak-detection-threshold</code></td>
+            <td><code>5000ms – 10000ms</code></td>
+            <td>Logs stack trace of caller holding a connection beyond threshold.</td>
+          </tr>
+          <tr>
+            <td>Statement Execution</td>
+            <td><code>PreparedStatement.setQueryTimeout(sec)</code> / <code>options=-c statement_timeout=3s</code></td>
+            <td><code>2s – 10s</code> (OLTP)</td>
+            <td>Server-side cancellation of runaway SQL queries.</td>
+          </tr>
+          <tr>
+            <td>Network Dead-Peer</td>
+            <td>pgjdbc <code>socketTimeout</code> / <code>connectTimeout</code></td>
+            <td><code>connect=3, socket=15</code> (sec)</td>
+            <td>Prevents thread hang if DB host blackholes TCP packets mid-query.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>2. Essential Driver Batching Flags</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Database Driver</th>
+            <th>JDBC URL Parameter</th>
+            <th>Wire Effect</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>PostgreSQL (<code>pgjdbc</code>)</td>
+            <td><code>reWriteBatchedInserts=true&amp;prepareThreshold=5</code></td>
+            <td>Rewrites <code>INSERT ... VALUES (?,?,?)</code> batches into multi-row <code>VALUES (...),(...)</code> statements (10x–25x faster).</td>
+          </tr>
+          <tr>
+            <td>MySQL / MariaDB</td>
+            <td><code>rewriteBatchedStatements=true&amp;useServerPrepStmts=true</code></td>
+            <td>Packs single-row inserts into multi-value packets up to <code>max_allowed_packet</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>3. Canonical Production JDBC Batch Template</h2>
+      <pre><code>public int batchInsert(DataSource ds, List&lt;Row&gt; rows) throws SQLException {
+    final String sql = "INSERT INTO audit_log (id, actor, created_at) VALUES (?, ?, ?)";
+    try (Connection conn = ds.getConnection()) {
+        boolean priorAutoCommit = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            int i = 0;
+            for (Row r : rows) {
+                ps.setObject(1, r.id());
+                ps.setString(2, r.actor());
+                ps.setObject(3, r.createdAt()); // Java 21 OffsetDateTime / Instant via JDBC 4.2
+                ps.addBatch();
+                if (++i % 500 == 0) {
+                    ps.executeBatch();
+                    ps.clearBatch();
+                }
+            }
+            if (i % 500 != 0) {
+                ps.executeBatch();
+            }
+            conn.commit();
+            return i;
+        } catch (Exception ex) {
+            try { conn.rollback(); } catch (SQLException sup) { ex.addSuppressed(sup); }
+            throw ex;
+        } finally {
+            conn.setAutoCommit(priorAutoCommit);
+        }
+    }
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>4. Senior Production Pitfalls Checklist</h2>
+      <ul>
+        <li><strong>Never hold a DB connection across HTTP/RPC/Kafka I/O:</strong> Perform all external network calls <em>before</em> borrowing or <em>after</em> closing the JDBC connection.</li>
+        <li><strong>Keep <code>minimumIdle == maximumPoolSize</code>:</strong> Dynamic pool shrinking/growing causes TLS handshake latency spikes right when traffic surges arrive.</li>
+        <li><strong>Verify <code>replicas * maximumPoolSize &lt; max_connections</code>:</strong> During rolling Kubernetes deploys (<code>2x</code> pod surge), oversized pools will trip PostgreSQL <code>FATAL: sorry, too many clients already</code>.</li>
+        <li><strong>Chunk <code>addBatch()</code> at 500–1,000 rows:</strong> Unbounded <code>addBatch()</code> buffers millions of bind arrays in JVM heap before flushing to the socket.</li>
+        <li><strong>Use <code>ps.setObject(idx, OffsetDateTime/LocalDate)</code>:</strong> Prefer JDBC 4.2 <code>java.time</code> bindings over legacy <code>java.sql.Timestamp</code> to avoid JVM default-timezone shifts.</li>
+      </ul>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="../lessons/0056-jdbc-and-connection-pooling-mechanics.html">&larr; Return to Lesson 0056</a></div>
+      <div><a href="../lessons/0001-master-plan-and-curriculum.html">&#128203; Master Plan</a></div>
+      <div><a href="../lessons/0057-jpa-hibernate-entity-lifecycle.html">Next Lesson &rarr;</a></div>
+    </footer>
+  </div>
+</body>
+</html>

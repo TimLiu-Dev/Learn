@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0021: Multi-Tier Caching: L1 Caffeine + L2 Redis &amp; Stampede Defense</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Phase 5: In-Memory & Redis</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Title & Metadata -->
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0021 • Phase 5</span>
+    <h1 style="margin-top: 8px;">Multi-Tier Caching: L1 Caffeine + L2 Redis & Stampede Defense</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Architect enterprise multi-tier caching. Combine sub-microsecond in-process Caffeine cache (L1) with distributed Redis cache (L2), synchronize invalidation via Redis Pub/Sub, and eliminate cache stampedes.
+    </p>
+  </div>
+
+  <!-- Primary Source -->
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authority: <a href="https://github.com/ben-manes/caffeine/wiki" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Caffeine High-Performance In-Memory Cache Documentation</a>. Ground your learning in primary architecture rather than secondary summaries.
+    </p>
+  </div>
+
+  <!-- Main Concept & Code Examples -->
+  
+  <h2>1. Why Redis Network Roundtrips Slow Down High-Frequency Reads</h2>
+  <p>
+    Redis is fast (~1 millisecond over TCP), but for ultra-hot data queried 100,000 times per second (e.g. system configurations, tenant metadata, hot catalog items), <strong>network roundtrip latency and serialization become bottlenecks</strong>.
+  </p>
+  <p>
+    <strong>Multi-Tier Caching Architecture:</strong>
+  </p>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>L1 In-Memory Cache (Caffeine):</strong> Lives directly inside JVM heap RAM. Access time: <strong>sub-microsecond (&lt; 100ns)</strong> with zero serialization!</li>
+    <li><strong>L2 Distributed Cache (Redis):</strong> Shared across all container pods. Access time: ~1ms.</li>
+    <li><strong>L3 Relational Database (PostgreSQL):</strong> Disk/SSD access.</li>
+  </ul>
+
+  <h2>2. Invalidation Synchronization via Redis Pub/Sub</h2>
+  <p>
+    The classic problem with L1 in-process caching is <strong>cache inconsistency</strong>: If Pod A updates a product, how do Pod B and Pod C know to invalidate their local Caffeine caches?
+  </p>
+  <div style="background:#090d13; border:1px solid var(--border-color); border-radius:var(--radius-sm); padding:16px; font-family:var(--font-mono); font-size:13px; color:#7ee787; margin:16px 0;">
+1. Pod A updates product #42 in PostgreSQL & L2 Redis.
+2. Pod A publishes an invalidation event to Redis topic: "cache:evict:products" -> "42"
+3. Pod B and Pod C receive the message via Redis Pub/Sub listener!
+4. Pod B & C immediately evict key "42" from their local Caffeine L1 caches!
+  </div>
+
+  <h2>3. Production Dual Multi-Tier Cache Manager</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Multi-Tier Caching Service</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.ecommerce.cache;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import java.time.Duration;
+
+@Service
+public class MultiTierCacheService {
+
+    // L1: In-process Caffeine Cache
+    private final Cache&lt;String, String&gt; l1Cache = Caffeine.newBuilder()
+        .maximumSize(10_000)
+        .expireAfterWrite(Duration.ofMinutes(5))
+        .build();
+
+    private final StringRedisTemplate redis;
+
+    public MultiTierCacheService(StringRedisTemplate redis) {
+        this.redis = redis;
+    }
+
+    public String get(String key) {
+        // 1. Check L1 Caffeine (sub-microsecond)
+        String value = l1Cache.getIfPresent(key);
+        if (value != null) return value;
+
+        // 2. Check L2 Redis (~1ms)
+        value = redis.opsForValue().get(key);
+        if (value != null) {
+            l1Cache.put(key, value); // Populate L1
+            return value;
+        }
+
+        return null; // L3 DB miss handled by caller
+    }
+
+    public void evict(String key) {
+        l1Cache.invalidate(key);
+        redis.delete(key);
+        redis.convertAndSend("cache:evict", key); // Notify peer pods!
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.ecommerce.cache
+
+import com.github.benmanes.caffeine.cache.Cache
+import com.github.benmanes.caffeine.cache.Caffeine
+import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.stereotype.Service
+import java.time.Duration
+
+@Service
+class MultiTierCacheService(
+    private val redis: StringRedisTemplate
+) {
+    // L1: In-process Caffeine Cache
+    private final val l1Cache: Cache&lt;String, String&gt; = Caffeine.newBuilder()
+        .maximumSize(10_000)
+        .expireAfterWrite(Duration.ofMinutes(5))
+        .build()
+
+    fun get(key: String): String? {
+        // 1. Check L1 Caffeine
+        l1Cache.getIfPresent(key)?.let { return it }
+
+        // 2. Check L2 Redis
+        val redisVal = redis.opsForValue().get(key)
+        if (redisVal != null) {
+            l1Cache.put(key, redisVal)
+            return redisVal
+        }
+
+        return null
+    }
+
+    fun evict(key: String) {
+        l1Cache.invalidate(key)
+        redis.delete(key)
+        redis.convertAndSend("cache:evict", key)
+    }
+}</code></pre>
+    </div>
+  </div>
+
+
+  <!-- Active Recall Code Quizzes -->
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis. Review each distractor to build durable failure-mode recognition!
+  </p>
+  
+      <div class="quiz-card" id="q0021_1" data-explanation="Even though Redis is fast, high-volume reads (100k+ req/sec) consume network bandwidth and CPU cycles on JSON serialization. An in-memory L1 cache (Caffeine) serves requests in under 100 nanoseconds directly from JVM memory.">
+        <span class="quiz-badge">Quiz 1 of 3</span>
+        <div class="quiz-prompt">What is the primary motivation for adding an L1 Caffeine cache in front of Redis?</div>
+        <div class="quiz-code-snippet"><pre><code>L1: Caffeine (In-Memory Heap) -&gt; L2: Redis (Network In-Memory) -&gt; L3: PostgreSQL</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Caffeine reads direct JVM memory references in nanoseconds, eliminating TCP socket roundtrips and JSON byte parsing on every read.">
+            To eliminate TCP network latency and serialization overhead for ultra-hot read traffic
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Caffeine is a standard Java library; it does not disable garbage collection.">
+            To permanently disable garbage collection across the entire JVM heap
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="L1 caching is internal to the server; it does not expose direct client access to databases.">
+            To allow client Android phones to write directly to PostgreSQL without authentication
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Caching data structures has nothing to do with building Docker images.">
+            To convert relational SQL tables into binary Docker images
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0021_2" data-explanation="Redis Pub/Sub is lightweight and fast. When any node updates or deletes a key, it broadcasts a message (e.g. `cache:evict:products:42`), prompting all active pods to invalidate their local Caffeine entry.">
+        <span class="quiz-badge">Quiz 2 of 3</span>
+        <div class="quiz-prompt">How do multiple backend instances synchronize L1 cache invalidations when data updates?</div>
+        <div class="quiz-code-snippet"><pre><code>// Pod A updates data:
+// How do Pod B and Pod C invalidate their local Caffeine caches?</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="When a mutation occurs on one node, publishing a message to a shared topic triggers all peer nodes to evict their local L1 entries.">
+            By publishing an invalidation event over Redis Pub/Sub or Kafka that peer pods listen to
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Rebooting containers causes severe service disruption and downtime.">
+            By rebooting all container pods in the Kubernetes cluster simultaneously
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Client polling does not synchronize server-side peer caches and drains mobile batteries.">
+            By forcing Android client devices to poll the server every five milliseconds
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Disabling network cards disconnects machines from the network.">
+            By disabling the Linux kernel network card on peer server machines
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0021_3" data-explanation="Caffeine uses the Window TinyLFU eviction algorithm, which uses a frequency sketch to admit new keys only if they are more likely to be accessed than existing keys, dramatically outperforming traditional LRU.">
+        <span class="quiz-badge">Quiz 3 of 3</span>
+        <div class="quiz-prompt">What eviction algorithm does Caffeine use to maximize cache hit rates?</div>
+        <div class="quiz-code-snippet"><pre><code>Caffeine.newBuilder().maximumSize(10000).build();</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Window TinyLFU prevents one-hit wonders from polluting the cache and outperforms standard LRU and LFU.">
+            Window TinyLFU (combining recency and frequency to achieve near-optimal hit ratios)
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Random deletion produces poor hit ratios.">
+            Random deletion of fifty percent of keys upon reaching memory limits
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Variable names have no relevance to cache eviction policies.">
+            Alphabetical sorting by variable name in reverse order
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="FIFO performs poorly for caching compared to W-TinyLFU.">
+            First-In First-Out (FIFO) queue eviction exclusively
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+  <!-- Interactive Code Practice Lab -->
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Write and test your solution in either <strong>Java 21</strong> or <strong>Kotlin 2.x</strong>. The automated test runner executes multiple assertions in your browser with zero setup.
+  </p>
+
+  <div class="practice-container" 
+       data-practice-id="lesson-0021-lab"
+       data-starter-java="package com.example.cache;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+public class MultiTierReader {
+    public static String getWithFallback(Cache&lt;String, String&gt; l1, StringRedisTemplate redis, String key) {
+        // TODO: Read L1, fallback to L2 Redis and populate L1
+        return null;
+    }
+}"
+       data-starter-kotlin="package com.example.cache
+
+import com.github.benmanes.caffeine.cache.Cache
+import org.springframework.data.redis.core.StringRedisTemplate
+
+object MultiTierReader {
+    fun getWithFallback(l1: Cache&lt;String, String&gt;, redis: StringRedisTemplate, key: String): String? {
+        // TODO: Read L1, fallback to L2 Redis and populate L1
+        return null
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0021</span>
+        <span class="practice-title">Build Multi-Tier Cache Reader</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0021-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      
+<p><strong>Goal:</strong> Implement <code>getWithFallback(Cache&lt;String, String&gt; l1, StringRedisTemplate redis, String key)</code>:</p>
+<ul style="margin-left: 20px; line-height: 1.7;">
+  <li>Check <code>l1.getIfPresent(key)</code>; if non-null, return it</li>
+  <li>Else, check <code>redis.opsForValue().get(key)</code></li>
+  <li>If Redis value is non-null, populate <code>l1.put(key, val)</code> and return it</li>
+  <li>Otherwise, return <code>null</code></li>
+</ul>
+
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.cache;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+public class MultiTierReader {
+    public static String getWithFallback(Cache&lt;String, String&gt; l1, StringRedisTemplate redis, String key) {
+        // TODO: Read L1, fallback to L2 Redis and populate L1
+        return null;
+    }
+}</textarea>
+    </div>
+
+    <!-- Progressive Hints Drawer -->
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Architectural Nudge</div>
+        <div>Call l1.getIfPresent(key). If not null, return it.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Syntax Signature</div>
+        <div>Call redis.opsForValue().get(key). If not null, call l1.put(key, val) and return it.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Concrete Snippet</div>
+        <div><code>String val = l1.getIfPresent(key); if (val != null) return val; val = redis.opsForValue().get(key); if (val != null) { l1.put(key, val); return val; } return null;</code></div>
+      </div>
+    </div>
+
+    <!-- Final Solution Drawer -->
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.cache;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+public class MultiTierReader {
+    public static String getWithFallback(Cache&lt;String, String&gt; l1, StringRedisTemplate redis, String key) {
+        String val = l1.getIfPresent(key);
+        if (val != null) return val;
+
+        val = redis.opsForValue().get(key);
+        if (val != null) {
+            l1.put(key, val);
+            return val;
+        }
+        return null;
+    }
+}</code></pre>
+      
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.example.cache
+
+import com.github.benmanes.caffeine.cache.Cache
+import org.springframework.data.redis.core.StringRedisTemplate
+
+object MultiTierReader {
+    fun getWithFallback(l1: Cache&lt;String, String&gt;, redis: StringRedisTemplate, key: String): String? {
+        l1.getIfPresent(key)?.let { return it }
+        val redisVal = redis.opsForValue().get(key)
+        if (redisVal != null) {
+            l1.put(key, redisVal)
+            return redisVal
+        }
+        return null
+    }
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">L1 Caffeine avoids network hops for hot keys, while L2 Redis acts as the shared cluster source of truth before hitting PostgreSQL.</p>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run & Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <!-- Terminal Test Output Console -->
+    <div class="test-console"></div>
+  </div>
+
+  <!-- Teacher Agent Probing Questions -->
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"How can an engineer use probabilistic early expiration (XFetch algorithm) to recompute cache keys in the background before they expire?"</em>. I am here to explore every trade-off with you.
+    </p>
+  </div>
+
+  <!-- Lesson Navigation Footer -->
+  <div class="lesson-nav">
+    <a href="0020-distributed-idempotency-with-redis.html" class="btn btn-secondary">← Previous: Lesson 0020</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0022-distributed-rate-limiting-redis-bucket4j.html" class="btn btn-primary">Next: Lesson 0022 →</a>
+  </div>
+
+  <!-- Site Footer -->
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0021</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0021-lab'] = function(code, lang) {
+  const tests = [];
+  const hasL1Get = /getIfPresent/.test(code);
+  tests.push({ name: "Checks L1 getIfPresent", passed: hasL1Get, error: "Must check l1.getIfPresent(key)." });
+
+  const hasRedisGet = /opsForValue\s*\(\s*\)\.get/.test(code);
+  tests.push({ name: "Fallbacks to Redis", passed: hasRedisGet, error: "Must query redis.opsForValue().get(key)." });
+
+  const hasL1Put = /l1\s*\.?\s*put\s*\(/.test(code);
+  tests.push({ name: "Populates L1 on Redis Hit", passed: hasL1Put, error: "Must call l1.put(key, val) when found in Redis." });
+
+  return tests;
+};
+
+</script>
+</body>
+</html>

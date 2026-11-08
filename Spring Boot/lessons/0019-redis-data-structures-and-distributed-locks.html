@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0019: Redis Data Structures &amp; Distributed Locks (Redlock vs Fencing Tokens)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Phase 5: In-Memory & Redis</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Title & Metadata -->
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0019 • Phase 5</span>
+    <h1 style="margin-top: 8px;">Redis Data Structures & Distributed Locks (Redlock vs Fencing Tokens)</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Understand why Java's synchronized keyword fails in the cloud. Master Redis atomic operations (SETNX), distributed locks with Redisson, and the critical Martin Kleppmann fencing token caveat.
+    </p>
+  </div>
+
+  <!-- Primary Source -->
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authority: <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Martin Kleppmann: How to do distributed locking</a>. Ground your learning in primary architecture rather than secondary summaries.
+    </p>
+  </div>
+
+  <!-- Main Concept & Code Examples -->
+  
+  <h2>1. Why Java `synchronized` Fails in Cloud Microservices</h2>
+  <p>
+    On a single Android phone or single JVM, <code>synchronized</code> or <code>ReentrantLock</code> prevents race conditions.
+  </p>
+  <p>
+    In cloud backends, you run <strong>multiple container pods</strong> (e.g. 5 pods in AWS ECS or Kubernetes behind an Application Load Balancer):
+  </p>
+  <div style="background:#090d13; border:1px solid var(--border-color); border-radius:var(--radius-sm); padding:16px; font-family:var(--font-mono); font-size:13px; color:#ff7b72; margin:16px 0;">
+Pod #1 (Instance A) ──► synchronized(lock) { executes checkout }
+Pod #2 (Instance B) ──► synchronized(lock) { ALSO executes checkout! RACE CONDITION! }
+  </div>
+  <p>JVM locks only exist in the RAM of <strong>one single operating system process</strong>! Instance B has no idea Instance A is holding a lock.</p>
+
+  <h2>2. Distributed Locks with Redisson</h2>
+  <p>
+    Because all 5 server instances connect to the <strong>same shared Redis cluster</strong>, we coordinate locks centrally using atomic <code>SETNX</code> operations via Redisson:
+  </p>
+
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Distributed Lock with Redisson</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.ecommerce.inventory;
+
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.springframework.stereotype.Service;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class FlashSaleService {
+
+    private final RedissonClient redisson;
+
+    public FlashSaleService(RedissonClient redisson) {
+        this.redisson = redisson;
+    }
+
+    public void purchaseLimitedItem(String itemId, String userId) {
+        RLock lock = redisson.getLock("lock:item:" + itemId);
+
+        try {
+            // Wait up to 2 seconds to acquire; hold lock for at most 5 seconds
+            boolean acquired = lock.tryLock(2, 5, TimeUnit.SECONDS);
+            if (!acquired) {
+                throw new IllegalStateException("High traffic! Please retry.");
+            }
+
+            try {
+                // CRITICAL SECTION: Execute sensitive inventory deduction
+                System.out.println("Processing purchase for item: " + itemId);
+            } finally {
+                // Always unlock inside inner finally block!
+                if (lock.isHeldByCurrentThread()) {
+                    lock.unlock();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.ecommerce.inventory
+
+import org.redisson.api.RedissonClient
+import org.springframework.stereotype.Service
+import java.util.concurrent.TimeUnit
+
+@Service
+class FlashSaleService(
+    private val redisson: RedissonClient
+) {
+    fun purchaseLimitedItem(itemId: String, userId: String) {
+        val lock = redisson.getLock("lock:item:$itemId")
+
+        val acquired = lock.tryLock(2, 5, TimeUnit.SECONDS)
+        if (!acquired) {
+            throw IllegalStateException("High traffic! Please retry.")
+        }
+
+        try {
+            // CRITICAL SECTION: Execute inventory deduction
+            println("Processing purchase for item: $itemId")
+        } finally {
+            if (lock.isHeldByCurrentThread) {
+                lock.unlock()
+            }
+        }
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>3. The Martin Kleppmann Critique: Why Fencing Tokens Matter</h2>
+  <div class="callout warning">
+    <div class="callout-title">🧠 Senior Distributed Systems Insight: Lock Lease Expiration</div>
+    <p style="margin-bottom: 0;">
+      What happens if Instance A acquires the lock for 5 seconds, but encounters a 6-second GC pause or network stall?
+      <strong>The Redis lock expires while Instance A is frozen!</strong> Instance B acquires the lock. Instance A unfreezes and both write to the DB simultaneously!
+      <strong>The Solution:</strong> In addition to distributed locks, use <strong>Fencing Tokens (monotonic version numbers)</strong> or database-level constraints (optimistic locking) to reject out-of-order writes at the storage layer!
+    </p>
+  </div>
+
+
+  <!-- Active Recall Code Quizzes -->
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis. Review each distractor to build durable failure-mode recognition!
+  </p>
+  
+      <div class="quiz-card" id="q0019_1" data-explanation="In microservice architectures, incoming requests are load-balanced across multiple nodes. Single-process locking primitives (`synchronized`, `ReentrantLock`) do not coordinate across machines, requiring a centralized coordinator like Redis.">
+        <span class="quiz-badge">Quiz 1 of 3</span>
+        <div class="quiz-prompt">Why is Java's `synchronized` block insufficient for race-condition defense across cloud deployments?</div>
+        <div class="quiz-code-snippet"><pre><code>@Service
+public class InventoryService {
+    public synchronized void decrementStock() { ... } // 5 pods in AWS!
+}</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Each Docker container is an independent JVM operating in separate memory space. synchronized has zero cross-process visibility.">
+            synchronized only locks threads inside one JVM process; other container pods cannot see it
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="JVM language keywords have no control over PostgreSQL server processes.">
+            synchronized causes PostgreSQL to shut down its transaction write log
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="It synchronizes local execution; it does not drop network traffic.">
+            synchronized drops all incoming HTTP traffic arriving from mobile devices
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="synchronized is fully valid Java, but intended strictly for single-process concurrency.">
+            synchronized is deprecated in Java 21 and removed from modern bytecode
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0019_2" data-explanation="In distributed systems, physical time is untrusted (due to GC pauses, thread descheduling, network delays). A lock with a lease time can expire while the holder is paused. True safety requires fencing tokens verified at the storage tier.">
+        <span class="quiz-badge">Quiz 2 of 3</span>
+        <div class="quiz-prompt">What issue does Martin Kleppmann identify regarding distributed lock lease timeouts?</div>
+        <div class="quiz-code-snippet"><pre><code>// Instance A acquires lock with 5-second lease:
+// Instance A suffers 10-second GC freeze or network partition...</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="If an instance is paused longer than the lease time, another instance acquires the lock. When the first instance wakes up, both think they hold the lock.">
+            The lock expires during the pause, allowing another instance to acquire it and cause a dual-write
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="GC pauses do not reboot Linux operating system kernels.">
+            The JVM automatically restarts the operating system kernel
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Redis only expires the lock key; it never deletes database tables.">
+            Redis deletes all user database records from persistent disk storage
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Tomcat response statuses are not altered by Redis lease expirations.">
+            Tomcat converts all future REST calls to return 204 No Content
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0019_3" data-explanation="If the lock acquisition timed out or if the lock&#x27;s lease expired before the `finally` block executes, calling `unlock()` unconditionally will throw an `IllegalMonitorStateException`. Checking `isHeldByCurrentThread()` ensures safe cleanup.">
+        <span class="quiz-badge">Quiz 3 of 3</span>
+        <div class="quiz-prompt">Why should `lock.unlock()` always be guarded with `if (lock.isHeldByCurrentThread())`?</div>
+        <div class="quiz-code-snippet"><pre><code>finally {
+    if (lock.isHeldByCurrentThread()) { // Why check this?
+        lock.unlock();
+    }
+}</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Attempting to release a lock that expired or is held by another thread will throw an exception.">
+            To prevent throwing an IllegalMonitorStateException if the lease expired or lock was not acquired
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Lock checks are server-internal and invisible to mobile clients.">
+            To notify the Android client that the HTTP transaction completed
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Jackson serialization is completely unrelated to distributed locking.">
+            To force Jackson to re-serialize the response payload into JSON
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Unlocking releases only the specific lock key.">
+            To clear all Redis cache keys across the entire data center
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+  <!-- Interactive Code Practice Lab -->
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Write and test your solution in either <strong>Java 21</strong> or <strong>Kotlin 2.x</strong>. The automated test runner executes multiple assertions in your browser with zero setup.
+  </p>
+
+  <div class="practice-container" 
+       data-practice-id="lesson-0019-lab"
+       data-starter-java="package com.example.lock;
+
+import org.redisson.api.RLock;
+
+public class LockHelper {
+    public static void safeUnlock(RLock lock) {
+        // TODO: Release lock only if held by current thread
+    }
+}"
+       data-starter-kotlin="package com.example.lock
+
+import org.redisson.api.RLock
+
+object LockHelper {
+    fun safeUnlock(lock: RLock?) {
+        // TODO: Release lock only if held by current thread
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0019</span>
+        <span class="practice-title">Safe Redisson Lock Releaser</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0019-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      
+<p><strong>Goal:</strong> Implement <code>safeUnlock(RLock lock)</code>:</p>
+<ul style="margin-left: 20px; line-height: 1.7;">
+  <li>Check if <code>lock != null</code> and <code>lock.isHeldByCurrentThread()</code></li>
+  <li>If true, call <code>lock.unlock()</code></li>
+</ul>
+
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.lock;
+
+import org.redisson.api.RLock;
+
+public class LockHelper {
+    public static void safeUnlock(RLock lock) {
+        // TODO: Release lock only if held by current thread
+    }
+}</textarea>
+    </div>
+
+    <!-- Progressive Hints Drawer -->
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Architectural Nudge</div>
+        <div>Check if lock is non-null.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Syntax Signature</div>
+        <div>Check lock.isHeldByCurrentThread() before calling unlock().</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Concrete Snippet</div>
+        <div><code>if (lock != null &amp;&amp; lock.isHeldByCurrentThread()) { lock.unlock(); }</code></div>
+      </div>
+    </div>
+
+    <!-- Final Solution Drawer -->
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.lock;
+
+import org.redisson.api.RLock;
+
+public class LockHelper {
+    public static void safeUnlock(RLock lock) {
+        if (lock != null &amp;&amp; lock.isHeldByCurrentThread()) {
+            lock.unlock();
+        }
+    }
+}</code></pre>
+      
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.example.lock
+
+import org.redisson.api.RLock
+
+object LockHelper {
+    fun safeUnlock(lock: RLock?) {
+        if (lock != null &amp;&amp; lock.isHeldByCurrentThread) {
+            lock.unlock()
+        }
+    }
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Guarding unlock with isHeldByCurrentThread prevents crashing with IllegalMonitorStateException if the lease timed out while processing.</p>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run & Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <!-- Terminal Test Output Console -->
+    <div class="test-console"></div>
+  </div>
+
+  <!-- Teacher Agent Probing Questions -->
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"How does the Redisson Watchdog mechanism automatically extend lock lease times while a thread is still running?"</em>. I am here to explore every trade-off with you.
+    </p>
+  </div>
+
+  <!-- Lesson Navigation Footer -->
+  <div class="lesson-nav">
+    <a href="0018-redis-caching-and-spring-cache.html" class="btn btn-secondary">← Previous: Lesson 0018</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0020-distributed-idempotency-with-redis.html" class="btn btn-primary">Next: Lesson 0020 →</a>
+  </div>
+
+  <!-- Site Footer -->
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0019</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0019-lab'] = function(code, lang) {
+  const tests = [];
+  const hasNullCheck = /lock\s*!=\s*null|lock\?\./.test(code);
+  tests.push({ name: "Null Safety Guard", passed: hasNullCheck, error: "Must check lock != null." });
+
+  const hasHeldCheck = /isHeldByCurrentThread/.test(code);
+  tests.push({ name: "isHeldByCurrentThread Check", passed: hasHeldCheck, error: "Must verify lock.isHeldByCurrentThread()." });
+
+  const hasUnlock = /lock\s*\.?\s*unlock\s*\(/.test(code);
+  tests.push({ name: "Calls lock.unlock()", passed: hasUnlock, error: "Must call lock.unlock()." });
+
+  return tests;
+};
+
+</script>
+</body>
+</html>

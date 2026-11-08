@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0026: Resilient Event Pipelines: Retries, DLQs &amp; The Transactional Outbox</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Phase 7: Event-Driven Systems & Message Brokers</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Title & Metadata -->
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0026 • Phase 7</span>
+    <h1 style="margin-top: 8px;">Resilient Event Pipelines: Retries, DLQs & The Transactional Outbox</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Master the signature distributed systems pattern expected of Senior Backend Engineers. Permanently solve the dual-write problem with the Transactional Outbox Pattern and non-blocking retry pipelines.
+    </p>
+  </div>
+
+  <!-- Primary Source -->
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authority: <a href="https://microservices.io/patterns/data/transactional-outbox.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Chris Richardson: Microservices Pattern - Transactional Outbox</a>. Ground your learning in primary architecture rather than secondary summaries.
+    </p>
+  </div>
+
+  <!-- Main Concept & Code Examples -->
+  
+  <h2>1. The Dual-Write Trap: Why Direct Sending Fails</h2>
+  <div class="callout danger">
+    <div class="callout-title">⚠️ The Junior Dual-Write Trap</div>
+    <p style="margin-bottom: 0;">
+      Junior engineers write:
+      <code>orderRepo.save(order); kafkaTemplate.send("orders", event);</code>.
+      If the Kafka broker has a network blip, the DB committed but the event is permanently lost! If the server crashes after sending to Kafka but before the DB commits, a ghost event is published! You cannot execute an atomic transaction across a database and a message broker without two-phase commit overhead.
+    </p>
+  </div>
+
+  <h2>2. The Transactional Outbox Architecture</h2>
+  <p>
+    Instead of publishing directly to Kafka during the HTTP request, write the event into an <code>outbox</code> table in the <strong>same PostgreSQL transaction</strong>:
+  </p>
+  <div style="background:#090d13; border:1px solid var(--border-color); border-radius:var(--radius-sm); padding:16px; font-family:var(--font-mono); font-size:13px; color:#7ee787; margin:16px 0;">
+@Transactional
+public void createOrder(Order order) {
+    1. orderRepository.save(order);
+    2. outboxRepository.save(new OutboxEvent("orders.v1", order.getId(), jsonPayload));
+} // ACID COMMIT: BOTH succeed, or BOTH rollback. Data loss is impossible!
+  </div>
+  <p>A background worker (or Debezium CDC) polls unexported records, publishes them to Kafka, and marks them sent.</p>
+
+  <h2>3. Non-Blocking Retries & Dead Letter Queue (DLQ)</h2>
+  <p>
+    Spring Kafka 3.0+ introduces <strong><code>@RetryableTopic</code></strong>. If a consumer fails, messages are sent to non-blocking retry topics (e.g. <code>orders.v1-retry-1000</code>, <code>orders.v1-retry-2000</code>). 
+    After max attempts, it routes to a Dead Letter Queue (<code>orders.v1-dlt</code>), preventing pipeline stalls!
+  </p>
+
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Outbox Atomic Write & Non-Blocking Retry</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.ecommerce.order;
+
+import org.springframework.kafka.annotation.*;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OrderEventService {
+
+    private final OrderRepository orderRepo;
+    private final OutboxRepository outboxRepo;
+
+    public OrderEventService(OrderRepository orderRepo, OutboxRepository outboxRepo) {
+        this.orderRepo = orderRepo;
+        this.outboxRepo = outboxRepo;
+    }
+
+    // 1. Transactional Outbox atomic write:
+    @Transactional
+    public void placeOrder(OrderEntity order, String eventJson) {
+        orderRepo.save(order);
+        outboxRepo.save(new OutboxEntity("orders.v1", order.getId(), eventJson));
+    }
+
+    // 2. Non-blocking consumer with automated exponential backoff and DLQ:
+    @RetryableTopic(
+        attempts = "3",
+        backoff = @Backoff(delay = 1000, multiplier = 2.0)
+    )
+    @KafkaListener(topics = "orders.v1", groupId = "fulfillment-service")
+    public void handleOrderEvent(String orderJson) {
+        System.out.println("Processing fulfillment: " + orderJson);
+    }
+
+    @DltHandler
+    public void handlePoisonPill(String orderJson) {
+        System.err.println("ALERT: Poison message routed to DLQ! " + orderJson);
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.ecommerce.order
+
+import org.springframework.kafka.annotation.*
+import org.springframework.retry.annotation.Backoff
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
+
+@Service
+class OrderEventService(
+    private val orderRepo: OrderRepository,
+    private val outboxRepo: OutboxRepository
+) {
+    @Transactional
+    fun placeOrder(order: OrderEntity, eventJson: String) {
+        orderRepo.save(order)
+        outboxRepo.save(OutboxEntity("orders.v1", order.id!!, eventJson))
+    }
+
+    @RetryableTopic(
+        attempts = "3",
+        backoff = Backoff(delay = 1000.0, multiplier = 2.0)
+    )
+    @KafkaListener(topics = ["orders.v1"], groupId = "fulfillment-service")
+    fun handleOrderEvent(orderJson: String) {
+        println("Processing fulfillment: $orderJson")
+    }
+
+    @DltHandler
+    fun handlePoisonPill(orderJson: String) {
+        System.err.println("ALERT: Poison message routed to DLQ! $orderJson")
+    }
+}</code></pre>
+    </div>
+  </div>
+
+
+  <!-- Active Recall Code Quizzes -->
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis. Review each distractor to build durable failure-mode recognition!
+  </p>
+  
+      <div class="quiz-card" id="q0026_1" data-explanation="Because the business entity and the outbox event table reside in the same relational database, they are updated in a single ACID transaction. Either both succeed or both roll back, making data inconsistency impossible.">
+        <span class="quiz-badge">Quiz 1 of 3</span>
+        <div class="quiz-prompt">How does the Transactional Outbox pattern mathematically eliminate the dual-write problem?</div>
+        <div class="quiz-code-snippet"><pre><code>@Transactional
+public void saveOrder(Order o) {
+    orderRepo.save(o);
+    outboxRepo.save(new OutboxEvent(&quot;orders&quot;, o.getId(), json));
+}</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Both records commit or rollback together atomically, guaranteeing no ghost events or lost messages.">
+            By saving business state and the event in the same relational database ACID transaction
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Kafka does not manage PostgreSQL disk storage.">
+            By forcing Apache Kafka to manage PostgreSQL disk blocks directly
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="The pattern guarantees delivery, not deletion.">
+            By deleting all unconsumed messages from the broker queue automatically
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Outbox handles server-side messaging reliability without client involvement.">
+            By requiring client Android devices to retry failed calls every second
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0026_2" data-explanation="Sleeping in a consumer halts partition processing. Non-blocking retries publish the failed event to a separate retry topic and commit the offset, allowing subsequent messages in the main topic to continue processing immediately.">
+        <span class="quiz-badge">Quiz 2 of 3</span>
+        <div class="quiz-prompt">Why are non-blocking retries (@RetryableTopic) superior to sleeping inside a standard @KafkaListener?</div>
+        <div class="quiz-code-snippet"><pre><code>// ❌ Blocking retry: Thread.sleep(5000); // What is the fatal flaw?</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Kafka partitions are single-threaded per consumer. Sleeping freezes all subsequent messages in that partition.">
+            Sleeping in a listener blocks the entire partition, stalling all other customer events behind it
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Thread sleep does not disable hardware network interfaces.">
+            Sleeping causes the operating system to shut down its network card
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Kafka listener execution is decoupled from HTTP sessions.">
+            Sleeping invalidates all active user session cookies in Tomcat
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Thread sleeping has no effect on broker architectures.">
+            Sleeping converts the Kafka broker into a Redis cache cluster
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0026_3" data-explanation="A Dead Letter Queue isolates messages that fail repeatedly (e.g., corrupted JSON or invalid data), preventing infinite retry loops and allowing engineers to inspect the failed payloads.">
+        <span class="quiz-badge">Quiz 3 of 3</span>
+        <div class="quiz-prompt">What is the purpose of a Dead Letter Queue (DLQ / DLT)?</div>
+        <div class="quiz-code-snippet"><pre><code>@DltHandler
+public void handlePoisonPill(String payload) { ... }</code></pre></div>
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Corrupted or unparseable messages are moved to the DLT for inspection, letting healthy traffic proceed.">
+            To isolate unprocessable &#x27;poison pill&#x27; messages so they don&#x27;t block the pipeline, alerting engineers
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="DLQ is an enterprise backend dead-lettering concept.">
+            To format client mobile notifications in Android NotificationManager
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="DLQ is an asynchronous broker topic, not a database accelerator.">
+            To accelerate database query execution on read-replicas
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="DLQ has no effect on Redis cache keys.">
+            To clear all Redis cache keys across the cluster
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+  <!-- Interactive Code Practice Lab -->
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Write and test your solution in either <strong>Java 21</strong> or <strong>Kotlin 2.x</strong>. The automated test runner executes multiple assertions in your browser with zero setup.
+  </p>
+
+  <div class="practice-container" 
+       data-practice-id="lesson-0026-lab"
+       data-starter-java="package com.example.outbox;
+
+import org.springframework.transaction.annotation.Transactional;
+
+public class OutboxManager {
+
+    // TODO: Add @Transactional and save order + outbox event
+    public void executeOutboxTx(OrderDao orderDao, OutboxDao outboxDao, String order, String topic, String orderId, String payload) {
+    }
+}"
+       data-starter-kotlin="package com.example.outbox
+
+import org.springframework.transaction.annotation.Transactional
+
+class OutboxManager {
+
+    // TODO: Add @Transactional and save order + outbox event
+    fun executeOutboxTx(orderDao: OrderDao, outboxDao: OutboxDao, order: String, topic: String, orderId: String, payload: String) {
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0026</span>
+        <span class="practice-title">Atomic Outbox Demarcation</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0026-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      
+<p><strong>Goal:</strong> Complete <code>executeOutboxTx</code> with atomic transaction semantics:</p>
+<ul style="margin-left: 20px; line-height: 1.7;">
+  <li>Annotate method with <code>@Transactional</code></li>
+  <li>Save order: <code>orderDao.save(order)</code></li>
+  <li>Save outbox event: <code>outboxDao.save(new OutboxEvent(topic, orderId, payload))</code></li>
+</ul>
+
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.outbox;
+
+import org.springframework.transaction.annotation.Transactional;
+
+public class OutboxManager {
+
+    // TODO: Add @Transactional and save order + outbox event
+    public void executeOutboxTx(OrderDao orderDao, OutboxDao outboxDao, String order, String topic, String orderId, String payload) {
+    }
+}</textarea>
+    </div>
+
+    <!-- Progressive Hints Drawer -->
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Architectural Nudge</div>
+        <div>Annotate executeOutboxTx with @Transactional.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Syntax Signature</div>
+        <div>Call orderDao.save(order) and outboxDao.save(new OutboxEvent(topic, orderId, payload)).</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Concrete Snippet</div>
+        <div><code>@Transactional public void executeOutboxTx(...) { orderDao.save(order); outboxDao.save(new OutboxEvent(topic, orderId, payload)); }</code></div>
+      </div>
+    </div>
+
+    <!-- Final Solution Drawer -->
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.outbox;
+
+import org.springframework.transaction.annotation.Transactional;
+
+public class OutboxManager {
+
+    @Transactional
+    public void executeOutboxTx(OrderDao orderDao, OutboxDao outboxDao, String order, String topic, String orderId, String payload) {
+        orderDao.save(order);
+        outboxDao.save(new OutboxEvent(topic, orderId, payload));
+    }
+}</code></pre>
+      
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.example.outbox
+
+import org.springframework.transaction.annotation.Transactional
+
+class OutboxManager {
+
+    @Transactional
+    fun executeOutboxTx(orderDao: OrderDao, outboxDao: OutboxDao, order: String, topic: String, orderId: String, payload: String) {
+        orderDao.save(order)
+        outboxDao.save(OutboxEvent(topic, orderId, payload))
+    }
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Committing both the domain entity and the outbox event in the same ACID transaction eliminates distributed data loss permanently.</p>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run & Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <!-- Terminal Test Output Console -->
+    <div class="test-console"></div>
+  </div>
+
+  <!-- Teacher Agent Probing Questions -->
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"How does Debezium Change Data Capture (CDC) read the PostgreSQL Write-Ahead Log (WAL) to export outbox events to Kafka without polling overhead?"</em>. I am here to explore every trade-off with you.
+    </p>
+  </div>
+
+  <!-- Lesson Navigation Footer -->
+  <div class="lesson-nav">
+    <a href="0025-spring-kafka-producers-consumers-partitions.html" class="btn btn-secondary">← Previous: Lesson 0025</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0027-kafka-schema-registry-and-exactly-once.html" class="btn btn-primary">Next: Lesson 0027 →</a>
+  </div>
+
+  <!-- Site Footer -->
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0026</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0026-lab'] = function(code, lang) {
+  const tests = [];
+  const hasTx = /@Transactional/.test(code);
+  tests.push({ name: "@Transactional on method", passed: hasTx, error: "Must annotate with @Transactional." });
+
+  const hasOrderSave = /orderDao\s*\.?\s*save\s*\(\s*order\s*\)/.test(code);
+  tests.push({ name: "Calls orderDao.save(order)", passed: hasOrderSave, error: "Must call orderDao.save(order)." });
+
+  const hasOutboxSave = /outboxDao\s*\.?\s*save\s*\(/.test(code);
+  tests.push({ name: "Calls outboxDao.save(new OutboxEvent(...))", passed: hasOutboxSave, error: "Must call outboxDao.save(new OutboxEvent(...))." });
+
+  return tests;
+};
+
+</script>
+</body>
+</html>

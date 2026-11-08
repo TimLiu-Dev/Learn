@@ -148,20 +148,20 @@ ROWS = [
 SPEC = {"columns": ["You built (Shelf)", "Spring Boot 4.1 (docs, not run)", "Android"], "rows": ROWS}
 
 
-PHASES = [  # (number, name, first lesson, last lesson, reference sheets)
-    (1, "Foundations Sprint", 1, 3, ["cli-git-cheatsheet", "kotlin-java-basics"]),
-    (2, "Memory, Part 1: Where Things Live", 4, 5, ["memory-and-equality"]),
-    (3, "Objects & Types", 6, 9, ["classes-and-types"]),
-    (4, "Errors, Testing & Debugging", 10, 12, ["errors-testing-debugging"]),
-    (5, "Generics & Functional Style", 13, 15, ["generics-and-functions"]),
-    (6, "Data Structures & Algorithms", 16, 21, ["data-structures-and-algorithms"]),
-    (7, "How the Machine Runs Your Code", 22, 25, ["runtime-and-os"]),
-    (8, "Concurrency", 26, 29, ["concurrency"]),
-    (9, "Networks & the Web", 30, 33, ["networks-and-web"]),
-    (10, "Databases", 34, 36, ["databases"]),
-    (11, "Design & Clean Code", 37, 40, ["design-and-clean-code"]),
-    (12, "System Design & Caching", 41, 44, ["system-design"]),
-    (13, "Capstone: No-Framework REST API", 45, 47, ["capstone"]),
+PHASES = [  # (number, name, lessons in study order, reference sheets); v5 lessons L48–L57 slot in by study order
+    (1, "Foundations Sprint", [1, 2, 3], ["cli-git-cheatsheet", "kotlin-java-basics"]),
+    (2, "Memory, Part 1: Where Things Live", [4, 5], ["memory-and-equality"]),
+    (3, "Objects & Types", [6, 7, 8, 9], ["classes-and-types"]),
+    (4, "Errors, Testing & Debugging", [10, 11, 12], ["errors-testing-debugging"]),
+    (5, "Generics & Functional Style", [13, 14, 15], ["generics-and-functions"]),
+    (6, "Data Structures & Algorithms", [48, 16, 17, 18, 19, 20, 21, 49, 50, 51], ["data-structures-and-algorithms", "maths-and-theory"]),
+    (7, "How the Machine Runs Your Code", [52, 22, 53, 23, 54, 24, 25], ["runtime-and-os", "shell"]),
+    (8, "Concurrency", [26, 27, 28, 29], ["concurrency"]),
+    (9, "Networks & the Web", [30, 31, 32, 33, 55], ["networks-and-web"]),
+    (10, "Databases", [34, 35, 36, 56], ["databases"]),
+    (11, "Design & Clean Code", [37, 38, 39, 40], ["design-and-clean-code"]),
+    (12, "System Design & Caching", [41, 42, 43, 57, 44], ["system-design"]),
+    (13, "Capstone: No-Framework REST API", [45, 46, 47], ["capstone"]),
 ]
 EXTRA = {  # lessons that may not exist yet when this lesson is built
     46: ("0046-make-it-production-shaped.html", "L46 · Make It Production-Shaped"),
@@ -188,18 +188,29 @@ def sheet_title(name):
 def phasemap():
     ls = lessons()
     rows = []
-    for num, name, a, b, sheets in PHASES:
-        links = " · ".join(f'<a href="{ls[n][0]}">{ls[n][1].split(" · ", 1)[0]}</a>' for n in range(a, b + 1))
+    for num, name, ns, sheets in PHASES:
+        links = " · ".join(f'<a href="{ls[n][0]}">{ls[n][1].split(" · ", 1)[0]}</a>' for n in ns)
         refs = " · ".join(f'<a href="../reference/{s}.html">{sheet_title(s)}</a>' for s in sheets)
         rows.append(f'  <tr><td class="pm-n">{num}</td><td><a href="../reference/roadmap.html#p{num}">{html.escape(name)}</a></td>'
                     f'<td class="pm-l">{links}</td><td>{refs}</td></tr>')
     return '<div class="table-scroll"><table class="phasemap">\n  <tr><th>#</th><th>Phase</th><th>Lessons</th><th>Reference sheet</th></tr>\n' + "\n".join(rows) + "\n</table></div>"
 
 
+def span(ns):
+    """[48, 16, 17, 18] -> 'L48, L16–L18': consecutive runs collapse to ranges."""
+    runs = [[ns[0]]]
+    for n in ns[1:]:
+        if n == runs[-1][-1] + 1:
+            runs[-1].append(n)
+        else:
+            runs.append([n])
+    return ", ".join(f"L{r[0]}" if len(r) == 1 else f"L{r[0]}–L{r[-1]}" for r in runs)
+
+
 def ratings():
     out = []
-    for num, name, a, b, _ in PHASES:
-        out.append(f'    <div class="rating" data-id="phase-{num}" data-label="Phase {num}: {html.escape(name)} (L{a}–L{b})">'
+    for num, name, ns, _ in PHASES:
+        out.append(f'    <div class="rating" data-id="phase-{num}" data-label="Phase {num}: {html.escape(name)} ({span(ns)})">'
                    f'<span class="who">P{num}</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>')
     return '<div class="rating-group">\n' + "\n".join(out) + "\n  </div>"
 

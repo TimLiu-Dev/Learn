@@ -1,0 +1,3 @@
+# Zone of Proximal Development: Calibrating Phase 0 Backend Foundations
+
+The learner disclosed that Lessons 0001 (IoC Container) and 0002 (Configuration Properties) felt overwhelming and incomprehensible because they assumed prior knowledge of server architecture, network sockets, port binding, and the HTTP request/response cycle. To meet the learner in their true zone of proximal development, we restructured Phase 0 into the curriculum: starting with physical server mechanics (what a server actually does, embedded Tomcat, ports, statelessness) and HTTP protocol fundamentals before introducing Spring framework abstractions. We also enhanced the pedagogical format to include multiple active recall quizzes and multi-stage code exercises per lesson.

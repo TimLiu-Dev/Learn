@@ -1,0 +1,2805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L56 · Storage Engines &amp; Other Data Models</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  .layers td:first-child { font-weight: 600; white-space: nowrap; }
+  .layers td { vertical-align: top; }
+  .layers td.y { color: var(--ok); font-weight: 600; }
+  .layers td.n { color: var(--accent); font-weight: 600; }
+</style>
+</head>
+<body data-lesson="l56">
+<main>
+
+<div class="kicker">Lesson 56 · Phase 10 Databases · <a href="../reference/roadmap.html#p10">roadmap</a></div>
+<h1>Storage Engines &amp; Other Data Models</h1>
+<p class="subtitle">L34–L36 used SQLite as a black box. This lesson opens the box. You'll build the two designs nearly every database storage engine descends from: a log with a hash index, and a log-structured merge tree. Then you'll kill them with <code>kill -9</code> to see what survives, measure what a durable write really costs, and finish with the data models that trade the relational table for documents, keys or graphs.</p>
+
+<div class="lesson-meta">
+  <span><b>~115–130 min</b> · warm-up + 4 parts + final</span>
+  <span>stop cleanly after any part</span>
+  <span id="resume"></span>
+</div>
+
+<div class="win">
+  <b>TODAY'S WIN</b>
+  You'll write, test-first, a key-value store that a <code>kill -9</code> in the middle of writing can't break: every write it acknowledged is still there afterwards, a half-written record is detected by its checksum and cut off, and compaction swaps files with one atomic rename. One of your tests launches a second JVM and kills it.
+</div>
+
+<ol class="toc">
+  <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · A log with a hash index</a><span class="t">25 min</span></li>
+  <li data-part="p2"><a href="#p2">2 · What survives which crash</a><span class="t">25 min</span></li>
+  <li data-part="p3"><a href="#p3">3 · LSM-trees, Bloom filters and B-trees</a><span class="t">25 min</span></li>
+  <li data-part="p4"><a href="#p4">4 · Documents, keys and graphs</a><span class="t">15 min</span></li>
+  <li data-part="p5"><a href="#p5">Final exercise: a store that survives kill -9</a><span class="t">25 min</span></li>
+  <li><a href="#wrap">Exit quiz, recall card, sources</a><span class="t">5 min</span></li>
+</ol>
+
+<p class="note">Work in <code>~/katas/l56/</code>. Every output on this page was captured from real runs on Kotlin 2.4 and JDK 26, on my machine (an Apple M5 Max, macOS, an internal SSD). Timings will differ on yours, and disk timings differ more than most: the ratios are the point. The SQLite programs need the <code>sqlite-jdbc</code> jar from L36 on the classpath. One section is marked <span class="deep-tag">Optional deep dive</span>: skip it if the sitting is running long.</p>
+
+<!-- ═════════════════════════ WARM-UP ═════════════════════════ -->
+<div class="part-label">Warm-up</div>
+<div class="part-head" id="warm"><h2>Recall from L19, L35, L36, L48 and L53</h2><span class="t">~10 min</span></div>
+<div class="warmup">
+  <div class="label">From memory: no peeking</div>
+  <ol>
+    <li>Sketch <code>MyHashMap.get</code> from L19. Why is it O(1) on average, and what has to be true of the hash function for that? (L19)</li>
+    <li>What does SQLite write <em>before</em> it changes a page of the database file, and why? (L36)</li>
+    <li>Why does a range query like <code>WHERE due BETWEEN … AND …</code> want a B-tree rather than a hash index? (L35)</li>
+    <li>Which of <code>SIGTERM</code> and <code>SIGKILL</code> lets a JVM run its shutdown hooks, and what exit code does each give? (L53)</li>
+  </ol>
+</div>
+<div class="quiz" data-id="w-1" data-group="Warm-up" data-answer="0">
+  <p class="q">Before SQLite changes a database page in its default mode, its rollback journal saves… (L36)</p>
+  <div class="opts"><button>The page's original content</button><button>Only the new rows</button><button>A hash per page</button><button>The SQL statement text</button></div>
+  <p class="why">"Prior to making any changes to the database file, SQLite first creates a separate rollback journal file and writes into the rollback journal the original content of the database pages that are to be altered" (<a href="https://www.sqlite.org/atomiccommit.html">SQLite: Atomic Commit</a>). After a crash, the old pages go back. Part 2 builds the same idea, all-or-nothing records, into a log.</p>
+</div>
+<div class="quiz" data-id="w-2" data-group="Warm-up" data-answer="2">
+  <p class="q">Why do databases default to B-tree indexes rather than hash tables? (L35)</p>
+  <div class="opts"><button>Hash tables cannot store strings</button><button>B-trees never need any rebalancing</button><button>Range queries walk sorted leaves</button><button>Hashing is slower than disk</button></div>
+  <p class="why">A hash sends neighbouring keys to unrelated buckets, so "everything between A and B" means checking every key. A B-tree keeps keys sorted and chains its leaves. Part 1's store has exactly this weakness, and Part 3 fixes it by sorting.</p>
+</div>
+<div class="quiz" data-id="w-3" data-group="Warm-up" data-answer="1">
+  <p class="q">A JVM receives <code>kill -9</code>. Its shutdown hooks… (L53)</p>
+  <div class="opts"><button>Run before it exits</button><button>Never run at all</button><button>Run only on Linux</button><button>Run after a delay</button></div>
+  <p class="why">SIGKILL can't be caught: the kernel ends the process with no warning, so nothing in the JVM runs and the exit code is 128 + 9 = 137. Whatever a storage engine hasn't handed to the operating system by then is gone. Part 2 measures exactly how much.</p>
+</div>
+<div class="quiz" data-id="w-4" data-group="Warm-up" data-answer="3">
+  <p class="q">Two independent checks each wrongly answer "yes" with probability 0.1. The chance that both do is… (L48)</p>
+  <div class="opts"><button><code>0.2</code></button><button><code>0.1</code></button><button><code>0.05</code></button><button><code>0.01</code></button></div>
+  <p class="why">Independent events multiply: 0.1 × 0.1 = 0.01. A Bloom filter (Part 3) is built on this: it checks <i>k</i> bits per key, and a false "yes" needs all <i>k</i> of them to be set by chance.</p>
+</div>
+
+<!-- ═════════════════════════ PART 1 ═════════════════════════ -->
+<div class="part-label">Part 1</div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>A log with a hash index</h2><span class="t">~25 min</span></div>
+
+<p>Here is a complete database, in the shell from L53. Writing appends a line; reading takes the <em>last</em> line for the key, because later lines overrule earlier ones:</p>
+<pre class="term"><span class="p">$ </span>echo 'dune,Herbert' &gt;&gt; db.txt
+<span class="p">$ </span>echo 'emma,Austen' &gt;&gt; db.txt
+<span class="p">$ </span>echo 'dune,Frank Herbert' &gt;&gt; db.txt
+<span class="p">$ </span>grep '^dune,' db.txt | tail -n 1
+dune,Frank Herbert
+<span class="p">$ </span>cat db.txt
+dune,Herbert
+emma,Austen
+dune,Frank Herbert</pre>
+<p>Writes are as fast as a file can grow: nothing is ever looked up or rewritten, just appended. But <code>grep</code> reads the whole file on every lookup, which is O(n) in the number of writes ever made (L16), and the file grows forever, because an overwrite leaves the old line behind. Every storage engine in this lesson is an answer to those two problems that keeps the fast append.</p>
+
+<h3>Bitcask: keep the log, add an index</h3>
+<p>The first answer is to keep a hash map in memory from each key to where its latest value sits in the file. That's the design of <dfn>Bitcask</dfn>, the storage engine Basho wrote for the Riak database. Its paper is six readable pages (<a href="https://riak.com/assets/bitcask-intro.pdf">Sheehy &amp; Smith, "Bitcask: A Log-Structured Hash Table for Fast Key/Value Data", 2010</a>):</p>
+<ul>
+  <li><b>Writes append.</b> "The active file is only written by appending, which means that sequential writes do not require disk seeking." A delete "is simply a write of a special tombstone value, which will be removed on the next merge."</li>
+  <li><b>An index in memory.</b> "After the append completes, an in-memory structure called a "keydir" is updated. A keydir is simply a hash table that maps every key in a Bitcask to a fixed-size structure giving the file, offset, and size of the most recently written entry for that key."</li>
+  <li><b>Reads seek once.</b> Reading "doesn't ever require more than a single disk seek. We look up the key in our keydir, and from there we read the data."</li>
+  <li><b>Merging removes garbage.</b> "The merge process iterates over all non-active (i.e. immutable) files in a Bitcask and produces as output a set of data files containing only the "live" or latest versions of each present key."</li>
+</ul>
+<p>The paper's figure shows each entry as <code>crc · tstamp · ksz · value_sz · key · value</code>: a checksum, a timestamp, the two lengths, then the bytes. Ours drops the timestamp:</p>
+<pre class="out">offset  0     4         8         12        12+keyLen
+        [crc ][keyLen  ][valLen  ][key bytes][value bytes]
+        CRC-32 of everything after it         valLen = -1 means "deleted" (a tombstone)</pre>
+<p>Fixed-size lengths in front let a reader find where each record ends without any separators, so keys and values can contain any bytes at all. The checksum is for Part 2. <code>java.util.zip.CRC32</code> is in the JDK: "A class that can be used to compute the CRC-32 of a data stream" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/zip/CRC32.html">CRC32</a>).</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LogKV.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardOpenOption.CREATE
+import java.nio.file.StandardOpenOption.READ
+import java.nio.file.StandardOpenOption.WRITE
+import java.util.zip.CRC32
+
+// Where a key's newest record lives in the file.
+data class Loc(val offset: Long, val size: Int)
+
+// A Bitcask-style store: an append-only log file plus an in-memory hash index.
+// Record layout: [crc 4][keyLen 4][valLen 4][key bytes][value bytes]; valLen = -1 is a tombstone.
+class LogKV(private val path: Path) : AutoCloseable {
+    private var ch: FileChannel = FileChannel.open(path, CREATE, READ, WRITE)
+    private val index = HashMap&lt;String, Loc&gt;()
+    var deadBytes = 0L
+        private set
+    val keys: Int get() = index.size
+    val fileSize: Long get() = ch.size()
+
+    init { recover() }
+
+    fun put(key: String, value: String) = append(key, value)
+    fun delete(key: String) { if (key in index) append(key, null) }
+
+    fun get(key: String): String? {
+        val loc = index[key] ?: return null
+        return readAt(loc.offset)?.second
+    }
+
+    fun indexSnapshot(): Map&lt;String, Loc&gt; = index.toSortedMap()
+
+    fun sync() = ch.force(false)
+
+    // Rewrite only the live records into a new file, then swap it in with one atomic rename.
+    fun compact() {
+        val tmp = path.resolveSibling("${path.fileName}.compact")
+        val fresh = HashMap&lt;String, Loc&gt;()
+        FileChannel.open(tmp, CREATE, WRITE).use { out -&gt;
+            var pos = 0L
+            for ((key, loc) in index) {
+                val buf = encode(key, readAt(loc.offset)!!.second)
+                val size = buf.remaining()
+                while (buf.hasRemaining()) out.write(buf)
+                fresh[key] = Loc(pos, size)
+                pos += size
+            }
+            out.force(true)
+        }
+        ch.close()
+        Files.move(tmp, path, ATOMIC_MOVE)
+        ch = FileChannel.open(path, READ, WRITE)
+        index.clear(); index.putAll(fresh)
+        deadBytes = 0
+    }
+
+    override fun close() = ch.close()
+
+    private fun append(key: String, value: String?) {
+        val buf = encode(key, value)
+        val offset = ch.size()
+        val size = buf.remaining()
+        var pos = offset
+        while (buf.hasRemaining()) pos += ch.write(buf, pos)
+        val old = if (value == null) index.remove(key) else index.put(key, Loc(offset, size))
+        if (old != null) deadBytes += old.size
+        if (value == null) deadBytes += size          // a tombstone is garbage once compacted away
+    }
+
+    // Scan the whole file and rebuild the index: Bitcask's startup. Stops at the first bad record.
+    private fun recover() {
+        var pos = 0L
+        while (true) {
+            val rec = readAt(pos) ?: break
+            val (key, value, size) = rec
+            val old = if (value == null) index.remove(key) else index.put(key, Loc(pos, size))
+            if (old != null) deadBytes += old.size
+            if (value == null) deadBytes += size
+            pos += size
+        }
+    }
+
+    // Returns (key, value or null for a tombstone, record size), or null if the record is missing or corrupt.
+    private fun readAt(pos: Long): Triple&lt;String, String?, Int&gt;? {
+        val header = ByteBuffer.allocate(HEADER)
+        if (ch.read(header, pos) &lt; HEADER) return null
+        header.flip()
+        val crc = header.getInt(); val keyLen = header.getInt(); val valLen = header.getInt()
+        if (keyLen !in 0..MAX_LEN || valLen !in -1..MAX_LEN) return null
+        val size = HEADER + keyLen + maxOf(valLen, 0)
+        if (pos + size &gt; ch.size()) return null
+        val body = ByteBuffer.allocate(size)
+        ch.read(body, pos)
+        val check = CRC32().apply { update(body.array(), 4, size - 4) }
+        if (check.value.toInt() != crc) return null
+        val key = String(body.array(), HEADER, keyLen)
+        val value = if (valLen &lt; 0) null else String(body.array(), HEADER + keyLen, valLen)
+        return Triple(key, value, size)
+    }
+
+    companion object {
+        const val HEADER = 12
+        const val MAX_LEN = 1 shl 20
+
+        fun encode(key: String, value: String?): ByteBuffer {
+            val k = key.toByteArray()
+            val v = value?.toByteArray()
+            val buf = ByteBuffer.allocate(HEADER + k.size + (v?.size ?: 0))
+            buf.position(4)
+            buf.putInt(k.size).putInt(v?.size ?: -1).put(k)
+            if (v != null) buf.put(v)
+            val crc = CRC32().apply { update(buf.array(), 4, buf.capacity() - 4) }
+            buf.putInt(0, crc.value.toInt())
+            return buf.flip()
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LogKV.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.zip.CRC32;
+import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
+import static java.nio.file.StandardOpenOption.*;
+
+// Where a key's newest record lives in the file.
+record Loc(long offset, int size) {}
+
+// One decoded record: value == null means a tombstone.
+record Rec(String key, String value, int size) {}
+
+// A Bitcask-style store: an append-only log file plus an in-memory hash index.
+// Record layout: [crc 4][keyLen 4][valLen 4][key bytes][value bytes]; valLen = -1 is a tombstone.
+public class LogKV implements AutoCloseable {
+    static final int HEADER = 12;
+    static final int MAX_LEN = 1 &lt;&lt; 20;
+
+    private final Path path;
+    private FileChannel ch;
+    private final Map&lt;String, Loc&gt; index = new HashMap&lt;&gt;();
+    private long deadBytes = 0;
+
+    public LogKV(Path path) throws IOException {
+        this.path = path;
+        this.ch = FileChannel.open(path, CREATE, READ, WRITE);
+        recover();
+    }
+
+    public long deadBytes() { return deadBytes; }
+    public int keys() { return index.size(); }
+    public long fileSize() throws IOException { return ch.size(); }
+
+    public void put(String key, String value) throws IOException { append(key, value); }
+    public void delete(String key) throws IOException { if (index.containsKey(key)) append(key, null); }
+
+    public String get(String key) throws IOException {
+        Loc loc = index.get(key);
+        if (loc == null) return null;
+        Rec r = readAt(loc.offset());
+        return r == null ? null : r.value();
+    }
+
+    public Map&lt;String, Loc&gt; indexSnapshot() { return new TreeMap&lt;&gt;(index); }
+
+    public void sync() throws IOException { ch.force(false); }
+
+    // Rewrite only the live records into a new file, then swap it in with one atomic rename.
+    public void compact() throws IOException {
+        Path tmp = path.resolveSibling(path.getFileName() + ".compact");
+        Map&lt;String, Loc&gt; fresh = new HashMap&lt;&gt;();
+        try (FileChannel out = FileChannel.open(tmp, CREATE, WRITE)) {
+            long pos = 0;
+            for (Map.Entry&lt;String, Loc&gt; e : index.entrySet()) {
+                ByteBuffer buf = encode(e.getKey(), readAt(e.getValue().offset()).value());
+                int size = buf.remaining();
+                while (buf.hasRemaining()) out.write(buf);
+                fresh.put(e.getKey(), new Loc(pos, size));
+                pos += size;
+            }
+            out.force(true);
+        }
+        ch.close();
+        Files.move(tmp, path, ATOMIC_MOVE);
+        ch = FileChannel.open(path, READ, WRITE);
+        index.clear();
+        index.putAll(fresh);
+        deadBytes = 0;
+    }
+
+    @Override public void close() throws IOException { ch.close(); }
+
+    private void append(String key, String value) throws IOException {
+        ByteBuffer buf = encode(key, value);
+        long offset = ch.size();
+        int size = buf.remaining();
+        long pos = offset;
+        while (buf.hasRemaining()) pos += ch.write(buf, pos);
+        Loc old = value == null ? index.remove(key) : index.put(key, new Loc(offset, size));
+        if (old != null) deadBytes += old.size();
+        if (value == null) deadBytes += size;         // a tombstone is garbage once compacted away
+    }
+
+    // Scan the whole file and rebuild the index: Bitcask's startup. Stops at the first bad record.
+    private void recover() throws IOException {
+        long pos = 0;
+        Rec r;
+        while ((r = readAt(pos)) != null) {
+            Loc old = r.value() == null ? index.remove(r.key()) : index.put(r.key(), new Loc(pos, r.size()));
+            if (old != null) deadBytes += old.size();
+            if (r.value() == null) deadBytes += r.size();
+            pos += r.size();
+        }
+    }
+
+    // Returns the record at pos, or null if it is missing or corrupt.
+    private Rec readAt(long pos) throws IOException {
+        ByteBuffer header = ByteBuffer.allocate(HEADER);
+        if (ch.read(header, pos) &lt; HEADER) return null;
+        header.flip();
+        int crc = header.getInt(), keyLen = header.getInt(), valLen = header.getInt();
+        if (keyLen &lt; 0 || keyLen &gt; MAX_LEN || valLen &lt; -1 || valLen &gt; MAX_LEN) return null;
+        int size = HEADER + keyLen + Math.max(valLen, 0);
+        if (pos + size &gt; ch.size()) return null;
+        ByteBuffer body = ByteBuffer.allocate(size);
+        ch.read(body, pos);
+        CRC32 check = new CRC32();
+        check.update(body.array(), 4, size - 4);
+        if ((int) check.getValue() != crc) return null;
+        String key = new String(body.array(), HEADER, keyLen, StandardCharsets.UTF_8);
+        String value = valLen &lt; 0 ? null : new String(body.array(), HEADER + keyLen, valLen, StandardCharsets.UTF_8);
+        return new Rec(key, value, size);
+    }
+
+    static ByteBuffer encode(String key, String value) {
+        byte[] k = key.getBytes(StandardCharsets.UTF_8);
+        byte[] v = value == null ? null : value.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buf = ByteBuffer.allocate(HEADER + k.length + (v == null ? 0 : v.length));
+        buf.position(4);
+        buf.putInt(k.length).putInt(v == null ? -1 : v.length).put(k);
+        if (v != null) buf.put(v);
+        CRC32 crc = new CRC32();
+        crc.update(buf.array(), 4, buf.capacity() - 4);
+        buf.putInt(0, (int) crc.getValue());
+        return buf.flip();
+    }
+}</code></pre></figure>
+</div>
+<ul>
+  <li><b>Positional I/O.</b> <code>ch.write(buf, pos)</code> and <code>ch.read(buf, pos)</code> take an explicit file position, so reads anywhere in the file never disturb where the next append goes. One <code>FileChannel</code> does both. The loops around <code>write</code> exist because a single call may write fewer bytes than asked.</li>
+  <li><b><code>ByteBuffer</code></b> packs ints and bytes into one array. Its integers are big-endian unless you change it: "The initial order of a byte buffer is always BIG_ENDIAN" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/ByteBuffer.html">ByteBuffer</a>). L30's length prefixes were big-endian too.</li>
+  <li><b>Recovery is a scan.</b> Opening the file reads every record from the start and replays it into the index. Bitcask calls this out as a cost, and its fix is the <em>hint file</em>: "like the data files but instead of the values they contain the position and size of the values," so startup reads less.</li>
+</ul>
+<p>A demo, then a peek at the raw bytes, then 100,000 writes and a compaction:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LogDemo.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.readBytes
+
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main() {
+    val dir = Files.createTempDirectory("l56")
+    val file = dir.resolve("data.log")
+
+    LogKV(file).use { db -&gt;
+        db.put("dune", "Herbert")
+        db.put("emma", "Austen")
+        db.put("dune", "Frank Herbert")      // an overwrite is just another append
+        db.delete("emma")                     // so is a delete: a tombstone
+        println("get(dune) = ${db.get("dune")}, get(emma) = ${db.get("emma")}")
+        println("index     = ${db.indexSnapshot()}")
+        println("file      = ${db.fileSize} bytes, ${db.deadBytes} of them garbage")
+    }
+
+    val raw = file.readBytes()
+    println("record 0  = " + raw.copyOfRange(0, 23).toHexString(HexFormat { bytes.byteSeparator = " " }))
+    println("            crc         keyLen=4    valLen=7    d  u  n  e  H  e  r  b  e  r  t")
+
+    LogKV(file).use { db -&gt;                  // a new process would do exactly this: scan and rebuild
+        println("reopened  : get(dune) = ${db.get("dune")}, keys = ${db.keys}")
+    }
+
+    LogKV(dir.resolve("big.log")).use { db -&gt;
+        repeat(100_000) { i -&gt; db.put("key${i % 1_000}", "value-$i") }
+        println("100,000 puts to 1,000 keys: ${db.fileSize / 1024} KB on disk, " +
+                "${db.deadBytes * 100 / db.fileSize}% garbage")
+        db.compact()
+        println("after compact():           ${db.fileSize / 1024} KB, get(key7) = ${db.get("key7")}")
+    }
+    dir.deleteRecursively()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LogDemo.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HexFormat;
+import java.util.stream.Stream;
+
+public class LogDemo {
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("l56");
+        Path file = dir.resolve("data.log");
+
+        try (LogKV db = new LogKV(file)) {
+            db.put("dune", "Herbert");
+            db.put("emma", "Austen");
+            db.put("dune", "Frank Herbert");     // an overwrite is just another append
+            db.delete("emma");                    // so is a delete: a tombstone
+            System.out.println("get(dune) = " + db.get("dune") + ", get(emma) = " + db.get("emma"));
+            System.out.println("index     = " + db.indexSnapshot());
+            System.out.println("file      = " + db.fileSize() + " bytes, " + db.deadBytes() + " of them garbage");
+        }
+
+        byte[] bytes = Files.readAllBytes(file);
+        System.out.println("record 0  = " + HexFormat.ofDelimiter(" ").formatHex(Arrays.copyOfRange(bytes, 0, 23)));
+        System.out.println("            crc         keyLen=4    valLen=7    d  u  n  e  H  e  r  b  e  r  t");
+
+        try (LogKV db = new LogKV(file)) {       // a new process would do exactly this: scan and rebuild
+            System.out.println("reopened  : get(dune) = " + db.get("dune") + ", keys = " + db.keys());
+        }
+
+        try (LogKV db = new LogKV(dir.resolve("big.log"))) {
+            for (int i = 0; i &lt; 100_000; i++) db.put("key" + (i % 1_000), "value-" + i);
+            System.out.println("100,000 puts to 1,000 keys: " + db.fileSize() / 1024 + " KB on disk, "
+                    + db.deadBytes() * 100 / db.fileSize() + "% garbage");
+            db.compact();
+            System.out.println("after compact():           " + db.fileSize() / 1024 + " KB, get(key7) = " + db.get("key7"));
+        }
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) {
+            s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete());
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="term"><span class="p">$ </span>kotlinc LogKV.kt LogDemo.kt -include-runtime -d logdemo.jar &amp;&amp; java -cp logdemo.jar LogDemoKt</pre>
+<pre class="out">get(dune) = Frank Herbert, get(emma) = null
+index     = {dune=Loc(offset=45, size=29)}
+file      = 90 bytes, 61 of them garbage
+record 0  = bf fb bd a2 00 00 00 04 00 00 00 07 64 75 6e 65 48 65 72 62 65 72 74
+            crc         keyLen=4    valLen=7    d  u  n  e  H  e  r  b  e  r  t
+reopened  : get(dune) = Frank Herbert, keys = 1
+100,000 puts to 1,000 keys: 2810 KB on disk, 98% garbage
+after compact():           28 KB, get(key7) = value-99007</pre>
+<p>Java prints the same, except a record prints as <code>Loc[offset=45, size=29]</code> instead of the data class's <code>Loc(offset=45, size=29)</code>. Run it with <code>java LogDemo.java</code>: since JDK 22 the source launcher finds <code>LogKV.java</code> in the same folder on its own (<a href="https://openjdk.org/jeps/458">JEP 458</a>). Reading the output:</p>
+<ul>
+  <li><b>Four writes, one live key.</b> The file holds 90 bytes, and 61 of them are garbage: the first <code>dune</code> (23 bytes), <code>emma</code> (22) and its tombstone (16). Only the second <code>dune</code> at offset 45 is live.</li>
+  <li><b>The bytes are exactly the layout.</b> <code>00 00 00 04</code> is the key length 4, <code>00 00 00 07</code> the value length 7, then ASCII <code>64 75 6e 65</code> is "dune" (L2). The first four bytes are the CRC.</li>
+  <li><b>Garbage dominates a busy log.</b> 100,000 writes over 1,000 keys make a 2.8 MB file that is 98% garbage. Compaction leaves 28 KB, one record per key.</li>
+</ul>
+
+<p><b>Step through it.</b> Each box is a record in the file, with its offset and size. Struck-through records are garbage, and ✝ marks a tombstone. The orange outline is the record the operation touched.</p>
+<div class="logviz" data-src="lz-log"></div>
+<script type="application/json" id="lz-log">{"modes": [{"name": "Log + hash index", "kind": "log", "steps": [{"log": [{"k": "dune", "v": "Herbert", "off": 0, "size": 23, "dead": false}], "index": [["dune", 0]], "hl": 0, "note": "put(dune): append 23 bytes at offset 0 (12-byte header + key + value), then point the index at it."}, {"log": [{"k": "dune", "v": "Herbert", "off": 0, "size": 23, "dead": false}, {"k": "emma", "v": "Austen", "off": 23, "size": 22, "dead": false}], "index": [["dune", 0], ["emma", 23]], "hl": 23, "note": "put(emma): append 22 bytes at offset 23 (12-byte header + key + value), then point the index at it."}, {"log": [{"k": "dune", "v": "Herbert", "off": 0, "size": 23, "dead": true}, {"k": "emma", "v": "Austen", "off": 23, "size": 22, "dead": false}, {"k": "dune", "v": "F. Herbert", "off": 45, "size": 26, "dead": false}], "index": [["dune", 45], ["emma", 23]], "hl": 45, "note": "put(dune) again: a <b>new<\/b> record is appended at offset 45. The index now points there; the old record is garbage, still on disk."}, {"log": [{"k": "dune", "v": "Herbert", "off": 0, "size": 23, "dead": true}, {"k": "emma", "v": "Austen", "off": 23, "size": 22, "dead": true}, {"k": "dune", "v": "F. Herbert", "off": 45, "size": 26, "dead": false}, {"k": "emma", "v": null, "off": 71, "size": 16, "dead": true}], "index": [["dune", 45]], "hl": 71, "note": "delete(emma): append a <b>tombstone<\/b> (value length −1) and drop the key from the index. Nothing is erased in place."}, {"log": [{"k": "dune", "v": "Herbert", "off": 0, "size": 23, "dead": true}, {"k": "emma", "v": "Austen", "off": 23, "size": 22, "dead": true}, {"k": "dune", "v": "F. Herbert", "off": 45, "size": 26, "dead": false}, {"k": "emma", "v": null, "off": 71, "size": 16, "dead": true}], "index": [["dune", 45]], "hl": 45, "note": "get(dune): one hash lookup gives offset 45, then one read at that offset: \"F. Herbert\"."}, {"log": [{"k": "dune", "v": "Herbert", "off": 0, "size": 23, "dead": true}, {"k": "emma", "v": "Austen", "off": 23, "size": 22, "dead": true}, {"k": "dune", "v": "F. Herbert", "off": 45, "size": 26, "dead": false}, {"k": "emma", "v": null, "off": 71, "size": 16, "dead": true}, {"k": "solaris", "v": "Lem", "off": 87, "size": 22, "dead": false}], "index": [["dune", 45], ["solaris", 87]], "hl": 87, "note": "put(solaris): append 22 bytes at offset 87 (12-byte header + key + value), then point the index at it."}, {"log": [{"k": "dune", "v": "F. Herbert", "off": 0, "size": 26, "dead": false}, {"k": "solaris", "v": "Lem", "off": 26, "size": 22, "dead": false}], "index": [["dune", 0], ["solaris", 26]], "hl": null, "note": "compact(): copy only the live records into a new file and rename it over the old one. 109 bytes → 48; the 61 bytes of garbage are gone."}]}]}</script>
+
+<p><b>Compaction is crash-safe because of the rename.</b> It writes the live records to a new file, forces them to disk, and only then renames the new file over the old one. If the process dies before the rename, the old file is untouched and the half-written new one is just a stray file to delete next time. If it dies after, the new file is complete. There's no moment when the store is half old and half new. <code>ATOMIC_MOVE</code> asks for exactly that: "The move is performed as an atomic file system operation", and if it can't be, "then AtomicMoveNotSupportedException is thrown" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/file/Files.html#move(java.nio.file.Path,java.nio.file.Path,java.nio.file.CopyOption...)">Files.move</a>). The same docs warn that if the target exists, "it is implementation specific if the existing file is replaced". On macOS and Linux the JDK implements it with the <code>rename</code> system call (<a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/unix/classes/sun/nio/fs/UnixFileSystem.java#L799-L801">UnixFileSystem.java</a>, an implementation detail), and macOS's man page promises: "If new exists, it is first removed" and "The rename() system call guarantees that an instance of new will always exist, even if the system should crash in the middle of the operation" (<a href="https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/rename.2.html">rename(2)</a>).</p>
+
+<div class="callout"><b>The price of the hash index.</b> Bitcask's authors are upfront about it: "the keydir structure grows by a small amount with the number of keys and must fit entirely in RAM". Every key must fit in memory, and a hash map can't answer "every key between <code>m</code> and <code>p</code>" without visiting them all. Part 3 removes both limits by keeping the data sorted.</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>data class Loc(val offset: Long, val size: Int)</code> and Java's <code>record Loc(long offset, int size)</code> are the same idea (L7). Kotlin also gives the <code>Triple</code> that <code>readAt</code> returns and destructures with <code>val (key, value, size) = rec</code>. Java needs its own <code>Rec</code> record for that.</li>
+    <li><code>LogKV(file).use { db -> … }</code> closes the channel however the block ends: Java's try-with-resources, as an ordinary function (L10).</li>
+    <li><code>val keys: Int get() = index.size</code> is a computed property; Java writes a <code>keys()</code> method.</li>
+    <li><code>keyLen !in 0..MAX_LEN</code> reads like the rule it checks; Java spells out two comparisons.</li>
+    <li><code>toHexString(HexFormat { … })</code> is in Kotlin's standard library; Java has <code>java.util.HexFormat</code> (JDK 17).</li>
+    <li>No checked exceptions: every Java method touching the file declares <code>throws IOException</code>, and Kotlin's don't (L10).</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: compaction that runs itself</div>
+  <p>From a blank file, in both languages. Wrap <code>LogKV</code> in an <code>AutoKV</code> that compacts automatically after a write once garbage is more than half the file, but never while the file is under 64 KB (compacting a tiny file is pure overhead). Run the same 100,000 writes over 1,000 keys and print how many compactions ran and the largest the file ever got. Then answer: why a <em>ratio</em> rather than "every 10,000 writes"?</p>
+  <details class="solution"><summary>Solution</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · AutoCompact.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.nio.file.Path
+import kotlin.io.path.deleteRecursively
+
+// LogKV that compacts itself once garbage is more than half of a file bigger than minBytes.
+class AutoKV(path: Path, private val minBytes: Long = 64 * 1024) : AutoCloseable {
+    private val db = LogKV(path)
+    var compactions = 0; private set
+    var largestFile = 0L; private set
+
+    fun put(key: String, value: String) { db.put(key, value); afterWrite() }
+    fun delete(key: String) { db.delete(key); afterWrite() }
+    fun get(key: String) = db.get(key)
+    val fileSize get() = db.fileSize
+
+    private fun afterWrite() {
+        largestFile = maxOf(largestFile, db.fileSize)
+        if (db.fileSize &gt;= minBytes &amp;&amp; db.deadBytes * 2 &gt; db.fileSize) { db.compact(); compactions++ }
+    }
+
+    override fun close() = db.close()
+}
+
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main() {
+    val dir = Files.createTempDirectory("l56")
+    AutoKV(dir.resolve("auto.log")).use { db -&gt;
+        repeat(100_000) { i -&gt; db.put("key${i % 1_000}", "value-$i") }
+        println("compactions ${db.compactions}, largest file ${db.largestFile / 1024} KB, " +
+                "now ${db.fileSize / 1024} KB, get(key7) = ${db.get("key7")}")
+    }
+    dir.deleteRecursively()
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · AutoCompact.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
+import java.util.stream.Stream;
+
+public class AutoCompact {
+    // LogKV that compacts itself once garbage is more than half of a file bigger than minBytes.
+    static final class AutoKV implements AutoCloseable {
+        private final LogKV db;
+        private final long minBytes;
+        int compactions = 0;
+        long largestFile = 0;
+
+        AutoKV(Path path, long minBytes) throws IOException { this.db = new LogKV(path); this.minBytes = minBytes; }
+
+        void put(String key, String value) throws IOException { db.put(key, value); afterWrite(); }
+        void delete(String key) throws IOException { db.delete(key); afterWrite(); }
+        String get(String key) throws IOException { return db.get(key); }
+        long fileSize() throws IOException { return db.fileSize(); }
+
+        private void afterWrite() throws IOException {
+            largestFile = Math.max(largestFile, db.fileSize());
+            if (db.fileSize() &gt;= minBytes &amp;&amp; db.deadBytes() * 2 &gt; db.fileSize()) { db.compact(); compactions++; }
+        }
+
+        @Override public void close() throws IOException { db.close(); }
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("l56");
+        try (AutoKV db = new AutoKV(dir.resolve("auto.log"), 64 * 1024)) {
+            for (int i = 0; i &lt; 100_000; i++) db.put("key" + (i % 1_000), "value-" + i);
+            System.out.println("compactions " + db.compactions + ", largest file " + db.largestFile / 1024 + " KB, now "
+                    + db.fileSize() / 1024 + " KB, get(key7) = " + db.get("key7"));
+        }
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) { s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">compactions 77, largest file 64 KB, now 47 KB, get(key7) = value-99007</pre>
+    <p>Java prints the same line. The file never passed 64 KB, against 2.8 MB without compaction. <b>Why a ratio:</b> it bounds the space directly. Garbage can never be more than about the live data again, however the writes are spread. It also keeps the cost fair: each compaction copies the live data, and it only runs after at least that much garbage has been written, so the copying amortises to a constant per write. That's L16's doubling-array argument again. A fixed count would compact too often for a small store and not often enough for a busy one.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p1-1" data-group="Part 1 · Log and hash index" data-answer="1">
+  <p class="q">In <code>LogKV</code>, what does <code>put("dune", "F. Herbert")</code> do to the earlier <code>dune</code> record on disk?</p>
+  <div class="opts"><button>Overwrites it in place</button><button>Leaves it as garbage</button><button>Deletes it right away</button><button>Copies it somewhere else</button></div>
+  <p class="why">Nothing is ever changed in place. A new record is appended and the index moves to it; the old one stays until compaction copies only live records. The widget's third step shows it.</p>
+</div>
+<div class="quiz" data-id="p1-2" data-group="Part 1 · Log and hash index" data-answer="3">
+  <p class="q">How many disk reads does <code>get</code> need in <code>LogKV</code>, however big the file is?</p>
+  <div class="opts"><button><code>O(n)</code></button><button><code>O(log n)</code></button><button><code>O(√n)</code></button><button><code>O(1)</code></button></div>
+  <p class="why">One hash lookup in memory (L19) gives the offset, then one read at that offset. Bitcask: reading "doesn't ever require more than a single disk seek". The shell version's <code>grep</code> was O(n).</p>
+</div>
+<div class="quiz" data-id="p1-3" data-group="Part 1 · Log and hash index" data-answer="0">
+  <p class="q">Why is a delete written as a tombstone instead of just removing the key from the index?</p>
+  <div class="opts"><button>Reopening would resurrect the value</button><button>Hash maps cannot remove keys</button><button>Tombstones make reads much faster</button><button>The CRC requires a record</button></div>
+  <p class="why">The index lives in memory and is rebuilt by replaying the file. Without a tombstone on disk, the replay would find the old value and bring it back.</p>
+</div>
+<div class="quiz" data-id="p1-4" data-group="Part 1 · Log and hash index" data-answer="2">
+  <p class="q">Compaction dies just before <code>Files.move</code>. After a restart, the store has…</p>
+  <div class="opts"><button>Half the old records</button><button>Only the compacted file</button><button>The complete old file</button><button>No readable data left</button></div>
+  <p class="why">The old file isn't touched until the atomic rename, so it's complete. The final exercise also deletes the leftover <code>.compact</code> file on startup.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>
+
+<!-- ═════════════════════════ PART 2 ═════════════════════════ -->
+<div class="part-label">Part 2</div>
+<div class="part-head" id="p2" data-title="Part 2"><h2>What survives which crash</h2><span class="t">~25 min</span></div>
+
+<p>"The write returned" doesn't mean "the write is safe". A byte you write passes through several places, and each kind of crash wipes out different ones:</p>
+<div class="table-scroll"><table class="layers">
+  <tr><th>Where the bytes are</th><th>Process crash<br>(<code>kill -9</code>, exception)</th><th>OS crash or<br>power loss</th><th>How they get to the next layer</th></tr>
+  <tr><td>Your JVM's buffer</td><td class="n">lost</td><td class="n">lost</td><td><code>flush()</code>, or a direct <code>write</code></td></tr>
+  <tr><td>The OS page cache</td><td class="y">survive</td><td class="n">lost</td><td><code>fsync</code> / <code>FileChannel.force</code></td></tr>
+  <tr><td>The drive's own cache</td><td class="y">survive</td><td class="n">may be lost</td><td>a drive flush (<code>F_FULLFSYNC</code> on macOS)</td></tr>
+  <tr><td>Stable storage</td><td class="y">survive</td><td class="y">survive</td><td>—</td></tr>
+</table></div>
+<p>The page cache belongs to the kernel, not to your process (L22), which is why it outlives a <code>kill -9</code>. Let's prove the top two rows. The program starts a copy of itself as a child process. The child writes 20,000 records, prints <code>acked 20000</code>, and goes to sleep. The parent kills it the moment it reads that line, then counts what's in the file:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · KillDemo.kt</figcaption>
+<pre><code class="language-kotlin">import java.io.BufferedOutputStream
+import java.io.FileOutputStream
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.Path
+import kotlin.io.path.deleteRecursively
+
+const val ACKED = 20_000
+
+// The child writes ACKED records, says so, then waits to be killed.
+fun child(mode: String, file: Path) {
+    if (mode == "direct") {
+        val db = LogKV(file)                                    // one write() system call per record
+        for (i in 0 until ACKED) db.put("k$i", "value-$i")
+    } else {
+        val out = BufferedOutputStream(FileOutputStream(file.toFile()), 8192)   // 8 KB buffer in the JVM
+        for (i in 0 until ACKED) out.write(LogKV.encode("k$i", "value-$i").array())
+    }
+    println("acked $ACKED")
+    System.out.flush()
+    Thread.sleep(60_000)
+}
+
+// Re-run this same program as a child process, with different arguments.
+fun startChild(mode: String, file: Path): Process {
+    val me = ProcessHandle.current().info()
+    val args = me.arguments().orElseThrow().dropLast(1)          // drop "parent"
+    return ProcessBuilder(listOf(me.command().orElseThrow()) + args + listOf("child", mode, file.toString()))
+        .redirectErrorStream(true).start()
+}
+
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main(args: Array&lt;String&gt;) {
+    if (args.firstOrNull() == "child") return child(args[1], Path.of(args[2]))
+    val dir = Files.createTempDirectory("l56")
+    for (mode in listOf("buffered", "direct")) {
+        val file = dir.resolve("$mode.log")
+        val p = startChild(mode, file)
+        val line = p.inputReader().readLine()                   // blocks until the child has acked
+        p.destroyForcibly()                                     // SIGKILL, like kill -9 (L53)
+        val exit = p.waitFor()
+        val size = Files.size(file)
+        val valid = FileChannel.open(file).use { validPrefix(it) }
+        val keys = LogKV(file).use { it.keys }
+        println("%-8s child said \"%s\", exit %d | file %,d bytes, torn tail %d bytes | recovered %,d of %,d"
+            .format(mode, line, exit, size, size - valid, keys, ACKED))
+    }
+    dir.deleteRecursively()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · KillDemo.java</figcaption>
+<pre><code class="language-java">import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.stream.Stream;
+
+public class KillDemo {
+    static final int ACKED = 20_000;
+
+    // The child writes ACKED records, says so, then waits to be killed.
+    static void child(String mode, Path file) throws Exception {
+        if (mode.equals("direct")) {
+            LogKV db = new LogKV(file);                              // one write() system call per record
+            for (int i = 0; i &lt; ACKED; i++) db.put("k" + i, "value-" + i);
+        } else {
+            OutputStream out = new BufferedOutputStream(new FileOutputStream(file.toFile()), 8192); // 8 KB in the JVM
+            for (int i = 0; i &lt; ACKED; i++) out.write(LogKV.encode("k" + i, "value-" + i).array());
+        }
+        System.out.println("acked " + ACKED);
+        System.out.flush();
+        Thread.sleep(60_000);
+    }
+
+    // Re-run this same program as a child process, with different arguments.
+    static Process startChild(String mode, Path file) throws IOException {
+        ProcessHandle.Info me = ProcessHandle.current().info();
+        String[] args = me.arguments().orElseThrow();
+        List&lt;String&gt; cmd = new ArrayList&lt;&gt;();
+        cmd.add(me.command().orElseThrow());
+        cmd.addAll(Arrays.asList(args).subList(0, args.length - 1)); // drop "parent"
+        cmd.addAll(List.of("child", mode, file.toString()));
+        return new ProcessBuilder(cmd).redirectErrorStream(true).start();
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length &gt; 0 &amp;&amp; args[0].equals("child")) { child(args[1], Path.of(args[2])); return; }
+        Path dir = Files.createTempDirectory("l56");
+        for (String mode : List.of("buffered", "direct")) {
+            Path file = dir.resolve(mode + ".log");
+            Process p = startChild(mode, file);
+            String line = p.inputReader().readLine();                 // blocks until the child has acked
+            p.destroyForcibly();                                      // SIGKILL, like kill -9 (L53)
+            int exit = p.waitFor();
+            long size = Files.size(file);
+            long valid;
+            try (FileChannel ch = FileChannel.open(file)) { valid = TornFix.validPrefix(ch); }
+            int keys;
+            try (LogKV db = new LogKV(file)) { keys = db.keys(); }
+            System.out.println(String.format("%-8s child said \"%s\", exit %d | file %,d bytes, torn tail %d bytes | recovered %,d of %,d",
+                    mode, line, exit, size, size - valid, keys, ACKED));
+        }
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) { s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+</div>
+<pre class="term"><span class="p">$ </span>java -cp killdemo.jar KillDemoKt parent</pre>
+<pre class="out">buffered child said "acked 20000", exit 137 | file 556,185 bytes, torn tail 0 bytes | recovered 19,945 of 20,000
+direct   child said "acked 20000", exit 137 | file 557,780 bytes, torn tail 0 bytes | recovered 20,000 of 20,000</pre>
+<p>Java (<code>java KillDemo.java parent</code>) prints identical numbers. <code>validPrefix</code> comes from today's second exercise; it measures how many bytes at the start of the file are whole, valid records.</p>
+<ul>
+  <li><b>Buffered: 55 acknowledged writes vanished.</b> The child's <code>write</code> calls returned, so it said "acked", but the last 1,595 bytes were still in the <code>BufferedOutputStream</code>'s 8 KB array inside the JVM. SIGKILL gave nothing a chance to flush (L53: exit 137, 128 + 9).</li>
+  <li><b>Direct: every acknowledged write survived</b>, with no <code>fsync</code> at all. Each <code>LogKV.put</code> is a <code>write</code> system call, which hands the bytes to the kernel's page cache before it returns. A dead process can't take them back.</li>
+  <li><b>No torn record, even in buffered mode.</b> That's an implementation detail. When a write doesn't fit in the buffer, JDK 26's <code>BufferedOutputStream</code> flushes the buffer first and then copies the whole write: <code>if (len &gt; buf.length - count) { flushBuffer(); }</code> (<a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/share/classes/java/io/BufferedOutputStream.java#L187-L189">BufferedOutputStream.java</a>). So records never straddle a flush. Nothing promises that, and an OS crash or power cut can tear a record anyway, which is next.</li>
+</ul>
+
+<h3>Torn writes and garbage tails</h3>
+<p>If the power goes off in the middle of a write, the end of the file can hold part of a record, or worse. SQLite's designers assume the worst: "SQLite assumes that when a file grows in length that the new file space originally contains garbage and then later is filled in with the data actually written. In other words, SQLite assumes that the file size is updated before the file content" (<a href="https://www.sqlite.org/atomiccommit.html">SQLite: Atomic Commit</a>). The lengths and the CRC are how <code>LogKV</code> notices. Simulate every kind of damage on a file of three 16-byte records:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · TornDemo.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.nio.file.Path
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.readBytes
+import kotlin.io.path.writeBytes
+import kotlin.random.Random
+
+fun keysAfterReopen(file: Path, bytes: ByteArray): List&lt;String&gt; {
+    file.writeBytes(bytes)
+    return LogKV(file).use { db -&gt; db.indexSnapshot().keys.toList() }
+}
+
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main() {
+    val dir = Files.createTempDirectory("l56")
+    val good = dir.resolve("good.log")
+    LogKV(good).use { db -&gt; for (i in 1..3) db.put("k$i", "v$i") }   // three 16-byte records
+    val full = good.readBytes()
+    val t = dir.resolve("t.log")
+
+    // 1. A crash can cut the file anywhere. Try every length inside the last record.
+    val byLength = (32..48).groupBy { len -&gt; keysAfterReopen(t, full.copyOf(len)) }
+    for ((keys, lens) in byLength) println("length ${lens.first()}..${lens.last()} -&gt; $keys")
+
+    // 2. The OS may grow the file before the data lands: garbage at the end.
+    val junk = Random(56).nextBytes(16)
+    println("full + 16 junk bytes -&gt; ${keysAfterReopen(t, full + junk)}")
+
+    // 3. One flipped bit in the middle record.
+    val flipped = full.copyOf().also { it[16 + 13] = (it[16 + 13].toInt() xor 1).toByte() }
+    println("bit flip in record 2 -&gt; ${keysAfterReopen(t, flipped)}")
+
+    // 4. The bug: reopen a torn file, then keep writing.
+    t.writeBytes(full.copyOf(40))                       // 2 good records + 8 bytes of a torn third
+    LogKV(t).use { db -&gt; db.put("k4", "v4"); println("wrote k4, get(k4) = ${db.get("k4")}") }
+    LogKV(t).use { db -&gt; println("reopen: keys = ${db.indexSnapshot().keys}, get(k4) = ${db.get("k4")}") }
+    dir.deleteRecursively()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · TornDemo.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.stream.Stream;
+
+public class TornDemo {
+    static List&lt;String&gt; keysAfterReopen(Path file, byte[] bytes) throws IOException {
+        Files.write(file, bytes);
+        try (LogKV db = new LogKV(file)) { return new ArrayList&lt;&gt;(db.indexSnapshot().keySet()); }
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("l56");
+        Path good = dir.resolve("good.log");
+        try (LogKV db = new LogKV(good)) { for (int i = 1; i &lt;= 3; i++) db.put("k" + i, "v" + i); }
+        byte[] full = Files.readAllBytes(good);
+        Path t = dir.resolve("t.log");
+
+        // 1. A crash can cut the file anywhere. Try every length inside the last record.
+        Map&lt;List&lt;String&gt;, List&lt;Integer&gt;&gt; byLength = new LinkedHashMap&lt;&gt;();
+        for (int len = 32; len &lt;= 48; len++)
+            byLength.computeIfAbsent(keysAfterReopen(t, Arrays.copyOf(full, len)), k -&gt; new ArrayList&lt;&gt;()).add(len);
+        for (var e : byLength.entrySet()) {
+            List&lt;Integer&gt; lens = e.getValue();
+            System.out.println("length " + lens.getFirst() + ".." + lens.getLast() + " -&gt; " + e.getKey());
+        }
+
+        // 2. The OS may grow the file before the data lands: garbage at the end.
+        byte[] junk = new byte[16];
+        new Random(56).nextBytes(junk);
+        byte[] withJunk = Arrays.copyOf(full, full.length + junk.length);
+        System.arraycopy(junk, 0, withJunk, full.length, junk.length);
+        System.out.println("full + 16 junk bytes -&gt; " + keysAfterReopen(t, withJunk));
+
+        // 3. One flipped bit in the middle record.
+        byte[] flipped = full.clone();
+        flipped[16 + 13] ^= 1;
+        System.out.println("bit flip in record 2 -&gt; " + keysAfterReopen(t, flipped));
+
+        // 4. The bug: reopen a torn file, then keep writing.
+        Files.write(t, Arrays.copyOf(full, 40));         // 2 good records + 8 bytes of a torn third
+        try (LogKV db = new LogKV(t)) { db.put("k4", "v4"); System.out.println("wrote k4, get(k4) = " + db.get("k4")); }
+        try (LogKV db = new LogKV(t)) {
+            System.out.println("reopen: keys = " + db.indexSnapshot().keySet() + ", get(k4) = " + db.get("k4"));
+        }
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) { s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">length 32..47 -&gt; [k1, k2]
+length 48..48 -&gt; [k1, k2, k3]
+full + 16 junk bytes -&gt; [k1, k2, k3]
+bit flip in record 2 -&gt; [k1]
+wrote k4, get(k4) = v4
+reopen: keys = [k1, k2], get(k4) = null</pre>
+<p>Both languages print the same thing (their <code>Random(56)</code> junk bytes differ, with the same outcome).</p>
+<ol>
+  <li><b>A cut anywhere inside the last record</b> (lengths 32 to 47) loses exactly that record. The length check stops at a record that runs past the end of the file.</li>
+  <li><b>Random garbage after the records</b> is rejected. The junk bytes parse as some header, but the CRC of what follows doesn't match. A random match would be a 1 in 2<sup>32</sup> chance (L48).</li>
+  <li><b>One flipped bit</b> fails record 2's CRC. <code>LogKV</code> stops scanning there, so record 3 is lost too, even though it's intact. For a crash at the end of a log, stopping is right. Corruption in the middle is a different failure (a bad disk, not a crash), and real systems report it rather than silently dropping data.</li>
+  <li><b>The bug.</b> After reopening the torn file, <code>put("k4")</code> works and <code>get</code> returns it. But the record was appended at offset 40, <em>after</em> the 8 torn bytes. On the next open the scan stops at the torn bytes and never reaches it. An acknowledged write is gone. The exercise fixes it.</li>
+</ol>
+<p>SQLite's own write-ahead log uses the same defence: "Checksums and counters attached to each frame are used to determine which frames within the WAL are valid and which are leftovers from prior checkpoints" (<a href="https://www.sqlite.org/fileformat2.html#walformat">SQLite file format, §4</a>).</p>
+
+<div class="exercise">
+  <div class="label">Exercise: never write after garbage</div>
+  <p>From a blank file, in both languages. Write <code>validPrefix(channel)</code>, which returns the length of the longest prefix of the file made of whole records with matching CRCs, and <code>repair(path)</code>, which truncates the file to that length and forces the change to disk. Then rerun step 4 with <code>repair</code> before reopening: <code>k4</code> must survive the second reopen.</p>
+  <details class="solution"><summary>Solution</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · TornFix.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption.READ
+import java.nio.file.StandardOpenOption.WRITE
+import java.util.zip.CRC32
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.readBytes
+import kotlin.io.path.writeBytes
+
+// Length of the longest prefix made of whole records whose CRC matches.
+fun validPrefix(ch: FileChannel): Long {
+    var pos = 0L
+    val header = ByteBuffer.allocate(LogKV.HEADER)
+    while (true) {
+        header.clear()
+        if (ch.read(header, pos) &lt; LogKV.HEADER) return pos
+        val crc = header.getInt(0); val keyLen = header.getInt(4); val valLen = header.getInt(8)
+        if (keyLen !in 0..LogKV.MAX_LEN || valLen !in -1..LogKV.MAX_LEN) return pos
+        val size = LogKV.HEADER + keyLen + maxOf(valLen, 0)
+        if (pos + size &gt; ch.size()) return pos
+        val body = ByteBuffer.allocate(size).also { ch.read(it, pos) }
+        if (CRC32().apply { update(body.array(), 4, size - 4) }.value.toInt() != crc) return pos
+        pos += size
+    }
+}
+
+// Cut the file back to its valid prefix, so the next append lands right after the last good record.
+fun repair(file: Path): Long = FileChannel.open(file, READ, WRITE).use { ch -&gt;
+    val end = validPrefix(ch)
+    val cut = ch.size() - end
+    ch.truncate(end)
+    ch.force(true)
+    cut
+}
+
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main() {
+    val dir = Files.createTempDirectory("l56")
+    val t = dir.resolve("t.log")
+    LogKV(t).use { db -&gt; for (i in 1..3) db.put("k$i", "v$i") }
+    t.writeBytes(t.readBytes().copyOf(40))                   // the same torn file as before
+    println("repair cut ${repair(t)} bytes")
+    LogKV(t).use { db -&gt; db.put("k4", "v4") }
+    LogKV(t).use { db -&gt; println("reopen: keys = ${db.indexSnapshot().keys}, get(k4) = ${db.get("k4")}") }
+    dir.deleteRecursively()
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · TornFix.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.stream.Stream;
+import java.util.zip.CRC32;
+import static java.nio.file.StandardOpenOption.READ;
+import static java.nio.file.StandardOpenOption.WRITE;
+
+public class TornFix {
+    // Length of the longest prefix made of whole records whose CRC matches.
+    static long validPrefix(FileChannel ch) throws IOException {
+        long pos = 0;
+        ByteBuffer header = ByteBuffer.allocate(LogKV.HEADER);
+        while (true) {
+            header.clear();
+            if (ch.read(header, pos) &lt; LogKV.HEADER) return pos;
+            int crc = header.getInt(0), keyLen = header.getInt(4), valLen = header.getInt(8);
+            if (keyLen &lt; 0 || keyLen &gt; LogKV.MAX_LEN || valLen &lt; -1 || valLen &gt; LogKV.MAX_LEN) return pos;
+            int size = LogKV.HEADER + keyLen + Math.max(valLen, 0);
+            if (pos + size &gt; ch.size()) return pos;
+            ByteBuffer body = ByteBuffer.allocate(size);
+            ch.read(body, pos);
+            CRC32 check = new CRC32();
+            check.update(body.array(), 4, size - 4);
+            if ((int) check.getValue() != crc) return pos;
+            pos += size;
+        }
+    }
+
+    // Cut the file back to its valid prefix, so the next append lands right after the last good record.
+    static long repair(Path file) throws IOException {
+        try (FileChannel ch = FileChannel.open(file, READ, WRITE)) {
+            long end = validPrefix(ch);
+            long cut = ch.size() - end;
+            ch.truncate(end);
+            ch.force(true);
+            return cut;
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("l56");
+        Path t = dir.resolve("t.log");
+        try (LogKV db = new LogKV(t)) { for (int i = 1; i &lt;= 3; i++) db.put("k" + i, "v" + i); }
+        Files.write(t, Arrays.copyOf(Files.readAllBytes(t), 40));   // the same torn file as before
+        System.out.println("repair cut " + repair(t) + " bytes");
+        try (LogKV db = new LogKV(t)) { db.put("k4", "v4"); }
+        try (LogKV db = new LogKV(t)) {
+            System.out.println("reopen: keys = " + db.indexSnapshot().keySet() + ", get(k4) = " + db.get("k4"));
+        }
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) { s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">repair cut 8 bytes
+reopen: keys = [k1, k2, k4], get(k4) = v4</pre>
+    <p>Java prints the same. <code>FileChannel.truncate</code> cuts the file; the <code>force(true)</code> after it makes the cut itself durable, so a second crash can't bring the torn bytes back. The final exercise builds this into the store's startup.</p>
+  </details>
+</div>
+
+<h3>What a durable write costs</h3>
+<p>To survive power loss, the bytes have to leave the page cache. <code>FileChannel.force</code> is how: "If this channel's file resides on a local storage device then when this method returns it is guaranteed that all changes made to the file since this channel was created, or since this method was last invoked, will have been written to that device. This is useful for ensuring that critical information is not lost in the event of a system crash" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/FileChannel.html#force(boolean)">FileChannel.force</a>). Bitcask offers it as a "sync on put" option, for a writer that "would prefer to sync the write file after every write operation". What does that cost?</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · FsyncCost.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import kotlin.io.path.deleteRecursively
+import kotlin.time.measureTime
+
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main() {
+    val dir = Files.createTempDirectory("l56")
+    val n = 2_000
+    LogKV(dir.resolve("warm.log")).use { db -&gt; repeat(500) { db.put("w$it", "x"); db.sync() } }   // warm-up (L16)
+    for ((label, every) in listOf("sync every put" to 1, "sync every 10" to 10, "sync every 100" to 100, "never sync" to 0)) {
+        LogKV(dir.resolve("$every.log")).use { db -&gt;
+            val t = measureTime {
+                for (i in 1..n) {
+                    db.put("k$i", "value-$i")
+                    if (every &gt; 0 &amp;&amp; i % every == 0) db.sync()
+                }
+            }
+            val us = t.inWholeMicroseconds.toDouble() / n
+            println("%-15s %8.1f µs per put  %,10d puts/s".format(label, us, (1_000_000 / us).toLong()))
+        }
+    }
+    dir.deleteRecursively()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · FsyncCost.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
+import java.util.Map;
+import java.util.stream.Stream;
+
+public class FsyncCost {
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("l56");
+        int n = 2_000;
+        try (LogKV db = new LogKV(dir.resolve("warm.log"))) {          // warm-up (L16)
+            for (int i = 0; i &lt; 500; i++) { db.put("w" + i, "x"); db.sync(); }
+        }
+        var runs = new java.util.LinkedHashMap&lt;String, Integer&gt;();
+        runs.put("sync every put", 1); runs.put("sync every 10", 10); runs.put("sync every 100", 100); runs.put("never sync", 0);
+        for (Map.Entry&lt;String, Integer&gt; run : runs.entrySet()) {
+            int every = run.getValue();
+            try (LogKV db = new LogKV(dir.resolve(every + ".log"))) {
+                long t0 = System.nanoTime();
+                for (int i = 1; i &lt;= n; i++) {
+                    db.put("k" + i, "value-" + i);
+                    if (every &gt; 0 &amp;&amp; i % every == 0) db.sync();
+                }
+                double us = (System.nanoTime() - t0) / 1000.0 / n;
+                System.out.println(String.format("%-15s %8.1f µs per put  %,10d puts/s", run.getKey(), us, (long) (1_000_000 / us)));
+            }
+        }
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) { s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">sync every put    3556.0 µs per put         281 puts/s
+sync every 10      386.7 µs per put       2,586 puts/s
+sync every 100      42.6 µs per put      23,476 puts/s
+never sync           1.6 µs per put     617,474 puts/s</pre>
+<pre class="out">sync every put    3534.3 µs per put         282 puts/s
+sync every 10      379.7 µs per put       2,633 puts/s
+sync every 100      39.8 µs per put      25,116 puts/s
+never sync           2.0 µs per put     490,140 puts/s</pre>
+</div>
+<p>Kotlin on the left, Java on the right. A forced write costs about 3.5 ms, roughly 2,000 times a write that stops in the page cache. That's the latency ladder from L22: memory is nanoseconds, a real trip to the drive is milliseconds. The middle rows show the standard escape, <dfn>group commit</dfn>. Write several records, force once, and only then acknowledge all of them. Ten writes per force cost a tenth as much each. The trade-off is that nothing is acknowledged until the batch's force returns, so each caller waits a little longer while the system as a whole does far more.</p>
+<p>Databases expose exactly this dial. SQLite's <code>PRAGMA synchronous</code>: "When synchronous is FULL (2), the SQLite database engine will use the xSync method of the VFS to ensure that all content is safely written to the disk surface prior to continuing" (<a href="https://www.sqlite.org/pragma.html#pragma_synchronous">SQLite pragmas</a>). And L36's batching measurement, where 10,000 inserts ran far faster inside one transaction than as 10,000 auto-commits, was group commit: one forced journal write instead of ten thousand.</p>
+
+<h3>Two kinds of sync on macOS <span class="deep-tag">Optional deep dive</span></h3>
+<p>Apple's <code>fsync</code> man page has an unusual warning: "while fsync() will flush all data from the host to the drive (i.e. the "permanent storage device"), the drive itself may not physically write the data to the platters for quite some time and it may be written in an out-of-order sequence." It goes on: "This is not a theoretical edge case. This scenario is easily reproduced with real world workloads and drive power failures," and the fix is that "Mac OS X provides the F_FULLFSYNC fcntl. The F_FULLFSYNC fcntl asks the drive to flush all buffered data to permanent storage" (<a href="https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html">fsync(2)</a>).</p>
+<p>The JDK has both. On macOS, <code>FileChannel.force</code> calls <code>fcntl(fd, F_FULLFSYNC)</code> (<a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/macosx/native/libnio/ch/FileDispatcherImpl.c#L51">FileDispatcherImpl.c</a>), while the older <code>FileDescriptor.sync()</code> is a plain <code>fsync</code> (<code>#define IO_Sync fsync</code> in <a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/unix/native/libjava/io_util_md.h#L62">io_util_md.h</a>). Both are implementation details, not guarantees. Measuring them:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · SyncKinds.kt</figcaption>
+<pre><code class="language-kotlin">import java.io.RandomAccessFile
+import java.nio.file.Files
+import kotlin.io.path.deleteRecursively
+import kotlin.time.measureTime
+
+// Same 64-byte appends, two ways to "sync" them on macOS.
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main() {
+    val dir = Files.createTempDirectory("l56")
+    val record = ByteArray(64) { 'x'.code.toByte() }
+    val n = 1_000
+    val kinds = listOf&lt;Pair&lt;String, (RandomAccessFile) -&gt; Unit&gt;&gt;(
+        "FileDescriptor.sync()" to { f -&gt; f.fd.sync() },               // fsync(2)
+        "FileChannel.force()" to { f -&gt; f.channel.force(false) },     // fcntl(F_FULLFSYNC) on macOS
+    )
+    for (round in 1..2) {                                              // round 1 is the warm-up
+        for ((label, sync) in kinds) {
+            RandomAccessFile(dir.resolve("$label.$round").toFile(), "rw").use { f -&gt;
+                val t = measureTime { repeat(n) { f.write(record); sync(f) } }
+                if (round == 2) println("%-22s %7.1f µs per write".format(label, t.inWholeMicroseconds.toDouble() / n))
+            }
+        }
+    }
+    dir.deleteRecursively()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · SyncKinds.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.stream.Stream;
+
+// Same 64-byte appends, two ways to "sync" them on macOS.
+public class SyncKinds {
+    interface Sync { void run(RandomAccessFile f) throws IOException; }
+
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("l56");
+        byte[] record = new byte[64];
+        Arrays.fill(record, (byte) 'x');
+        int n = 1_000;
+        String[] labels = { "FileDescriptor.sync()", "FileChannel.force()" };
+        Sync[] syncs = {
+            f -&gt; f.getFD().sync(),                 // fsync(2)
+            f -&gt; f.getChannel().force(false),      // fcntl(F_FULLFSYNC) on macOS
+        };
+        for (int round = 1; round &lt;= 2; round++) {                     // round 1 is the warm-up
+            for (int k = 0; k &lt; syncs.length; k++) {
+                try (RandomAccessFile f = new RandomAccessFile(dir.resolve(labels[k] + "." + round).toFile(), "rw")) {
+                    long t0 = System.nanoTime();
+                    for (int i = 0; i &lt; n; i++) { f.write(record); syncs[k].run(f); }
+                    double us = (System.nanoTime() - t0) / 1000.0 / n;
+                    if (round == 2) System.out.println(String.format("%-22s %7.1f µs per write", labels[k], us));
+                }
+            }
+        }
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) { s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+<pre class="out">FileDescriptor.sync()     22.0 µs per write
+FileChannel.force()     3757.5 µs per write</pre>
+<pre class="out">FileDescriptor.sync()     35.6 µs per write
+FileChannel.force()     3600.4 µs per write</pre>
+</div>
+<p>A plain <code>fsync</code> on this Mac is 100 to 170 times cheaper, because it doesn't wait for the drive. It survives a kernel crash but, per Apple, not necessarily a power cut. SQLite makes the same choice by default: its <code>fullfsync</code> flag "determines whether or not the F_FULLFSYNC syncing method is used on systems that support it. The default value of the fullfsync flag is off" (<a href="https://www.sqlite.org/pragma.html#pragma_fullfsync">SQLite pragmas</a>). "Durable" always means "durable against which failure?"</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>me.arguments().orElseThrow().dropLast(1)</code> turns a Java array into a list and trims it in one call. Java copies the array into a <code>List</code> and uses <code>subList</code>.</li>
+    <li><code>if (args.firstOrNull() == "child") return child(…)</code> returns <code>Unit</code> from <code>main</code> in one line, without crashing on empty <code>args</code>.</li>
+    <li><code>full.copyOf(40)</code>, <code>full + junk</code> and <code>.also { it[29] = … }</code> are standard-library array helpers; Java writes <code>Arrays.copyOf</code> and <code>System.arraycopy</code>.</li>
+    <li><code>(32..48).groupBy { … }</code> collects the lengths by outcome in one expression; Java uses <code>computeIfAbsent</code> on a <code>LinkedHashMap</code>.</li>
+    <li><code>measureTime { }</code> (L16) returns a <code>Duration</code>; Java subtracts two <code>System.nanoTime()</code> readings.</li>
+  </ul>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p2-1" data-group="Part 2 · Crashes and durability" data-answer="2">
+  <p class="q">A program calls <code>FileChannel.write</code> (no <code>force</code>), then gets <code>kill -9</code>. The bytes it wrote…</p>
+  <div class="opts"><button>Are always lost</button><button>Are half written</button><button>Survive the crash</button><button>Need a restart</button></div>
+  <p class="why">They're in the kernel's page cache, which doesn't belong to the process. KillDemo's direct mode recovered 20,000 of 20,000. A power cut is a different story.</p>
+</div>
+<div class="quiz" data-id="p2-2" data-group="Part 2 · Crashes and durability" data-answer="0">
+  <p class="q">Why must recovery truncate a torn tail instead of just stopping the scan there?</p>
+  <div class="opts"><button>Later appends land after garbage</button><button>Truncating makes reads much faster</button><button>The CRC is stored there</button><button>The index needs the space</button></div>
+  <p class="why">New records go at the end of the file. With the garbage still there, the next scan stops at it and never reaches them: TornDemo step 4 lost <code>k4</code> that way.</p>
+</div>
+<div class="quiz" data-id="p2-3" data-group="Part 2 · Crashes and durability" data-answer="3">
+  <p class="q">One forced write costs 3.5 ms. Roughly how many writes per second does "force after every write" allow?</p>
+  <div class="opts"><button><code>3,500</code></button><button><code>35,000</code></button><button><code>3.5</code></button><button><code>285</code></button></div>
+  <p class="why">1 s ÷ 3.5 ms ≈ 285, and the measurement said 281. That ceiling is why databases batch commits: 100 writes per force reached about 23,000 per second.</p>
+</div>
+<div class="quiz" data-id="p2-4" data-group="Part 2 · Crashes and durability" data-answer="1">
+  <p class="q">With group commit, when may the store tell a caller "your write is durable"?</p>
+  <div class="opts"><button>When its write returns</button><button>After the batch's force</button><button>Before the batch starts</button><button>When the buffer fills</button></div>
+  <p class="why">The acknowledgement has to wait for the force that covers the record; otherwise it's the buffered child's promise again. Batching delays each caller slightly and multiplies throughput.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p2"> Part 2 done</label>
+
+<!-- ═════════════════════════ PART 3 ═════════════════════════ -->
+<div class="part-label">Part 3</div>
+<div class="part-head" id="p3" data-title="Part 3"><h2>LSM-trees, Bloom filters and B-trees</h2><span class="t">~25 min</span></div>
+
+<p>Bitcask's two limits, every key in memory and no ranges, both come from the hash index. Keep the data <em>sorted</em> and they go away, without giving up sequential writes. The trick is to sort in memory and write sorted files in one go:</p>
+<ul>
+  <li><b>Memtable.</b> Writes go into a sorted map in memory. RocksDB: "new writes are inserted into the memtable and are optionally written to the logfile (aka. Write Ahead Log(WAL))" and "The default implementation of the memtable for RocksDB is a skiplist" (<a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Overview">RocksDB Overview</a>). A skip list is a sorted map like L20's trees; the JDK has one, <code>ConcurrentSkipListMap</code>, "providing expected average log(n) time cost for the containsKey, get, put and remove operations" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentSkipListMap.html">ConcurrentSkipListMap</a>). Ours is a <code>TreeMap</code>.</li>
+  <li><b>SSTable.</b> When the memtable fills, it's written out in key order as an immutable <dfn>sorted string table</dfn>: "When the memtable fills up, it is flushed to a sstfile on storage and the corresponding logfile can be safely deleted. The data in an sstfile is sorted to facilitate easy lookup of keys."</li>
+  <li><b>Tombstones and merging.</b> LevelDB's design notes: each entry "is either a value for the key, or a deletion marker for the key. (Deletion markers are kept around to hide obsolete values present in older sorted tables)" (<a href="https://github.com/google/leveldb/blob/main/doc/impl.md">LevelDB implementation notes</a>). Merging sorted files, keeping the newest version of each key, is merge sort's merge step (L18).</li>
+</ul>
+<p>The design is the <dfn>log-structured merge tree</dfn>, published by O'Neil, Cheng, Gawlick and O'Neil as "<a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">The Log-Structured Merge-Tree (LSM-Tree)</a>" (1996). LevelDB, RocksDB and Cassandra use it: "The Cassandra storage engine is optimized for high performance, write-oriented workloads. The architecture is based on Log Structured Merge (LSM) trees, which utilize an append-only approach instead of the traditional relational database design with B-trees" (<a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html">Cassandra: Storage Engine</a>).</p>
+<div class="logviz" data-src="lz-lsm"></div>
+<script type="application/json" id="lz-lsm">{"modes": [{"name": "LSM tree", "kind": "lsm", "steps": [{"mem": [["cat", "1"]], "tables": [], "note": "put(cat): goes into the memtable, a sorted map in memory (a TreeMap here; RocksDB uses a skip list)."}, {"mem": [["ant", "1"], ["cat", "1"]], "tables": [], "note": "put(ant): goes into the memtable, a sorted map in memory (a TreeMap here; RocksDB uses a skip list)."}, {"mem": [["ant", "1"], ["cat", "1"], ["eel", "1"]], "tables": [], "note": "put(eel): goes into the memtable, a sorted map in memory (a TreeMap here; RocksDB uses a skip list)."}, {"mem": [], "tables": [{"name": "sst-0000", "mark": "new", "rows": [["ant", "1"], ["cat", "1"], ["eel", "1"]]}], "note": "The memtable is full (3 keys in this demo), so it's written out <b>in key order<\/b> as an immutable SSTable, in one sequential write."}, {"mem": [["bee", "2"], ["cat", "2"], ["fox", "2"]], "tables": [{"name": "sst-0000", "mark": null, "rows": [["ant", "1"], ["cat", "1"], ["eel", "1"]]}], "note": "Three more puts, including a newer value for cat. The old cat=1 in sst-0000 is not touched."}, {"mem": [], "tables": [{"name": "sst-0001", "mark": "new", "rows": [["bee", "2"], ["cat", "2"], ["fox", "2"]]}, {"name": "sst-0000", "mark": null, "rows": [["ant", "1"], ["cat", "1"], ["eel", "1"]]}], "note": "Flush again: a second SSTable. Newest tables are listed first, because a read must check them first."}, {"mem": [["ant", null]], "tables": [{"name": "sst-0001", "mark": null, "rows": [["bee", "2"], ["cat", "2"], ["fox", "2"]]}, {"name": "sst-0000", "mark": null, "rows": [["ant", "1"], ["cat", "1"], ["eel", "1"]]}], "note": "delete(ant): a tombstone goes into the memtable. It must hide ant=1 in the older table until a merge removes both."}, {"mem": [["ant", null]], "tables": [{"name": "sst-0001", "mark": "hit", "rows": [["bee", "2"], ["cat", "2"], ["fox", "2"]]}, {"name": "sst-0000", "mark": null, "rows": [["ant", "1"], ["cat", "1"], ["eel", "1"]]}], "note": "get(cat): not in the memtable. sst-0001: found \"2\". Stop here: anything in an older table is an older version."}, {"mem": [["ant", null]], "tables": [{"name": "sst-0001", "mark": "skip", "rows": [["bee", "2"], ["cat", "2"], ["fox", "2"]]}, {"name": "sst-0000", "mark": "skip", "rows": [["ant", "1"], ["cat", "1"], ["eel", "1"]]}], "note": "get(dog): not in the memtable. sst-0001: Bloom filter says no, file not read. sst-0000: Bloom filter says no, file not read."}, {"mem": [["ant", null]], "tables": [{"name": "sst-0001", "mark": null, "rows": [["bee", "2"], ["cat", "2"], ["fox", "2"]]}, {"name": "sst-0000", "mark": null, "rows": [["ant", "1"], ["cat", "1"], ["eel", "1"]]}], "note": "get(ant): found in the memtable as a <b>tombstone<\/b>, so the answer is null. Older tables are never asked."}, {"mem": [], "tables": [{"name": "sst-0002", "mark": "new", "rows": [["ant", null]]}, {"name": "sst-0001", "mark": null, "rows": [["bee", "2"], ["cat", "2"], ["fox", "2"]]}, {"name": "sst-0000", "mark": null, "rows": [["ant", "1"], ["cat", "1"], ["eel", "1"]]}], "note": "Flush the tombstone into its own SSTable. Three files now: every read of a missing key could cost three probes without Bloom filters."}, {"mem": [], "tables": [{"name": "sst-0003", "mark": "new", "rows": [["bee", "2"], ["cat", "2"], ["eel", "1"], ["fox", "2"]]}], "note": "compact(): merge all tables like merge sort's merge step. For each key keep only the newest version; drop the tombstone and the ant=1 it was hiding. One file, no garbage."}]}]}</script>
+
+<h3>Bloom filters: skip the files that can't have it</h3>
+<p>Reading a key that's in an old table, or in none, means checking table after table. A <dfn>Bloom filter</dfn> per table answers "definitely not here" without touching the disk. Broder and Mitzenmacher's survey defines it: "A Bloom filter for representing a set S = {x1, x2, …, xn} of n elements is described by an array of m bits, initially all set to 0. A Bloom filter uses k independent hash functions." Adding a key sets <i>k</i> bits; to check a key, "If not, then clearly y is not a member of S. If all hi(y) are set to 1, we assume that y is in S, although we are wrong with some probability" (<a href="https://www.eecs.harvard.edu/~michaelm/postscripts/im2005b.pdf">"Network Applications of Bloom Filters: A Survey", Internet Mathematics, 2004</a>). "No" is always right; "maybe" is sometimes wrong. The same survey derives the false-positive rate, f = (1 − e<sup>−kn/m</sup>)<sup>k</sup>, and that it's smallest when k = ln 2 · (m/n).</p>
+<p>You don't need <i>k</i> separate hash functions. Kirsch and Mitzenmacher showed that two are enough, combined "to simulate additional hash functions of the form g<sub>i</sub>(x) = h<sub>1</sub>(x) + ih<sub>2</sub>(x)" (<a href="https://www.eecs.harvard.edu/~michaelm/postscripts/rsa2008.pdf">"Less Hashing, Same Performance", 2008</a>). Ours takes both halves of one 64-bit hash: FNV-1a over the bytes, which loops "hash = hash xor octet_of_data; hash = hash * FNV_prime" (<a href="http://www.isthe.com/chongo/tech/comp/fnv/index.html">FNV hash</a>), then MurmurHash3's <code>fmix64</code> finaliser (<a href="https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp#L81-L90">MurmurHash3.cpp</a>) to spread the bits, as L19's <code>HashMap</code> spreads <code>hashCode</code>.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Bloom.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.math.exp
+import kotlin.math.ln
+import kotlin.math.roundToInt
+
+// A Bloom filter: m bits, k hash positions per key. "No" is always right; "maybe" can be wrong.
+class Bloom(val m: Int, val k: Int) {
+    private val bits = LongArray((m + 63) / 64)
+
+    fun add(key: String) = positions(key).forEach { bits[it ushr 6] = bits[it ushr 6] or (1L shl it) }
+    fun mightContain(key: String) = positions(key).all { bits[it ushr 6] and (1L shl it) != 0L }
+
+    // Two hashes simulate k of them: g_i = h1 + i*h2 (Kirsch &amp; Mitzenmacher).
+    private fun positions(key: String): List&lt;Int&gt; {
+        val h = hash64(key)
+        val h1 = h.toInt(); val h2 = (h ushr 32).toInt()
+        return List(k) { i -&gt; Math.floorMod(h1 + i * h2, m) }
+    }
+
+    companion object {
+        fun optimalK(m: Int, n: Int) = maxOf(1, (ln(2.0) * m / n).roundToInt())
+        fun predicted(m: Int, n: Int, k: Int) = Math.pow(1 - exp(-k.toDouble() * n / m), k.toDouble())
+
+        // FNV-1a over the UTF-8 bytes, then MurmurHash3's 64-bit finaliser to mix the bits well.
+        fun hash64(s: String): Long {
+            var h = 0xcbf29ce484222325uL.toLong()           // the FNV-1a offset basis
+            for (b in s.toByteArray()) { h = h xor (b.toLong() and 0xff); h *= 0x100000001b3L }
+            h = h xor (h ushr 33); h *= 0xff51afd7ed558ccduL.toLong()
+            h = h xor (h ushr 33); h *= 0xc4ceb9fe1a85ec53uL.toLong()
+            return h xor (h ushr 33)
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Bloom.java</figcaption>
+<pre><code class="language-java">import java.nio.charset.StandardCharsets;
+
+// A Bloom filter: m bits, k hash positions per key. "No" is always right; "maybe" can be wrong.
+public class Bloom {
+    final int m, k;
+    private final long[] bits;
+
+    Bloom(int m, int k) { this.m = m; this.k = k; this.bits = new long[(m + 63) / 64]; }
+
+    void add(String key) {
+        for (int p : positions(key)) bits[p &gt;&gt;&gt; 6] |= 1L &lt;&lt; p;
+    }
+
+    boolean mightContain(String key) {
+        for (int p : positions(key)) if ((bits[p &gt;&gt;&gt; 6] &amp; (1L &lt;&lt; p)) == 0) return false;
+        return true;
+    }
+
+    // Two hashes simulate k of them: g_i = h1 + i*h2 (Kirsch &amp; Mitzenmacher).
+    private int[] positions(String key) {
+        long h = hash64(key);
+        int h1 = (int) h, h2 = (int) (h &gt;&gt;&gt; 32);
+        int[] out = new int[k];
+        for (int i = 0; i &lt; k; i++) out[i] = Math.floorMod(h1 + i * h2, m);
+        return out;
+    }
+
+    static int optimalK(int m, int n) { return Math.max(1, (int) Math.round(Math.log(2) * m / n)); }
+    static double predicted(int m, int n, int k) { return Math.pow(1 - Math.exp(-(double) k * n / m), k); }
+
+    // FNV-1a over the UTF-8 bytes, then MurmurHash3's 64-bit finaliser to mix the bits well.
+    static long hash64(String s) {
+        long h = 0xcbf29ce484222325L;
+        for (byte b : s.getBytes(StandardCharsets.UTF_8)) { h ^= b &amp; 0xff; h *= 0x100000001b3L; }
+        h ^= h &gt;&gt;&gt; 33; h *= 0xff51afd7ed558ccdL;
+        h ^= h &gt;&gt;&gt; 33; h *= 0xc4ceb9fe1a85ec53L;
+        return h ^ (h &gt;&gt;&gt; 33);
+    }
+}</code></pre></figure>
+</div>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · BloomDemo.kt</figcaption>
+<pre><code class="language-kotlin">// Measure a Bloom filter's false-positive rate and compare it with the formula (1 - e^(-kn/m))^k.
+fun main() {
+    val n = 100_000
+    val probes = 1_000_000
+    println("bits/key   k   memory    measured   predicted")
+    for ((bitsPerKey, kOverride) in listOf(4 to 0, 8 to 0, 10 to 0, 10 to 1, 16 to 0)) {
+        val m = n * bitsPerKey
+        val k = if (kOverride &gt; 0) kOverride else Bloom.optimalK(m, n)
+        val bloom = Bloom(m, k)
+        for (i in 0 until n) bloom.add("key-$i")
+        check((0 until n).all { bloom.mightContain("key-$it") })            // never a false "no"
+        val fp = (0 until probes).count { bloom.mightContain("absent-$it") }
+        println("%8d  %2d  %5d KB    %6.3f%%    %6.3f%%".format(
+            bitsPerKey, k, m / 8 / 1024, 100.0 * fp / probes, 100 * Bloom.predicted(m, n, k)))
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · BloomDemo.java</figcaption>
+<pre><code class="language-java">// Measure a Bloom filter's false-positive rate and compare it with the formula (1 - e^(-kn/m))^k.
+public class BloomDemo {
+    public static void main(String[] args) {
+        int n = 100_000;
+        int probes = 1_000_000;
+        System.out.println("bits/key   k   memory    measured   predicted");
+        int[][] runs = { {4, 0}, {8, 0}, {10, 0}, {10, 1}, {16, 0} };
+        for (int[] run : runs) {
+            int m = n * run[0];
+            int k = run[1] &gt; 0 ? run[1] : Bloom.optimalK(m, n);
+            Bloom bloom = new Bloom(m, k);
+            for (int i = 0; i &lt; n; i++) bloom.add("key-" + i);
+            for (int i = 0; i &lt; n; i++) if (!bloom.mightContain("key-" + i)) throw new IllegalStateException("false no");
+            int fp = 0;
+            for (int i = 0; i &lt; probes; i++) if (bloom.mightContain("absent-" + i)) fp++;
+            System.out.println(String.format("%8d  %2d  %5d KB    %6.3f%%    %6.3f%%",
+                    run[0], k, m / 8 / 1024, 100.0 * fp / probes, 100 * Bloom.predicted(m, n, k)));
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">bits/key   k   memory    measured   predicted
+       4   3     48 KB    14.722%    14.689%
+       8   6     97 KB     2.131%     2.158%
+      10   7    122 KB     0.826%     0.819%
+      10   1    122 KB     9.513%     9.516%
+      16  11    195 KB     0.044%     0.046%</pre>
+<p>Both languages print exactly this table, because the hash is the same bit for bit. The measurements land within a few hundredths of a percent of the formula. Ten bits per key, about 1.2 bytes, rules out 99.2% of absent keys, and the <code>check</code> confirms there's never a false "no". The fourth row is the same memory with <i>k</i> = 1: 9.5% wrong instead of 0.8%. Choosing <i>k</i> matters as much as choosing <i>m</i>.</p>
+
+<h3>The whole LSM tree</h3>
+<p>Each SSTable keeps two small things in memory: the Bloom filter, and a <dfn>sparse index</dfn> holding the first key of every 16-record block. A lookup checks the filter, finds the block with <code>TreeMap.floorEntry</code> (the entry version of the <code>floorKey</code> you met in L20), and reads at most 16 records. The records use Part 1's format, so <code>LogKV.encode</code> writes them.</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Lsm.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption.CREATE_NEW
+import java.nio.file.StandardOpenOption.WRITE
+import java.util.PriorityQueue
+import java.util.TreeMap
+
+data class Entry(val key: String, val value: String?, val size: Int)        // value == null: tombstone
+
+class Stats { var blocksRead = 0L; var bloomSkips = 0L }
+
+// Reads one record in Part 1's format (LogKV.encode wrote it), or null at the end of the file.
+fun readEntry(ch: FileChannel, pos: Long): Entry? {
+    val header = ByteBuffer.allocate(LogKV.HEADER)
+    if (ch.read(header, pos) &lt; LogKV.HEADER) return null
+    val keyLen = header.getInt(4); val valLen = header.getInt(8)
+    val body = ByteBuffer.allocate(keyLen + maxOf(valLen, 0))
+    ch.read(body, pos + LogKV.HEADER)
+    val key = String(body.array(), 0, keyLen)
+    val value = if (valLen &lt; 0) null else String(body.array(), keyLen, valLen)
+    return Entry(key, value, LogKV.HEADER + body.capacity())
+}
+
+// An immutable file of records sorted by key, plus a sparse index and a Bloom filter kept in memory.
+class SsTable(val path: Path, private val sparse: TreeMap&lt;String, Long&gt;, private val bloom: Bloom, val bytes: Long) {
+    fun lookup(key: String, stats: Stats, useBloom: Boolean): Pair&lt;Boolean, String?&gt; {
+        if (useBloom &amp;&amp; !bloom.mightContain(key)) { stats.bloomSkips++; return false to null }
+        val start = sparse.floorEntry(key) ?: return false to null          // sorts before our first key
+        stats.blocksRead++
+        FileChannel.open(path).use { ch -&gt;
+            var pos = start.value
+            repeat(BLOCK) {                                                  // the key can only be in this block
+                val e = readEntry(ch, pos) ?: return false to null
+                if (e.key == key) return true to e.value
+                if (e.key &gt; key) return false to null
+                pos += e.size
+            }
+        }
+        return false to null
+    }
+
+    // Records in key order, starting at the block that could hold `from`.
+    fun entries(from: String = ""): Sequence&lt;Entry&gt; = sequence {
+        FileChannel.open(path).use { ch -&gt;
+            var pos = sparse.floorEntry(from)?.value ?: 0L
+            while (true) { val e = readEntry(ch, pos) ?: break; yield(e); pos += e.size }
+        }
+    }
+
+    companion object {
+        const val BLOCK = 16
+
+        fun write(path: Path, sorted: List&lt;Pair&lt;String, String?&gt;&gt;): SsTable {
+            val sparse = TreeMap&lt;String, Long&gt;()
+            val bloom = Bloom(maxOf(64, sorted.size * 10), 7)                // 10 bits per key: about 1% false positives
+            var pos = 0L
+            FileChannel.open(path, CREATE_NEW, WRITE).use { ch -&gt;
+                sorted.forEachIndexed { i, (key, value) -&gt;
+                    if (i % BLOCK == 0) sparse[key] = pos
+                    bloom.add(key)                                           // tombstones too: they must be found
+                    val buf = LogKV.encode(key, value)
+                    while (buf.hasRemaining()) pos += ch.write(buf)
+                }
+            }
+            return SsTable(path, sparse, bloom, pos)
+        }
+    }
+}
+
+// A log-structured merge tree: writes go to a sorted in-memory memtable, which is flushed to SSTables.
+class Lsm(private val dir: Path, private val memLimit: Int) {
+    val stats = Stats()
+    var useBloom = true
+    var userBytes = 0L; private set                    // bytes a plain append-only log would have written
+    var diskBytes = 0L; private set                    // bytes we actually wrote to SSTables, ever
+    private var mem = TreeMap&lt;String, String?&gt;()
+    private val tables = ArrayList&lt;SsTable&gt;()          // newest first
+    private var nextId = 0
+    val tableCount get() = tables.size
+
+    fun put(key: String, value: String) = write(key, value)
+    fun delete(key: String) = write(key, null)
+
+    private fun write(key: String, value: String?) {
+        mem[key] = value
+        userBytes += LogKV.encode(key, value).remaining()
+        if (mem.size &gt;= memLimit) flush()
+    }
+
+    fun get(key: String): String? {
+        if (mem.containsKey(key)) return mem[key]
+        for (t in tables) {
+            val (found, value) = t.lookup(key, stats, useBloom)
+            if (found) return value                    // the newest version wins, even a tombstone
+        }
+        return null
+    }
+
+    // All live keys with from &lt;= key &lt; to, in order. Oldest first, so newer versions overwrite older ones.
+    fun range(from: String, to: String): List&lt;Pair&lt;String, String&gt;&gt; {
+        val merged = TreeMap&lt;String, String?&gt;()
+        for (t in tables.asReversed()) for (e in t.entries(from)) {
+            if (e.key &gt;= to) break
+            if (e.key &gt;= from) merged[e.key] = e.value
+        }
+        merged.putAll(mem.subMap(from, to))
+        return merged.mapNotNull { (k, v) -&gt; v?.let { k to it } }
+    }
+
+    fun flush() {
+        if (mem.isEmpty()) return
+        val t = SsTable.write(nextPath(), mem.map { it.key to it.value })
+        diskBytes += t.bytes
+        tables.add(0, t)
+        mem = TreeMap()
+    }
+
+    // Merge every table into one, like merge sort's merge step (L18) over k inputs with a heap (L20).
+    fun compact() {
+        class Cursor(val age: Int, val it: Iterator&lt;Entry&gt;) {
+            var head: Entry? = null
+            fun advance(): Boolean { head = if (it.hasNext()) it.next() else null; return head != null }
+        }
+        val heap = PriorityQueue(compareBy&lt;Cursor&gt;({ it.head!!.key }, { it.age }))   // ties: newest first
+        tables.forEachIndexed { age, t -&gt; Cursor(age, t.entries().iterator()).let { if (it.advance()) heap.add(it) } }
+        val out = ArrayList&lt;Pair&lt;String, String?&gt;&gt;()
+        while (heap.isNotEmpty()) {
+            val c = heap.poll()
+            val e = c.head!!
+            while (heap.isNotEmpty() &amp;&amp; heap.peek().head!!.key == e.key) {          // older versions: skip
+                val old = heap.poll()
+                if (old.advance()) heap.add(old)
+            }
+            if (e.value != null) out += e.key to e.value                         // a full merge drops tombstones
+            if (c.advance()) heap.add(c)
+        }
+        val merged = SsTable.write(nextPath(), out)
+        diskBytes += merged.bytes
+        tables.forEach { Files.delete(it.path) }
+        tables.clear(); tables.add(merged)
+    }
+
+    private fun nextPath() = dir.resolve("sst-%04d".format(nextId++))
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Lsm.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import static java.nio.file.StandardOpenOption.CREATE_NEW;
+import static java.nio.file.StandardOpenOption.WRITE;
+
+// A log-structured merge tree: writes go to a sorted in-memory memtable, which is flushed to SSTables.
+public class Lsm {
+    record Entry(String key, String value, int size) {}          // value == null: tombstone
+    record Found(boolean found, String value) {}
+    static final Found MISS = new Found(false, null);
+    static final class Stats { long blocksRead, bloomSkips; }
+
+    // Reads one record in Part 1's format (LogKV.encode wrote it), or null at the end of the file.
+    static Entry readEntry(FileChannel ch, long pos) throws IOException {
+        ByteBuffer header = ByteBuffer.allocate(LogKV.HEADER);
+        if (ch.read(header, pos) &lt; LogKV.HEADER) return null;
+        int keyLen = header.getInt(4), valLen = header.getInt(8);
+        ByteBuffer body = ByteBuffer.allocate(keyLen + Math.max(valLen, 0));
+        ch.read(body, pos + LogKV.HEADER);
+        String key = new String(body.array(), 0, keyLen, StandardCharsets.UTF_8);
+        String value = valLen &lt; 0 ? null : new String(body.array(), keyLen, valLen, StandardCharsets.UTF_8);
+        return new Entry(key, value, LogKV.HEADER + body.capacity());
+    }
+
+    // An immutable file of records sorted by key, plus a sparse index and a Bloom filter kept in memory.
+    static final class SsTable {
+        static final int BLOCK = 16;
+        final Path path;
+        final long bytes;
+        private final TreeMap&lt;String, Long&gt; sparse;
+        private final Bloom bloom;
+
+        SsTable(Path path, TreeMap&lt;String, Long&gt; sparse, Bloom bloom, long bytes) {
+            this.path = path; this.sparse = sparse; this.bloom = bloom; this.bytes = bytes;
+        }
+
+        Found lookup(String key, Stats stats, boolean useBloom) throws IOException {
+            if (useBloom &amp;&amp; !bloom.mightContain(key)) { stats.bloomSkips++; return MISS; }
+            Map.Entry&lt;String, Long&gt; start = sparse.floorEntry(key);
+            if (start == null) return MISS;                                   // sorts before our first key
+            stats.blocksRead++;
+            try (FileChannel ch = FileChannel.open(path)) {
+                long pos = start.getValue();
+                for (int i = 0; i &lt; BLOCK; i++) {                             // the key can only be in this block
+                    Entry e = readEntry(ch, pos);
+                    if (e == null || e.key().compareTo(key) &gt; 0) return MISS;
+                    if (e.key().equals(key)) return new Found(true, e.value());
+                    pos += e.size();
+                }
+            }
+            return MISS;
+        }
+
+        // Records in key order, starting at the block that could hold `from`.
+        List&lt;Entry&gt; entries(String from) throws IOException {
+            List&lt;Entry&gt; out = new ArrayList&lt;&gt;();
+            Map.Entry&lt;String, Long&gt; start = sparse.floorEntry(from);
+            try (FileChannel ch = FileChannel.open(path)) {
+                long pos = start == null ? 0 : start.getValue();
+                Entry e;
+                while ((e = readEntry(ch, pos)) != null) { out.add(e); pos += e.size(); }
+            }
+            return out;
+        }
+
+        static SsTable write(Path path, List&lt;Map.Entry&lt;String, String&gt;&gt; sorted) throws IOException {
+            TreeMap&lt;String, Long&gt; sparse = new TreeMap&lt;&gt;();
+            Bloom bloom = new Bloom(Math.max(64, sorted.size() * 10), 7);     // 10 bits per key: about 1% false positives
+            long pos = 0;
+            try (FileChannel ch = FileChannel.open(path, CREATE_NEW, WRITE)) {
+                for (int i = 0; i &lt; sorted.size(); i++) {
+                    String key = sorted.get(i).getKey();
+                    if (i % BLOCK == 0) sparse.put(key, pos);
+                    bloom.add(key);                                           // tombstones too: they must be found
+                    ByteBuffer buf = LogKV.encode(key, sorted.get(i).getValue());
+                    while (buf.hasRemaining()) pos += ch.write(buf);
+                }
+            }
+            return new SsTable(path, sparse, bloom, pos);
+        }
+    }
+
+    final Stats stats = new Stats();
+    boolean useBloom = true;
+    private long userBytes = 0, diskBytes = 0;          // a plain log's bytes vs bytes written to SSTables
+    private TreeMap&lt;String, String&gt; mem = new TreeMap&lt;&gt;();
+    private final List&lt;SsTable&gt; tables = new ArrayList&lt;&gt;();   // newest first
+    private final Path dir;
+    private final int memLimit;
+    private int nextId = 0;
+
+    Lsm(Path dir, int memLimit) { this.dir = dir; this.memLimit = memLimit; }
+
+    long userBytes() { return userBytes; }
+    long diskBytes() { return diskBytes; }
+    int tableCount() { return tables.size(); }
+
+    void put(String key, String value) throws IOException { write(key, value); }
+    void delete(String key) throws IOException { write(key, null); }
+
+    private void write(String key, String value) throws IOException {
+        mem.put(key, value);
+        userBytes += LogKV.encode(key, value).remaining();
+        if (mem.size() &gt;= memLimit) flush();
+    }
+
+    String get(String key) throws IOException {
+        if (mem.containsKey(key)) return mem.get(key);
+        for (SsTable t : tables) {
+            Found f = t.lookup(key, stats, useBloom);
+            if (f.found()) return f.value();                // the newest version wins, even a tombstone
+        }
+        return null;
+    }
+
+    // All live keys with from &lt;= key &lt; to, in order. Oldest first, so newer versions overwrite older ones.
+    List&lt;Map.Entry&lt;String, String&gt;&gt; range(String from, String to) throws IOException {
+        TreeMap&lt;String, String&gt; merged = new TreeMap&lt;&gt;();
+        for (SsTable t : tables.reversed()) {
+            for (Entry e : t.entries(from)) {
+                if (e.key().compareTo(to) &gt;= 0) break;
+                if (e.key().compareTo(from) &gt;= 0) merged.put(e.key(), e.value());
+            }
+        }
+        merged.putAll(mem.subMap(from, to));
+        List&lt;Map.Entry&lt;String, String&gt;&gt; out = new ArrayList&lt;&gt;();
+        merged.forEach((k, v) -&gt; { if (v != null) out.add(Map.entry(k, v)); });
+        return out;
+    }
+
+    void flush() throws IOException {
+        if (mem.isEmpty()) return;
+        List&lt;Map.Entry&lt;String, String&gt;&gt; sorted = new ArrayList&lt;&gt;();
+        mem.forEach((k, v) -&gt; sorted.add(new AbstractMap.SimpleEntry&lt;&gt;(k, v)));   // Map.entry rejects null
+        SsTable t = SsTable.write(nextPath(), sorted);
+        diskBytes += t.bytes;
+        tables.addFirst(t);
+        mem = new TreeMap&lt;&gt;();
+    }
+
+    // Merge every table into one, like merge sort's merge step (L18) over k inputs with a heap (L20).
+    void compact() throws IOException {
+        final class Cursor {
+            final int age; final Iterator&lt;Entry&gt; it; Entry head;
+            Cursor(int age, Iterator&lt;Entry&gt; it) { this.age = age; this.it = it; }
+            boolean advance() { head = it.hasNext() ? it.next() : null; return head != null; }
+        }
+        PriorityQueue&lt;Cursor&gt; heap = new PriorityQueue&lt;&gt;(
+                Comparator.comparing((Cursor c) -&gt; c.head.key()).thenComparingInt(c -&gt; c.age));   // ties: newest first
+        for (int age = 0; age &lt; tables.size(); age++) {
+            Cursor c = new Cursor(age, tables.get(age).entries("").iterator());
+            if (c.advance()) heap.add(c);
+        }
+        List&lt;Map.Entry&lt;String, String&gt;&gt; out = new ArrayList&lt;&gt;();
+        while (!heap.isEmpty()) {
+            Cursor c = heap.poll();
+            Entry e = c.head;
+            while (!heap.isEmpty() &amp;&amp; heap.peek().head.key().equals(e.key())) {   // older versions: skip
+                Cursor old = heap.poll();
+                if (old.advance()) heap.add(old);
+            }
+            if (e.value() != null) out.add(Map.entry(e.key(), e.value()));       // a full merge drops tombstones
+            if (c.advance()) heap.add(c);
+        }
+        SsTable merged = SsTable.write(nextPath(), out);
+        diskBytes += merged.bytes;
+        for (SsTable t : tables) Files.delete(t.path);
+        tables.clear();
+        tables.add(merged);
+    }
+
+    private Path nextPath() { return dir.resolve(String.format("sst-%04d", nextId++)); }
+}</code></pre></figure>
+</div>
+<p><code>compact</code> is a k-way merge: a min-heap (L20) holds the head record of every table, ordered by key and then by age, so for equal keys the newest comes out first and the older copies are skipped. Then 100,000 random writes over 50,000 possible keys, a memtable of 10,000, and lookups checked against a plain <code>HashMap</code> of the truth:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · LsmDemo.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import kotlin.io.path.deleteRecursively
+import kotlin.random.Random
+
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main() {
+    val dir = Files.createTempDirectory("l56")
+    val db = Lsm(dir, memLimit = 10_000)
+    val rnd = Random(56)
+    val latest = HashMap&lt;String, String&gt;()                         // the truth, to check against
+    repeat(100_000) { i -&gt;
+        val key = "user%05d".format(rnd.nextInt(50_000))
+        db.put(key, "v$i"); latest[key] = "v$i"
+    }
+    db.delete("user00042"); latest.remove("user00042")
+    db.flush()
+    println("100,000 puts to ${latest.size} keys -&gt; ${db.tableCount} SSTables, write amplification %.2f"
+        .format(db.diskBytes.toDouble() / db.userBytes))
+
+    fun probe(label: String, keys: List&lt;String&gt;) {
+        db.stats.blocksRead = 0; db.stats.bloomSkips = 0
+        val wrong = keys.count { db.get(it) != latest[it] }
+        println("%-28s blocks read per get %5.2f  bloom skips per get %5.2f  wrong %d".format(label,
+            db.stats.blocksRead.toDouble() / keys.size, db.stats.bloomSkips.toDouble() / keys.size, wrong))
+    }
+    val present = latest.keys.shuffled(Random(1)).take(10_000)
+    val absent = List(10_000) { "user%05d-x".format(it * 5) } + listOf("user00042")   // between real keys
+    probe("present keys", present)
+    probe("absent keys, Bloom on", absent)
+    db.useBloom = false
+    probe("absent keys, Bloom off", absent)
+    db.useBloom = true
+
+    println("range(user01000, user01004) = ${db.range("user01000", "user01004")}")
+
+    db.compact()
+    println("after compact: ${db.tableCount} SSTable, write amplification %.2f"
+        .format(db.diskBytes.toDouble() / db.userBytes))
+    probe("present keys, compacted", present)
+    dir.deleteRecursively()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · LsmDemo.java</figcaption>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.stream.Stream;
+
+public class LsmDemo {
+    static Lsm db;
+    static Map&lt;String, String&gt; latest = new HashMap&lt;&gt;();             // the truth, to check against
+
+    static void probe(String label, List&lt;String&gt; keys) throws IOException {
+        db.stats.blocksRead = 0; db.stats.bloomSkips = 0;
+        int wrong = 0;
+        for (String k : keys) if (!Objects.equals(db.get(k), latest.get(k))) wrong++;
+        System.out.println(String.format("%-28s blocks read per get %5.2f  bloom skips per get %5.2f  wrong %d", label,
+                (double) db.stats.blocksRead / keys.size(), (double) db.stats.bloomSkips / keys.size(), wrong));
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("l56");
+        db = new Lsm(dir, 10_000);
+        Random rnd = new Random(56);
+        for (int i = 0; i &lt; 100_000; i++) {
+            String key = String.format("user%05d", rnd.nextInt(50_000));
+            db.put(key, "v" + i); latest.put(key, "v" + i);
+        }
+        db.delete("user00042"); latest.remove("user00042");
+        db.flush();
+        System.out.println(String.format("100,000 puts to %d keys -&gt; %d SSTables, write amplification %.2f",
+                latest.size(), db.tableCount(), (double) db.diskBytes() / db.userBytes()));
+
+        List&lt;String&gt; present = new ArrayList&lt;&gt;(latest.keySet());
+        Collections.shuffle(present, new Random(1));
+        present = present.subList(0, 10_000);
+        List&lt;String&gt; absent = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 10_000; i++) absent.add(String.format("user%05d-x", i * 5));   // between real keys
+        absent.add("user00042");
+        probe("present keys", present);
+        probe("absent keys, Bloom on", absent);
+        db.useBloom = false;
+        probe("absent keys, Bloom off", absent);
+        db.useBloom = true;
+
+        System.out.println("range(user01000, user01004) = " + db.range("user01000", "user01004"));
+
+        db.compact();
+        System.out.println(String.format("after compact: %d SSTable, write amplification %.2f",
+                db.tableCount(), (double) db.diskBytes() / db.userBytes()));
+        probe("present keys, compacted", present);
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) { s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">100,000 puts to 43107 keys -&gt; 9 SSTables, write amplification 0.90
+present keys                 blocks read per get  1.02  bloom skips per get  2.59  wrong 0
+absent keys, Bloom on        blocks read per get  0.08  bloom skips per get  8.92  wrong 0
+absent keys, Bloom off       blocks read per get  9.00  bloom skips per get  0.00  wrong 0
+range(user01000, user01004) = [(user01001, v66031), (user01002, v12661), (user01003, v36833)]
+after compact: 1 SSTable, write amplification 1.33
+present keys, compacted      blocks read per get  1.00  bloom skips per get  0.00  wrong 0</pre>
+<p>That's Kotlin. Java's numbers agree to within a few hundredths, but it draws different random keys (<code>kotlin.random.Random</code> and <code>java.util.Random</code> are different generators), so its range lists other values.</p>
+<ul>
+  <li><b>Every answer is right</b> (<code>wrong 0</code>), including the deleted <code>user00042</code>: its tombstone in a newer table hides the older value.</li>
+  <li><b>Present keys cost about one block read</b>, because the Bloom filters skip on average 2.6 of the tables in front of the right one.</li>
+  <li><b>Absent keys: 0.08 block reads with filters, 9.00 without.</b> Every one of the 9 tables would otherwise be read. With filters, the only reads are false positives: 9 tables × about 0.8% ≈ 0.07.</li>
+  <li><b>Range queries work</b>, which Bitcask couldn't do: the tables are sorted, so <code>range</code> reads from the right block of each and stops at the end key.</li>
+  <li><b>Write amplification</b> is bytes written to SSTables divided by the bytes Part 1's plain log would have written. Flushing alone gave 0.90, because overwrites inside one memtable never reach the disk. Compaction rewrote everything once more: 1.33 in total. Real engines compact again and again as data moves down levels. Cassandra's docs call it out: "Every write of data in Cassandra is re-written multiple times, known as write amplification, and this adds background I/O to the database workload."</li>
+</ul>
+
+<h3>B-trees write pages, not records</h3>
+<p>For comparison, a B-tree database (L35) updates a page in place. With SQLite's write-ahead log, every changed page is appended to the WAL first: "Each frame consists of a 24-byte frame-header followed by a page-size bytes of page data" (<a href="https://www.sqlite.org/fileformat2.html#walformat">SQLite file format</a>), and "the default page size increased to 4096" (<a href="https://www.sqlite.org/pragma.html#pragma_page_size">PRAGMA page_size</a>). So a commit costs at least 4,120 bytes per changed page, however small the change. Measure it by switching off automatic checkpoints so the WAL keeps every frame:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · WalAmp.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.file.Files
+import java.sql.DriverManager
+import kotlin.io.path.deleteRecursively
+import kotlin.random.Random
+
+// How many bytes does a B-tree database write per small row? Count what lands in SQLite's write-ahead log.
+@OptIn(kotlin.io.path.ExperimentalPathApi::class)
+fun main() {
+    val dir = Files.createTempDirectory("l56")
+    val rows = 2_000
+    for ((label, perCommit) in listOf("1 row per commit" to 1, "100 rows per commit" to 100, "all rows in 1 commit" to rows)) {
+        val db = dir.resolve("$perCommit.db")
+        DriverManager.getConnection("jdbc:sqlite:$db").use { c -&gt;
+            c.createStatement().use { s -&gt;
+                s.execute("PRAGMA journal_mode = WAL")
+                s.execute("PRAGMA wal_autocheckpoint = 0")        // keep every frame in the WAL so we can measure it
+                s.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID")   // one B-tree
+            }
+            c.autoCommit = false
+            val rnd = Random(56)
+            var logBytes = 0L                                     // what Part 1's log would have written
+            c.prepareStatement("INSERT OR REPLACE INTO kv VALUES (?, ?)").use { ins -&gt;
+                for (i in 1..rows) {
+                    val k = "user%05d".format(rnd.nextInt(50_000)); val v = "v$i"
+                    ins.setString(1, k); ins.setString(2, v); ins.executeUpdate()
+                    logBytes += LogKV.encode(k, v).remaining()
+                    if (i % perCommit == 0) c.commit()
+                }
+            }
+            val wal = Files.size(dir.resolve("$perCommit.db-wal"))
+            println("%-21s WAL %,10d bytes = %,6d per row, %6.1f× a plain log".format(
+                label, wal, wal / rows, wal.toDouble() / logBytes))
+        }
+    }
+    dir.deleteRecursively()
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · WalAmp.java</figcaption>
+<pre><code class="language-java">import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.*;
+import java.util.*;
+import java.util.stream.Stream;
+
+// How many bytes does a B-tree database write per small row? Count what lands in SQLite's write-ahead log.
+public class WalAmp {
+    public static void main(String[] args) throws Exception {
+        Path dir = Files.createTempDirectory("l56");
+        int rows = 2_000;
+        var runs = new LinkedHashMap&lt;String, Integer&gt;();
+        runs.put("1 row per commit", 1); runs.put("100 rows per commit", 100); runs.put("all rows in 1 commit", rows);
+        for (var run : runs.entrySet()) {
+            int perCommit = run.getValue();
+            Path db = dir.resolve(perCommit + ".db");
+            try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
+                try (Statement s = c.createStatement()) {
+                    s.execute("PRAGMA journal_mode = WAL");
+                    s.execute("PRAGMA wal_autocheckpoint = 0");      // keep every frame in the WAL so we can measure it
+                    s.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");   // one B-tree
+                }
+                c.setAutoCommit(false);
+                Random rnd = new Random(56);
+                long logBytes = 0;                                   // what Part 1's log would have written
+                try (PreparedStatement ins = c.prepareStatement("INSERT OR REPLACE INTO kv VALUES (?, ?)")) {
+                    for (int i = 1; i &lt;= rows; i++) {
+                        String k = String.format("user%05d", rnd.nextInt(50_000)), v = "v" + i;
+                        ins.setString(1, k); ins.setString(2, v); ins.executeUpdate();
+                        logBytes += LogKV.encode(k, v).remaining();
+                        if (i % perCommit == 0) c.commit();
+                    }
+                }
+                long wal = Files.size(dir.resolve(perCommit + ".db-wal"));
+                System.out.println(String.format("%-21s WAL %,10d bytes = %,6d per row, %6.1f× a plain log",
+                        run.getKey(), wal, wal / rows, (double) wal / logBytes));
+            }
+        }
+        try (Stream&lt;Path&gt; s = Files.walk(dir)) { s.sorted(Comparator.reverseOrder()).forEach(p -&gt; p.toFile().delete()); }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">1 row per commit      WAL  9,167,032 bytes =  4,583 per row,  180.1× a plain log
+100 rows per commit   WAL    572,712 bytes =    286 per row,   11.3× a plain log
+all rows in 1 commit  WAL     57,712 bytes =     28 per row,    1.1× a plain log</pre>
+<p>Java's run matches to within 1%. A one-row commit writes about 4.6 KB to the WAL for a row that takes about 25 bytes in Part 1's log: 180 times what a plain log writes, and that's before a checkpoint copies the same pages into the database file again. Batch 100 rows per commit and many of them share pages, and the ratio falls to 11. All 2,000 in one commit is barely more than a log. So "B-trees write more than LSM-trees" is true per small transaction, and mostly a statement about how you batch. The honest summary is a table of trade-offs:</p>
+<div class="table-scroll"><table>
+  <tr><th></th><th>Hash log (Bitcask)</th><th>LSM-tree</th><th>B-tree</th></tr>
+  <tr><td>Write</td><td>one append</td><td>memtable, then sequential flushes; compaction rewrites</td><td>rewrite the page in place, plus the journal or WAL</td></tr>
+  <tr><td>Point read</td><td>one seek</td><td>memtable, then tables newest first; Bloom filters skip most</td><td>one path from root to leaf, about 3–4 pages (L35)</td></tr>
+  <tr><td>Range read</td><td>no</td><td>yes: merge sorted tables</td><td>yes: walk the linked leaves</td></tr>
+  <tr><td>Keys in memory</td><td>all of them</td><td>sparse index and filters only</td><td>whatever pages are cached</td></tr>
+  <tr><td>Used by</td><td>Riak (Bitcask)</td><td>LevelDB, RocksDB, Cassandra</td><td>SQLite, PostgreSQL, MySQL's InnoDB</td></tr>
+</table></div>
+<p>RocksDB lets you tune the LSM side of this. Its leveled compaction optimises "disk footprint vs. logical database size (space amplification)", while universal compaction optimises "total bytes written to disk vs. logical database size (write amplification)" and "typically results in lower write-amplification but higher space- and read-amplification" (<a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Overview">RocksDB Overview</a>). Read, write and space amplification trade against each other: no engine minimises all three.</p>
+
+<div class="callout"><b>Bridge to Android.</b> "The Room persistence library provides an abstraction layer over SQLite to allow fluent database access while harnessing the full power of SQLite" (<a href="https://developer.android.com/training/data-storage/room">Android: Room</a>). And SQLite commits every statement that isn't already inside a transaction: "Any command that accesses the database (basically, any SQL command, except a few PRAGMA statements) will automatically start a transaction if one is not already in effect. Automatically started transactions are committed when the last SQL statement finishes" (<a href="https://www.sqlite.org/lang_transaction.html">SQLite: Transaction</a>). So an app that saves rows one at a time in a loop pays the 180× row above on every one. Wrapping the loop in one transaction is the fix you just measured.</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><b>The <code>sequence { }</code> builder</b> (L50) makes <code>SsTable.entries()</code> lazy: records are read only as the caller iterates, and <code>use</code> closes the file when the sequence ends. The Java version reads the whole table into a list, which is simpler to write but reads more than a range query needs.</li>
+    <li><code>compareBy&lt;Cursor&gt;({ it.head!!.key }, { it.age })</code> builds a two-key comparator; Java chains <code>Comparator.comparing(…).thenComparingInt(…)</code>.</li>
+    <li><code>val (found, value) = t.lookup(…)</code> destructures a <code>Pair</code>. Java declares a <code>Found</code> record.</li>
+    <li><code>0xcbf29ce484222325uL.toLong()</code> writes a 64-bit constant above <code>Long.MAX_VALUE</code> as an unsigned literal. Java's <code>0xcbf29ce484222325L</code> is allowed directly, because a Java hex literal may set the sign bit: <code>0xffff_ffff_ffff_ffffL</code> is <code>-1L</code> (<a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-3.html#jls-3.10.1">JLS §3.10.1</a>). Kotlin rejects the same literal with <code>error: value out of range</code>.</li>
+    <li><code>tables.asReversed()</code> is a reversed <i>view</i>, with no copy. Java 21 added <code>List.reversed()</code> (<a href="https://openjdk.org/jeps/431">JEP 431</a>), which is also a view.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: size a Bloom filter for a target error rate</div>
+  <p>From a blank file, in both languages. Using the survey's two results, k = ln 2 · (m/n) and, at that <i>k</i>, a false-positive rate of (1/2)<sup>k</sup>, derive how many bits per key a filter needs for a target rate <i>p</i>. Write <code>bitsPerKey(p)</code>, build filters for 10%, 1% and 0.1% over 100,000 keys, and measure them on 1,000,000 absent keys.</p>
+  <details class="solution"><summary>Solution</summary>
+    <p>(1/2)<sup>k</sup> = p gives k = −log<sub>2</sub> p. Substituting k = ln 2 · (m/n): m/n = −log<sub>2</sub> p / ln 2 = −ln p / (ln 2)<sup>2</sup>. That's about 1.44 · log<sub>2</sub>(1/p) bits per key, and every tenfold improvement costs another 4.8 bits.</p>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · BloomSize.kt</figcaption>
+<pre><code class="language-kotlin">import kotlin.math.ceil
+import kotlin.math.ln
+import kotlin.math.roundToInt
+
+// From k = ln2 · m/n and f = (1/2)^k: bits per key for a target false-positive rate p is -ln(p) / (ln 2)².
+fun bitsPerKey(p: Double) = -ln(p) / (ln(2.0) * ln(2.0))
+
+fun main() {
+    val n = 100_000
+    for (p in listOf(0.10, 0.01, 0.001)) {
+        val m = ceil(n * bitsPerKey(p)).toInt()
+        val k = (ln(2.0) * m / n).roundToInt()
+        val bloom = Bloom(m, k)
+        for (i in 0 until n) bloom.add("key-$i")
+        val fp = (0 until 1_000_000).count { bloom.mightContain("absent-$it") }
+        println("target %5.1f%%: %5.2f bits/key, k = %2d, measured %6.3f%%".format(100 * p, m.toDouble() / n, k, fp / 10_000.0))
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · BloomSize.java</figcaption>
+<pre><code class="language-java">// From k = ln2 · m/n and f = (1/2)^k: bits per key for a target false-positive rate p is -ln(p) / (ln 2)².
+public class BloomSize {
+    static double bitsPerKey(double p) { return -Math.log(p) / (Math.log(2) * Math.log(2)); }
+
+    public static void main(String[] args) {
+        int n = 100_000;
+        for (double p : new double[] { 0.10, 0.01, 0.001 }) {
+            int m = (int) Math.ceil(n * bitsPerKey(p));
+            int k = (int) Math.round(Math.log(2) * m / n);
+            Bloom bloom = new Bloom(m, k);
+            for (int i = 0; i &lt; n; i++) bloom.add("key-" + i);
+            int fp = 0;
+            for (int i = 0; i &lt; 1_000_000; i++) if (bloom.mightContain("absent-" + i)) fp++;
+            System.out.println(String.format("target %5.1f%%: %5.2f bits/key, k = %2d, measured %6.3f%%",
+                    100 * p, (double) m / n, k, fp / 10_000.0));
+        }
+    }
+}</code></pre></figure>
+    </div>
+<pre class="out">target  10.0%:  4.79 bits/key, k =  3, measured 10.093%
+target   1.0%:  9.59 bits/key, k =  7, measured  0.991%
+target   0.1%: 14.38 bits/key, k = 10, measured  0.103%</pre>
+    <p>Java prints the same. 9.59 bits per key and k = 7 is the "about 1%" filter the SSTables use (they round up to 10 bits).</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p3-1" data-group="Part 3 · LSM, Bloom, B-tree" data-answer="1">
+  <p class="q">A Bloom filter says a key is <em>not</em> in a table. The key is…</p>
+  <div class="opts"><button>Probably not there</button><button>Definitely not there</button><button>Probably there anyway</button><button>In older tables</button></div>
+  <p class="why">A key that was added set all its <i>k</i> bits, and bits are never cleared, so a 0 among them proves absence. Only "maybe" can be wrong.</p>
+</div>
+<div class="quiz" data-id="p3-2" data-group="Part 3 · LSM, Bloom, B-tree" data-answer="3">
+  <p class="q">An LSM tree reads a key. Why must it check the SSTables newest first?</p>
+  <div class="opts"><button>Newer files are always smaller</button><button>Older files have no indexes</button><button>Bloom filters require that order</button><button>The newest version must win</button></div>
+  <p class="why">A key can be in several tables. The newest copy, value or tombstone, is the truth, so the search stops at the first table that has the key.</p>
+</div>
+<div class="quiz" data-id="p3-3" data-group="Part 3 · LSM, Bloom, B-tree" data-answer="0">
+  <p class="q">Compacting all SSTables into one, a key's newest entry is a tombstone. The merge…</p>
+  <div class="opts"><button>Drops the key entirely</button><button>Keeps the tombstone forever</button><button>Restores the older value</button><button>Throws an exception immediately</button></div>
+  <p class="why">When every table takes part, nothing older remains for the tombstone to hide, so both go. A partial merge has to keep it, which is why LevelDB keeps "deletion markers … around to hide obsolete values present in older sorted tables".</p>
+</div>
+<div class="quiz" data-id="p3-4" data-group="Part 3 · LSM, Bloom, B-tree" data-answer="2">
+  <p class="q">Why did one-row commits write about 4.6 KB of WAL per small row?</p>
+  <div class="opts"><button>SQLite never compresses rows</button><button>The CRC is huge</button><button>Whole pages are logged</button><button>JDBC adds extra padding</button></div>
+  <p class="why">The WAL records whole changed pages, 24 bytes of frame header plus 4,096 bytes of page, sometimes two pages when a leaf splits. Batching lets many rows share each logged page.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p3"> Part 3 done</label>
+
+<!-- ═════════════════════════ PART 4 ═════════════════════════ -->
+<div class="part-label">Part 4</div>
+<div class="part-head" id="p4" data-title="Part 4"><h2>Documents, keys and graphs</h2><span class="t">~15 min</span></div>
+
+<p>A storage engine decides how bytes sit on disk. A <dfn>data model</dfn> decides what shape your data has when you think about it. L34 taught the relational model: tables of rows, related by keys, recombined with <code>JOIN</code>. Three other models are common, and SQLite can imitate each one closely enough to compare them in a single script:</p>
+<pre class="term"><span class="p">$ </span>/usr/bin/sqlite3 :memory: &lt; models.sql</pre>
+<figure><figcaption>SQL · models.sql</figcaption>
+<pre><code class="language-sql">-- models.sql: the same library data as documents, as rows, and as a graph. Run: /usr/bin/sqlite3 :memory: &lt; models.sql
+.mode box
+.headers on
+
+-- 1. Document model: each book carries its authors inside it (embedded, denormalised).
+CREATE TABLE book_docs (id INTEGER PRIMARY KEY, doc TEXT NOT NULL);
+INSERT INTO book_docs (doc) VALUES
+  ('{"title": "The Dispossessed", "year": 1974, "authors": ["Ursula K. Le Guin"]}'),
+  ('{"title": "Good Omens", "year": 1990, "authors": ["Terry Pratchett", "Neil Gaiman"]}'),
+  ('{"title": "The Lathe of Heaven", "authors": ["Ursula K. Le Guin"]}');  -- no year: nothing stops it
+
+SELECT doc -&gt;&gt; '$.title' AS title, doc -&gt;&gt; '$.year' AS year,
+       json_array_length(doc -&gt; '$.authors') AS authors
+FROM book_docs;
+
+-- Who wrote what? The author names live inside every document that mentions them.
+SELECT a.value AS author, count(*) AS books
+FROM book_docs, json_each(book_docs.doc, '$.authors') AS a
+GROUP BY a.value ORDER BY books DESC, author;
+
+-- 2. Relational model: the schema is checked when you write (L34–L35).
+CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, year INTEGER NOT NULL);
+INSERT INTO books (title) VALUES ('The Lathe of Heaven');
+
+-- 3. Graph model: who can Ana reach through friends, within 2 hops?
+CREATE TABLE friends (a TEXT, b TEXT);
+INSERT INTO friends VALUES ('ana','ben'), ('ben','cai'), ('cai','dee'), ('ana','eve'), ('eve','cai'), ('dee','fay');
+WITH RECURSIVE reach(person, hops) AS (
+  SELECT 'ana', 0
+  UNION
+  SELECT f.b, r.hops + 1 FROM reach r JOIN friends f ON f.a = r.person WHERE r.hops &lt; 2
+)
+SELECT person, min(hops) AS hops FROM reach GROUP BY person ORDER BY hops, person;</code></pre></figure>
+<pre class="out">┌─────────────────────┬──────┬─────────┐
+│        title        │ year │ authors │
+├─────────────────────┼──────┼─────────┤
+│ The Dispossessed    │ 1974 │ 1       │
+│ Good Omens          │ 1990 │ 2       │
+│ The Lathe of Heaven │      │ 1       │
+└─────────────────────┴──────┴─────────┘
+┌───────────────────┬───────┐
+│      author       │ books │
+├───────────────────┼───────┤
+│ Ursula K. Le Guin │ 2     │
+│ Neil Gaiman       │ 1     │
+│ Terry Pratchett   │ 1     │
+└───────────────────┴───────┘
+Runtime error near line 23: NOT NULL constraint failed: books.year (19)
+┌────────┬──────┐
+│ person │ hops │
+├────────┼──────┤
+│ ana    │ 0    │
+│ ben    │ 1    │
+│ eve    │ 1    │
+│ cai    │ 2    │
+└────────┴──────┘</pre>
+
+<h3>Documents: one record holds the whole thing</h3>
+<p>MongoDB stores JSON-like documents: "Embedded documents store related data in a single document structure. A document can contain arrays and sub-documents with related data. These denormalized data models allow applications to retrieve related data in a single database operation" (<a href="https://www.mongodb.com/docs/manual/data-modeling/embedding/">MongoDB: Embedded Data</a>). The first query is that win: a book and its authors come back together, with no join. SQLite's <code>-&gt;&gt;</code> operator pulls a field out, and it "returns an SQL TEXT, INTEGER, REAL, or NULL value that represents the selected subcomponent, or NULL if the subcomponent does not exist" (<a href="https://www.sqlite.org/json1.html#jptr">SQLite JSON functions</a>).</p>
+<p>Two prices show up in the output:</p>
+<ul>
+  <li><b>Schema-on-read.</b> <i>The Lathe of Heaven</i> has no year, and nothing complained: the query just got <code>NULL</code>. MongoDB calls this a feature: "Documents within a single collection are not required to have the same set of fields or data types" (<a href="https://www.mongodb.com/docs/manual/data-modeling/">MongoDB: Data Modeling</a>). The relational table refused the same insert: <code>NOT NULL constraint failed</code>. That's <dfn>schema-on-write</dfn>. A document store moves the check into every program that reads the data.</li>
+  <li><b>Duplicated relationships.</b> "Ursula K. Le Guin" is spelled out inside two documents. Counting her books meant unpacking every document's array with <code>json_each</code>, and renaming her means rewriting every document that mentions her. One-to-many data that's read together suits documents; many-to-many data (authors ↔ books, students ↔ courses) is what joins and normalisation (L35) are for.</li>
+</ul>
+
+<h3>Key-value and wide-column</h3>
+<p>Parts 1 and 3 built key-value stores: <code>get</code>, <code>put</code> and <code>delete</code> by key, with the value opaque to the database. That's the whole model, and it scales well because a key says exactly where its data lives (L42's sharding). <dfn>Wide-column</dfn> stores such as Cassandra add structure on top: rows grouped into partitions by a key, sorted inside each partition, all of it stored in an LSM tree. You design the tables backwards from the questions: "In Cassandra, data modeling is query-driven" (<a href="https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/intro.html">Cassandra: Data Modeling</a>).</p>
+
+<h3>Graphs: when the relationships are the data</h3>
+<p>"A Neo4j graph database stores data as nodes, relationships, and properties instead of in tables or documents" (<a href="https://neo4j.com/docs/getting-started/graph-database/">Neo4j: Graph database concepts</a>). Its strength is questions that follow edges an unknown number of times: friends of friends, the shortest route, everything a package depends on. SQL can do it too, with a recursive common table expression, and SQLite's docs describe how it runs: "Run the initial-select and add the results to a queue. While the queue is not empty: Extract a single row from the queue. Insert that single row into the recursive table. Pretend that the single row just extracted is the only row in the recursive table and run the recursive-select, adding all results to the queue" (<a href="https://www.sqlite.org/lang_with.html#recursive_common_table_expressions">SQLite: WITH</a>). A queue of frontier rows, expanded one at a time: that's L21's breadth-first search. Check it against a BFS written by hand:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Friends.kt</figcaption>
+<pre><code class="language-kotlin">import java.sql.DriverManager
+
+val edges = listOf("ana" to "ben", "ben" to "cai", "cai" to "dee", "ana" to "eve", "eve" to "cai", "dee" to "fay")
+
+// L21's breadth-first search, stopping after maxHops.
+fun bfs(start: String, maxHops: Int): Map&lt;String, Int&gt; {
+    val next = edges.groupBy({ it.first }, { it.second })
+    val hops = linkedMapOf(start to 0)
+    val queue = ArrayDeque(listOf(start))
+    while (queue.isNotEmpty()) {
+        val p = queue.removeFirst()
+        if (hops.getValue(p) == maxHops) continue
+        for (q in next[p].orEmpty()) if (q !in hops) { hops[q] = hops.getValue(p) + 1; queue.addLast(q) }
+    }
+    return hops
+}
+
+fun main() {
+    DriverManager.getConnection("jdbc:sqlite::memory:").use { c -&gt;
+        c.createStatement().use { it.execute("CREATE TABLE friends (a TEXT, b TEXT)") }
+        c.prepareStatement("INSERT INTO friends VALUES (?, ?)").use { ins -&gt;
+            for ((a, b) in edges) { ins.setString(1, a); ins.setString(2, b); ins.executeUpdate() }
+        }
+        val sql = """
+            WITH RECURSIVE reach(person, hops) AS (
+              SELECT ?, 0
+              UNION
+              SELECT f.b, r.hops + 1 FROM reach r JOIN friends f ON f.a = r.person WHERE r.hops &lt; ?
+            )
+            SELECT person, min(hops) FROM reach GROUP BY person""".trimIndent()
+        for (maxHops in 1..4) {
+            val fromSql = c.prepareStatement(sql).use { q -&gt;
+                q.setString(1, "ana"); q.setInt(2, maxHops)
+                q.executeQuery().use { rs -&gt; buildMap { while (rs.next()) put(rs.getString(1), rs.getInt(2)) } }
+            }
+            val fromBfs = bfs("ana", maxHops)
+            println("within $maxHops: ${fromBfs.toSortedMap()}  same as SQL: ${fromSql == fromBfs}")
+        }
+    }
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Friends.java</figcaption>
+<pre><code class="language-java">import java.sql.*;
+import java.util.*;
+
+public class Friends {
+    static final String[][] EDGES = { {"ana","ben"}, {"ben","cai"}, {"cai","dee"}, {"ana","eve"}, {"eve","cai"}, {"dee","fay"} };
+
+    // L21's breadth-first search, stopping after maxHops.
+    static Map&lt;String, Integer&gt; bfs(String start, int maxHops) {
+        Map&lt;String, List&lt;String&gt;&gt; next = new HashMap&lt;&gt;();
+        for (String[] e : EDGES) next.computeIfAbsent(e[0], k -&gt; new ArrayList&lt;&gt;()).add(e[1]);
+        Map&lt;String, Integer&gt; hops = new LinkedHashMap&lt;&gt;();
+        hops.put(start, 0);
+        Deque&lt;String&gt; queue = new ArrayDeque&lt;&gt;(List.of(start));
+        while (!queue.isEmpty()) {
+            String p = queue.removeFirst();
+            if (hops.get(p) == maxHops) continue;
+            for (String q : next.getOrDefault(p, List.of()))
+                if (!hops.containsKey(q)) { hops.put(q, hops.get(p) + 1); queue.addLast(q); }
+        }
+        return hops;
+    }
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite::memory:")) {
+            try (Statement s = c.createStatement()) { s.execute("CREATE TABLE friends (a TEXT, b TEXT)"); }
+            try (PreparedStatement ins = c.prepareStatement("INSERT INTO friends VALUES (?, ?)")) {
+                for (String[] e : EDGES) { ins.setString(1, e[0]); ins.setString(2, e[1]); ins.executeUpdate(); }
+            }
+            String sql = """
+                WITH RECURSIVE reach(person, hops) AS (
+                  SELECT ?, 0
+                  UNION
+                  SELECT f.b, r.hops + 1 FROM reach r JOIN friends f ON f.a = r.person WHERE r.hops &lt; ?
+                )
+                SELECT person, min(hops) FROM reach GROUP BY person""";
+            for (int maxHops = 1; maxHops &lt;= 4; maxHops++) {
+                Map&lt;String, Integer&gt; fromSql = new HashMap&lt;&gt;();
+                try (PreparedStatement q = c.prepareStatement(sql)) {
+                    q.setString(1, "ana"); q.setInt(2, maxHops);
+                    try (ResultSet rs = q.executeQuery()) { while (rs.next()) fromSql.put(rs.getString(1), rs.getInt(2)); }
+                }
+                Map&lt;String, Integer&gt; fromBfs = bfs("ana", maxHops);
+                System.out.println("within " + maxHops + ": " + new TreeMap&lt;&gt;(fromBfs) + "  same as SQL: " + fromSql.equals(fromBfs));
+            }
+        }
+    }
+}</code></pre></figure>
+</div>
+<pre class="out">within 1: {ana=0, ben=1, eve=1}  same as SQL: true
+within 2: {ana=0, ben=1, cai=2, eve=1}  same as SQL: true
+within 3: {ana=0, ben=1, cai=2, dee=3, eve=1}  same as SQL: true
+within 4: {ana=0, ben=1, cai=2, dee=3, eve=1, fay=4}  same as SQL: true</pre>
+<p>Both languages print the same, and SQL agrees with BFS at every depth. <code>UNION</code> rather than <code>UNION ALL</code> drops repeated rows ("only add rows to the queue if no identical row has been previously added"), and the <code>hops &lt; ?</code> limit is what stops a cycle from looping forever. <code>cai</code> is reachable two ways, through <code>ben</code> and through <code>eve</code>; <code>min(hops)</code> keeps the shorter.</p>
+
+<div class="table-scroll"><table>
+  <tr><th>Model</th><th>Reach for it when</th><th>It costs you</th></tr>
+  <tr><td>Relational</td><td>many-to-many data, ad hoc questions, constraints the database enforces</td><td>joins, and a schema to migrate</td></tr>
+  <tr><td>Document</td><td>self-contained records read whole (a profile, an order with its lines)</td><td>duplication, and checks in every reader</td></tr>
+  <tr><td>Key-value</td><td>lookup by one key at huge scale (sessions, caches, carts)</td><td>no queries beyond the key</td></tr>
+  <tr><td>Wide-column</td><td>huge write volumes, queries known in advance</td><td>one table per query pattern</td></tr>
+  <tr><td>Graph</td><td>paths through relationships of unknown depth</td><td>a separate query language (Cypher)</td></tr>
+</table></div>
+
+<div class="callout"><b>Bridge to Spring.</b> Spring Data covers all of these with one repository style: "Spring Data's mission is to provide a familiar and consistent, Spring-based programming model for data access while still retaining the special traits of the underlying data store." Its modules include Spring Data JPA for relational databases, Spring Data MongoDB ("object-document support"), Spring Data for Apache Cassandra, Spring Data Neo4j ("object-graph support") and Spring Data Redis (<a href="https://spring.io/projects/spring-data">Spring Data</a>). The repository interface looks the same; the trade-offs in this table don't go away.</div>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li><code>edges.groupBy({ it.first }, { it.second })</code> builds the adjacency list in one call. Java loops with <code>computeIfAbsent</code>.</li>
+    <li><code>buildMap { while (rs.next()) put(…) }</code> builds a read-only map from a <code>ResultSet</code> loop.</li>
+    <li><code>"""…""".trimIndent()</code> strips the shared indentation from the SQL. Java's text blocks (<code>"""</code>, JDK 15) do the same automatically.</li>
+    <li><code>next[p].orEmpty()</code> turns a missing key into an empty list; Java writes <code>getOrDefault(p, List.of())</code>.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise: every prerequisite, however deep</div>
+  <p>In <code>/usr/bin/sqlite3</code>. A table <code>requires(course, needs)</code> says which course needs which: distributed needs networks and databases, networks needs os, databases and os both need datastructures, and datastructures needs programming. Write one recursive query that lists everything you must take before <code>distributed</code>, with how many levels back each one is (its longest chain). Is this graph a tree?</p>
+  <details class="solution"><summary>Solution</summary>
+    <figure><figcaption>SQL · prereqs.sql</figcaption>
+<pre><code class="language-sql">-- prereqs.sql: everything you must take before 'distributed', and how far back it is.
+-- Run: /usr/bin/sqlite3 :memory: &lt; prereqs.sql
+.mode box
+.headers on
+CREATE TABLE requires (course TEXT, needs TEXT);
+INSERT INTO requires VALUES
+  ('distributed', 'networks'), ('distributed', 'databases'), ('networks', 'os'),
+  ('databases', 'datastructures'), ('os', 'datastructures'), ('datastructures', 'programming');
+
+WITH RECURSIVE before(course, depth) AS (
+  SELECT needs, 1 FROM requires WHERE course = 'distributed'
+  UNION
+  SELECT r.needs, b.depth + 1 FROM before b JOIN requires r ON r.course = b.course
+)
+SELECT course, max(depth) AS levels_back FROM before GROUP BY course ORDER BY levels_back DESC, course;</code></pre></figure>
+<pre class="out">┌────────────────┬─────────────┐
+│     course     │ levels_back │
+├────────────────┼─────────────┤
+│ programming    │ 4           │
+│ datastructures │ 3           │
+│ os             │ 2           │
+│ databases      │ 1           │
+│ networks       │ 1           │
+└────────────────┴─────────────┘</pre>
+    <p>It isn't a tree: <code>datastructures</code> is reached by two paths (through <code>databases</code> at depth 2 and through <code>networks</code> → <code>os</code> at depth 3). It's a DAG, L21's topological-sort shape, and <code>max(depth)</code> keeps the longest chain. Taking courses in descending <code>levels_back</code> order is a valid topological order.</p>
+  </details>
+</div>
+
+<h3>Check</h3>
+<div class="quiz" data-id="p4-1" data-group="Part 4 · Data models" data-answer="2">
+  <p class="q">A document store accepts a book with no <code>year</code> field. Reading <code>year</code> later gives…</p>
+  <div class="opts"><button>Gives 0</button><button>Throws exception</button><button>Gives null</button><button>Compile error</button></div>
+  <p class="why">Schema-on-read: nothing checked the shape on the way in, so a missing field reads as absent, <code>NULL</code> in SQLite's <code>-&gt;&gt;</code>. The relational table rejected the same row at insert time.</p>
+</div>
+<div class="quiz" data-id="p4-2" data-group="Part 4 · Data models" data-answer="0">
+  <p class="q">SQLite runs a recursive CTE by repeatedly taking rows from a queue. That makes it…</p>
+  <div class="opts"><button>A breadth-first search</button><button>A depth-first search</button><button>A binary search</button><button>A merge sort</button></div>
+  <p class="why">A FIFO queue of frontier rows, each expanded once: BFS (L21). The Friends program confirms it against a hand-written BFS at every depth.</p>
+</div>
+<div class="quiz" data-id="p4-3" data-group="Part 4 · Data models" data-answer="1">
+  <p class="q">Which data most needs a relational model with joins?</p>
+  <div class="opts"><button>A single user's settings</button><button>Students and their courses</button><button>A shopping cart's items</button><button>A web session's state</button></div>
+  <p class="why">Students ↔ courses is many-to-many: embedding either side in the other duplicates data and makes updates touch many documents. The other three are self-contained, read whole by one key.</p>
+</div>
+<label class="done"><input type="checkbox" class="part-done" data-part="p4"> Part 4 done</label>
+
+<!-- ═════════════════════════ FINAL ═════════════════════════ -->
+<div class="part-label">Final exercise</div>
+<div class="part-head" id="p5" data-title="Final exercise"><h2>A store that survives kill -9</h2><span class="t">~25 min</span></div>
+
+<p>Do this in a fresh Gradle project (L11), from blank files, test-first. Kotlin first, then Java. No peeking at the parts above until you've rated your attempt.</p>
+<div class="task">
+  <p><b>The spec.</b> A <code>LogStore</code> in package <code>katas</code>, opened with <code>LogStore.open(dir, sync)</code>, where <code>sync</code> is <code>Sync.EVERY_WRITE</code> (the default) or <code>Sync.NEVER</code>:</p>
+  <ul>
+    <li><code>put(key, value)</code>, <code>get(key)</code> (null if absent), <code>delete(key)</code>, <code>size</code>, <code>fileBytes</code>, <code>compact()</code> and <code>close()</code>. An empty key is an <code>IllegalArgumentException</code>.</li>
+    <li>One file, <code>data.log</code>, in Part 1's record format, CRC included. With <code>EVERY_WRITE</code>, <code>put</code> returns only after <code>force</code>.</li>
+    <li>On open: delete any leftover <code>data.log.compact</code>, rebuild the index, and <b>truncate</b> anything after the last valid record.</li>
+    <li><code>compact()</code> writes the live records to <code>data.log.compact</code>, forces it, and renames it over <code>data.log</code> with <code>ATOMIC_MOVE</code>.</li>
+  </ul>
+  <p><b>Tests to write, in this order:</b> an empty store has nothing → put then get → an overwrite keeps the latest → a delete survives reopening → reopening recovers 100 keys → a torn tail is cut at <em>every</em> length inside the last record, and a write after repair survives a second reopen → garbage after the last record is truncated → compaction shrinks the file and keeps the latest values → a leftover compaction file is ignored → an empty key is rejected → finally, <b>kill -9 loses no acknowledged write</b>.</p>
+  <p><b>The kill test.</b> Put a <code>main</code> in the test sources that opens a store and loops forever: <code>put("k$i", "v$i")</code>, then print <code>acked $i</code>. The test starts it as a separate JVM with the same <code>java</code> and classpath (<code>ProcessHandle.current().info().command()</code> and the <code>java.class.path</code> system property), reads lines until about 2,000 writes are acked, kills it with SIGKILL, and reads any acks still in the pipe. It asserts exit code 137, then reopens the store and checks every acked key. <code>Sync.NEVER</code> is enough here, because Part 2 showed the page cache survives a process crash. Power loss is the one failure a test can't produce.</p>
+  <p><code>./gradlew run</code> should print:</p>
+<pre class="out">size 1, 90 bytes on disk
+reopened: dune = Frank Herbert, emma = null
+compacted: 29 bytes on disk</pre>
+  <div class="rating-group">
+    <div class="rating" data-id="final-kt" data-label="Final: LogStore (Kotlin)"><span class="who kt">KOTLIN</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-jv" data-label="Final: LogStore (Java)"><span class="who jv">JAVA</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+    <div class="rating" data-id="final-durability" data-label="Explain what survives which crash, and why"><span class="who">DURABILITY</span><button>Solid</button><button>Needed docs</button><button>Stuck</button><button>Skipped</button></div>
+  </div>
+  <p><b>The DURABILITY row:</b> without looking, explain to yourself, or write in your katas repo, which of your store's guarantees hold after (a) an exception, (b) <code>kill -9</code>, (c) a kernel panic, (d) a power cut, for both <code>Sync</code> settings, and which line of code provides each one. Then open the model answer.</p>
+  <details class="solution"><summary>Model answer: what survives which crash</summary>
+    <ul>
+      <li><b>(a) An exception, and (b) <code>kill -9</code>:</b> every completed <code>put</code> survives with either setting, because <code>ch.write</code> has handed the bytes to the kernel. A crash in the middle of <code>compact()</code> leaves the old file intact (the rename hasn't happened), and the next open deletes the leftover file.</li>
+      <li><b>(c) A kernel panic:</b> with <code>NEVER</code>, writes still in the page cache are lost, possibly leaving a torn tail. Startup's CRC check and <code>truncate</code> remove it, so the store opens with a clean prefix of the writes. With <code>EVERY_WRITE</code>, every acknowledged write was forced, so nothing acknowledged is lost.</li>
+      <li><b>(d) A power cut:</b> the same as (c) on this Mac, because JDK 26's <code>force</code> uses <code>F_FULLFSYNC</code> and flushes the drive's cache too. With a plain <code>fsync</code>, Apple warns the drive may still lose or reorder recent writes.</li>
+      <li><b>One gap:</b> the rename itself is a change to the directory. A fully careful store also forces the directory after the rename, which is what SQLite's <code>synchronous=EXTRA</code> adds for its journal ("the directory containing a rollback journal is synced after that journal is unlinked").</li>
+    </ul>
+  </details>
+  <details class="solution"><summary>Reference solution: LogStore</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · app/src/main/kotlin/katas/LogStore.kt</figcaption>
+<pre><code class="language-kotlin">package katas
+
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardOpenOption.CREATE
+import java.nio.file.StandardOpenOption.READ
+import java.nio.file.StandardOpenOption.WRITE
+import java.util.zip.CRC32
+
+enum class Sync { EVERY_WRITE, NEVER }
+
+// A crash-safe key-value store: an append-only log of CRC-checked records plus an in-memory hash index.
+// Record: [crc 4][keyLen 4][valLen 4][key][value]; valLen = -1 is a tombstone.
+class LogStore private constructor(private val dir: Path, private val sync: Sync) : AutoCloseable {
+    private val file = dir.resolve(DATA)
+    private var ch: FileChannel
+    private val index = HashMap&lt;String, Long&gt;()            // key -&gt; offset of its newest record
+
+    init {
+        Files.deleteIfExists(dir.resolve(COMPACT))         // a compaction that crashed never happened
+        ch = FileChannel.open(file, CREATE, READ, WRITE)
+        recover()
+    }
+
+    val size: Int get() = index.size
+    val fileBytes: Long get() = ch.size()
+
+    fun put(key: String, value: String) {
+        require(key.isNotEmpty()) { "key must not be empty" }
+        index[key] = append(key, value)
+    }
+
+    fun delete(key: String) {
+        if (index.remove(key) != null) append(key, null)
+    }
+
+    fun get(key: String): String? = index[key]?.let { read(ch, it)!!.value }
+
+    // Write the live records to a new file, make it durable, then rename it over the old one in one step.
+    fun compact() {
+        val tmp = dir.resolve(COMPACT)
+        val fresh = HashMap&lt;String, Long&gt;()
+        FileChannel.open(tmp, CREATE, WRITE).use { out -&gt;
+            for ((key, offset) in index) {
+                fresh[key] = out.position()
+                val buf = encode(key, read(ch, offset)!!.value)
+                while (buf.hasRemaining()) out.write(buf)
+            }
+            out.force(true)
+        }
+        ch.close()
+        Files.move(tmp, file, ATOMIC_MOVE)
+        ch = FileChannel.open(file, READ, WRITE)
+        index.clear(); index.putAll(fresh)
+    }
+
+    override fun close() = ch.close()
+
+    private fun append(key: String, value: String?): Long {
+        val buf = encode(key, value)
+        val offset = ch.size()
+        var pos = offset
+        while (buf.hasRemaining()) pos += ch.write(buf, pos)
+        if (sync == Sync.EVERY_WRITE) ch.force(false)       // only now is the write acknowledged as durable
+        return offset
+    }
+
+    // Rebuild the index, then cut off anything after the last good record (a torn or garbage tail).
+    private fun recover() {
+        var pos = 0L
+        while (true) {
+            val rec = read(ch, pos) ?: break
+            if (rec.value == null) index.remove(rec.key) else index[rec.key] = pos
+            pos += rec.size
+        }
+        if (pos &lt; ch.size()) { ch.truncate(pos); ch.force(true) }
+    }
+
+    private class Rec(val key: String, val value: String?, val size: Int)
+
+    companion object {
+        const val DATA = "data.log"
+        const val COMPACT = "data.log.compact"
+        private const val HEADER = 12
+        private const val MAX_LEN = 1 shl 20
+
+        fun open(dir: Path, sync: Sync = Sync.EVERY_WRITE) = LogStore(dir, sync)
+
+        private fun encode(key: String, value: String?): ByteBuffer {
+            val k = key.toByteArray()
+            val v = value?.toByteArray()
+            val buf = ByteBuffer.allocate(HEADER + k.size + (v?.size ?: 0))
+            buf.position(4)
+            buf.putInt(k.size).putInt(v?.size ?: -1).put(k)
+            if (v != null) buf.put(v)
+            buf.putInt(0, CRC32().apply { update(buf.array(), 4, buf.capacity() - 4) }.value.toInt())
+            return buf.flip()
+        }
+
+        private fun read(ch: FileChannel, pos: Long): Rec? {
+            val header = ByteBuffer.allocate(HEADER)
+            if (ch.read(header, pos) &lt; HEADER) return null
+            val crc = header.getInt(0); val keyLen = header.getInt(4); val valLen = header.getInt(8)
+            if (keyLen !in 0..MAX_LEN || valLen !in -1..MAX_LEN) return null
+            val size = HEADER + keyLen + maxOf(valLen, 0)
+            if (pos + size &gt; ch.size()) return null
+            val body = ByteBuffer.allocate(size).also { ch.read(it, pos) }
+            if (CRC32().apply { update(body.array(), 4, size - 4) }.value.toInt() != crc) return null
+            val value = if (valLen &lt; 0) null else String(body.array(), HEADER + keyLen, valLen)
+            return Rec(String(body.array(), HEADER, keyLen), value, size)
+        }
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · app/src/main/java/katas/LogStore.java</figcaption>
+<pre><code class="language-java">package katas;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.zip.CRC32;
+import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
+import static java.nio.file.StandardOpenOption.*;
+
+// A crash-safe key-value store: an append-only log of CRC-checked records plus an in-memory hash index.
+// Record: [crc 4][keyLen 4][valLen 4][key][value]; valLen = -1 is a tombstone.
+public final class LogStore implements AutoCloseable {
+    public static final String DATA = "data.log";
+    public static final String COMPACT = "data.log.compact";
+    private static final int HEADER = 12;
+    private static final int MAX_LEN = 1 &lt;&lt; 20;
+
+    private record Rec(String key, String value, int size) {}
+
+    private final Path dir;
+    private final Path file;
+    private final Sync sync;
+    private FileChannel ch;
+    private final Map&lt;String, Long&gt; index = new HashMap&lt;&gt;();   // key -&gt; offset of its newest record
+
+    private LogStore(Path dir, Sync sync) throws IOException {
+        this.dir = dir;
+        this.file = dir.resolve(DATA);
+        this.sync = sync;
+        Files.deleteIfExists(dir.resolve(COMPACT));             // a compaction that crashed never happened
+        ch = FileChannel.open(file, CREATE, READ, WRITE);
+        recover();
+    }
+
+    public static LogStore open(Path dir) throws IOException { return open(dir, Sync.EVERY_WRITE); }
+    public static LogStore open(Path dir, Sync sync) throws IOException { return new LogStore(dir, sync); }
+
+    public int size() { return index.size(); }
+    public long fileBytes() throws IOException { return ch.size(); }
+
+    public void put(String key, String value) throws IOException {
+        if (key.isEmpty()) throw new IllegalArgumentException("key must not be empty");
+        index.put(key, append(key, value));
+    }
+
+    public void delete(String key) throws IOException {
+        if (index.remove(key) != null) append(key, null);
+    }
+
+    public String get(String key) throws IOException {
+        Long offset = index.get(key);
+        return offset == null ? null : read(ch, offset).value();
+    }
+
+    // Write the live records to a new file, make it durable, then rename it over the old one in one step.
+    public void compact() throws IOException {
+        Path tmp = dir.resolve(COMPACT);
+        Map&lt;String, Long&gt; fresh = new HashMap&lt;&gt;();
+        try (FileChannel out = FileChannel.open(tmp, CREATE, WRITE)) {
+            for (Map.Entry&lt;String, Long&gt; e : index.entrySet()) {
+                fresh.put(e.getKey(), out.position());
+                ByteBuffer buf = encode(e.getKey(), read(ch, e.getValue()).value());
+                while (buf.hasRemaining()) out.write(buf);
+            }
+            out.force(true);
+        }
+        ch.close();
+        Files.move(tmp, file, ATOMIC_MOVE);
+        ch = FileChannel.open(file, READ, WRITE);
+        index.clear();
+        index.putAll(fresh);
+    }
+
+    @Override public void close() throws IOException { ch.close(); }
+
+    private long append(String key, String value) throws IOException {
+        ByteBuffer buf = encode(key, value);
+        long offset = ch.size();
+        long pos = offset;
+        while (buf.hasRemaining()) pos += ch.write(buf, pos);
+        if (sync == Sync.EVERY_WRITE) ch.force(false);           // only now is the write acknowledged as durable
+        return offset;
+    }
+
+    // Rebuild the index, then cut off anything after the last good record (a torn or garbage tail).
+    private void recover() throws IOException {
+        long pos = 0;
+        Rec r;
+        while ((r = read(ch, pos)) != null) {
+            if (r.value() == null) index.remove(r.key()); else index.put(r.key(), pos);
+            pos += r.size();
+        }
+        if (pos &lt; ch.size()) { ch.truncate(pos); ch.force(true); }
+    }
+
+    private static ByteBuffer encode(String key, String value) {
+        byte[] k = key.getBytes(StandardCharsets.UTF_8);
+        byte[] v = value == null ? null : value.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buf = ByteBuffer.allocate(HEADER + k.length + (v == null ? 0 : v.length));
+        buf.position(4);
+        buf.putInt(k.length).putInt(v == null ? -1 : v.length).put(k);
+        if (v != null) buf.put(v);
+        CRC32 crc = new CRC32();
+        crc.update(buf.array(), 4, buf.capacity() - 4);
+        buf.putInt(0, (int) crc.getValue());
+        return buf.flip();
+    }
+
+    private static Rec read(FileChannel ch, long pos) throws IOException {
+        ByteBuffer header = ByteBuffer.allocate(HEADER);
+        if (ch.read(header, pos) &lt; HEADER) return null;
+        int crc = header.getInt(0), keyLen = header.getInt(4), valLen = header.getInt(8);
+        if (keyLen &lt; 0 || keyLen &gt; MAX_LEN || valLen &lt; -1 || valLen &gt; MAX_LEN) return null;
+        int size = HEADER + keyLen + Math.max(valLen, 0);
+        if (pos + size &gt; ch.size()) return null;
+        ByteBuffer body = ByteBuffer.allocate(size);
+        ch.read(body, pos);
+        CRC32 check = new CRC32();
+        check.update(body.array(), 4, size - 4);
+        if ((int) check.getValue() != crc) return null;
+        String value = valLen &lt; 0 ? null : new String(body.array(), HEADER + keyLen, valLen, StandardCharsets.UTF_8);
+        return new Rec(new String(body.array(), HEADER, keyLen, StandardCharsets.UTF_8), value, size);
+    }
+}</code></pre></figure>
+    </div>
+    <p>Java also needs <code>Sync.java</code>, the one-line <code>public enum Sync { EVERY_WRITE, NEVER }</code>; Kotlin declares the enum at the top of <code>LogStore.kt</code>. The index stores only offsets now, since compaction is the only thing that needed sizes in Part 1.</p>
+  </details>
+  <details class="solution"><summary>Reference tests, two real red runs, and the green run</summary>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · LogStoreTest.kt</figcaption>
+<pre><code class="language-kotlin">package katas
+
+import java.nio.file.Files
+import java.nio.file.Path
+import kotlin.io.path.readBytes
+import kotlin.io.path.writeBytes
+import kotlin.random.Random
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+import org.junit.jupiter.api.io.TempDir
+
+class LogStoreTest {
+    @TempDir lateinit var dir: Path
+
+    private fun open(sync: Sync = Sync.NEVER) = LogStore.open(dir, sync)
+    private val data get() = dir.resolve(LogStore.DATA)
+
+    @Test fun `an empty store has nothing`() = open().use { db -&gt;
+        assertNull(db.get("dune")); assertEquals(0, db.size)
+    }
+
+    @Test fun `put then get`() = open().use { db -&gt;
+        db.put("dune", "Herbert")
+        assertEquals("Herbert", db.get("dune"))
+    }
+
+    @Test fun `an overwrite keeps the latest value`() = open().use { db -&gt;
+        db.put("dune", "Herbert"); db.put("dune", "Frank Herbert")
+        assertEquals("Frank Herbert", db.get("dune")); assertEquals(1, db.size)
+    }
+
+    @Test fun `a delete survives reopening`() {
+        open().use { db -&gt; db.put("emma", "Austen"); db.delete("emma") }
+        open().use { db -&gt; assertNull(db.get("emma")); assertEquals(0, db.size) }
+    }
+
+    @Test fun `reopening recovers every key`() {
+        open(Sync.EVERY_WRITE).use { db -&gt; for (i in 0 until 100) db.put("k$i", "v$i") }
+        open().use { db -&gt; assertEquals(100, db.size); assertEquals("v42", db.get("k42")) }
+    }
+
+    @Test fun `a torn tail is cut off at every possible length, and new writes survive`() {
+        open().use { db -&gt; for (i in 1..3) db.put("k$i", "v$i") }      // three 16-byte records
+        val full = data.readBytes()
+        for (len in 33 until full.size) {
+            data.writeBytes(full.copyOf(len))
+            open().use { db -&gt;
+                assertEquals(setOf("k1", "k2"), (1..3).map { "k$it" }.filter { db.get(it) != null }.toSet(), "len $len")
+                db.put("k4", "v4")
+            }
+            open().use { db -&gt; assertEquals("v4", db.get("k4"), "write after repair lost, len $len") }
+        }
+    }
+
+    @Test fun `garbage after the last record is ignored`() {
+        open().use { db -&gt; db.put("dune", "Herbert") }
+        data.writeBytes(data.readBytes() + Random(56).nextBytes(100))
+        open().use { db -&gt; assertEquals("Herbert", db.get("dune")); assertEquals(1, db.size) }
+        assertEquals(23, Files.size(data))                              // the junk was truncated
+    }
+
+    @Test fun `compact shrinks the file and keeps the latest values`() = open().use { db -&gt;
+        repeat(1_000) { i -&gt; db.put("key${i % 10}", "value-$i") }
+        db.delete("key3")
+        val before = db.fileBytes
+        db.compact()
+        assertTrue(db.fileBytes &lt; before / 50, "${db.fileBytes} vs $before")
+        assertEquals("value-999", db.get("key9")); assertNull(db.get("key3")); assertEquals(9, db.size)
+        db.put("after", "compaction")
+        assertEquals("compaction", db.get("after"))
+    }
+
+    @Test fun `a compaction file left by a crash is ignored`() {
+        open().use { db -&gt; db.put("dune", "Herbert") }
+        dir.resolve(LogStore.COMPACT).writeBytes(Random(1).nextBytes(500))
+        open().use { db -&gt; assertEquals("Herbert", db.get("dune")) }
+        assertFalse(Files.exists(dir.resolve(LogStore.COMPACT)))
+    }
+
+    @Test fun `an empty key is rejected`() = open().use { db -&gt;
+        assertFailsWith&lt;IllegalArgumentException&gt; { db.put("", "x") }
+        Unit
+    }
+
+    @Test fun `kill -9 loses no acknowledged write`() {
+        val java = ProcessHandle.current().info().command().orElseThrow()
+        val child = ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), "katas.KillChildKt", dir.toString())
+            .redirectErrorStream(true).start()
+        val out = child.inputReader()
+        var acked = -1
+        while (acked &lt; 2_000) acked = out.readLine().removePrefix("acked ").toInt()
+        child.toHandle().destroyForcibly()      // SIGKILL mid-write; Process.destroyForcibly() would also close our pipe
+        assertEquals(137, child.waitFor())
+        out.lineSequence().forEach { acked = it.removePrefix("acked ").toInt() }   // acks already in the pipe
+        open().use { db -&gt;
+            for (i in 0..acked) assertEquals("v$i", db.get("k$i"), "acked k$i lost")
+            println("acked ${acked + 1}, recovered ${db.size}")
+        }
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · LogStoreTest.java</figcaption>
+<pre><code class="language-java">package katas;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeSet;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import static org.junit.jupiter.api.Assertions.*;
+
+class LogStoreTest {
+    @TempDir Path dir;
+
+    private LogStore open() throws IOException { return LogStore.open(dir, Sync.NEVER); }
+    private Path data() { return dir.resolve(LogStore.DATA); }
+
+    @Test void emptyStoreHasNothing() throws IOException {
+        try (LogStore db = open()) { assertNull(db.get("dune")); assertEquals(0, db.size()); }
+    }
+
+    @Test void putThenGet() throws IOException {
+        try (LogStore db = open()) { db.put("dune", "Herbert"); assertEquals("Herbert", db.get("dune")); }
+    }
+
+    @Test void overwriteKeepsLatestValue() throws IOException {
+        try (LogStore db = open()) {
+            db.put("dune", "Herbert"); db.put("dune", "Frank Herbert");
+            assertEquals("Frank Herbert", db.get("dune")); assertEquals(1, db.size());
+        }
+    }
+
+    @Test void deleteSurvivesReopening() throws IOException {
+        try (LogStore db = open()) { db.put("emma", "Austen"); db.delete("emma"); }
+        try (LogStore db = open()) { assertNull(db.get("emma")); assertEquals(0, db.size()); }
+    }
+
+    @Test void reopeningRecoversEveryKey() throws IOException {
+        try (LogStore db = LogStore.open(dir, Sync.EVERY_WRITE)) { for (int i = 0; i &lt; 100; i++) db.put("k" + i, "v" + i); }
+        try (LogStore db = open()) { assertEquals(100, db.size()); assertEquals("v42", db.get("k42")); }
+    }
+
+    @Test void tornTailIsCutAtEveryLengthAndNewWritesSurvive() throws IOException {
+        try (LogStore db = open()) { for (int i = 1; i &lt;= 3; i++) db.put("k" + i, "v" + i); }   // three 16-byte records
+        byte[] full = Files.readAllBytes(data());
+        for (int len = 33; len &lt; full.length; len++) {
+            Files.write(data(), Arrays.copyOf(full, len));
+            try (LogStore db = open()) {
+                Set&lt;String&gt; found = new TreeSet&lt;&gt;();
+                for (int i = 1; i &lt;= 3; i++) if (db.get("k" + i) != null) found.add("k" + i);
+                assertEquals(Set.of("k1", "k2"), found, "len " + len);
+                db.put("k4", "v4");
+            }
+            try (LogStore db = open()) { assertEquals("v4", db.get("k4"), "write after repair lost, len " + len); }
+        }
+    }
+
+    @Test void garbageAfterLastRecordIsIgnored() throws IOException {
+        try (LogStore db = open()) { db.put("dune", "Herbert"); }
+        byte[] junk = new byte[100];
+        new Random(56).nextBytes(junk);
+        byte[] good = Files.readAllBytes(data());
+        byte[] both = Arrays.copyOf(good, good.length + junk.length);
+        System.arraycopy(junk, 0, both, good.length, junk.length);
+        Files.write(data(), both);
+        try (LogStore db = open()) { assertEquals("Herbert", db.get("dune")); assertEquals(1, db.size()); }
+        assertEquals(23, Files.size(data()));                         // the junk was truncated
+    }
+
+    @Test void compactShrinksFileAndKeepsLatestValues() throws IOException {
+        try (LogStore db = open()) {
+            for (int i = 0; i &lt; 1_000; i++) db.put("key" + (i % 10), "value-" + i);
+            db.delete("key3");
+            long before = db.fileBytes();
+            db.compact();
+            assertTrue(db.fileBytes() &lt; before / 50, db.fileBytes() + " vs " + before);
+            assertEquals("value-999", db.get("key9")); assertNull(db.get("key3")); assertEquals(9, db.size());
+            db.put("after", "compaction");
+            assertEquals("compaction", db.get("after"));
+        }
+    }
+
+    @Test void compactionFileLeftByCrashIsIgnored() throws IOException {
+        try (LogStore db = open()) { db.put("dune", "Herbert"); }
+        byte[] junk = new byte[500];
+        new Random(1).nextBytes(junk);
+        Files.write(dir.resolve(LogStore.COMPACT), junk);
+        try (LogStore db = open()) { assertEquals("Herbert", db.get("dune")); }
+        assertFalse(Files.exists(dir.resolve(LogStore.COMPACT)));
+    }
+
+    @Test void emptyKeyIsRejected() throws IOException {
+        try (LogStore db = open()) { assertThrows(IllegalArgumentException.class, () -&gt; db.put("", "x")); }
+    }
+
+    @Test void killDashNineLosesNoAcknowledgedWrite() throws Exception {
+        String java = ProcessHandle.current().info().command().orElseThrow();
+        Process child = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), "katas.KillChild", dir.toString())
+                .redirectErrorStream(true).start();
+        BufferedReader out = child.inputReader();
+        int acked = -1;
+        while (acked &lt; 2_000) acked = Integer.parseInt(out.readLine().replace("acked ", ""));
+        child.toHandle().destroyForcibly();     // SIGKILL mid-write; Process.destroyForcibly() would also close our pipe
+        assertEquals(137, child.waitFor());
+        String line;
+        while ((line = out.readLine()) != null) acked = Integer.parseInt(line.replace("acked ", ""));   // acks already in the pipe
+        try (LogStore db = open()) {
+            for (int i = 0; i &lt;= acked; i++) assertEquals("v" + i, db.get("k" + i), "acked k" + i + " lost");
+            System.out.println("acked " + (acked + 1) + ", recovered " + db.size());
+        }
+    }
+}</code></pre></figure>
+    </div>
+    <div class="pair">
+      <figure class="kotlin"><figcaption>KOTLIN · KillChild.kt (test sources)</figcaption>
+<pre><code class="language-kotlin">package katas
+
+import java.nio.file.Path
+
+// Run as its own process by the kill -9 test: write forever, acknowledging each put on stdout.
+fun main(args: Array&lt;String&gt;) {
+    LogStore.open(Path.of(args[0]), Sync.NEVER).use { db -&gt;
+        var i = 0
+        while (true) {
+            db.put("k$i", "v$i")
+            println("acked $i")                 // printed only after put() returned
+            System.out.flush()
+            i++
+        }
+    }
+}</code></pre></figure>
+      <figure class="java"><figcaption>JAVA · KillChild.java (test sources)</figcaption>
+<pre><code class="language-java">package katas;
+
+import java.nio.file.Path;
+
+// Run as its own process by the kill -9 test: write forever, acknowledging each put on stdout.
+public class KillChild {
+    public static void main(String[] args) throws Exception {
+        try (LogStore db = LogStore.open(Path.of(args[0]), Sync.NEVER)) {
+            for (int i = 0; ; i++) {
+                db.put("k" + i, "v" + i);
+                System.out.println("acked " + i);       // printed only after put() returned
+                System.out.flush();
+            }
+        }
+    }
+}</code></pre></figure>
+    </div>
+    <p><b>Red run 1: recovery without the truncate.</b> With the <code>truncate</code> line commented out, two tests catch Part 2's bug at once:</p>
+<pre class="err">LogStoreTest &gt; a torn tail is cut off at every possible length, and new writes survive() FAILED
+    org.opentest4j.AssertionFailedError: write after repair lost, len 33 ==&gt; expected: &lt;v4&gt; but was: &lt;null&gt;</pre>
+<pre class="err">LogStoreTest &gt; garbage after the last record is ignored() FAILED
+    org.opentest4j.AssertionFailedError: expected: &lt;23&gt; but was: &lt;123&gt;</pre>
+    <p><b>Red run 2: the kill test that killed its own pipe.</b> My first version killed the child with <code>child.destroyForcibly()</code> and then tried to read the remaining acks:</p>
+<pre class="err">LogStoreTest &gt; kill -9 loses no acknowledged write() FAILED
+    java.io.IOException: Stream closed</pre>
+    <p><code>Process.destroyForcibly()</code> does send SIGKILL, but JDK 26's implementation then closes the parent's ends of the child's pipes: <code>try { stdout.close(); } catch (IOException ignored) {}</code> (<a href="https://github.com/openjdk/jdk/blob/jdk-26-ga/src/java.base/unix/classes/java/lang/ProcessImpl.java#L476-L478">ProcessImpl.java</a>, an implementation detail). <code>child.toHandle().destroyForcibly()</code> sends the same signal through the <code>ProcessHandle</code> and leaves the pipe open, so the acks the child had already printed can still be read. Then the green run:</p>
+<pre class="term"><span class="p">$ </span>./gradlew test --rerun</pre>
+<pre class="out">LogStoreTest &gt; an empty key is rejected() PASSED
+
+LogStoreTest &gt; a compaction file left by a crash is ignored() PASSED
+
+LogStoreTest &gt; compact shrinks the file and keeps the latest values() PASSED
+
+LogStoreTest &gt; put then get() PASSED
+
+LogStoreTest &gt; reopening recovers every key() PASSED
+
+LogStoreTest &gt; a delete survives reopening() PASSED
+
+LogStoreTest &gt; an empty store has nothing() PASSED
+
+LogStoreTest &gt; a torn tail is cut off at every possible length, and new writes survive() PASSED
+
+LogStoreTest &gt; an overwrite keeps the latest value() PASSED
+
+LogStoreTest &gt; kill -9 loses no acknowledged write() PASSED
+
+LogStoreTest &gt; garbage after the last record is ignored() PASSED
+
+BUILD SUCCESSFUL in 1s</pre>
+    <p>The Java project's run shows the same 11 tests passing, under their camelCase names. Each run's kill test counts differently, because the kill lands at a random moment. On my Kotlin run the child acknowledged 2,035 writes and the store recovered 2,036: one more write had reached the file before the kill, but the child never got to print its ack. That's correct. A crash may keep a write you were never told about, but must never lose one you were.</p>
+  </details>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p5"> Final exercise done</label>
+
+<!-- ═════════════════════════ WRAP-UP ═════════════════════════ -->
+<div class="part-label">Wrap-up</div>
+<div class="part-head" id="wrap"><h2>Exit quiz, recall card, sources</h2><span class="t">~5 min</span></div>
+
+<div class="quiz" data-id="e-1" data-group="Exit quiz" data-answer="1">
+  <p class="q">Merging <i>k</i> sorted SSTables with a min-heap of their heads costs, for <i>n</i> records in total… (L18, L20)</p>
+  <div class="opts"><button><code>O(n·k)</code></button><button><code>O(n log k)</code></button><button><code>O(n²)</code></button><button><code>O(k log n)</code></button></div>
+  <p class="why">Each record is pushed and popped once, and each heap operation is O(log k) for a heap of <i>k</i> cursors. Merge sort's two-way merge is the case k = 2.</p>
+</div>
+<div class="quiz" data-id="e-2" data-group="Exit quiz" data-answer="3">
+  <p class="q">L36 found 10,000 inserts far faster inside one transaction than as 10,000 auto-commits. Today's name for that is… (L36)</p>
+  <div class="opts"><button>Write amplification</button><button>Bloom filtering</button><button>Log compaction</button><button>Group commit</button></div>
+  <p class="why">One forced write covers many changes. FsyncCost showed the same thing with 1, 10 and 100 writes per force, and WalAmp with rows per commit.</p>
+</div>
+<div class="quiz" data-id="e-3" data-group="Exit quiz" data-answer="0">
+  <p class="q">A CRC-32 check passes on 4 random garbage bytes by chance with probability about… (L48)</p>
+  <div class="opts"><button><code>1 / 2³²</code></button><button><code>1 / 32</code></button><button><code>1 / 2⁸</code></button><button><code>1 / 4</code></button></div>
+  <p class="why">Random bytes produce a random 32-bit value, so the chance it equals the stored CRC is 1 in 2<sup>32</sup>, about 1 in 4.3 billion. Rare, which is why it's good enough to tell a torn tail from a real record.</p>
+</div>
+<div class="quiz" data-id="e-4" data-group="Exit quiz" data-answer="2">
+  <p class="q">A child JVM was killed with SIGKILL. <code>waitFor()</code> returns… (L53)</p>
+  <div class="opts"><button><code>0</code></button><button><code>143</code></button><button><code>137</code></button><button><code>9</code></button></div>
+  <p class="why">128 + 9. The final's kill test asserts exactly this, so it fails loudly if the child died some other way, such as a crash at startup.</p>
+</div>
+
+<h3>Send your results</h3>
+<div class="summary-box">
+  <p><button class="btn" data-summary="#summary">Build my results</button></p>
+  <textarea id="summary" readonly placeholder="Your results will appear here. Paste them into the chat with Claude."></textarea>
+</div>
+
+<h3>Midweek recall card <span style="font-weight:400;color:var(--ink-soft);font-size:.85rem">(optional, ~10 min)</span></h3>
+<div class="recall">
+  <ol>
+    <li>Draw Part 1's record layout from memory. What does each field protect against, and how is a delete written?</li>
+    <li>Fill in the "what survives which crash" table for: a JVM buffer, the page cache, the drive's cache. Which call moves bytes from each layer to the next?</li>
+    <li>Write <code>validPrefix</code> from a blank file, then explain why recovery must truncate rather than just stop.</li>
+    <li>Explain an LSM read path for a key that exists only in the oldest SSTable, with and without Bloom filters. What is a tombstone doing in a newer table?</li>
+    <li>For each of: user profiles, a social graph, shopping carts, course enrolments, name the data model you'd pick and one thing it would cost you.</li>
+  </ol>
+</div>
+
+<div class="primary">
+  <b>Primary source for this lesson</b>
+  Martin Kleppmann and Chris Riccomini, <em>Designing Data-Intensive Applications</em>, 2nd ed. (<a href="https://martin.kleppmann.com/2026/03/24/designing-data-intensive-applications-2e.html">O'Reilly, 2026</a>), chapter 4, "Storage and Retrieval", which walks from a log with a hash index to SSTables, LSM-trees, Bloom filters and B-trees, the same path as Parts 1 and 3. Chapter 3, "Data Models and Query Languages", is Part 4 in depth. Then the six-page <a href="https://riak.com/assets/bitcask-intro.pdf">Bitcask paper</a>, the clearest storage-engine design document there is, and SQLite's <a href="https://www.sqlite.org/atomiccommit.html">Atomic Commit</a> page for how a real database survives a power cut. For lectures, CMU's free <a href="https://15445.courses.cs.cmu.edu/">15-445 Database Systems</a> course covers storage, buffer pools, indexes and recovery.
+</div>
+
+<p><b>Reference sheet:</b> <a href="../reference/databases.html">Databases</a>.</p>
+
+<p class="ask">Anything unclear? Ask your teacher in the chat. "Why doesn't the page cache die with my process?", "when would I pick RocksDB over SQLite?" or "how do I size a Bloom filter for my data?" are exactly the right kind of question. Paste in your kill test's output or a red run you can't explain, and we'll work through it.</p>
+
+<div class="lesson-nav">
+  <a href="0036-transactions-and-jdbc.html">← L36 · Transactions &amp; JDBC</a>
+  <a href="0037-clean-code-and-refactoring.html">L37 · Clean Code &amp; Refactoring →</a>
+</div>
+<p style="margin-top:2rem"><button class="btn ghost" data-reset>Reset this lesson's saved answers</button></p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+<script src="../assets/lesson.js"></script>
+<script src="../assets/logviz.js"></script>
+</body>
+</html>

@@ -1,13 +1,14 @@
 # Curriculum: Idiomatic Kotlin
 
-Draft roadmap. One lesson per session; **R** = mixed review that ends each section.
-Items marked ➕ were added to your original scope.
+Master roadmap targeting **Android**, **Kotlin Multiplatform (KMP)**, **Spring Boot**, and **DSA Coding Interviews**.
+One lesson per session; **R** = mixed review that ends each section.
+Items marked ➕ were added to expand the language scope.
 
 **Every lesson follows the same shape:**
 1. Warm-up: 2–3 recall questions from earlier lessons (spaced practice)
-2. The concept: what problem it solves, why the syntax looks the way it does
+2. The concept: what problem it solves, why the syntax looks the way it does, and its implications across Android, backend, and algorithmic efficiency
 3. Quick check: a short quiz with instant feedback
-4. Practice in Kotlin Playground: one **write-from-blank** task plus one or two **refactors** of AI/Java-flavoured Kotlin. You paste your answers back to me for review.
+4. Practice: Native in-browser code editor with instant typing. One **write-from-blank** task plus one or two **refactors** of AI/Java-flavoured code. Every exercise includes a **Model Answer** tab with self-check rationale. Run code in your separate local IDE or playground.
 
 ---
 
@@ -59,31 +60,69 @@ Items marked ➕ were added to your original scope.
 - **6.3** Choosing one: a decision table, overuse (nested `?.let` chains AI loves), ➕ `takeIf`/`takeUnless`
 - **R6** Mixed review
 
-## 7 · Collections
-- **7.1** Read-only vs mutable (read-only isn't immutable), `listOf`, ➕ `buildList`
-- **7.2** Transforming: `map`, `mapNotNull`, `flatMap`, `filter`, `associate`/`associateBy`
+## 7 · Collections & DSA Data Structures
+- **7.1** Read-only vs mutable collections (`listOf`, `mutableListOf`, `buildList`), primitive unboxed arrays (`IntArray`) vs boxed `Array<Int>`
+- **7.2** Transforming: `map`, `mapNotNull`, `flatMap`, `filter`, `associateBy`, and index mapping
 - **7.3** Grouping and aggregating: `groupBy`, `partition`, `fold`/`reduce`, `sumOf`, `count`
-- **7.4** Finding and ordering: `firstOrNull`, `any`/`all`/`none`, `sortedBy`, `maxByOrNull`, `chunked`/`windowed`
-- **7.5** ➕ Sequences: when lazy evaluation matters
-- **R7** Mixed review
+- **7.4** DSA search & ordering: `binarySearch()`, custom `Comparator`, `sortedBy`, sliding window (`windowed`, `chunked`), ➕ infix bitwise ops (`shl`, `shr`, `and`, `or`, `xor`, `inv`), and ➕ 2D primitive matrix allocation
+- **7.5** DSA core structures: double-ended queue (`ArrayDeque` for BFS/Stack), `PriorityQueue` (Min/Max Heap for Top-K), `LinkedHashMap`
+- **7.6** ➕ Sequences: lazy evaluation pipelines and big-O space complexity
+- **R7** Mixed review: collections & algorithmic puzzles
 
 ## 8 · Delegation
 - **8.1** `by lazy`, and `lazy` vs `lateinit`
-- **8.2** Delegated properties: how `by` works (`getValue`), `observable`, and the ones you already use (`by viewModels()`, `by remember`)
+- **8.2** Delegated properties: how `by` works (`getValue`), `observable`, and Android delegates (`by viewModels()`, `by remember`)
 - **8.3** Class delegation: composition instead of inheritance
 - **R8** Mixed review
 
-## 9 · Idiomatic vs AI/Java-flavoured Kotlin (capstone)
-- **9.1** ➕ Error handling: no checked exceptions, `require`/`check`/`error`, `runCatching`/`Result`
-- **9.2** Smell catalogue: spot and name 15 common non-idiomatic patterns
-- **9.3** Capstone A (Android): write a small screen's state + ViewModel-ish logic from blank, with AI turned off
-- **9.4** Capstone B (Spring-flavoured): refactor a service/DTO layer
-- **R9** Cumulative review across everything
+## 9 · Generics and the advanced type system
+- **9.1** Generic classes and functions: type parameters, constraints (`T : Comparable<T>`)
+- **9.2** Variance: covariance (`out`), contravariance (`in`), and call-site variance (`out`/`in` projection)
+- **9.3** Star projections (`*`) and type erasure vs `inline` with `reified` type parameters
+- **R9** Mixed review
+
+## 10 · Concurrency with Coroutines and Flow
+- **10.1** Coroutines foundations: `suspend`, suspending vs blocking, `launch` vs `async`/`await`
+- **10.2** Coroutine contexts, dispatchers (`Dispatchers.IO`, `Default`, `Main`), and `withContext`
+- **10.3** Structured concurrency: `CoroutineScope`, `Job`, supervisor jobs, cancellation and timeouts
+- **10.4** Channels and cold streams: `Flow`, operators (`map`, `filter`, `transform`), exception handling
+- **10.5** Hot streams in practice: `StateFlow` and `SharedFlow` (UI state and event pipelines)
+- **R10** Mixed review
+
+## 11 · Idiomatic vs AI/Java-flavoured Kotlin (capstones)
+- **11.1** ➕ Error handling: no checked exceptions, `require`/`check`/`error`, `runCatching`/`Result`, and the `CancellationException` coroutine trap
+- **11.2** Smell catalogue: spot and name 15 common non-idiomatic patterns produced by AI & Java habits
+- **11.3** Capstone A (Android): UDF search & bookmark ViewModel (`StateFlow.update` + buffered `Channel` one-off effects)
+- **11.4** Capstone B (Backend/Spring Boot): DTO invariants, `@field:` targets, JPA entity caveats, and service mapping
+- **11.5** Capstone C (DSA Interview): Two Pointers, Monotonic Deque (`ArrayDeque`), overflow-safe comparators & bitwise ops
+- **11.6** ➕ Kotlin Multiplatform (KMP) essentials: `expect`/`actual` vs common interfaces & in-memory fakes
+- **R11** Cumulative review across the entire language
+
+## 12 · Testing Idiomatic Kotlin, Coroutines & Flows (Senior Track — Built & Live)
+- **12.1** ➕ Idiomatic unit testing: `kotlin.test` & JUnit 5, backtick test names, parameterized tests, and Fakes vs `MockK` (`commonTest`)
+- **12.2** ➕ Testing Coroutines & virtual time: `runTest`, `StandardTestDispatcher` vs `UnconfinedTestDispatcher`, `advanceTimeBy`, and injected dispatchers
+- **12.3** ➕ Testing Flows & hot state: `StateFlow` conflation, `Channel` effects, `backgroundScope`, and `Turbine`
+- **R12** ➕ Mixed review & Senior Production Bug Hunt: race conditions, unmockable singletons, and dispatcher leaks
+
+---
+
+## Senior Deep-Dive Expansion Queue (Section-by-Section)
+1. **Section 3 (Functions)**: Expand to 3–4 quizzes/lesson, progressive hints, `check()` harnesses, and JVM interop annotations (`@JvmOverloads`, `@JvmName`, `@JvmStatic`).
+2. **Section 4 (Classes & Modeling)**: Expand quizzes/hints + `data class` binary compatibility, array equality traps, and `copy()` encapsulation caveats.
+3. **Section 5 (Lambdas & DSLs)**: Add `fun interface` (SAM), `@DslMarker`, `crossinline` / `noinline` / `@PublishedApi`, and Kotlin Contracts (`callsInPlace`).
+4. **Section 6 (Scope Functions)**: Expand to 3–4 quizzes/lesson, hints, `check()` harnesses, and Production Bug Hunt exercises.
+5. **Section 7 (Collections & DSA)**: Add `tailrec` & `DeepRecursiveFunction`, `List<T>` vs `ImmutableList<T>`, and `Sequence` small-list overhead crossover.
+6. **Section 8 & 9 (Delegation & Generics)**: Expand thin reference sheets (`delegation.html`, `generics.html`), add 3–4 quizzes/lesson, hints, and JVM signature clash resolution.
+7. **Section 10 (Coroutines & Flow)**: Add `Mutex.withLock` / `Semaphore`, `callbackFlow` + `awaitClose`, `stateIn` / `shareIn` (`WhileSubscribed(5_000)`), `collectLatest` / `flatMapLatest`, and `CoroutineExceptionHandler` traps.
+8. **Section 12 (Testing)**: Build Lessons `0062`–`0065` + `reference/testing.html`.
 
 ---
 
 ## Reference sheets built along the way (`reference/`)
-Syntax cheat sheet · Null-safety operators · Scope function decision table · Collections operations by intent · Smell catalogue (AI/Java-flavoured → idiomatic) · Glossary
-
-## Later tracks (out of scope for now)
-➕ Generics (`in`/`out`, `reified`) · Coroutines and Flow · Compose idioms · Spring Boot with Kotlin · KMP (`expect`/`actual`)
+- **Language Reference Sheets**: Foundations (1.x) · Null-safety (2.x) · Functions (3.x) · Classes & Modeling (4.x) · Lambdas (5.x) · Scope functions (6.x) · Collections & DSA (7.x) · Delegation (8.x) · Generics (9.x) · Coroutines & Flow (10.x) · Smell catalogue (11.x).
+- **The Four Production Pillar Playbooks**:
+  1. **Android & Jetpack Compose Playbook** (`reference/android.html`): UDF state, `collectAsStateWithLifecycle`, one-off effect channels, Compose stability contracts.
+  2. **Spring Boot & Server-Side Kotlin Playbook** (`reference/spring-boot.html`): Compiler plugins (`kotlin-spring`/`all-open`, `kotlin-jpa`/`no-arg`), use-site target annotations (`@field:NotBlank`), JPA entity patterns, and non-blocking WebFlux coroutines.
+  3. **Kotlin Multiplatform (KMP) Architecture Playbook** (`reference/kmp.html`): Source set hierarchies, `expect`/`actual` vs common interfaces, Ktor client, and `kotlinx.serialization`.
+  4. **DSA Coding Interview Playbook** (`reference/dsa-patterns.html`): Unboxed `IntArray`, infix bitwise ops (`shl`/`shr`/`and`/`or`/`xor`/`inv`), 2D matrices, and canonical LeetCode templates (Two Pointers, Sliding Window, Monotonic Stack, Bisect Binary Search, BFS/DFS).
+- **Glossary**: Canonical terminology and definitions (`GLOSSARY.md`).

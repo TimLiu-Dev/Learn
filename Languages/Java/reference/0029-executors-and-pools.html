@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reference 0029: Thread Pools, Bounded Queues &amp; Executor Sizing</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="../lessons/0029-concurrency-utilities-executors.html">&larr; Back to Lesson 0029</a></div>
+      <div class="lesson-nav-center"><a href="../lessons/0001-master-plan-and-curriculum.html">&#128203; Course Hub</a></div>
+      <div><a href="../lessons/0030-concurrent-collections-and-contention.html">Next: Lesson 0030 &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Reference Cheat Sheet &bull; Lesson 0029</div>
+      <h1><code>ThreadPoolExecutor</code>, Queues &amp; Sizing Quick Reference</h1>
+      <p class="lesson-subtitle">
+        Fast lookup matrix for factory hazards, queue memory layouts, saturation policies, and pool-sizing equations.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. <code>Executors</code> Factories vs. Explicit <code>ThreadPoolExecutor</code></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Executor Construction</th>
+            <th>Core / Max Threads</th>
+            <th>Backing Queue</th>
+            <th>Failure Mode Under Load</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>newFixedThreadPool(n)</code></td>
+            <td><code>n</code> / <code>n</code></td>
+            <td><code>LinkedBlockingQueue(Integer.MAX_VALUE)</code></td>
+            <td><strong>Heap OOM:</strong> Queue grows without bound when downstream slows.</td>
+          </tr>
+          <tr>
+            <td><code>newSingleThreadExecutor()</code></td>
+            <td><code>1</code> / <code>1</code></td>
+            <td><code>LinkedBlockingQueue(Integer.MAX_VALUE)</code></td>
+            <td><strong>Heap OOM:</strong> Unbounded FIFO queue behind single worker.</td>
+          </tr>
+          <tr>
+            <td><code>newCachedThreadPool()</code></td>
+            <td><code>0</code> / <code>Integer.MAX_VALUE</code></td>
+            <td><code>SynchronousQueue</code> (0 capacity)</td>
+            <td><strong>Native OOM / CPU Thrash:</strong> Spawns thousands of ~1 MB OS threads.</td>
+          </tr>
+          <tr>
+            <td><code>newScheduledThreadPool(n)</code></td>
+            <td><code>n</code> / <code>Integer.MAX_VALUE</code></td>
+            <td><code>DelayedWorkQueue</code> (unbounded heap)</td>
+            <td><strong>Heap OOM</strong> if millions of far-future timers are registered unchecked.</td>
+          </tr>
+          <tr>
+            <td>Explicit <code>ThreadPoolExecutor</code></td>
+            <td>Explicit <code>core</code> / <code>max</code></td>
+            <td><code>ArrayBlockingQueue(bounded)</code></td>
+            <td><strong>Predictable:</strong> Bounded RAM + deterministic backpressure/load-shedding.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>2. Blocking Queue &amp; Sizing Matrix</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Dimension</th>
+            <th>Recommendation</th>
+            <th>Key Invariant / Formula</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Dispatch Order</strong></td>
+            <td>Core &rarr; Queue &rarr; Max &rarr; Reject</td>
+            <td>Burst threads (<code>&gt; corePoolSize</code>) ONLY spawn after <code>workQueue.offer()</code> returns <code>false</code>!</td>
+          </tr>
+          <tr>
+            <td><strong>Queue Choice</strong></td>
+            <td><code>ArrayBlockingQueue(cap)</code></td>
+            <td>Pre-allocated <code>Object[]</code> ring buffer; zero per-task <code>Node</code> GC allocation churn.</td>
+          </tr>
+          <tr>
+            <td><strong>CPU-Bound Sizing</strong></td>
+            <td><code>N_cpu</code> (or <code>N_cpu + 1</code>)</td>
+            <td><code>Runtime.getRuntime().availableProcessors()</code>; extra threads degrade L1/L2 cache locality.</td>
+          </tr>
+          <tr>
+            <td><strong>Blocking I/O Sizing</strong></td>
+            <td><code>N_cpu * U * (1 + W / C)</code></td>
+            <td>Cap strictly below downstream DB pool / rate limits; prefer Virtual Threads + <code>Semaphore</code> in JDK 21.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>3. Canonical Production Template (Java 21 LTS)</h2>
+      <pre><code>ThreadFactory factory = Thread.ofPlatform()
+        .name("svc-worker-", 0)
+        .uncaughtExceptionHandler((t, e) -&gt; log.error("Uncaught in {}", t.getName(), e))
+        .factory();
+
+ThreadPoolExecutor pool = new ThreadPoolExecutor(
+        cores,
+        cores * 2,
+        60L, TimeUnit.SECONDS,
+        new ArrayBlockingQueue&lt;&gt;(512),
+        factory,
+        new ThreadPoolExecutor.AbortPolicy()
+);
+
+// Graceful two-phase shutdown hook:
+pool.shutdown();
+try {
+    if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
+        pool.shutdownNow();
+    }
+} catch (InterruptedException e) {
+    pool.shutdownNow();
+    Thread.currentThread().interrupt();
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>4. Senior Production Pitfalls Checklist</h2>
+      <ul>
+        <li><strong>Never pair <code>CallerRunsPolicy</code> with Netty/NIO event loops:</strong> Overflow tasks run synchronously on the caller event-loop thread, freezing all multiplexed non-blocking connections.</li>
+        <li><strong>Never pair <code>DiscardPolicy</code> / <code>DiscardOldestPolicy</code> with <code>submit()</code> + untimed <code>Future.get()</code>:</strong> Silently dropping an uncancelled <code>FutureTask</code> parks the waiting caller forever—always pass timeouts to <code>future.get(t, unit)</code>.</li>
+        <li><strong>Watch container CPU quotas:</strong> Verify <code>-XX:+UseContainerSupport</code> (enabled by default) so <code>availableProcessors()</code> reflects Kubernetes pod CPU limits rather than the 64-core bare-metal host.</li>
+        <li><strong>Core threads never time out by default:</strong> Idle threads at or below <code>corePoolSize</code> stay alive indefinitely unless <code>pool.allowCoreThreadTimeOut(true)</code> is explicitly enabled.</li>
+      </ul>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="../lessons/0029-concurrency-utilities-executors.html">&larr; Return to Lesson 0029</a></div>
+      <div><a href="../lessons/0001-master-plan-and-curriculum.html">&#128203; Master Plan</a></div>
+      <div><a href="../lessons/0030-concurrent-collections-and-contention.html">Next: Lesson 0030 &rarr;</a></div>
+    </footer>
+  </div>
+</body>
+</html>

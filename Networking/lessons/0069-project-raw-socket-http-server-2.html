@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Session 69: Project: Concurrency, Virtual Threads &amp; Static Files — Computer Networking</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<article class="page">
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 6 — Capstones · Session 69</p>
+  <h1>Project: Concurrency, Virtual Threads &amp; Static Files</h1>
+  <p class="subtitle">Transforming our sequential socket parser into a production-grade concurrent HTTP engine capable of 10,000+ persistent Keep-Alive connections, static file delivery, and chunked streaming.</p>
+  <div class="meta"><span>~35 minutes</span><span>Language: Java 26 / Kotlin</span><span class="badge interview">★ Capstone</span><span class="badge prod">💻 code</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>You'll scale your raw socket HTTP/1.1 server to thousands of concurrent connections using Virtual Threads, implement persistent <code>Keep-Alive</code> loops without framing desync, block path-traversal exploits on static files, and stream dynamic responses with <code>Transfer-Encoding: chunked</code>.</p>
+  </div>
+
+  <h2>From Toy Parser to High-Throughput Server</h2>
+  <p>In Session 68, we parsed raw TCP byte streams into HTTP request lines and generated compliant RFC 9112 responses. However, our server suffered from a catastrophic structural limitation: <strong>sequential execution</strong>. If a browser opened a socket and waited 30 seconds before sending bytes, or downloaded a massive file across a slow mobile link, every other client in the world was blocked in the OS accept queue.</p>
+  <p>In this second capstone session, we scale our engine to handle massive concurrency using modern runtime capabilities: Java 21+ Virtual Threads (Project Loom) or lightweight coroutines. We then implement the three remaining pillars of production HTTP servers: persistent TCP connections (<code>Connection: keep-alive</code>), path-traversal-safe static file delivery with MIME resolution, and dynamic streaming via <code>Transfer-Encoding: chunked</code>.</p>
+</section>
+
+<section>
+  <h2>The Concurrency Evolution: Threads vs Virtual Threads</h2>
+  <p>Network servers have evolved through three distinct concurrency architectures over the past three decades:</p>
+  <ul>
+    <li><strong>Thread-per-Connection (Classic POSIX):</strong> Each accepted socket is handed to a kernel OS thread (<code>pthread</code>). Because each platform thread reserves a 1&nbsp;MB virtual memory stack and requires kernel context switches, memory exhausts around 2,000 to 5,000 connections (the classic C10K problem).</li>
+    <li><strong>Non-blocking Event Loops (Reactor / epoll):</strong> Frameworks like Netty or Node.js use a small pool of threads running an OS event loop (<code>epoll</code>, <code>kqueue</code>). This handles 100,000+ connections with low memory, but fractures business logic into asynchronous callbacks, futures, or reactive pipelines ("callback hell").</li>
+    <li><strong>Virtual Threads (Java 21+ / Coroutines):</strong> Millions of user-mode lightweight threads managed by the JVM rather than the OS kernel. When a virtual thread executes a blocking socket read or write (<code>InputStream.read()</code>), the JVM unmounts the virtual thread from its underlying OS carrier thread, parking its tiny call stack (often under 1&nbsp;KB) in heap memory. When the socket triggers an <code>epoll</code> readiness event, the runtime reschedules the virtual thread onto an available carrier thread. You write simple, synchronous, blocking code that scales to hundreds of thousands of concurrent connections.</li>
+  </ul>
+
+  <figure class="fullwidth" style="max-width:44rem">
+    <svg viewBox="0 0 760 300" class="dia" role="img" aria-label="Virtual Thread Scheduling Architecture: OS carrier threads execute active virtual threads while 100,000+ blocked virtual threads park cheaply on the JVM heap.">
+      <defs>
+        <marker id="arr69" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 1 L 10 5 L 0 9 z" style="fill:var(--muted)"/>
+        </marker>
+      </defs>
+      <rect x="10" y="10" width="740" height="280" rx="8" style="fill:var(--panel); stroke:var(--rule); stroke-width:1.5"/>
+      <text x="30" y="38" style="font-family:var(--mono); font-size:14px; font-weight:700">Virtual Thread Scheduling Architecture (Project Loom)</text>
+
+      <!-- Carrier Threads (OS) -->
+      <rect x="40" y="60" width="310" height="210" rx="6" style="fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.5"/>
+      <text x="55" y="85" style="font-size:13px; font-weight:700; fill:var(--accent)">OS Carrier Threads (CPU Cores)</text>
+      
+      <rect x="55" y="100" width="280" height="38" rx="4" style="fill:var(--bg); stroke:var(--accent)"/>
+      <text x="70" y="124" style="font-family:var(--mono); font-size:12px">Carrier Thread #1 (Running VT-A)</text>
+
+      <rect x="55" y="150" width="280" height="38" rx="4" style="fill:var(--bg); stroke:var(--accent)"/>
+      <text x="70" y="174" style="font-family:var(--mono); font-size:12px">Carrier Thread #2 (Running VT-B)</text>
+
+      <rect x="55" y="200" width="280" height="38" rx="4" style="fill:var(--bg); stroke:var(--accent)"/>
+      <text x="70" y="224" style="font-family:var(--mono); font-size:12px">Carrier Thread #3 (Idle / Stealing)</text>
+
+      <!-- Virtual Threads Parking Heap -->
+      <rect x="410" y="60" width="310" height="210" rx="6" style="fill:var(--bg); stroke:var(--layer-link); stroke-width:1.5"/>
+      <text x="425" y="85" style="font-size:13px; font-weight:700; fill:var(--layer-link)">JVM Heap: 100,000+ Parked Virtual Threads</text>
+
+      <rect x="425" y="100" width="280" height="32" rx="4" style="fill:var(--panel); stroke:var(--rule)"/>
+      <text x="435" y="121" style="font-family:var(--mono); font-size:11px">VT-C: Blocked on SocketInputStream.read()</text>
+
+      <rect x="425" y="140" width="280" height="32" rx="4" style="fill:var(--panel); stroke:var(--rule)"/>
+      <text x="435" y="161" style="font-family:var(--mono); font-size:11px">VT-D: Blocked on SocketInputStream.read()</text>
+
+      <rect x="425" y="180" width="280" height="32" rx="4" style="fill:var(--panel); stroke:var(--rule)"/>
+      <text x="435" y="201" style="font-family:var(--mono); font-size:11px">VT-E: Blocked on FileChannel.read()</text>
+
+      <rect x="425" y="220" width="280" height="32" rx="4" style="fill:var(--panel); stroke:var(--rule)"/>
+      <text x="435" y="241" style="font-family:var(--mono); font-size:11px">VT-F...VT-100K (Parked memory ~1KB each)</text>
+
+      <!-- Arrow -->
+      <path d="M 350 145 L 408 145" style="stroke:var(--muted); stroke-width:2; fill:none" marker-end="url(#arr69)" stroke-dasharray="4,4"/>
+      <text x="380" y="136" text-anchor="middle" class="muted" style="font-size:10px">Park/Unpark</text>
+    </svg>
+    <figcaption>Virtual threads unmount from OS carrier threads whenever they execute a blocking network I/O call, consuming almost zero CPU and minimal heap while awaiting packets.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Persistent Connections (HTTP/1.1 Keep-Alive)</h2>
+  <p>In HTTP/1.0, every single request required a fresh TCP handshake (SYN, SYN-ACK, ACK) and teardown (FIN-ACK dance). In HTTP/1.1 (RFC 9112 Section 9.3), connections are <strong>persistent by default</strong>. The server must keep the TCP socket open to serve multiple sequential requests from the same client until either:</p>
+  <ol>
+    <li>The client sends <code>Connection: close</code> in its request headers.</li>
+    <li>The server decides to close the connection and sends <code>Connection: close</code>.</li>
+    <li>A read timeout expires (e.g. <code>socket.setSoTimeout(5000)</code>) due to client inactivity.</li>
+  </ol>
+  <p>To support persistent connections, the connection handler must wrap request parsing inside a <code>while</code> loop. Crucially, the server <strong>must strictly calculate and consume exact request and response boundaries</strong> (via <code>Content-Length</code> or Chunked encoding); otherwise, trailing bytes leak into the next request line, corrupting the connection.</p>
+</section>
+
+<section>
+  <h2>Static File Delivery &amp; Security Guards</h2>
+  <p>A production web server serves static files (HTML, CSS, JavaScript, WebP images). This introduces two critical engineering requirements:</p>
+
+  <h3>1. Directory Traversal Vulnerability (Path Traversal)</h3>
+  <p>If a client requests <code>GET /../../etc/passwd HTTP/1.1</code>, a naive implementation concatenates the root directory with the URI: <code>public_html/../../etc/passwd</code>. The operating system resolves this path to <code>/etc/passwd</code>, leaking sensitive host files!</p>
+  <p>To prevent path traversal, the server must resolve the path against the document root and verify that the canonical normalized path still starts with the authorized root directory prefix:</p>
+  <pre><code>Path docRoot = Path.of("./public").toRealPath();
+Path target = docRoot.resolve(uriPath.substring(1)).normalize();
+if (!target.startsWith(docRoot)) {
+    // 403 Forbidden or 404 Not Found
+    sendError(403, "Access Denied");
+}</code></pre>
+
+  <h3>2. MIME Type Content Resolution</h3>
+  <p>The client browser relies on the <code>Content-Type</code> response header to determine whether to execute a file as JavaScript, render it as HTML, or style it as CSS. The server must map file extensions to authoritative IANA media types (e.g. <code>.html</code> &rarr; <code>text/html; charset=utf-8</code>, <code>.css</code> &rarr; <code>text/css</code>, <code>.png</code> &rarr; <code>image/png</code>).</p>
+</section>
+
+<section>
+  <h2>Chunked Transfer Encoding (Dynamic Streaming)</h2>
+  <p>What if the response size is unknown upfront (e.g. dynamic live database streaming, real-time log tailing, or compressed data generation)? In HTTP/1.1, the server cannot emit a <code>Content-Length</code> header. Instead, it emits:</p>
+  <pre><code>HTTP/1.1 200 OK\r\n
+Content-Type: text/plain\r\n
+Transfer-Encoding: chunked\r\n
+\r\n</code></pre>
+  <p>The body is then streamed as a sequence of chunks. Each chunk begins with its byte size formatted in <strong>hexadecimal</strong> followed by <code>\r\n</code>, followed by the chunk payload, followed by another <code>\r\n</code>. The stream terminates with a zero-length chunk (<code>0\r\n\r\n</code>):</p>
+  <pre><code>7\r\n
+Mozilla\r\n
+9\r\n
+Developer\r\n
+7\r\n
+Network\r\n
+0\r\n
+\r\n</code></pre>
+</section>
+
+<section>
+  <h2>Complete Production Server Implementation</h2>
+  <p>Below is the complete, self-contained single-file Java 21+ server (<code>HttpServerV2.java</code>). It features Virtual Thread per-connection scheduling, persistent Keep-Alive request loops, directory traversal guards, static file streaming, and a dynamic chunked streaming endpoint (<code>/stream</code>):</p>
+
+  <pre><code>// HttpServerV2.java (Requires Java 21+)
+// Run: java HttpServerV2.java
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.Executors;
+
+public class HttpServerV2 {
+    private static final int PORT = 8080;
+    private static final Path PUBLIC_DIR = Path.of("./public");
+
+    public static void main(String[] args) throws IOException {
+        Files.createDirectories(PUBLIC_DIR);
+        Files.writeString(PUBLIC_DIR.resolve("index.html"), 
+            "&lt;html&gt;&lt;body&gt;&lt;h1&gt;Raw Socket Server Live!&lt;/h1&gt;&lt;p&gt;Delivered via Java Virtual Threads.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;");
+
+        // Java 21+ Virtual Thread Executor: Spawns lightweight thread per connection
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor();
+             var serverSocket = new ServerSocket(PORT)) {
+            
+            serverSocket.setReuseAddress(true);
+            System.out.printf("🚀 HTTP/1.1 Server running on http://127.0.0.1:%d%n", PORT);
+
+            while (!serverSocket.isClosed()) {
+                Socket clientSocket = serverSocket.accept();
+                // Hand each socket to an independent virtual thread
+                executor.submit(() -&gt; handleClient(clientSocket));
+            }
+        }
+    }
+
+    private static void handleClient(Socket socket) {
+        try (socket) {
+            // Socket inactivity timeout of 5 seconds for Keep-Alive connections
+            socket.setSoTimeout(5000);
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
+
+            boolean keepAlive = true;
+
+            // Persistent Connection Loop
+            while (keepAlive) {
+                String requestLine = readLine(in);
+                if (requestLine == null || requestLine.isBlank()) {
+                    break; // Connection dropped by client or timeout
+                }
+
+                String[] parts = requestLine.split(" ");
+                if (parts.length &lt; 3) break;
+                String method = parts[0];
+                String uri = parts[1];
+                String version = parts[2];
+
+                // Parse headers
+                Map&lt;String, String&gt; headers = new HashMap&lt;&gt;();
+                String headerLine;
+                while ((headerLine = readLine(in)) != null &amp;&amp; !headerLine.isEmpty()) {
+                    int colon = headerLine.indexOf(':');
+                    if (colon &gt; 0) {
+                        headers.put(headerLine.substring(0, colon).trim().toLowerCase(),
+                                    headerLine.substring(colon + 1).trim());
+                    }
+                }
+
+                // Check Keep-Alive header preferences
+                String connHeader = headers.getOrDefault("connection",
+                        "HTTP/1.0".equalsIgnoreCase(version) ? "close" : "keep-alive");
+                if ("close".equalsIgnoreCase(connHeader)) {
+                    keepAlive = false;
+                }
+
+                // Drain any declared request body so trailing bytes never desync Keep-Alive!
+                if (!drainRequestBody(in, headers)) {
+                    keepAlive = false;
+                }
+
+                // Route request
+                if (uri.equals("/stream")) {
+                    sendChunkedResponse(out, keepAlive);
+                } else if ("GET".equalsIgnoreCase(method)) {
+                    serveStaticFile(uri, out, keepAlive);
+                } else {
+                    sendError(out, 405, "Method Not Allowed", "Only GET supported", keepAlive);
+                }
+                out.flush();
+            }
+        } catch (SocketTimeoutException e) {
+            // Client idle timeout reached; cleanly terminate socket
+        } catch (IOException e) {
+            // Socket disconnected
+        }
+    }
+
+    private static boolean drainRequestBody(InputStream in, Map&lt;String, String&gt; headers) throws IOException {
+        if (headers.containsKey("transfer-encoding")) {
+            return false; // Close connection rather than risking unparsed chunked body desync
+        }
+        String cl = headers.get("content-length");
+        if (cl == null) return true;
+        long remaining;
+        try {
+            remaining = Long.parseLong(cl.trim());
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        if (remaining &lt; 0 || remaining &gt; 1_048_576) return false; // Cap drained body at 1 MiB
+        byte[] discard = new byte[4096];
+        while (remaining &gt; 0) {
+            int n = in.read(discard, 0, (int) Math.min(discard.length, remaining));
+            if (n == -1) return false;
+            remaining -= n;
+        }
+        return true;
+    }
+
+    private static void serveStaticFile(String uri, OutputStream out, boolean keepAlive) throws IOException {
+        String cleanUri = uri.equals("/") ? "/index.html" : uri;
+        Path requestedPath = PUBLIC_DIR.resolve(cleanUri.substring(1)).normalize();
+
+        // Path Traversal Security Check
+        if (!requestedPath.toAbsolutePath().startsWith(PUBLIC_DIR.toAbsolutePath())) {
+            sendError(out, 403, "Forbidden", "Access Denied", keepAlive);
+            return;
+        }
+
+        if (!Files.exists(requestedPath) || Files.isDirectory(requestedPath)) {
+            sendError(out, 404, "Not Found", "File Not Found", keepAlive);
+            return;
+        }
+
+        byte[] content = Files.readAllBytes(requestedPath);
+        String contentType = getMimeType(requestedPath);
+
+        StringBuilder res = new StringBuilder();
+        res.append("HTTP/1.1 200 OK\r\n");
+        res.append("Content-Type: ").append(contentType).append("\r\n");
+        res.append("Content-Length: ").append(content.length).append("\r\n");
+        res.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n");
+        res.append("\r\n");
+
+        out.write(res.toString().getBytes(StandardCharsets.US_ASCII));
+        out.write(content);
+    }
+
+    private static void sendChunkedResponse(OutputStream out, boolean keepAlive) throws IOException {
+        StringBuilder headers = new StringBuilder();
+        headers.append("HTTP/1.1 200 OK\r\n");
+        headers.append("Content-Type: text/plain\r\n");
+        headers.append("Transfer-Encoding: chunked\r\n");
+        headers.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n");
+        headers.append("\r\n");
+        out.write(headers.toString().getBytes(StandardCharsets.US_ASCII));
+
+        // Stream 3 distinct chunks with simulated work
+        for (int i = 1; i &lt;= 3; i++) {
+            byte[] chunkData = ("Live event chunk #" + i + "\n").getBytes(StandardCharsets.UTF_8);
+            // Write chunk length in hex followed by \r\n
+            String hexLength = Integer.toHexString(chunkData.length) + "\r\n";
+            out.write(hexLength.getBytes(StandardCharsets.US_ASCII));
+            out.write(chunkData);
+            out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        }
+
+        // Terminal 0-byte chunk
+        out.write("0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private static void sendError(OutputStream out, int code, String phrase, String msg, boolean keepAlive) throws IOException {
+        byte[] body = ("&lt;h1&gt;" + code + " " + phrase + "&lt;/h1&gt;&lt;p&gt;" + msg + "&lt;/p&gt;").getBytes(StandardCharsets.UTF_8);
+        String res = "HTTP/1.1 " + code + " " + phrase + "\r\n" +
+                     "Content-Type: text/html\r\n" +
+                     "Content-Length: " + body.length + "\r\n" +
+                     "Connection: " + (keepAlive ? "keep-alive" : "close") + "\r\n" +
+                     "\r\n";
+        out.write(res.getBytes(StandardCharsets.US_ASCII));
+        out.write(body);
+    }
+
+    private static String getMimeType(Path path) {
+        String name = path.getFileName().toString().toLowerCase();
+        if (name.endsWith(".html") || name.endsWith(".htm")) return "text/html; charset=utf-8";
+        if (name.endsWith(".css")) return "text/css";
+        if (name.endsWith(".js")) return "application/javascript";
+        if (name.endsWith(".png")) return "image/png";
+        if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+        return "application/octet-stream";
+    }
+
+    private static String readLine(InputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        int c;
+        while ((c = in.read()) != -1) {
+            if (c == '\r') {
+                int next = in.read();
+                if (next == '\n') break;
+                if (next != -1) buf.write(next);
+            } else if (c == '\n') {
+                break;
+            } else {
+                buf.write(c);
+            }
+        }
+        if (c == -1 &amp;&amp; buf.size() == 0) return null;
+        return buf.toString(StandardCharsets.US_ASCII);
+    }
+}</code></pre>
+  <div class="callout">
+    <span class="box-label">Production Security Trap: Keep-Alive Framing Desync &amp; HTTP Request Smuggling</span>
+    <p>Notice <code>drainRequestBody()</code> inside the <code>Keep-Alive</code> loop! If a client sends <code>POST /upload HTTP/1.1</code> with <code>Content-Length: 60</code> and your server returns <code>405 Method Not Allowed</code> <em>without</em> draining those 60 body bytes (or closing the socket), the next iteration of <code>while (keepAlive)</code> reads the leftover POST body as a brand-new HTTP request line! When a reverse proxy and backend server disagree on where a body ends (<code>Content-Length</code> vs <code>Transfer-Encoding</code>), attackers exploit this exact desync to smuggle unauthorized requests across shared backend sockets (<strong class="term">HTTP Request Smuggling</strong>).</p>
+  </div>
+</section>
+
+<section>
+  <h2>Hands-On: Benchmarking &amp; Testing with curl</h2>
+  <ol class="steps" data-key="0069-bench-cli">
+    <li>Test persistent connection reuse over a single TCP socket using <code>curl -v</code>:
+      <pre><code><span class="prompt">$ </span>curl -v http://127.0.0.1:8080/ http://127.0.0.1:8080/index.html</code></pre>
+      Notice the terminal output: <em>"Re-using existing connection! (#0) with host 127.0.0.1"</em>. A single TCP handshake served both requests!
+    </li>
+    <li>Inspect the dynamic chunked response stream:
+      <pre><code><span class="prompt">$ </span>curl -i http://127.0.0.1:8080/stream</code></pre>
+      Observe the <code>Transfer-Encoding: chunked</code> header and the arrival of each payload block before the connection finishes.
+    </li>
+    <li>Test directory traversal security defense:
+      <pre><code><span class="prompt">$ </span>curl -i --path-as-is http://127.0.0.1:8080/../../etc/passwd</code></pre>
+      Verify that your server returns <code>HTTP/1.1 403 Forbidden</code> instead of serving the host system file.
+    </li>
+  </ol>
+</section>
+
+
+  <h2>Code Implementation: Java &amp; Kotlin</h2>
+  <div class="code-tabs">
+    <div class="tab-buttons">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <div class="code-block-header">
+        <span class="code-lang-label">Java 25</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// HTTP/1.1 Wire Serializer in Java
+import java.nio.charset.StandardCharsets;
+
+public class HttpResponseBuilder {
+    public static String build(int code, String type, String body) {
+        String phrase = switch (code) {
+            case 200 -&gt; "OK";
+            case 404 -&gt; "Not Found";
+            case 500 -&gt; "Internal Server Error";
+            default -&gt; "Unknown";
+        };
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        return "HTTP/1.1 " + code + " " + phrase + "\r\n" +
+               "Content-Type: " + type + "\r\n" +
+               "Content-Length: " + bytes.length + "\r\n" +
+               "Connection: close\r\n\r\n" +
+               body;
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <div class="code-block-header">
+        <span class="code-lang-label">Kotlin</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// HTTP/1.1 Wire Serializer in Kotlin
+fun buildResponse(code: Int, type: String, body: String): String {
+    val phrase = when (code) {
+        200 -&gt; "OK"
+        404 -&gt; "Not Found"
+        500 -&gt; "Internal Server Error"
+        else -&gt; "Unknown"
+    }
+    val bytes = body.toByteArray(Charsets.UTF_8)
+    return "HTTP/1.1 $code $phrase\r\n" +
+           "Content-Type: $type\r\n" +
+           "Content-Length: ${bytes.size}\r\n" +
+           "Connection: close\r\n\r\n" +
+           body
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Interactive Code Practice: HTTP/1.1 Response Wire Serializer</h2>
+  <div class="code-practice" data-key="0069-raw-http-serializer">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Capstone Part 2: Build a compliant HTTP/1.1 response wire byte serializer. Given statusCode (200, 404, 500), contentType, and body string, format: status line ('HTTP/1.1 200 OK\r\n', 'HTTP/1.1 404 Not Found\r\n', 'HTTP/1.1 500 Internal Server Error\r\n'), 'Content-Type: <type>\r\n', 'Content-Length: <len>\r\n', 'Connection: close\r\n\r\n', followed by the body.</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">public class Solution {
+    public static String buildResponse(int statusCode, String contentType, String body) {
+        // TODO: Map statusCode to phrase:
+        // 200 -> "OK", 404 -> "Not Found", 500 -> "Internal Server Error"
+        // Return fully serialized HTTP/1.1 response string with \r\n line endings.
+        return null;
+    }
+}</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">public class Solution {
+    public static String buildResponse(int statusCode, String contentType, String body) {
+        // TODO: Map statusCode to phrase:
+        // 200 -> "OK", 404 -> "Not Found", 500 -> "Internal Server Error"
+        // Return fully serialized HTTP/1.1 response string with \r\n line endings.
+        return null;
+    }
+}</script>
+    <script type="text/plain" class="test-harness">
+// __STUDENT_CODE__
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0;
+        int total = 3;
+
+        // Test 1: 200 OK text response
+        String r1 = Solution.buildResponse(200, "text/plain", "Hello World");
+        if (r1 != null && r1.startsWith("HTTP/1.1 200 OK\r\n") && r1.contains("Content-Length: 11\r\n") && r1.endsWith("Hello World")) {
+            passed++;
+        } else {
+            System.err.println("Test 1 failed: got\n" + r1);
+        }
+
+        // Test 2: 404 Not Found
+        String r2 = Solution.buildResponse(404, "application/json", "{\"error\":\"not found\"}");
+        if (r2 != null && r2.startsWith("HTTP/1.1 404 Not Found\r\n") && r2.contains("Content-Type: application/json\r\n")) {
+            passed++;
+        } else {
+            System.err.println("Test 2 failed: got\n" + r2);
+        }
+
+        // Test 3: 500 Internal Server Error
+        String r3 = Solution.buildResponse(500, "text/html", "<h1>Crash</h1>");
+        if (r3 != null && r3.startsWith("HTTP/1.1 500 Internal Server Error\r\n")) {
+            passed++;
+        } else {
+            System.err.println("Test 3 failed: got\n" + r3);
+        }
+
+        System.out.printf("Passed %d of %d tests.%n", passed, total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">public class Solution {
+    public static String buildResponse(int statusCode, String contentType, String body) {
+        String phrase = switch (statusCode) {
+            case 200 -> "OK";
+            case 404 -> "Not Found";
+            case 500 -> "Internal Server Error";
+            default -> "Unknown";
+        };
+
+        int len = body != null ? body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length : 0;
+        String b = body != null ? body : "";
+
+        return "HTTP/1.1 " + statusCode + " " + phrase + "\r\n" +
+               "Content-Type: " + contentType + "\r\n" +
+               "Content-Length: " + len + "\r\n" +
+               "Connection: close\r\n\r\n" +
+               b;
+    }
+}</script>
+    <script type="application/json" class="hints-data">["Use a switch expression to map statusCode to standard phrases (200 -> 'OK', 404 -> 'Not Found', 500 -> 'Internal Server Error').", "Calculate byte length using `body.getBytes(StandardCharsets.UTF_8).length`.", "Ensure lines terminate strictly with `\\r\\n`, and an extra `\\r\\n` separates headers from the body."]</script>
+  </div>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0069-virtual-threads">
+    <p class="r-prompt">Explain why Java 21+ Virtual Threads enable thousands of concurrent blocking socket reads without crashing the JVM or running out of memory.</p>
+    <div class="keypoints">
+      <ul>
+        <li>Virtual threads are user-mode lightweight green threads managed by the JVM rather than OS kernel threads.</li>
+        <li>Their memory stack begins at under 1&nbsp;KB on the heap, compared to 1&nbsp;MB reserved for OS platform threads.</li>
+        <li>When a virtual thread executes a blocking socket read/write, the JVM unmounts it from the underlying carrier thread and parks it, freeing the OS thread to do other work.</li>
+        <li>When the OS socket notifies readiness via epoll/kqueue, the JVM seamlessly remounts the virtual thread onto an available carrier thread.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Interactive Knowledge Check</h2>
+  <div class="quiz" data-quiz-id="quiz-69">
+    <div class="q" data-answer="1">
+      <p class="q-prompt">How does an HTTP/1.1 receiver detect the end of a message body when <code>Transfer-Encoding: chunked</code> is used?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Virtual threads do not run in hardware GPU cores; they run on standard carrier CPU threads.">When the server abruptly closes the underlying TCP socket</li>
+        <li data-why="Incorrect: Virtual threads cannot prevent OS out-of-memory errors if millions of large heap objects are allocated.">When a chunk with a length of zero (0\r\n\r\n) is received</li>
+        <li data-why="Correct! Operating system platform threads are heavy (~1MB stack memory and costly kernel context switches), limiting concurrency to thousands. Java Virtual Threads are lightweight user-space threads (~few KB) that unmount during blocking I/O, allowing millions of concurrent connections.">When the Content-Length byte counter reaches its maximum limit</li>
+        <li data-why="Incorrect: Virtual threads operate within standard TCP/IP networking and do not bypass the Linux network stack.">When a TCP FIN packet arrives after the first 1024 bytes</li>
+      </ol>
+      <div class="q-explain">RFC 9112 defines that chunked streaming terminates when the sender transmits a chunk of size 0 (hex "0\r\n\r\n").</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">Why is path normalization with <code>normalize()</code> and <code>startsWith(docRoot)</code> critical when serving static files?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Chunked encoding does not compress payloads; compression is handled by gzip/brotli.">It prevents directory traversal attacks requesting parent paths like ../../etc/passwd</li>
+        <li data-why="Incorrect: Chunked encoding operates over standard unencrypted HTTP or encrypted HTTPS; it does not replace TLS.">It accelerates file caching inside the L1 CPU instruction cache</li>
+        <li data-why="Correct! Chunked Transfer Encoding allows the server to stream dynamically generated data without knowing the total content length in advance, sending data in sized chunks terminated by a zero-length chunk.">It automatically compresses JPEG image binaries into WebP format</li>
+        <li data-why="Incorrect: Chunked encoding transmits payloads over standard TCP streams and does not convert them to UDP.">It converts Windows backslashes into standard Unix linefeeds</li>
+      </ol>
+      <div class="q-explain">Without checking that the canonical normalized path starts with the document root, attackers can escape public directories and read arbitrary system files.</div>
+    </div>
+    <div class="q" data-answer="2">
+      <p class="q-prompt">What occurs if a server fails to implement a socket read timeout (<code>setSoTimeout</code>) on a Keep-Alive connection?</p>
+      <ol class="options">
+        <li data-why="Incorrect: The server should not send a TCP RST to close an idle persistent connection.">The router hardware instantly drops the packet due to TTL expiration</li>
+        <li data-why="Correct! To gracefully close a persistent connection, the server sends a final response with the 'Connection: close' header and initiates a graceful TCP FIN shutdown after sending the last byte.">The server automatically upgrades the connection to an HTTP/3 QUIC stream</li>
+        <li data-why="Incorrect: Dropping packets silently without a FIN leaves the client socket in a hanging state until timeout.">Idle clients can leave sockets open indefinitely, eventually exhausting file descriptors</li>
+        <li data-why="Incorrect: Sending an empty 400 Bad Request is incorrect protocol behavior for a graceful timeout.">The browser triggers an automatic SSL renegotiation loop every five seconds</li>
+      </ol>
+      <div class="q-explain">Without an idle read timeout, clients that hold connections open without sending requests will consume server file descriptors and resources indefinitely (Slowloris vulnerability).</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://openjdk.org/jeps/444">JEP 444: Virtual Threads</a>. The OpenJDK specification for high-throughput lightweight concurrency.</p>
+    <p><a href="https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1">RFC 9112 Section 7.1: Chunked Transfer Coding</a>.</p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>Anything unclear about virtual threads, persistent TCP keep-alive loops, or chunked framing? Ask your teacher in chat.</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0068-project-raw-socket-http-server-1.html"><small>Previous · Session 68</small>Project: Raw socket HTTP server (Part 1)</a>
+  <a class="next" href="0070-outage-autopsy-facebook-2021.html"><small>Next · Session 70</small>Outage autopsy: Facebook global BGP collapse</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

@@ -10,6 +10,15 @@
 - Bring back problems from earlier patterns (spaced review).
 - Toward the end: timed mock interviews, with feedback on both the solution and the communication.
 
+## Updated preferences (2026-11-07)
+- Target: End-to-end Big Tech coding interview mastery for 2027.
+- Language scope expanded to trilingual: Kotlin, Python, and Java comprehensively across lessons, code examples, quizzes, and exercises.
+- Comprehensive Masterlist created at `reference/masterlist.html` serving as a full legend for all lessons and patterns.
+- Curriculum expanded to include 2027 Big Tech essentials: Data Structure Design (LRU/LFU/Rate Limiter), Range Query Trees (Segment/Fenwick Trees), Bitwise Tries, 0-1 BFS, and Concurrency/Thread-Safe DSA in Kotlin and Java.
+- All 33 lesson files (Sessions 0 to 32: `lessons/0001` through `lessons/0033`) are fully generated and linked, featuring synchronized language tabs, step-by-step walkthroughs, quizzes with character-balanced choices, and problem hints.
+- Interactive in-browser runnable code practice (`assets/practice.js` powered by Skulpt) allows live code execution, test verification, standard output capture, 3-tier progressive hint reveals, and final solution drawers in Kotlin, Python, and Java.
+- Quizzes updated with per-choice explanations (`data-why="..."`), visual indicators, and expandable `<details>` breakdown explaining why the chosen answer is right/wrong and why each distractor is flawed.
+
 ## Working notes
 - The roadmap lives at `reference/roadmap.html`. On 2026-10-18 the user replied "build all of phase 0 and 1" without commenting on it, so treat it as accepted for now.
 - The user hasn't yet answered the questions about timeline, prior level, target companies, or coding environment. Ask again at the start of the first teaching session.

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reference 0065: Multi-Tier Caching (Caffeine &amp; Redis)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="../lessons/0065-caching-architecture-caffeine-and-redis.html">&larr; Back to Lesson 0065</a></div>
+      <div class="lesson-nav-center"><a href="../lessons/0001-master-plan-and-curriculum.html">&#128203; Master Plan</a></div>
+      <div><a href="../lessons/0066-production-testing-mockmvc-testcontainers.html">Next Lesson &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Reference Cheat Sheet &bull; 0065</div>
+      <h1>Multi-Tier Caching: Caffeine (W-TinyLFU) &amp; Redis Quick Reference</h1>
+      <p class="lesson-subtitle">Failure-mode defenses, L1/L2 sizing parameters, and transactional eviction templates.</p>
+    </header>
+
+    <section>
+      <h2>1. Cache Failure Modes &amp; Architectural Mitigations</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Hazard</th>
+            <th>Trigger Condition</th>
+            <th>Symptom</th>
+            <th>Mandatory Production Mitigation</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Cache Stampede</strong> (Dogpiling)</td>
+            <td>Hot key expires under high concurrency</td>
+            <td>Thousands of threads execute identical expensive SQL queries simultaneously</td>
+            <td>Caffeine <code>AsyncLoadingCache</code> single-flight + <code>refreshAfterWrite</code>, or <code>@Cacheable(sync = true)</code></td>
+          </tr>
+          <tr>
+            <td><strong>Cache Penetration</strong></td>
+            <td>Requests for keys that exist in neither cache nor DB</td>
+            <td>100% cache bypass straight to PostgreSQL (often malicious ID enumeration)</td>
+            <td>Cache negative sentinel (<code>"__MISSING__"</code>) with 30s TTL, or guard entry with a <strong>Bloom Filter</strong></td>
+          </tr>
+          <tr>
+            <td><strong>Cache Avalanche</strong></td>
+            <td>Bulk-warmed keys share an identical fixed TTL or Redis node restarts</td>
+            <td>Sudden cliff of misses overwhelms DB connection pool</td>
+            <td>Randomized TTL jitter (<code>baseTtl + random(0..120s)</code>) + Resilience4j DB bulkhead</td>
+          </tr>
+          <tr>
+            <td><strong>Pre-Commit Stale Populate</strong></td>
+            <td>Calling <code>redis.delete(k)</code> inside <code>@Transactional</code> before <code>COMMIT</code></td>
+            <td>Reader misses cache, reads old MVCC snapshot, writes stale row back for full TTL</td>
+            <td>Publish domain event and evict inside <code>@TransactionalEventListener(AFTER_COMMIT)</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>2. Canonical Typed RedisCacheManager Configuration (No JDK Serialization!)</h2>
+      <pre><code>@Configuration
+@EnableCaching
+public class RedisCacheConfig {
+
+    @Bean
+    public RedisCacheManager cacheManager(RedisConnectionFactory connectionFactory, ObjectMapper mapper) {
+        var serializer = new GenericJackson2JsonRedisSerializer(mapper);
+        RedisCacheConfiguration defaults = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(15))
+            .disableCachingNullValues()
+            .computePrefixWith(cacheName -&gt; "app:v1:" + cacheName + ":")
+            .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(serializer));
+
+        return RedisCacheManager.builder(connectionFactory)
+            .cacheDefaults(defaults)
+            .transactionAware() // Defers Redis PUT/EVICT operations until Spring transaction commits
+            .build();
+    }
+}</code></pre>
+
+      <h2>3. Canonical Caffeine Weight-Bounded Builder</h2>
+      <pre><code>AsyncLoadingCache&lt;String, byte[]&gt; documentCache = Caffeine.newBuilder()
+    .maximumWeight(64L * 1024 * 1024) // Hard 64 MiB heap ceiling
+    .weigher((String key, byte[] bytes) -&gt; key.length() * 2 + bytes.length + 64)
+    .refreshAfterWrite(Duration.ofMinutes(1))
+    .expireAfterWrite(Duration.ofMinutes(5))
+    .recordStats()
+    .buildAsync((key, executor) -&gt; CompletableFuture.supplyAsync(() -&gt; fetchBytes(key), executor));</code></pre>
+    </section>
+
+    <section>
+      <h2>4. Senior Production Pitfalls Checklist</h2>
+      <ul>
+        <li><strong>Never leave <code>JdkSerializationRedisSerializer</code> enabled:</strong> It couples Redis state to private Java class internals, inflates network bandwidth, and breaks blue/green rollouts.</li>
+        <li><strong>Never build an in-heap cache without <code>maximumSize</code> or <code>maximumWeight</code>:</strong> Time-only TTLs (<code>expireAfterWrite</code>) will still OOM the JVM under high key cardinality.</li>
+        <li><strong>Remember <code>refreshAfterWrite</code> is lazy:</strong> Cold keys are not refreshed on a timer; pair <code>refreshAfterWrite</code> with a longer <code>expireAfterWrite</code> so abandoned keys actually get evicted.</li>
+        <li><strong>Export <code>CaffeineStatsCounter</code> to Micrometer:</strong> Monitor <code>cache.gets(result=hit/miss)</code> and <code>cache.evictions</code>; a high eviction rate with low hit ratio signals an undersized window/main space.</li>
+        <li><strong>Synchronize L1 invalidations across pods:</strong> When mutating mutable entities cached in L1 across multiple Kubernetes pods, keep L1 TTL tight (15&ndash;60s) or broadcast invalidation keys over Redis Pub/Sub / Kafka.</li>
+      </ul>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="../lessons/0065-caching-architecture-caffeine-and-redis.html">&larr; Return to Lesson 0065</a></div>
+      <div><a href="../lessons/0001-master-plan-and-curriculum.html">&#128203; Master Plan</a></div>
+      <div><a href="../lessons/0066-production-testing-mockmvc-testcontainers.html">Next Lesson &rarr;</a></div>
+    </footer>
+  </div>
+</body>
+</html>

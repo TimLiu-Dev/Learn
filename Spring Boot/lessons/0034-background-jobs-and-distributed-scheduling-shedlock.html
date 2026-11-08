@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0034: Background Jobs &amp; Distributed Scheduling with ShedLock</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Phase 9: High-Throughput Concurrency, Threading & JVM Diagnostics</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Title & Metadata -->
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0034 • Phase 9</span>
+    <h1 style="margin-top: 8px;">Background Jobs & Distributed Scheduling with ShedLock</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Every production backend needs scheduled background work: dispatching daily billing invoices, purging expired user sessions, or compiling analytics rollups. Spring's built-in '@Scheduled' annotation makes cron scheduling trivial in a local environment. However, the moment your application is deployed to Kubernetes with 5 replica pods, each pod executes that cron job simultaneously! Unless protected by distributed locking, your users receive 5 duplicate billing charges, or database tables suffer violent write collisions. In this lesson, we master ShedLock—the industry standard for distributed task scheduling—and explore how to protect cron executions across multi-replica cloud clusters.
+    </p>
+  </div>
+
+  <!-- Primary Source -->
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authority: <a href="https://github.com/lukas-krecan/ShedLock" target="_blank" style="color: var(--accent-spring); font-weight: 600;">ShedLock Official GitHub Documentation & Guide (net.javacrumbs.shedlock) by Lukáš Křístek.</a>. Ground your learning in primary architecture rather than secondary summaries.
+    </p>
+  </div>
+
+  <!-- Main Concept & Code Examples -->
+  
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">A duplicate scheduled job in production can double-charge thousands of credit cards, send spam notification blasts, or corrupt audit ledgers. Senior engineers never use bare '@Scheduled' without distributed mutex guarantees. Understanding clock drift, 'lockAtLeastFor', and 'lockAtMostFor' is critical to ensuring jobs execute exactly once across distributed instances.</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li>Spring's '@Scheduled' has zero cluster awareness; every active pod in a Kubernetes ReplicaSet executes the scheduled method independently.</li><li>ShedLock coordinates scheduled tasks across multiple nodes using an external shared store (e.g. PostgreSQL, MySQL, Redis, DynamoDB).</li><li>The ShedLock database table ('shedlock') tracks 'name', 'lock_until', 'locked_at', and 'locked_by'. It uses database conditional updates to guarantee mutual exclusion without requiring heavy leader election.</li><li>'lockAtMostFor' protects against deadlocks if a pod crashes mid-execution (ensures the lock auto-expires).</li><li>'lockAtLeastFor' protects against clock skew and fast tasks completing before other nodes evaluate their cron trigger (preventing duplicate runs in short intervals).</li><li>Enable ShedLock with '@EnableSchedulerLock(defaultLockAtMostFor = "10m")' and annotate individual jobs with '@SchedulerLock(name = "...")'.</li>
+  </ul>
+
+  
+<h3>1. The Kubernetes Multi-Replica Cron Problem</h3>
+<p>
+Suppose you configure a job:
+</p>
+<pre><code>@Scheduled(cron = "0 0 2 * * ?") // 2:00 AM daily
+public void generateDailyInvoices() { ... }</code></pre>
+<p>
+If Kubernetes runs 4 replicas of your service, at 02:00:00 UTC, all 4 pods trigger the invoice generator simultaneously. Each pod queries unbilled accounts and processes payments. Customers get billed 4 times.
+</p>
+
+<h3>2. The Architecture of ShedLock</h3>
+<p>
+ShedLock does not replace Spring's scheduler; it wraps scheduled method invocations in an AOP proxy that attempts to acquire a row in a dedicated database table:
+</p>
+<pre><code>CREATE TABLE shedlock (
+    name VARCHAR(64) NOT NULL PRIMARY KEY,
+    lock_until TIMESTAMP WITH TIME ZONE NOT NULL,
+    locked_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    locked_by VARCHAR(255) NOT NULL
+);</code></pre>
+<p>
+When Pod A triggers at 02:00:00.002, it issues an atomic SQL statement:
+</p>
+<pre><code>UPDATE shedlock 
+SET lock_until = :now + :lockAtMostFor, locked_at = :now, locked_by = :podName 
+WHERE name = :lockName AND lock_until &lt;= :now;</code></pre>
+<p>
+If Pod A updates 1 row, it acquired the lock and executes the task. When Pod B fires at 02:00:00.005, its update statement affects 0 rows because <code>lock_until</code> is in the future. Pod B immediately skips execution without error.
+</p>
+
+<h3>3. The Critical Role of 'lockAtLeastFor'</h3>
+<p>
+Consider a task that takes only 100 milliseconds to complete. Pod A acquires the lock, completes the work in 100ms, and releases the lock at 02:00:00.100.
+</p>
+<p>
+Pod B's system clock happens to be 200 milliseconds behind Pod A's clock. When Pod B hits 02:00:00, Pod A has already released the lock! Pod B acquires the lock and runs the job a second time!
+</p>
+<p>
+<strong>The Fix:</strong> Specify <code>lockAtLeastFor = "30s"</code>. Even if the task finishes in 100ms, ShedLock holds the lock until 02:00:30 UTC, preventing any clock-skewed peer node from executing during that schedule window.
+</p>
+
+
+  <h2>Production Implementation (Java 21 vs Kotlin 2.x)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Background Jobs & Distributed Scheduling with ShedLock</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.scheduling;
+
+import net.javacrumbs.shedlock.core.LockProvider;
+import net.javacrumbs.shedlock.provider.jdbctemplate.JdbcTemplateLockProvider;
+import net.javacrumbs.shedlock.spring.annotation.EnableSchedulerLock;
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import javax.sql.DataSource;
+
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = &quot;15m&quot;)
+class SchedulingConfig {
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcTemplateLockProvider(
+            JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(new org.springframework.jdbc.core.JdbcTemplate(dataSource))
+                .usingDbTime() // Crucial: rely on DB server clock to eliminate app pod clock drift
+                .build()
+        );
+    }
+}
+
+@Component
+class InvoicingScheduledJob {
+    private static final Logger log = LoggerFactory.getLogger(InvoicingScheduledJob.class);
+
+    @Scheduled(cron = &quot;0 0 2 * * ?&quot;) // 2:00 AM every night
+    @SchedulerLock(
+        name = &quot;InvoicingJob_generateNightlyInvoices&quot;,
+        lockAtMostFor = &quot;30m&quot;,   // Auto-unlock if pod crashes or is killed by OOM
+        lockAtLeastFor = &quot;2m&quot;    // Keep locked for 2 mins even if task finishes in 5 secs
+    )
+    public void generateNightlyInvoices() {
+        log.info(&quot;Acquired distributed ShedLock! Processing nightly invoices...&quot;);
+        // Heavy processing logic here
+        simulateWork();
+        log.info(&quot;Nightly invoices generated successfully.&quot;);
+    }
+
+    private void simulateWork() {
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.scheduling
+
+import net.javacrumbs.shedlock.core.LockProvider
+import net.javacrumbs.shedlock.provider.jdbctemplate.JdbcTemplateLockProvider
+import net.javacrumbs.shedlock.spring.annotation.EnableSchedulerLock
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock
+import org.slf4j.LoggerFactory
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.scheduling.annotation.EnableScheduling
+import org.springframework.scheduling.annotation.Scheduled
+import org.springframework.stereotype.Component
+import javax.sql.DataSource
+
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = &quot;15m&quot;)
+class SchedulingConfig {
+    @Bean
+    fun lockProvider(dataSource: DataSource): LockProvider {
+        return JdbcTemplateLockProvider(
+            JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(JdbcTemplate(dataSource))
+                .usingDbTime() // Eliminates pod clock drift issues
+                .build()
+        )
+    }
+}
+
+@Component
+class InvoicingScheduledJob {
+    private val log = LoggerFactory.getLogger(InvoicingScheduledJob::class.java)
+
+    @Scheduled(cron = &quot;0 0 2 * * ?&quot;)
+    @SchedulerLock(
+        name = &quot;InvoicingJob_generateNightlyInvoices&quot;,
+        lockAtMostFor = &quot;30m&quot;,
+        lockAtLeastFor = &quot;2m&quot;
+    )
+    fun generateNightlyInvoices() {
+        log.info(&quot;Acquired distributed ShedLock! Processing nightly invoices...&quot;)
+        Thread.sleep(1000)
+        log.info(&quot;Nightly invoices generated successfully.&quot;)
+    }
+}</code></pre>
+    </div>
+  </div>
+
+
+  <!-- Active Recall Code Quizzes -->
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis. Review each distractor to build durable failure-mode recognition!
+  </p>
+  
+      <div class="quiz-card" id="q0034_1" data-explanation="Correct! If a job runs in 100ms, another pod whose clock is slightly behind might trigger the same cron schedule right after release. &#x27;lockAtLeastFor&#x27; prevents this race condition.">
+        <span class="quiz-badge">Quiz 1 of 3</span>
+        <div class="quiz-prompt">What is the purpose of 'lockAtLeastFor' in ShedLock when executing background jobs in a distributed cluster?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. It does not pause the executing thread; it ensures the lock record remains active in the DB even if the task completes quickly.">
+            It forces the current thread to sleep for that duration before beginning execution.
+          </button>
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! If a job runs in 100ms, another pod whose clock is slightly behind might trigger the same cron schedule right after release. &#x27;lockAtLeastFor&#x27; prevents this race condition.">
+            It prevents duplicate executions across pods due to clock skew or short task durations by ensuring the lock isn&#x27;t released immediately upon task completion.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. ShedLock does not wait or queue; if the lock is held, other nodes immediately skip the execution.">
+            It specifies how long the application should wait when attempting to acquire the database lock before timing out.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. HikariCP timeouts are configured separately via connectionTimeout properties.">
+            It configures the maximum database connection timeout for HikariCP.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0034_2" data-explanation="Correct! Distributed containers often experience subtle NTP drift. Using the database server&#x27;s internal NOW() clock ensures all pods evaluate lock expiration against a single source of truth.">
+        <span class="quiz-badge">Quiz 2 of 3</span>
+        <div class="quiz-prompt">Why is 'usingDbTime()' recommended when configuring JdbcTemplateLockProvider in ShedLock?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Distributed containers often experience subtle NTP drift. Using the database server&#x27;s internal NOW() clock ensures all pods evaluate lock expiration against a single source of truth.">
+            It synchronizes lock expiration with the database engine&#x27;s clock, neutralizing application node clock drift across different Kubernetes pods.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. The database driver already handles timezone representations.">
+            It converts all timestamps to UTC+0 automatically in the JVM heap.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. The table is still mandatory for persisting lock rows.">
+            It bypasses the need for creating the &#x27;shedlock&#x27; database table.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. ShedLock has nothing to do with logical replication slots.">
+            It enables PostgreSQL logical replication for scheduled events.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+      <div class="quiz-card" id="q0034_3" data-explanation="Correct! &#x27;lockAtMostFor&#x27; acts as a crash safety net. Even if a pod dies without releasing the lock, the lock expires after that configured window.">
+        <span class="quiz-badge">Quiz 3 of 3</span>
+        <div class="quiz-prompt">What happens if a pod executing a @SchedulerLock-annotated job encounters an OutOfMemoryError and crashes abruptly?</div>
+        
+        <div class="quiz-options">
+          
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. &#x27;lockAtMostFor&#x27; exists precisely to guarantee automatic expiration.">
+            The distributed lock remains permanently held, completely stopping all future executions forever.
+          </button>
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! &#x27;lockAtMostFor&#x27; acts as a crash safety net. Even if a pod dies without releasing the lock, the lock expires after that configured window.">
+            The lock expires automatically once &#x27;lockAtMostFor&#x27; elapses, allowing surviving pods to acquire the lock during the next scheduled cycle.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. The lock row was committed at acquisition time; it is not held in an open pending transaction.">
+            PostgreSQL automatically rolls back the entire shedlock table to its initial state.
+          </button>
+          <button class="quiz-opt-btn " data-is-correct="false" data-reason="Incorrect. Kubernetes only restarts the crashed container, unaware of ShedLock semantics.">
+            Kubernetes automatically restarts all pods in the namespace simultaneously.
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+  <!-- Interactive Code Practice Lab -->
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Write and test your solution in either <strong>Java 21</strong> or <strong>Kotlin 2.x</strong>. The automated test runner executes multiple assertions in your browser with zero setup.
+  </p>
+
+  <div class="practice-container" 
+       data-practice-id="lesson-0034-lab"
+       data-starter-java="package com.example.scheduling;
+
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+public class SessionPurgeScheduler {
+
+    // TODO: Add @Scheduled cron for top of every hour (&quot;0 0 * * * ?&quot;)
+    // TODO: Add @SchedulerLock with name &quot;SessionPurge_purgeExpiredSessions&quot;,
+    //       lockAtMostFor = &quot;15m&quot;, and lockAtLeastFor = &quot;5m&quot;
+    public void purgeExpiredSessions() {
+        // Business logic to delete expired JWTs or sessions
+    }
+}"
+       data-starter-kotlin="package com.example.scheduling
+
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock
+import org.springframework.scheduling.annotation.Scheduled
+import org.springframework.stereotype.Component
+
+@Component
+class SessionPurgeScheduler {
+
+    // TODO: Add @Scheduled(cron = &quot;0 0 * * * ?&quot;)
+    // TODO: Add @SchedulerLock with name = &quot;SessionPurge_purgeExpiredSessions&quot;,
+    //       lockAtMostFor = &quot;15m&quot;, lockAtLeastFor = &quot;5m&quot;
+    fun purgeExpiredSessions() {
+        // Business logic to delete expired sessions
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0034</span>
+        <span class="practice-title">Background Jobs & Distributed Scheduling with ShedLock Practice</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0034-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Configure a distributed purge job using ShedLock. Create a scheduled component that runs hourly, locks with a distinct lock name, sets lockAtMostFor to 15 minutes to survive crashes, and sets lockAtLeastFor to 5 minutes to prevent clock-skew double execution.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.scheduling;
+
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+public class SessionPurgeScheduler {
+
+    // TODO: Add @Scheduled cron for top of every hour (&quot;0 0 * * * ?&quot;)
+    // TODO: Add @SchedulerLock with name &quot;SessionPurge_purgeExpiredSessions&quot;,
+    //       lockAtMostFor = &quot;15m&quot;, and lockAtLeastFor = &quot;5m&quot;
+    public void purgeExpiredSessions() {
+        // Business logic to delete expired JWTs or sessions
+    }
+}</textarea>
+    </div>
+
+    <!-- Progressive Hints Drawer -->
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Architectural Nudge</div>
+        <div>Annotate with @Scheduled(cron = "0 0 * * * ?").</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Syntax Signature</div>
+        <div>Annotate with @SchedulerLock(name = "SessionPurge_purgeExpiredSessions", lockAtMostFor = "15m", lockAtLeastFor = "5m").</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Concrete Snippet</div>
+        <div><code>Make sure both annotations are placed directly above the purgeExpiredSessions method.</code></div>
+      </div>
+    </div>
+
+    <!-- Final Solution Drawer -->
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.scheduling;
+
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+public class SessionPurgeScheduler {
+
+    @Scheduled(cron = &quot;0 0 * * * ?&quot;)
+    @SchedulerLock(
+        name = &quot;SessionPurge_purgeExpiredSessions&quot;,
+        lockAtMostFor = &quot;15m&quot;,
+        lockAtLeastFor = &quot;5m&quot;
+    )
+    public void purgeExpiredSessions() {
+        // Business logic to delete expired JWTs or sessions
+    }
+}</code></pre>
+      
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.example.scheduling
+
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock
+import org.springframework.scheduling.annotation.Scheduled
+import org.springframework.stereotype.Component
+
+@Component
+class SessionPurgeScheduler {
+
+    @Scheduled(cron = &quot;0 0 * * * ?&quot;)
+    @SchedulerLock(
+        name = &quot;SessionPurge_purgeExpiredSessions&quot;,
+        lockAtMostFor = &quot;15m&quot;,
+        lockAtLeastFor = &quot;5m&quot;
+    )
+    fun purgeExpiredSessions() {
+        // Business logic to delete expired sessions
+    }
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Follows production patterns to enforce correctness.</p>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run & Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <!-- Terminal Test Output Console -->
+    <div class="test-console"></div>
+  </div>
+
+  <!-- Teacher Agent Probing Questions -->
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"Ask your teacher: 'What are the tradeoffs between using a relational database (JDBC) vs Redis as the LockProvider backend for ShedLock in high-availability environments?'"</em>. I am here to explore every trade-off with you.
+    </p>
+  </div>
+
+  <!-- Lesson Navigation Footer -->
+  <div class="lesson-nav">
+    <a href="0033-concurrency-defense-optimistic-vs-pessimistic-locking.html" class="btn btn-secondary">← Previous: Lesson 0033</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0035-jvm-diagnostics-profiling-and-thread-dumps.html" class="btn btn-primary">Next: Lesson 0035 →</a>
+  </div>
+
+  <!-- Site Footer -->
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0034</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0034-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Scheduled Cron Pattern",
+    passed: new RegExp("@Scheduled\\s*\\(\\s*cron\\s*=\\s*\"0 0 \\* \\* \\* \\?\"\\s*\\)").test(code),
+    error: "Must annotate method with @Scheduled(cron = \"0 0 * * * ?\")."
+  });
+  tests.push({
+    name: "SchedulerLock Name Defined",
+    passed: new RegExp("@SchedulerLock.*name\\s*=\\s*\"SessionPurge_purgeExpiredSessions\"").test(code),
+    error: "Must specify name = \"SessionPurge_purgeExpiredSessions\" on @SchedulerLock."
+  });
+  tests.push({
+    name: "lockAtMostFor Safety",
+    passed: new RegExp("lockAtMostFor\\s*=\\s*\"15m\"").test(code),
+    error: "Must configure lockAtMostFor = \"15m\" to protect against crashed instances."
+  });
+  tests.push({
+    name: "lockAtLeastFor Clock Drift Defense",
+    passed: new RegExp("lockAtLeastFor\\s*=\\s*\"5m\"").test(code),
+    error: "Must configure lockAtLeastFor = \"5m\" to guard against clock skew."
+  });
+  return tests;
+};
+
+</script>
+</body>
+</html>
