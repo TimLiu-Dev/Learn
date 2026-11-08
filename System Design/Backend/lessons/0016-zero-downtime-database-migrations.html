@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0016: Zero-Downtime Database Migrations</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="page-container">
+    <!-- Top Navigation -->
+    <nav class="top-nav">
+      <a href="../master-plan.html" class="nav-brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <polyline points="15 18 9 12 15 6"></polyline>
+        </svg>
+        <span>Back to Master Plan</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../master-plan.html">Master Plan</a></li>
+        <li><a href="../reference/0001-distributed-systems-cheatsheet.html">Reference Sheet</a></li>
+        <li><a href="../reference/0002-capstone-nexus-pulse-spec.html">Resume Capstone</a></li>
+      </ul>
+    </nav>
+
+    <!-- Header Section -->
+    <header>
+      <div class="badge-group">
+        <span class="badge badge-benchmark">Module 0016</span>
+        <span class="badge badge-mid">Mid Tech Senior</span>
+        <span class="badge badge-big">Big Tech Senior</span>
+        <span class="badge badge-senior">Production Architecture Pillar</span>
+      </div>
+      <h1>Zero-Downtime Database Migrations: The Expand-Contract Pattern</h1>
+      <p style="font-size: 1.15rem; color: var(--text-secondary);">
+        In enterprise systems with 500 million records, running a naive <code>ALTER TABLE</code> statement acquires an exclusive metadata lock that queues queries, exhausts connection pools, and takes the entire production site offline.
+      </p>
+    </header>
+
+    <!-- Section 1: The Lock Avalanche -->
+    <section>
+      <h2>1. The Lock Avalanche: Why Naive DDL Takes Sites Down</h2>
+      <p>
+        In an interview, candidates are frequently asked: <em>"We need to rename a column or split a table with 200 million rows in Postgres/MySQL. How do you do it without downtime?"</em>
+      </p>
+
+      <div class="callout callout-warning">
+        <div class="callout-title">⚠️ The Metadata Lock Trap</div>
+        <p>
+          In PostgreSQL, an <code>ALTER TABLE</code> requires an <code>ACCESS EXCLUSIVE</code> lock. Even if the alter takes 20ms, it must wait behind any active in-flight <code>SELECT</code> queries. While it waits, <strong>every incoming query queues behind the lock request</strong>. Within seconds:
+        </p>
+        <ul>
+          <li>All application server connection pool slots are exhausted waiting for table access.</li>
+          <li>Load balancers fail health check probes due to HTTP request timeout cascades.</li>
+          <li>The entire cluster collapses into an outage while waiting for a single DDL statement.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Section 2: The 5-Phase Expand-Contract Pattern -->
+    <section>
+      <h2>2. The 5-Phase Expand-Contract (Parallel Run) Architecture</h2>
+      <p>
+        Senior engineers decouple database schema changes from application deployments using the 5-phase Expand-Contract pattern:
+      </p>
+
+      <div class="diagram-box">
+        <div class="diagram-title">Expand-Contract Migration Lifecycle</div>
+        <pre class="ascii-diagram">
+Phase 1: EXPAND           Phase 2: DUAL-WRITE       Phase 3: BACKFILL         Phase 4: CUTOVER          Phase 5: CONTRACT
++--------------------+   +--------------------+   +--------------------+   +--------------------+   +--------------------+
+| App writes: OLD    |   | App writes: BOTH   |   | App writes: BOTH   |   | App writes: BOTH   |   | App writes: NEW    |
+| App reads:  OLD    |   | App reads:  OLD    |   | App reads:  OLD    |   | App reads:  NEW    |   | App reads:  NEW    |
+| Schema: OLD + NEW* |   | Schema: OLD + NEW  |   | [Worker backfills  |   | [Verify telemetry  |   | Schema: NEW only   |
+| (*new is NULLABLE) |   |                    |   |  historical rows]  |   |  & consistency]    |   | (Drop OLD column)  |
++--------------------+   +--------------------+   +--------------------+   +--------------------+   +--------------------+
+        </pre>
+      </div>
+
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>Phase</th>
+              <th>Application Deployment State</th>
+              <th>Database Operations &amp; Safety Guards</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1. Expand</strong></td>
+              <td>Deploy schema migration first. Application code remains untouched.</td>
+              <td>Add the new column/table as <code>NULLABLE</code> or with a safe default. In Postgres, <code>NOT NULL</code> without a default requires rewriting the entire table disk space.</td>
+            </tr>
+            <tr>
+              <td><strong>2. Dual-Write</strong></td>
+              <td>Deploy code version 2. Writes write to <strong>both</strong> Old and New fields inside a single transaction.</td>
+              <td>Reads still read from Old. Guarantees that any new row created from this point forward contains valid data in both schemas.</td>
+            </tr>
+            <tr>
+              <td><strong>3. Backfill</strong></td>
+              <td>Background asynchronous worker runs independently of user traffic.</td>
+              <td>Iterates through historical records in bounded primary key chunks (e.g. 1,000 rows at a time). Throttles execution if database replication lag exceeds 100ms.</td>
+            </tr>
+            <tr>
+              <td><strong>4. Cutover</strong></td>
+              <td>Deploy code version 3. Reads switch to <strong>New</strong> schema. Writes still write to both.</td>
+              <td>Shadow reads or async reconciliation jobs compare Old vs New values to verify 100% data parity. If a bug is detected, rollback requires zero database downtime.</td>
+            </tr>
+            <tr>
+              <td><strong>5. Contract</strong></td>
+              <td>Deploy code version 4. Writes write only to <strong>New</strong> schema. Old code is deleted.</td>
+              <td>Drop old column asynchronously using online schema tools (e.g., <code>gh-ost</code> or <code>pg_repack</code>).</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Section 3: Interactive In-Browser Code Practice -->
+    <section>
+      <h2>3. Interactive Hands-On: Build a Migration Router &amp; Backfill Engine</h2>
+      <p>
+        Implement an Expand-Contract migration coordinator. The coordinator manages transition states, executes dual writes, routes reads based on phase, and runs chunked idempotent backfills:
+      </p>
+
+      <div id="code-sandbox-container"></div>
+    </section>
+
+    <!-- Section 4: Active Recall Quizzes -->
+    <section>
+      <h2>4. Zero-Downtime Migration Quizzes</h2>
+      <p>Test your mastery of production database operations and lock mitigation:</p>
+
+      <div id="quiz-lock-container"></div>
+      <div id="quiz-backfill-container"></div>
+      <div id="quiz-cutover-container"></div>
+    </section>
+
+    <!-- Section 5: Primary Sources & Citations -->
+    <section>
+      <h2>5. Recommended Primary Sources</h2>
+      <ul>
+        <li>
+          <a href="https://stripe.com/blog/online-migrations" target="_blank" rel="noopener">
+            <strong>Stripe Engineering: "Online Migrations at Scale"</strong>
+          </a> — The landmark blog post explaining Stripe's 4-phase safe database migration pattern.
+        </li>
+        <li>
+          <a href="https://github.com/github/gh-ost" target="_blank" rel="noopener">
+            <strong>GitHub: "gh-ost: GitHub's triggerless online schema migrator for MySQL"</strong>
+          </a> — Architecture behind schema changes running asynchronously via binlog stream without table locking.
+        </li>
+      </ul>
+    </section>
+
+    <!-- Footer -->
+    <footer class="page-footer">
+      <div class="agent-help-box">
+        <p style="margin-bottom: 0.5rem;">
+          <strong>Mentor Active Guidance:</strong> Have questions about shadow reads, replication lag throttling, or online DDL tools like pg_repack?
+        </p>
+        <p style="margin-bottom: 0;">
+          Ask your agent directly in chat.
+        </p>
+      </div>
+      <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem;">
+        <span>Lesson 0016 // Production Architecture Mastery</span>
+        <a href="../master-plan.html">Back to Master Plan Index ↑</a>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Reusable Shared Assets -->
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/code-runner.js"></script>
+
+  <script>
+    // 1. Initialize Code Runner
+    new CodeRunner('code-sandbox-container', {
+      id: 'lesson0016_migration_router',
+      starterCode: `/**
+ * Expand-Contract Migration Router & Backfill Engine
+ * Complete the implementation below.
+ */
+class MigrationRouter {
+  /**
+   * @param {Object} options
+   * @param {'EXPAND' | 'DUAL_WRITE' | 'CUTOVER' | 'CONTRACT'} options.phase - Current migration phase
+   */
+  constructor({ phase = 'EXPAND' } = {}) {
+    this.phase = phase;
+    // Map of recordId -> { id, oldField, newField }
+    this.storage = new Map();
+  }
+
+  setPhase(newPhase) {
+    this.phase = newPhase;
+  }
+
+  /**
+   * Writes a record based on current migration phase.
+   * In DUAL_WRITE and CUTOVER, writes must populate both oldField and newField.
+   * In CONTRACT, only newField is populated.
+   *
+   * @param {string} id
+   * @param {string} value
+   */
+  write(id, value) {
+    // TODO: Implement phase-aware write logic
+  }
+
+  /**
+   * Reads a record based on current migration phase.
+   * In EXPAND and DUAL_WRITE, reads from oldField.
+   * In CUTOVER and CONTRACT, reads from newField.
+   *
+   * @param {string} id
+   * @returns {string | null}
+   */
+  read(id) {
+    // TODO: Implement phase-aware read routing
+    return null;
+  }
+
+  /**
+   * Asynchronously backfills unmigrated historical records.
+   * Migrates historical records that have oldField but null/undefined newField.
+   *
+   * @param {number} batchSize - Maximum records to process per batch
+   * @returns {number} count of records backfilled in this pass
+   */
+  backfillBatch(batchSize) {
+    // TODO: Iterate storage, populate newField from oldField, bounded by batchSize
+    return 0;
+  }
+}
+
+return { MigrationRouter };
+`,
+      solutionCode: `class MigrationRouter {
+  constructor({ phase = 'EXPAND' } = {}) {
+    this.phase = phase;
+    this.storage = new Map();
+  }
+
+  setPhase(newPhase) {
+    this.phase = newPhase;
+  }
+
+  write(id, value) {
+    let record = this.storage.get(id);
+    if (!record) {
+      record = { id, oldField: null, newField: null };
+      this.storage.set(id, record);
+    }
+
+    switch (this.phase) {
+      case 'EXPAND':
+        record.oldField = value;
+        break;
+      case 'DUAL_WRITE':
+      case 'CUTOVER':
+        record.oldField = value;
+        record.newField = value;
+        break;
+      case 'CONTRACT':
+        record.newField = value;
+        break;
+      default:
+        throw new Error('Unknown migration phase: ' + this.phase);
+    }
+  }
+
+  read(id) {
+    const record = this.storage.get(id);
+    if (!record) return null;
+
+    switch (this.phase) {
+      case 'EXPAND':
+      case 'DUAL_WRITE':
+        return record.oldField;
+      case 'CUTOVER':
+      case 'CONTRACT':
+        return record.newField;
+      default:
+        return null;
+    }
+  }
+
+  backfillBatch(batchSize) {
+    let migratedCount = 0;
+    for (const record of this.storage.values()) {
+      if (migratedCount >= batchSize) break;
+
+      if (record.oldField !== null && record.newField === null) {
+        record.newField = record.oldField;
+        migratedCount++;
+      }
+    }
+    return migratedCount;
+  }
+}
+
+return { MigrationRouter };
+`,
+      hints: [
+        {
+          title: "Phase-based Write Rules",
+          content: "In <code>DUAL_WRITE</code> and <code>CUTOVER</code>, update both: <code>record.oldField = value; record.newField = value;</code>."
+        },
+        {
+          title: "Phase-based Read Rules",
+          content: "In <code>EXPAND</code> and <code>DUAL_WRITE</code> return <code>record.oldField</code>. In <code>CUTOVER</code> and <code>CONTRACT</code> return <code>record.newField</code>."
+        },
+        {
+          title: "Bounded Backfill Iteration",
+          content: "Loop through <code>this.storage.values()</code>. If <code>record.oldField !== null && record.newField === null</code>, copy it and increment count up to <code>batchSize</code>."
+        }
+      ],
+      tests: [
+        {
+          name: "Handles EXPAND phase reads and writes correctly",
+          exportSymbol: "MigrationRouter",
+          testFn: (exports) => {
+            const Router = exports.MigrationRouter;
+            const router = new Router({ phase: 'EXPAND' });
+            router.write('rec_1', 'original_val');
+            const res = router.read('rec_1');
+            if (res !== 'original_val') throw new Error(`Expected 'original_val', got ${res}`);
+            const raw = router.storage.get('rec_1');
+            if (raw.newField !== null) throw new Error("newField must remain null in EXPAND phase");
+          }
+        },
+        {
+          name: "Dual writes to both schemas during DUAL_WRITE phase",
+          exportSymbol: "MigrationRouter",
+          testFn: (exports) => {
+            const Router = exports.MigrationRouter;
+            const router = new Router({ phase: 'DUAL_WRITE' });
+            router.write('rec_2', 'dual_val');
+            const raw = router.storage.get('rec_2');
+            if (raw.oldField !== 'dual_val' || raw.newField !== 'dual_val') {
+              throw new Error("Both oldField and newField must be populated during DUAL_WRITE");
+            }
+            if (router.read('rec_2') !== 'dual_val') throw new Error("Read must still succeed from oldField");
+          }
+        },
+        {
+          name: "Backfills historical unmigrated records in batches",
+          exportSymbol: "MigrationRouter",
+          testFn: (exports) => {
+            const Router = exports.MigrationRouter;
+            const router = new Router({ phase: 'EXPAND' });
+            router.write('old_1', 'val_1');
+            router.write('old_2', 'val_2');
+            router.write('old_3', 'val_3');
+
+            router.setPhase('DUAL_WRITE');
+            const batch1Count = router.backfillBatch(2);
+            if (batch1Count !== 2) throw new Error(`Expected batch of 2, backfilled ${batch1Count}`);
+            if (router.storage.get('old_1').newField !== 'val_1') throw new Error("old_1 was not backfilled");
+            if (router.storage.get('old_3').newField !== null) throw new Error("old_3 should not be backfilled in batch 1");
+
+            const batch2Count = router.backfillBatch(2);
+            if (batch2Count !== 1) throw new Error(`Expected remaining 1 record, backfilled ${batch2Count}`);
+            if (router.storage.get('old_3').newField !== 'val_3') throw new Error("old_3 was not backfilled in batch 2");
+          }
+        },
+        {
+          name: "Switches read path during CUTOVER and leaves old behind during CONTRACT",
+          exportSymbol: "MigrationRouter",
+          testFn: (exports) => {
+            const Router = exports.MigrationRouter;
+            const router = new Router({ phase: 'CUTOVER' });
+            router.storage.set('rec_x', { id: 'rec_x', oldField: 'stale', newField: 'modern' });
+            if (router.read('rec_x') !== 'modern') throw new Error("CUTOVER must read from newField");
+
+            router.setPhase('CONTRACT');
+            router.write('rec_new', 'brand_new_val');
+            const raw = router.storage.get('rec_new');
+            if (raw.newField !== 'brand_new_val') throw new Error("CONTRACT must write newField");
+            if (raw.oldField !== null) throw new Error("CONTRACT should not populate oldField");
+          }
+        }
+      ]
+    });
+
+    // 2. Initialize Quizzes with EXACT equal word count options
+    // Quiz 1: 9 words per option
+    new QuizEngine('quiz-lock-container', {
+      id: 'quiz_ddl_lock_collapse',
+      question: "Why does running ALTER TABLE without online tools crash production database connection pools?",
+      summary: "Exclusive metadata locks queue all incoming queries until application connection limits are exhausted.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "Exclusive metadata locks queue incoming queries until server connections exhaust.",
+          rationale: "Correct! The ALTER acquires an ACCESS EXCLUSIVE lock. All subsequent queries queue behind it, instantly filling the connection pool and causing client timeouts."
+        },
+        {
+          text: "Hardware memory chips trigger instant parity errors during column alterations.",
+          rationale: "Incorrect. Schema alterations are software database engine operations that do not trigger hardware memory parity errors."
+        },
+        {
+          text: "Distributed consensus algorithms automatically initiate emergency split-brain cluster partitions.",
+          rationale: "Incorrect. Consensus protocols handle network partitions between nodes, not relational database schema alterations."
+        },
+        {
+          text: "Operating system kernels terminate processes that execute long database transactions.",
+          rationale: "Incorrect. The OS kernel does not kill running processes unless an out-of-memory (OOM) killer threshold is breached."
+        }
+      ]
+    });
+
+    // Quiz 2: 9 words per option
+    new QuizEngine('quiz-backfill-container', {
+      id: 'quiz_backfill_throttling',
+      question: "Why must historical data backfill jobs execute in small, throttled batches?",
+      summary: "Large unbounded updates saturate write-ahead logs and induce critical database replication lag.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "Throttled batches prevent transaction log saturation and replication lag spikes.",
+          rationale: "Correct! Updating 100M rows in a single query floods the Write-Ahead Log (WAL), blows out undo logs, locks rows, and causes read replica lag to skyrocket."
+        },
+        {
+          text: "Network cards cannot transmit database queries exceeding one kilobyte size.",
+          rationale: "Incorrect. Network cards transmit packets continuously via MTU frames regardless of query size."
+        },
+        {
+          text: "Relational database primary keys reject updates that occur during daylight.",
+          rationale: "Incorrect. Database primary keys enforce uniqueness constraints regardless of the time of day."
+        },
+        {
+          text: "Operating system file systems only permit sequential batch file writes.",
+          rationale: "Incorrect. Modern operating systems support arbitrary random and sequential I/O across storage files."
+        }
+      ]
+    });
+
+    // Quiz 3: 9 words per option
+    new QuizEngine('quiz-cutover-container', {
+      id: 'quiz_cutover_safety',
+      question: "Why does the CUTOVER phase continue dual-writing to the old schema?",
+      summary: "Maintaining parity on the old schema enables instantaneous, zero-loss rollback if bugs appear.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "Writing to both schemas enables instant zero-loss emergency rollback capability.",
+          rationale: "Correct! If newly deployed read logic reveals a critical bug in CUTOVER, you can revert traffic back to reading the old schema instantly without losing any newly created data."
+        },
+        {
+          text: "Relational database engines mandate dual writes for table integrity verification.",
+          rationale: "Incorrect. Dual writing is an application-level pattern; the database engine has no intrinsic requirement for dual writes."
+        },
+        {
+          text: "Distributed caching layers crash whenever database write patterns change abruptly.",
+          rationale: "Incorrect. Caching layers are isolated from schema changes unless cache key serialization contracts are broken."
+        },
+        {
+          text: "Storage hardware drives require redundant writes to maintain disk rotation.",
+          rationale: "Incorrect. Physical disk platters and NVMe cells operate independently of application-level database schema duplication."
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

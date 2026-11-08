@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0002: Storage Engine Internals — LSM-Trees vs. B-Trees</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="page-container">
+    <!-- Navigation -->
+    <nav class="top-nav">
+      <a href="../master-plan.html" class="nav-brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <polyline points="15 18 9 12 15 6"></polyline>
+        </svg>
+        <span>Back to Master Plan</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../master-plan.html">Master Plan</a></li>
+        <li><a href="../reference/0001-distributed-systems-cheatsheet.html">Reference Sheet</a></li>
+        <li><a href="../reference/0002-capstone-nexus-pulse-spec.html">Resume Capstone</a></li>
+      </ul>
+    </nav>
+
+    <!-- Header -->
+    <header>
+      <div class="badge-group">
+        <span class="badge badge-senior">Core Pillar 1: Storage Internals</span>
+        <span class="badge badge-big">Big Tech Scale</span>
+        <span class="badge badge-benchmark">Hardware Mechanical Sympathy</span>
+      </div>
+      <h1>Storage Engine Internals: LSM-Trees vs. B-Trees, Write-Ahead Logs &amp; Compaction</h1>
+      <p style="font-size: 1.15rem; color: var(--text-secondary);">
+        All distributed systems—from Raft consensus logs and Kafka partitions to Cassandra, RocksDB, and Spanner—are constrained by the physical mechanics of persistent disk storage. To pass as a Senior or Staff Engineer in 2027, you must demonstrate mechanical sympathy: knowing exactly when to choose B-Trees versus LSM-Trees based on read, write, and space amplification.
+      </p>
+    </header>
+
+    <!-- Section 1: Mechanical Sympathy & Hardware Realities -->
+    <section>
+      <h2>1. Hardware Physics: The Tyranny of Random Disk I/O</h2>
+      <p>
+        Regardless of whether storage is a spinning hard drive or a modern NVMe SSD, <strong>sequential writes are 100x to 1,000x faster than random in-place overwrites</strong>:
+      </p>
+      <ul>
+        <li><strong>On NVMe SSDs:</strong> Flash memory cannot overwrite data in-place without erasing an entire 2MB–8MB flash block. Random updates trigger massive background Flash Translation Layer (FTL) garbage collection, causing high write amplification and SSD wear.</li>
+        <li><strong>Sequential Append:</strong> Appending bytes sequentially to an open file stream operates at the physical line-rate of PCIe buses (3,000 to 7,000 MB/s).</li>
+      </ul>
+
+      <div class="diagram-box">
+        <div class="diagram-title">B-Tree In-Place Updates vs. LSM-Tree Sequential Append</div>
+        <pre class="ascii-diagram">
+B-TREE (In-Place Mutation - Postgres / MySQL InnoDB):
+Write Key "user:99" -> Search Page -> Lock Page -> Mutate Page in-place on Disk
+[ Page 0x01 ] ---> [ Page 0x4B (Random Seek) ] ---> [ Page 0x9F (Random Seek) ]
+Result: Slow random disk writes; requires WAL + Double-Write Buffer to prevent torn pages.
+
+LSM-TREE (Append-Only Sequential Writes - RocksDB / Cassandra / ScyllaDB):
+Write Key "user:99" -> (1) Append to WAL on disk (Sequential)
+                    -> (2) Insert into In-Memory MemTable (SkipList/Red-Black Tree)
+                    -> (3) Background flush to Immutable SSTables on Disk
+Result: Maximum write throughput; zero random disk writes during write path.
+        </pre>
+      </div>
+    </section>
+
+    <!-- Section 2: Architectural Comparison -->
+    <section>
+      <h2>2. Detailed Architectural Comparison: B-Tree vs. LSM-Tree</h2>
+
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>B-Tree (PostgreSQL, MySQL, Oracle)</th>
+              <th>LSM-Tree (RocksDB, Cassandra, LevelDB, TiKV)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Primary Design Goal</strong></td>
+              <td>Fast random reads ($O(\log_B N)$) via balanced fixed-size pages (4KB–16KB).</td>
+              <td>Maximum write throughput by eliminating random in-place updates.</td>
+            </tr>
+            <tr>
+              <td><strong>Write Path Mechanics</strong></td>
+              <td>Appends to WAL, updates buffer pool page, periodically flushes dirty pages in-place.</td>
+              <td>Appends to WAL, updates in-memory MemTable, sequentially flushes immutable SSTables.</td>
+            </tr>
+            <tr>
+              <td><strong>Read Path Mechanics</strong></td>
+              <td>Traverses tree index directly to target page ($1\text{ to }3$ page reads).</td>
+              <td>Checks MemTable $\rightarrow$ queries Bloom filters $\rightarrow$ reads SSTables.</td>
+            </tr>
+            <tr>
+              <td><strong>Deletion Semantics</strong></td>
+              <td>Marks slot deleted inside page; immediately reclaims or fragments page.</td>
+              <td>Appends a <strong>Tombstone</strong> marker; space is reclaimed later during background compaction.</td>
+            </tr>
+            <tr>
+              <td><strong>The RUM Trade-Off</strong></td>
+              <td>Optimizes <strong>R</strong>ead latency at expense of <strong>U</strong>pdate write speed.</td>
+              <td>Optimizes <strong>U</strong>pdate throughput at expense of <strong>R</strong>ead latency &amp; <strong>M</strong>emory.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Section 3: Deep Anatomy of an LSM-Tree -->
+    <section>
+      <h2>3. The Four Core Components of an LSM-Tree</h2>
+      <ol>
+        <li>
+          <strong>Write-Ahead Log (WAL):</strong> An append-only file on disk. Every write (insert, update, delete) is appended to the WAL before being acknowledged. If the server loses power, the WAL is replayed on restart to restore in-memory state.
+        </li>
+        <li>
+          <strong>MemTable:</strong> An in-memory, concurrent sorted data structure (typically a SkipList or Red-Black Tree). Because keys are held in sorted order in RAM, range scans and lookups are instantaneous.
+        </li>
+        <li>
+          <strong>Immutable SSTables (Sorted String Tables):</strong> When the MemTable exceeds a configured size threshold (e.g. 64MB), it is frozen into a read-only MemTable and flushed sequentially to disk as an SSTable. Once written, an SSTable file is <strong>never modified</strong>.
+        </li>
+        <li>
+          <strong>Bloom Filters:</strong> A space-efficient probabilistic data structure stored in RAM alongside each SSTable. It answers: <em>"Is this key definitely not in this SSTable, or might it be?"</em> If the Bloom filter returns false, the storage engine completely avoids reading that SSTable from disk!
+        </li>
+      </ol>
+
+      <div class="callout callout-note">
+        <div class="callout-title">Compaction Strategies: Leveled vs. Size-Tiered</div>
+        <p>
+          As SSTables accumulate, multiple versions of the same key exist across files, degrading read performance. <strong>Compaction</strong> merges multiple sorted SSTables into new sorted runs, discarding overwritten versions and tombstones.
+        </p>
+        <ul>
+          <li><strong>Size-Tiered Compaction (STCS):</strong> Merges SSTables of similar sizes. Great for high write throughput, but requires up to 50% free disk headroom.</li>
+          <li><strong>Leveled Compaction (LCS):</strong> Divides storage into Levels (L0, L1, L2, each 10x larger). Key ranges do not overlap in L1+. Guarantees bounded read latency and lower space amplification, at the cost of higher write amplification.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Section 4: In-Browser Code Sandbox -->
+    <section>
+      <h2>4. Interactive Hands-On: Build a Mini-LSM Storage Engine</h2>
+      <p>
+        To truly master storage engines for 2027 senior interviews, implement the core mechanics of an LSM-Tree: WAL appending, MemTable sorting, threshold flushing to immutable SSTables, Bloom filter checks, and Tombstone deletions.
+      </p>
+
+      <div id="code-sandbox-container"></div>
+    </section>
+
+    <!-- Section 5: Active Recall Quizzes -->
+    <section>
+      <h2>5. Active Recall Quizzes</h2>
+      <p>Test your conceptual retention. Every choice is calibrated with identical word counts:</p>
+
+      <div id="quiz-throughput-container"></div>
+      <div id="quiz-bloom-container"></div>
+      <div id="quiz-compaction-container"></div>
+    </section>
+
+    <!-- Section 6: Primary Sources -->
+    <section>
+      <h2>6. Primary Sources &amp; Literature</h2>
+      <ul>
+        <li>
+          <a href="https://dataintensive.net/" target="_blank" rel="noopener">
+            <strong>Designing Data-Intensive Applications — Martin Kleppmann</strong>
+          </a> (Chapter 3: Storage and Retrieval: Hash Indexes, SSTables, and LSM-Trees vs. B-Trees).
+        </li>
+        <li>
+          <a href="https://www.databass.dev/" target="_blank" rel="noopener">
+            <strong>Database Internals — Alex Petrov</strong>
+          </a> (Part 1: Storage Engines — B-Tree variants, page management, and LSM compaction pipelines).
+        </li>
+        <li>
+          <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Basics" target="_blank" rel="noopener">
+            <strong>Facebook RocksDB Architecture Documentation</strong>
+          </a> — The definitive production implementation powering Meta, TiKV, CockroachDB, and Kafka Streams.
+        </li>
+      </ul>
+    </section>
+
+    <!-- Footer -->
+    <footer class="page-footer">
+      <div class="agent-help-box">
+        <p style="margin-bottom: 0.5rem;">
+          <strong>Mentor Active Guidance:</strong> Wondering how RocksDB optimizes Write Amplification Factor (WAF) or how Bloom filter hash collisions impact disk I/O?
+        </p>
+        <p style="margin-bottom: 0;">
+          Ask your mentor agent directly in chat. When ready, we will transition to <strong>Pillar 2: Distributed Consensus (Raft &amp; Paxos)</strong>!
+        </p>
+      </div>
+      <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem;">
+        <span>Lesson 0002 // Core Distributed Backend Systems</span>
+        <a href="../master-plan.html">Back to Master Plan Index ↑</a>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Shared Assets -->
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/code-runner.js"></script>
+
+  <script>
+    // 1. Code Runner: Implement MiniLSMTree
+    new CodeRunner('code-sandbox-container', {
+      id: 'lesson0002_mini_lsm',
+      starterCode: `/**
+ * Mini-LSM Storage Engine
+ * Implement the core storage engine methods below.
+ */
+class MiniLSMTree {
+  /**
+   * @param {number} memTableThreshold - Max entries before MemTable is flushed to SSTable
+   */
+  constructor({ memTableThreshold = 3 } = {}) {
+    this.threshold = memTableThreshold;
+    this.wal = []; // Append-only log: Array of { op, key, value }
+    this.memTable = new Map(); // In-memory active write buffer
+    this.sstables = []; // List of immutable SSTables: [{ id, entries: [[k, v]], bloomFilter: Set }]
+    this.nextSSTableId = 1;
+    this.TOMBSTONE = '__TOMBSTONE__';
+  }
+
+  /**
+   * Writes a key-value pair.
+   * 1. Append { op: 'PUT', key, value } to WAL
+   * 2. Store in memTable
+   * 3. If memTable.size >= threshold, trigger this.flush()
+   */
+  put(key, value) {
+    // TODO: Implement put logic
+  }
+
+  /**
+   * Deletes a key by inserting a Tombstone.
+   * 1. Append { op: 'DEL', key, value: this.TOMBSTONE } to WAL
+   * 2. Store tombstone in memTable
+   * 3. If memTable.size >= threshold, trigger this.flush()
+   */
+  delete(key) {
+    // TODO: Implement delete logic
+  }
+
+  /**
+   * Reads a key.
+   * 1. Check memTable. If found, return value (or null if Tombstone).
+   * 2. Traverse sstables from newest to oldest:
+   *    - Check sstable.bloomFilter. If key is missing, skip reading entries!
+   *    - Find key in sstable.entries. If found, return value (or null if Tombstone).
+   * 3. Return null if not found.
+   */
+  get(key) {
+    // TODO: Implement get logic
+    return null;
+  }
+
+  /**
+   * Flushes memTable into an immutable sorted SSTable.
+   */
+  flush() {
+    if (this.memTable.size === 0) return;
+
+    // Sort entries lexicographically by key
+    const sortedEntries = Array.from(this.memTable.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]));
+
+    // Construct Bloom filter (represented here as a Set for fast membership)
+    const bloom = new Set(sortedEntries.map(e => e[0]));
+
+    // Create immutable SSTable
+    this.sstables.unshift({
+      id: this.nextSSTableId++,
+      entries: sortedEntries,
+      bloomFilter: bloom
+    });
+
+    // Clear memTable and reset WAL
+    this.memTable.clear();
+    this.wal = [];
+  }
+}
+
+return { MiniLSMTree };
+`,
+      solutionCode: `class MiniLSMTree {
+  constructor({ memTableThreshold = 3 } = {}) {
+    this.threshold = memTableThreshold;
+    this.wal = [];
+    this.memTable = new Map();
+    this.sstables = [];
+    this.nextSSTableId = 1;
+    this.TOMBSTONE = '__TOMBSTONE__';
+  }
+
+  put(key, value) {
+    this.wal.push({ op: 'PUT', key, value });
+    this.memTable.set(key, value);
+    if (this.memTable.size >= this.threshold) {
+      this.flush();
+    }
+  }
+
+  delete(key) {
+    this.wal.push({ op: 'DEL', key, value: this.TOMBSTONE });
+    this.memTable.set(key, this.TOMBSTONE);
+    if (this.memTable.size >= this.threshold) {
+      this.flush();
+    }
+  }
+
+  get(key) {
+    // 1. Search in-memory active MemTable
+    if (this.memTable.has(key)) {
+      const val = this.memTable.get(key);
+      return val === this.TOMBSTONE ? null : val;
+    }
+
+    // 2. Search immutable SSTables from newest to oldest
+    for (const sstable of this.sstables) {
+      // Bloom Filter bypass: If key not in filter, skip disk scan completely
+      if (!sstable.bloomFilter.has(key)) {
+        continue;
+      }
+
+      // Binary/linear search through sorted entries
+      for (const [k, v] of sstable.entries) {
+        if (k === key) {
+          return v === this.TOMBSTONE ? null : v;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  flush() {
+    if (this.memTable.size === 0) return;
+
+    const sortedEntries = Array.from(this.memTable.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]));
+
+    const bloom = new Set(sortedEntries.map(e => e[0]));
+
+    this.sstables.unshift({
+      id: this.nextSSTableId++,
+      entries: sortedEntries,
+      bloomFilter: bloom
+    });
+
+    this.memTable.clear();
+    this.wal = [];
+  }
+}
+
+return { MiniLSMTree };
+`,
+      hints: [
+        {
+          title: "Write Path & WAL Append",
+          content: "Remember that every mutation (both <code>put</code> and <code>delete</code>) must append to <code>this.wal</code> before updating <code>this.memTable</code> to guarantee durability."
+        },
+        {
+          title: "Tombstone Deletion Semantics",
+          content: "In LSM-Trees, a deletion is simply a write of a special tombstone value (<code>this.TOMBSTONE</code>). Never immediately delete from older SSTables, because SSTables are strictly immutable!"
+        },
+        {
+          title: "Read Precedence & Bloom Bypass",
+          content: "Check <code>this.memTable</code> first. If not found, iterate through <code>this.sstables</code> (which are stored newest-first). Always check <code>sstable.bloomFilter.has(key)</code> before scanning <code>entries</code>."
+        }
+      ],
+      tests: [
+        {
+          name: "Stores and retrieves keys directly from active MemTable",
+          exportSymbol: "MiniLSMTree",
+          testFn: (exports) => {
+            const LSM = exports.MiniLSMTree;
+            const tree = new LSM({ memTableThreshold: 5 });
+            tree.put("user:1", "Alice");
+            tree.put("user:2", "Bob");
+            if (tree.get("user:1") !== "Alice") throw new Error("Expected user:1 to be Alice");
+            if (tree.get("user:2") !== "Bob") throw new Error("Expected user:2 to be Bob");
+            if (tree.get("user:99") !== null) throw new Error("Expected non-existent key to return null");
+          }
+        },
+        {
+          name: "Automatically flushes to sorted SSTable when threshold is reached",
+          exportSymbol: "MiniLSMTree",
+          testFn: (exports) => {
+            const LSM = exports.MiniLSMTree;
+            const tree = new LSM({ memTableThreshold: 3 });
+            tree.put("c", "Charlie");
+            tree.put("a", "Alice");
+            tree.put("b", "Bob"); // Triggers flush (size=3)
+
+            if (tree.sstables.length !== 1) throw new Error("Expected exactly 1 flushed SSTable");
+            if (tree.memTable.size !== 0) throw new Error("Expected active MemTable to be empty after flush");
+
+            // Verify entries are sorted alphabetically
+            const keys = tree.sstables[0].entries.map(e => e[0]);
+            if (keys.join(",") !== "a,b,c") {
+              throw new Error(`Expected SSTable keys to be sorted 'a,b,c', got '${keys.join(",")}'`);
+            }
+
+            // Verify retrieval works seamlessly from SSTable
+            if (tree.get("a") !== "Alice" || tree.get("b") !== "Bob" || tree.get("c") !== "Charlie") {
+              throw new Error("Failed to retrieve flushed keys from SSTable");
+            }
+          }
+        },
+        {
+          name: "Bypasses SSTables using Bloom Filter for missing keys",
+          exportSymbol: "MiniLSMTree",
+          testFn: (exports) => {
+            const LSM = exports.MiniLSMTree;
+            const tree = new LSM({ memTableThreshold: 2 });
+            tree.put("k1", "v1");
+            tree.put("k2", "v2"); // Flushed to SSTable 1
+
+            if (!tree.sstables[0].bloomFilter.has("k1")) throw new Error("Bloom filter must contain k1");
+            if (tree.sstables[0].bloomFilter.has("non_existent")) {
+              throw new Error("Bloom filter should not match non-existent key");
+            }
+            if (tree.get("non_existent") !== null) throw new Error("Expected null for missing key");
+          }
+        },
+        {
+          name: "Correctly handles Tombstones across MemTable and older SSTables",
+          exportSymbol: "MiniLSMTree",
+          testFn: (exports) => {
+            const LSM = exports.MiniLSMTree;
+            const tree = new LSM({ memTableThreshold: 2 });
+            tree.put("user:42", "Original");
+            tree.put("dummy:1", "Val"); // Flushed to SSTable 1
+
+            // Now delete user:42 in active MemTable
+            tree.delete("user:42");
+
+            // Even though "user:42" is present in older SSTable 1,
+            // the newer tombstone in MemTable must mask it and return null!
+            if (tree.get("user:42") !== null) {
+              throw new Error("Tombstone failed to mask older SSTable value");
+            }
+
+            // Flush the deletion to SSTable 2
+            tree.put("dummy:2", "Val"); // Triggers flush of tombstone
+
+            // Now both SSTables exist; newer SSTable has tombstone
+            if (tree.get("user:42") !== null) {
+              throw new Error("Tombstone in newer SSTable failed to mask older SSTable value");
+            }
+          }
+        }
+      ]
+    });
+
+    // 2. Quizzes: Exactly 9 words per option
+    new QuizEngine('quiz-throughput-container', {
+      id: 'quiz_lsm_write_throughput',
+      question: "Why do LSM-Trees provide significantly higher write throughput than B-Trees?",
+      summary: "LSM-Trees eliminate costly random in-place disk seeks by buffering in memory and writing sequentially.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "LSM-Trees transform random writes into sequential disk append operations.",
+          rationale: "Correct! By logging to an append-only WAL and buffering updates in MemTable, all disk writes occur sequentially at maximum hardware throughput."
+        },
+        {
+          text: "B-Trees lack write-ahead logging mechanisms for transaction crash durability.",
+          rationale: "Incorrect. B-Trees use Write-Ahead Logs (WAL) extensively to recover from unexpected server crashes."
+        },
+        {
+          text: "LSM-Trees eliminate all read amplification through automated background compaction.",
+          rationale: "Incorrect. LSM-Trees suffer from higher read amplification than B-Trees because multiple SSTable levels may need to be inspected."
+        },
+        {
+          text: "B-Tree indexes require complete memory rebuilds during server restarts.",
+          rationale: "Incorrect. B-Trees persist page indexes directly on disk; they do not rebuild from scratch on restart."
+        }
+      ]
+    });
+
+    new QuizEngine('quiz-bloom-container', {
+      id: 'quiz_bloom_filter_role',
+      question: "What is the primary role of a Bloom Filter in an LSM-Tree?",
+      summary: "Bloom filters are space-efficient probabilistic guards preventing wasteful disk reads.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "Rapidly bypasses SSTables that definitely do not contain keys.",
+          rationale: "Correct! If the Bloom filter returns false, the storage engine guarantees the key is absent and skips loading SSTable blocks from disk."
+        },
+        {
+          text: "Periodically cleans obsolete tombstone records from existing disk segments.",
+          rationale: "Incorrect. That is the responsibility of the background compaction pipeline, not Bloom filters."
+        },
+        {
+          text: "Serializes concurrent incoming mutations into persistent append-only log files.",
+          rationale: "Incorrect. The Write-Ahead Log (WAL) handles append-only serialization, not Bloom filters."
+        },
+        {
+          text: "Compresses sparse index blocks before flushing to NVMe storage.",
+          rationale: "Incorrect. Block compression algorithms (e.g. ZSTD, Snappy) handle block compression, not Bloom filters."
+        }
+      ]
+    });
+
+    new QuizEngine('quiz-compaction-container', {
+      id: 'quiz_compaction_tradeoffs',
+      question: "What is the principal operational trade-off of Leveled Compaction versus Size-Tiered Compaction?",
+      summary: "Leveled compaction trades higher write amplification for lower space amplification and predictable read latency.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "Leveled compaction increases write amplification while reducing read latency.",
+          rationale: "Correct! Because each level has strictly non-overlapping key ranges, reads touch at most one SSTable per level, but moving data across levels incurs higher write amplification."
+        },
+        {
+          text: "Size-tiered compaction requires zero background disk input-output processing capacity.",
+          rationale: "Incorrect. Size-tiered compaction requires significant disk I/O when merging multiple large SSTables together."
+        },
+        {
+          text: "Leveled compaction eliminates all secondary sparse index lookups completely.",
+          rationale: "Incorrect. Sparse indexes are still used inside each SSTable to locate keys within data blocks."
+        },
+        {
+          text: "Size-tiered compaction prevents duplicate key overwrites during runtime execution.",
+          rationale: "Incorrect. Size-tiered compaction actually retains duplicate key versions across tiers until a major compaction occurs."
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

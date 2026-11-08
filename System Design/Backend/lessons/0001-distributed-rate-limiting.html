@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0001: Distributed Rate Limiting &amp; Edge Coordination</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="page-container">
+    <!-- Navigation -->
+    <nav class="top-nav">
+      <a href="../master-plan.html" class="nav-brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <polyline points="15 18 9 12 15 6"></polyline>
+        </svg>
+        <span>Back to Master Plan</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../master-plan.html">Master Plan</a></li>
+        <li><a href="../reference/0001-distributed-systems-cheatsheet.html">Reference Sheet</a></li>
+        <li><a href="../reference/0002-capstone-nexus-pulse-spec.html">Resume Capstone</a></li>
+      </ul>
+    </nav>
+
+    <!-- Header -->
+    <header>
+      <div class="badge-group">
+        <span class="badge badge-benchmark">Benchmark Lesson 0001</span>
+        <span class="badge badge-mid">Mid Tech Core</span>
+        <span class="badge badge-big">Big Tech Scale</span>
+        <span class="badge badge-senior">Senior / Staff Focus</span>
+      </div>
+      <h1>Distributed Rate Limiting: Algorithms, Redis Clusters &amp; Edge Coordination</h1>
+      <p style="font-size: 1.15rem; color: var(--text-secondary);">
+        Rate limiting is the archetypal system design interview question: it deceptively appears simple, yet exposes whether a candidate grasps concurrency race conditions, memory sizing, distributed state coordination, and failover topologies.
+      </p>
+    </header>
+
+    <!-- Section 1: Algorithmic Comparison -->
+    <section>
+      <h2>1. The Four Core Rate Limiting Algorithms</h2>
+      <p>
+        In an interview, you must instantly contrast algorithms based on memory overhead, burst tolerance, and accuracy:
+      </p>
+
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>Algorithm</th>
+              <th>Memory Complexity</th>
+              <th>Burst Handling</th>
+              <th>Production Trade-off</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Token Bucket</strong></td>
+              <td><code>O(1)</code> (Tokens count + Last timestamp)</td>
+              <td>Permits bursts up to bucket capacity.</td>
+              <td><strong>Industry Standard (Stripe/AWS):</strong> Highly memory efficient; allows natural traffic bursts while maintaining average throughput.</td>
+            </tr>
+            <tr>
+              <td><strong>Leaky Bucket (FIFO)</strong></td>
+              <td><code>O(Queue Size)</code> or <code>O(1)</code></td>
+              <td>Smooths bursts into constant rate.</td>
+              <td>Ideal for packet egress or queuing background jobs; drops or delays traffic if queue overflows.</td>
+            </tr>
+            <tr>
+              <td><strong>Fixed Window Counter</strong></td>
+              <td><code>O(1)</code> (1 integer per window)</td>
+              <td>Vulnerable to 2x burst at boundary.</td>
+              <td>Dangerous edge flaw: A burst at <code>00:59</code> and <code>01:01</code> doubles permitted quota across that 2-second span.</td>
+            </tr>
+            <tr>
+              <td><strong>Sliding Window Log</strong></td>
+              <td><code>O(N)</code> (Stores timestamp per request)</td>
+              <td>100% Mathematically accurate.</td>
+              <td>Memory prohibitive: 100k requests = 100k stored timestamps in Redis sorted set. Unviable at scale.</td>
+            </tr>
+            <tr>
+              <td><strong>Sliding Window Counter</strong></td>
+              <td><code>O(1)</code> (Current count + Previous count)</td>
+              <td>Smooth rolling approximation.</td>
+              <td><strong>Gold Standard for Distributed Redis:</strong> Combines low O(1) memory of fixed windows with 99.9% rolling accuracy.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="diagram-box">
+        <div class="diagram-title">Sliding Window Counter Calculation Logic</div>
+        <pre class="ascii-diagram">
++------------------------------+------------------------------+
+| Previous Window (Count: 80)  |  Current Window (Count: 30)  |
++------------------------------+------------------------------+
+[00:00                 01:00]  [01:00        * (01:18)  02:00]
+                                             |
+                                             v 30% through window (elapsed = 0.3)
+Formula:
+  Weight of Previous Window = 1.0 - 0.3 = 0.70
+  Estimated Requests In Rolling 60s = (80 * 0.70) + 30 = 56 + 30 = 86 requests
+  If Limit = 100 -> 86 &lt; 100 -> REQUEST ALLOWED (Increment current to 31)
+        </pre>
+      </div>
+    </section>
+
+    <!-- Section 2: Distributed Concurrency & Redis Lua -->
+    <section>
+      <h2>2. Mid Tech vs. Big Tech Architecture</h2>
+
+      <h3>The Mid Tech Approach: Centralized Redis Cluster with Atomic Lua Scripts</h3>
+      <p>
+        In a mid-sized architecture (1,000 to 50,000 QPS), API instances route requests through a shared Redis cluster. The fatal mistake junior engineers make is executing a <code>GET count</code>, incrementing in application memory, and calling <code>SET count</code>. Under concurrent load, this creates a catastrophic <strong>Read-Modify-Write Race Condition</strong>.
+      </p>
+
+      <div class="callout callout-warning">
+        <div class="callout-title">⚠️ The Atomicity Requirement</div>
+        <p>
+          To eliminate race conditions without distributed locks (which introduce severe latency), Redis executes an embedded <strong>Lua Script</strong>. Because Redis executes scripts in a single-threaded event loop, the entire check-and-increment runs atomically in a single network roundtrip.
+        </p>
+      </div>
+
+      <pre><code>-- Production Redis Lua Script for Sliding Window Counter
+local key = KEYS[1]
+local current_bucket = ARGV[1]
+local prev_bucket = ARGV[2]
+local weight = tonumber(ARGV[3])
+local limit = tonumber(ARGV[4])
+
+local prev_count = tonumber(redis.call('HGET', key, prev_bucket) or '0')
+local curr_count = tonumber(redis.call('HGET', key, current_bucket) or '0')
+
+local estimated = math.floor(prev_count * weight + curr_count)
+
+if estimated &lt; limit then
+    redis.call('HINCRBY', key, current_bucket, 1)
+    redis.call('EXPIRE', key, 120) -- TTL safety cleanup
+    return {1, limit - estimated - 1} -- {Allowed: true, Remaining}
+else
+    return {0, 0} -- {Allowed: false, Remaining: 0}
+end</code></pre>
+
+      <h3>The Big Tech Approach (10,000,000+ QPS): Local Batching &amp; Edge Synchronization</h3>
+      <p>
+        At Google or Cloudflare scale, sending 10M requests/second to a centralized Redis cluster will saturate network interfaces and blow past CPU limits.
+      </p>
+      <ul>
+        <li><strong>Local In-Memory Token Batching:</strong> Each microservice instance requests a quota chunk (e.g., 100 tokens) from the cluster once every few seconds. Local worker threads decrement their in-memory quota with sub-microsecond latency.</li>
+        <li><strong>Edge Rate Limiting (Cloudflare / Envoy / eBPF):</strong> Rate limiting is enforced at regional Point-of-Presence (PoP) edge servers via Anycast DNS, stopping DDoS attacks before traffic hits the core cloud infrastructure.</li>
+        <li><strong>Failure Mode (Fail-Open vs. Fail-Closed):</strong> Always state your failure strategy in an interview:
+          <em>"If Redis fails or partitions, critical business APIs (e.g. Checkout) fail open to local fallback heuristics, whereas unauthenticated public endpoints fail closed."</em>
+        </li>
+      </ul>
+    </section>
+
+    <!-- Section 3: Interactive In-Browser Code Practice -->
+    <section>
+      <h2>3. Interactive Hands-On: Implement a Sliding Window Counter</h2>
+      <p>
+        Cement your understanding by writing the core mathematical algorithm. The sandbox runs directly in your browser with automated unit tests:
+      </p>
+
+      <div id="code-sandbox-container"></div>
+    </section>
+
+    <!-- Section 4: Active Recall Quizzes -->
+    <section>
+      <h2>4. Senior System Design Quizzes</h2>
+      <p>Test your knowledge with rigorous interview scenarios. Each option has been calibrated to test real-world trade-off comprehension:</p>
+
+      <div id="quiz-concurrency-container"></div>
+      <div id="quiz-scale-container"></div>
+      <div id="quiz-batching-container"></div>
+    </section>
+
+    <!-- Section 5: Primary Sources & Citations -->
+    <section>
+      <h2>5. Recommended Primary Sources</h2>
+      <ul>
+        <li>
+          <a href="https://stripe.com/blog/rate-limiters" target="_blank" rel="noopener">
+            <strong>Stripe Engineering: "Scaling your API with rate limiters"</strong>
+          </a> — Explains Stripe's 4 distinct rate limiting tiers (Request rate limiter, Concurrent request limiter, Fleet usage limiter, and Credential credential stuffing limiter).
+        </li>
+        <li>
+          <a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/" target="_blank" rel="noopener">
+            <strong>Cloudflare: "How we built rate limiting capable of 400 million requests per second"</strong>
+          </a> — Deep dive into sliding window counter approximations and edge memory efficiency.
+        </li>
+      </ul>
+    </section>
+
+    <!-- Footer & Agent Prompts -->
+    <footer class="page-footer">
+      <div class="agent-help-box">
+        <p style="margin-bottom: 0.5rem;">
+          <strong>Mentor Active Guidance:</strong> Have a question about how to handle Redis cluster sharding keys, or want to discuss how to convert this code into a production Envoy filter?
+        </p>
+        <p style="margin-bottom: 0;">
+          Ask your agent directly in chat. When ready, proceed to Lesson 0002!
+        </p>
+      </div>
+      <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem;">
+        <span>Lesson 0001 // Distributed Systems Mastery</span>
+        <a href="../master-plan.html">Back to Master Plan Index ↑</a>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Reusable Shared Assets -->
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/code-runner.js"></script>
+
+  <script>
+    // 1. Initialize Code Practice Sandbox
+    new CodeRunner('code-sandbox-container', {
+      id: 'lesson0001_sliding_window',
+      starterCode: `/**
+ * Sliding Window Counter Rate Limiter
+ * Complete the class implementation below.
+ */
+class SlidingWindowRateLimiter {
+  /**
+   * @param {number} windowMs - Size of rate limit window in milliseconds (e.g. 60000 for 1 min)
+   * @param {number} maxRequests - Max requests allowed within any rolling window
+   */
+  constructor({ windowMs, maxRequests }) {
+    this.windowMs = windowMs;
+    this.maxRequests = maxRequests;
+    // Map of clientId -> { currentBucket, currentCount, prevBucket, prevCount }
+    this.clients = new Map();
+  }
+
+  /**
+   * Evaluates if a request from clientId at currentTimeMs is permitted.
+   * @param {string} clientId
+   * @param {number} currentTimeMs
+   * @returns {{ allowed: boolean, currentEstimated: number }}
+   */
+  isAllowed(clientId, currentTimeMs) {
+    // TODO: Calculate current bucket index
+    // TODO: Compute time progress through current bucket (0.0 to 1.0)
+    // TODO: Calculate weighted request estimate
+    // TODO: If within limits, record request and return allowed: true
+
+    return { allowed: false, currentEstimated: 0 };
+  }
+}
+
+// Export for test harness
+return { SlidingWindowRateLimiter };
+`,
+      solutionCode: `class SlidingWindowRateLimiter {
+  constructor({ windowMs, maxRequests }) {
+    this.windowMs = windowMs;
+    this.maxRequests = maxRequests;
+    this.clients = new Map();
+  }
+
+  isAllowed(clientId, currentTimeMs) {
+    const currentBucket = Math.floor(currentTimeMs / this.windowMs);
+    let state = this.clients.get(clientId);
+
+    if (!state) {
+      state = {
+        currentBucket,
+        currentCount: 0,
+        prevBucket: currentBucket - 1,
+        prevCount: 0
+      };
+      this.clients.set(clientId, state);
+    } else {
+      // Check if time rolled over to a new bucket
+      if (state.currentBucket !== currentBucket) {
+        if (state.currentBucket === currentBucket - 1) {
+          // Immediately adjacent bucket: slide current to previous
+          state.prevBucket = state.currentBucket;
+          state.prevCount = state.currentCount;
+        } else {
+          // Time jumped forward by more than 1 window: old data is obsolete
+          state.prevBucket = currentBucket - 1;
+          state.prevCount = 0;
+        }
+        state.currentBucket = currentBucket;
+        state.currentCount = 0;
+      }
+    }
+
+    // Calculate percentage through the current window
+    const timeIntoCurrentWindow = currentTimeMs % this.windowMs;
+    const currentRatio = timeIntoCurrentWindow / this.windowMs;
+    const prevWeight = 1.0 - currentRatio;
+
+    // Rolling estimation formula: (Previous * Weight) + Current
+    const estimated = Math.floor(state.prevCount * prevWeight) + state.currentCount;
+
+    if (estimated < this.maxRequests) {
+      state.currentCount += 1;
+      return { allowed: true, currentEstimated: estimated + 1 };
+    } else {
+      return { allowed: false, currentEstimated: estimated };
+    }
+  }
+}
+
+return { SlidingWindowRateLimiter };
+`,
+      hints: [
+        {
+          title: "Bucket Identification Math",
+          content: "Use <code>Math.floor(currentTimeMs / this.windowMs)</code> to find the integer ID of the active window bucket. Any timestamp within that duration belongs to that bucket."
+        },
+        {
+          title: "Bucket Transition & Eviction",
+          content: "When <code>currentBucket</code> changes, if the new bucket is exactly <code>state.currentBucket + 1</code>, set <code>prevCount = currentCount</code> and reset <code>currentCount = 0</code>. If more than 1 window elapsed, set both to 0."
+        },
+        {
+          title: "Weighting & Estimation Formula",
+          content: "The time into the current window is <code>currentTimeMs % this.windowMs</code>. The weight of the previous bucket is <code>1.0 - (timeIntoCurrentWindow / this.windowMs)</code>. Estimated count = <code>Math.floor(prevCount * prevWeight) + currentCount</code>."
+        }
+      ],
+      tests: [
+        {
+          name: "Allows requests within limit during initial window",
+          exportSymbol: "SlidingWindowRateLimiter",
+          testFn: (exports) => {
+            const Limiter = exports.SlidingWindowRateLimiter;
+            const limiter = new Limiter({ windowMs: 1000, maxRequests: 5 });
+            for (let i = 0; i < 5; i++) {
+              const res = limiter.isAllowed('user_1', 100 + i * 50);
+              if (!res.allowed) throw new Error(`Expected request ${i + 1} to be allowed`);
+            }
+          }
+        },
+        {
+          name: "Blocks requests exceeding limit in the same window",
+          exportSymbol: "SlidingWindowRateLimiter",
+          testFn: (exports) => {
+            const Limiter = exports.SlidingWindowRateLimiter;
+            const limiter = new Limiter({ windowMs: 1000, maxRequests: 3 });
+            limiter.isAllowed('user_2', 100);
+            limiter.isAllowed('user_2', 200);
+            limiter.isAllowed('user_2', 300);
+            const res = limiter.isAllowed('user_2', 400);
+            if (res.allowed) throw new Error("Expected 4th request to be blocked (limit is 3)");
+          }
+        },
+        {
+          name: "Calculates rolling weight accurately across window boundary",
+          exportSymbol: "SlidingWindowRateLimiter",
+          testFn: (exports) => {
+            const Limiter = exports.SlidingWindowRateLimiter;
+            // 10 requests allowed per 1000ms
+            const limiter = new Limiter({ windowMs: 1000, maxRequests: 10 });
+            // Fill previous window (bucket 0) with 10 requests
+            for (let i = 0; i < 10; i++) {
+              limiter.isAllowed('user_3', 900);
+            }
+            // Now at 1250ms (bucket 1, 25% through).
+            // Previous weight = 1 - 0.25 = 0.75.
+            // Estimated from prev = 10 * 0.75 = 7.5 -> 7 requests.
+            // Limit is 10. Can accept 3 requests in current window!
+            const r1 = limiter.isAllowed('user_3', 1250);
+            const r2 = limiter.isAllowed('user_3', 1250);
+            const r3 = limiter.isAllowed('user_3', 1250);
+            if (!r1.allowed || !r2.allowed || !r3.allowed) {
+              throw new Error("Expected first 3 requests in new window to be allowed based on rolling formula");
+            }
+            // 4th request: estimated = 7 + 3 = 10. Should be blocked!
+            const r4 = limiter.isAllowed('user_3', 1250);
+            if (r4.allowed) {
+              throw new Error("Expected 4th request at 25% into window to be blocked due to previous window weight");
+            }
+          }
+        },
+        {
+          name: "Completely resets quota when full window has elapsed",
+          exportSymbol: "SlidingWindowRateLimiter",
+          testFn: (exports) => {
+            const Limiter = exports.SlidingWindowRateLimiter;
+            const limiter = new Limiter({ windowMs: 1000, maxRequests: 2 });
+            limiter.isAllowed('user_4', 100);
+            limiter.isAllowed('user_4', 200);
+            // Advance by 3000ms (3 full windows)
+            const res = limiter.isAllowed('user_4', 3500);
+            if (!res.allowed) throw new Error("Expected request after multiple window intervals to be allowed");
+          }
+        }
+      ]
+    });
+
+    // 2. Initialize Quizzes with EXACT equal word count options
+    // Quiz 1: 10 words per option
+    new QuizEngine('quiz-concurrency-container', {
+      id: 'quiz_concurrency_race',
+      question: "Why is executing a separate Redis GET and SET dangerous in distributed rate limiting?",
+      summary: "Non-atomic operations across distributed app instances lead to lost updates under concurrency.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "Multiple concurrent servers can create unexpected race condition data overwrites.",
+          rationale: "Correct! If two instances read count=4 concurrently, both calculate 5 and write 5, allowing 2 requests when only 1 should be permitted."
+        },
+        {
+          text: "Redis network latency causes severe packet drops during network transmission.",
+          rationale: "Incorrect. Redis uses TCP; packets are retransmitted reliably by the OS network stack rather than dropped."
+        },
+        {
+          text: "Memory usage increases exponentially inside database storage without timely expiration.",
+          rationale: "Incorrect. The danger of non-atomic GET/SET is concurrency correctness, not exponential memory growth."
+        },
+        {
+          text: "CPU cache invalidation forces server crashes under heavy concurrent throughput.",
+          rationale: "Incorrect. CPU cache invalidation affects hardware efficiency, but has nothing to do with distributed race conditions."
+        }
+      ]
+    });
+
+    // Quiz 2: 9 words per option
+    new QuizEngine('quiz-scale-container', {
+      id: 'quiz_centralized_redis_bottleneck',
+      question: "At 50,000,000 requests per second, why does a centralized Redis cluster fail?",
+      summary: "Network interface cards (NICs) and connection limits bottleneck centralized clusters regardless of memory speed.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "Centralized network bandwidth and connection sockets quickly get exhausted.",
+          rationale: "Correct! Even if Redis in-memory commands execute in 20 microseconds, receiving and replying to 50M TCP packets per second saturates network switches and NIC bandwidth."
+        },
+        {
+          text: "Relational database replication threads experience severe distributed deadlock timeouts.",
+          rationale: "Incorrect. A centralized Redis rate limiter operates on Redis in-memory data structures, not relational database replication threads."
+        },
+        {
+          text: "Memory garbage collection pauses freeze operating system kernel processes.",
+          rationale: "Incorrect. Redis is written in C and manages memory manually without JVM or runtime stop-the-world garbage collection pauses."
+        },
+        {
+          text: "Token bucket algorithms cannot handle floating point mathematical computations.",
+          rationale: "Incorrect. Token bucket rate limiting math involves basic addition, multiplication, and truncation, which CPUs execute in single nanoseconds."
+        }
+      ]
+    });
+
+    // Quiz 3: 9 words per option
+    new QuizEngine('quiz-batching-container', {
+      id: 'quiz_local_token_batching',
+      question: "How does local token batching solve the centralized cache bottleneck at scale?",
+      summary: "Batching decouples per-request verification from network roundtrips.",
+      correctIndex: 0,
+      options: [
+        {
+          text: "Application nodes reserve token chunks locally, reducing Redis roundtrips.",
+          rationale: "Correct! Instead of making 1 Redis call per request, an application server reserves a batch of 100 tokens, serving the next 100 requests in-memory and reducing Redis QPS by 99%."
+        },
+        {
+          text: "Edge routers discard excess packets before reaching internal networks.",
+          rationale: "Incorrect. That describes perimeter DDoS filtering, not application-level local token batching."
+        },
+        {
+          text: "Database transactions execute asynchronously inside dedicated background worker threads.",
+          rationale: "Incorrect. Rate limiting is a synchronous admission control gate for in-flight requests, not asynchronous background DB writes."
+        },
+        {
+          text: "Hash rings redistribute incoming requests across alternative geographical regions.",
+          rationale: "Incorrect. Consistent hashing distributes keys, but does not address the per-request network roundtrip overhead of token verification."
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

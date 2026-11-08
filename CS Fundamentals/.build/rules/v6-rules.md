@@ -109,6 +109,7 @@ After each quiz's `<p class="why">…</p>`, add one `<li>` per button, in button
 - **Playground limits:**
   - Single file, Java 17 APIs, kotlinx.coroutines and kotlinx.serialization available.
   - No file system, no stdin, 10 s limit, output cap.
+  - Java 17 means no `ExecutorService.close()`, so Kotlin's `executor.use { }` fails with "Cannot infer type for type parameter 'R'". Also no virtual threads, no `HttpClient` close, and no JDBC drivers.
   - Threads and sockets work. Keep concurrency tests deterministic: join, use latches, no sleeps for timing.
 - **Where Kotlin can't express the skill** (pure shell, a design discussion), use the closest honest Kotlin exercise, e.g. reimplement a pipeline stage in Kotlin. Don't skip the practice.
 
