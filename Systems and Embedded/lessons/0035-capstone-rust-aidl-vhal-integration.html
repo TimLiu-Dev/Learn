@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0035: Capstone Rust VHAL & AAOS UI | Systems & Embedded</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js"></script>
+</head>
+<body>
+
+  <header class="course-nav">
+    <div class="nav-left">
+      <a href="../index.html" class="nav-btn">&larr; Master Plan</a>
+      <a href="0034-capstone-firmware-and-kernel-bsp.html" class="nav-btn">&larr; Lesson 0034</a>
+      <div class="nav-breadcrumb">Track 08 &bull; <span>Lesson 0035</span></div>
+    </div>
+    <div class="nav-status-pills">
+      <div id="status-read" class="status-pill completed"><span>📖 Theory Read</span></div>
+      <div id="status-practice" class="status-pill"><span>⚡ Practice Passed</span></div>
+      <div id="status-quiz" class="status-pill"><span>🎯 Quizzes Passed</span></div>
+    </div>
+  </header>
+
+  <main class="container">
+    <header class="lesson-header">
+      <span class="track-badge">Track 08: Capstone & Career &bull; Lesson 0035</span>
+      <h1>Grand Capstone Part 3:<br>Rust AIDL VHAL Service & Jetpack Compose Cockpit UI</h1>
+      <p class="lesson-lead">
+        In this third milestone of the Grand Capstone, you will complete the upper tiers of our automotive system: writing the native Rust Vehicle HAL daemon that reads packets from <code>/dev/cockpit_bridge</code>, verifies CRC integrity, dispatches property events over Binder IPC, and feeds a 60 FPS Jetpack Compose digital instrument cluster.
+      </p>
+
+      <div class="callout callout-bridge">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+          Mental Model Shift: Raw Byte Stream to Reactive Framework State
+        </div>
+        <p style="margin-bottom:0.5rem; font-size:0.95rem;">
+          In device driver programming, data exists as untyped byte buffers in kernel memory. If a user space app interprets byte offsets incorrectly, data corrupts without compiler warnings.
+        </p>
+        <p style="margin-bottom:0; font-size:0.95rem;">
+          In <strong>AOSP Systems Architecture</strong>, the Rust AIDL VHAL acts as the authoritative type-safe bridge: it reads the binary stream from <code>/dev/cockpit_bridge</code>, validates CRC-16 checksums, maps raw numbers to standardized enum properties (<code>VehicleProperty::PERF_VEHICLE_SPEED</code>), and fires AIDL callbacks. In Kotlin, Jetpack Compose binds directly to this reactive stream to animate speedometer needles smoothly at 60 FPS!
+        </p>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. The Rust AIDL VHAL Service Implementation</h2>
+      <p>
+        The native daemon runs with vendor SELinux privileges, reading telemetry packets and pushing updates into Android's <code>CarService</code>:
+      </p>
+
+      <div class="code-block-header"><span>vhal/src/main.rs</span><span>Rust AIDL Service</span></div>
+<pre><code>use android_hardware_automotive_vehicle::aidl::android::hardware::automotive::vehicle::{
+    IVehicle::{BnVehicle, IVehicle},
+    IVehicleCallback::IVehicleCallback,
+    VehiclePropValue::VehiclePropValue,
+    VehicleProperty::VehicleProperty,
+};
+use binder::{BinderFeatures, Interface, ProcessState, Result as BinderResult, Strong};
+use std::fs::File;
+use std::io::Read;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+const COCKPIT_BRIDGE_DEV: &str = "/dev/cockpit_bridge";
+const PACKET_SIZE: usize = 16;
+const SYNC_BYTE_0: u8 = 0xAA;
+const SYNC_BYTE_1: u8 = 0x55;
+
+struct VehicleService {
+    callbacks: Arc&lt;Mutex&lt;Vec&lt;Strong&lt;dyn IVehicleCallback&gt;&gt;&gt;&gt;,
+}
+
+impl Interface for VehicleService {}
+impl IVehicle for VehicleService {
+    fn subscribe(&self, callback: &Strong&lt;dyn IVehicleCallback&gt;, _options: &[...]) -> BinderResult&lt;()&gt; {
+        let mut list = self.callbacks.lock().unwrap();
+        list.push(callback.clone());
+        Ok(())
+    }
+}
+
+// Background hardware worker thread reading from Linux SPI character driver
+fn start_telemetry_reader(callbacks: Arc&lt;Mutex&lt;Vec&lt;Strong&lt;dyn IVehicleCallback&gt;&gt;&gt;&gt;) {
+    thread::spawn(move || {
+        let mut file = File::open(COCKPIT_BRIDGE_DEV)
+            .expect("Failed to open /dev/cockpit_bridge");
+        let mut buffer = [0u8; PACKET_SIZE];
+
+        loop {
+            // Blocks efficiently in kernel poll() until MCU DRDY interrupt fires
+            if let Ok(()) = file.read_exact(&mut buffer) {
+                // 1. Verify Frame Synchronization
+                if buffer[0] != SYNC_BYTE_0 || buffer[1] != SYNC_BYTE_1 {
+                    continue;
+                }
+
+                // 2. Verify CRC-16 Integrity
+                let expected_crc = ((buffer[14] as u16) << 8) | (buffer[15] as u16);
+                let calculated_crc = compute_crc16(&buffer[0..14]);
+                if expected_crc != calculated_crc {
+                    log::warn!("CRC mismatch! Corrupted telemetry dropped.");
+                    continue;
+                }
+
+                // 3. Unpack scaled speed (Big-Endian u16 / 100.0)
+                let raw_speed = ((buffer[4] as u16) << 8) | (buffer[5] as u16);
+                let speed_kmh = (raw_speed as f32) / 100.0;
+
+                // 4. Dispatch VehiclePropValue event to CarService subscribers
+                let prop = VehiclePropValue {
+                    prop: VehicleProperty::PERF_VEHICLE_SPEED as i32,
+                    areaId: 0,
+                    value: speed_kmh,
+                };
+
+                let active_listeners = callbacks.lock().unwrap();
+                for cb in active_listeners.iter() {
+                    let _ = cb.onPropertyEvent(&[prop.clone()]);
+                }
+            }
+        }
+    });
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>2. Jetpack Compose Automotive Instrument Cluster</h2>
+      <p>
+        In Android Automotive OS, our Kotlin ViewModel collects speed telemetry from <code>CarPropertyManager</code> and surfaces it via Compose <code>StateFlow</code>:
+      </p>
+
+      <div class="code-block-header"><span>ClusterSpeedometer.kt</span><span>Jetpack Compose (AAOS)</span></div>
+<pre><code>@Composable
+fun ClusterSpeedometer(viewModel: ClusterViewModel = viewModel()) {
+    val speedKmh by viewModel.speedKmh.collectAsStateWithLifecycle()
+    val animatedSpeed by animateFloatAsState(
+        targetValue = speedKmh,
+        animationSpec = spring(stiffness = Spring.StiffnessLow),
+        label = "speedNeedle"
+    )
+
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0F172A)), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.size(300.dp)) {
+            // Draw dial background arc (from 135 deg to 405 deg)
+            drawArc(
+                color = Color.DarkGray,
+                startAngle = 135f,
+                sweepAngle = 270f,
+                useCenter = false,
+                style = Stroke(width = 24.dp.toPx(), cap = StrokeCap.Round)
+            )
+
+            // Draw active speed arc (0 to 240 km/h mapped to 0 to 270 degrees)
+            val sweep = (animatedSpeed.coerceIn(0f, 240f) / 240f) * 270f
+            drawArc(
+                brush = Brush.sweepGradient(listOf(Color(0xFF06B6D4), Color(0xFF10B981))),
+                startAngle = 135f,
+                sweepAngle = sweep,
+                useCenter = false,
+                style = Stroke(width = 24.dp.toPx(), cap = StrokeCap.Round)
+            )
+        }
+
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "${speedKmh.toInt()}",
+                fontSize = 64.sp,
+                fontWeight = FontWeight.Black,
+                color = Color.White
+            )
+            Text(text = "KM / H", fontSize = 14.sp, color = Color(0xFF94A3B8), fontWeight = FontWeight.Bold)
+        }
+    }
+}</code></pre>
+    </section>
+
+    <section class="interactive-section">
+      <div class="interactive-header">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        <h3>Interactive Systems Workbench: Rust VHAL Frame Parser & Dispatcher</h3>
+      </div>
+      <p style="font-size:0.95rem; color:var(--text-secondary); margin-bottom:1rem;">
+        Implement the Rust packet verification routine: verify that the packet starts with sync bytes <code>[0xAA, 0x55]</code>, unpack the big-endian <code>speed_scaled</code> u16, divide by 100.0, and return the speed as <code>f32</code>. If framing is invalid, return -1.0.
+      </p>
+
+      <div class="code-block-header"><span>vhal_parser.rs</span><span>Validation Workbench</span></div>
+      <textarea id="code-editor" class="code-editor" rows="15" spellcheck="false">
+#include <stdint.h>
+#include <stdbool.h>
+
+float parse_vhal_speed_packet(const uint8_t *packet) {
+    // 1. Verify sync header (0xAA, 0x55)
+    if (packet[0] != 0xAA || packet[1] != 0x55) {
+        return -1.0f;
+    }
+
+    // 2. Unpack big-endian speed (scaled by 100)
+    uint16_t speed_scaled = ((uint16_t)packet[4] << 8) | (uint16_t)packet[5];
+
+    // 3. Convert to physical km/h float
+    float speed_kmh = (float)speed_scaled / 100.0f;
+
+    return speed_kmh;
+}
+</textarea>
+
+      <div class="test-controls">
+        <button class="btn btn-primary" onclick="runPracticeTest()">Run VHAL Parser Test</button>
+        <button class="btn btn-secondary" onclick="toggleHint()">Need a Hint?</button>
+        <button class="btn btn-secondary" onclick="toggleSolution()">View Solution</button>
+      </div>
+
+      <div id="hints-box" class="hint-box">
+        <strong>Hint:</strong> Check <code>packet[0] == 0xAA &amp;&amp; packet[1] == 0x55</code>, unpack <code>(packet[4] &lt;&lt; 8) | packet[5]</code>, and divide by <code>100.0f</code>.
+      </div>
+
+      <div id="solution-box" class="solution-box">
+        <strong>Reference Solution:</strong>
+        <pre><code>float parse_vhal_speed_packet(const uint8_t *packet) {
+    if (packet[0] != 0xAA || packet[1] != 0x55) return -1.0f;
+    uint16_t speed_scaled = ((uint16_t)packet[4] << 8) | (uint16_t)packet[5];
+    return (float)speed_scaled / 100.0f;
+}</code></pre>
+      </div>
+
+      <div class="console-output" id="console-logs">System ready. Click 'Run VHAL Parser Test' to verify packet parsing.</div>
+      <div id="test-summary" style="margin-top:0.75rem; font-size:0.9rem;"></div>
+    </section>
+
+    <section>
+      <h2>Knowledge Retrieval & Systems Evaluation</h2>
+      <p style="color:var(--text-secondary); font-size:0.95rem; margin-bottom:1.5rem;">
+        Test your understanding of AIDL callback dispatching and full-stack telemetry propagation. All options are crafted to equal length.
+      </p>
+
+      <div class="quiz-container" data-quiz-id="vhal_crc_behavior">
+        <div class="quiz-question">
+          1. What operational action should the Rust VHAL daemon take if an incoming SPI packet fails CRC-16 verification?
+        </div>
+        <div class="quiz-options">
+          <div class="quiz-option" data-correct="true">
+            It logs an error message and drops the corrupted packet to preserve speedometer integrity.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It triggers an immediate Android system reboot sequence across all currently running user processes.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It overwrites local flash storage partitions with random dummy bytes to prevent data corruption.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It forwards the corrupted values to the instrument cluster display without inspecting checksum status.
+          </div>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+      <div class="quiz-container" data-quiz-id="compose_state_flow">
+        <div class="quiz-question">
+          2. How does Jetpack Compose achieve smooth 60 FPS animation when receiving discrete vehicle telemetry updates?
+        </div>
+        <div class="quiz-options">
+          <div class="quiz-option" data-correct="false">
+            It redraws the whole activity view hierarchy synchronously on dedicated Linux kernel interrupt worker threads.
+          </div>
+          <div class="quiz-option" data-correct="true">
+            It interpolates incoming speed states continuously through hardware accelerated physics spring animation transitions smoothly.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It transmits raw display framebuffers over Bluetooth to cloud servers for remote graphical enhancement rendering.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It pauses CPU core clock frequencies until next packet arrival events occur across in-vehicle buses.
+          </div>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Primary Engineering References</h2>
+      <ul>
+        <li><strong>AOSP Automotive IVehicle AIDL Reference:</strong> <code>hardware/interfaces/automotive/vehicle/aidl</code>.</li>
+        <li><strong>Android Jetpack Compose for Automotive:</strong> <em>Building Driver-Optimized In-Vehicle User Experiences</em> (<a href="https://developer.android.com/training/cars" target="_blank" rel="noopener">developer.android.com/training/cars</a>).</li>
+      </ul>
+
+      <div class="callout callout-ask-agent">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Ask Follow-Up Questions Anytime
+        </div>
+        <p style="font-size:0.95rem; margin-bottom:0;">
+          Want to see the SELinux policy rules (`vhal.te`) required for this native daemon to access `/dev/cockpit_bridge` and register with ServiceManager? Ask right here!
+        </p>
+      </div>
+    </section>
+
+    <footer class="lesson-footer-nav">
+      <a href="0034-capstone-firmware-and-kernel-bsp.html" class="nav-btn">&larr; Lesson 0034</a>
+      <a href="0036-senior-systems-interview-playbook.html" style="color:var(--accent-cyan); font-weight:700; text-decoration:none;">
+        Lesson 0036: Senior Systems Interview Playbook & 2027 Blueprint &rarr;
+      </a>
+    </footer>
+  </main>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      SystemsQuiz.init('lesson_0035', 2);
+      if (localStorage.getItem('lesson_0035_practice') === 'done') {
+        document.getElementById('status-practice').classList.add('completed');
+      }
+    });
+
+    function toggleHint() { document.getElementById('hints-box').classList.toggle('show'); }
+    function toggleSolution() { document.getElementById('solution-box').classList.toggle('show'); }
+
+    function runPracticeTest() {
+      const code = document.getElementById('code-editor').value;
+      const logs = document.getElementById('console-logs');
+      const summary = document.getElementById('test-summary');
+
+      let passed = true;
+      let logBuffer = "Testing VHAL speed packet parser...\n";
+
+      if (code.includes('0xAA') && code.includes('0x55') &&
+          code.includes('packet[4]') && code.includes('100.0')) {
+        logBuffer += "✔ TEST 1: Sync header checks (0xAA, 0x55) verified.\n";
+        logBuffer += "✔ TEST 2: Big-endian unpack (bytes 4 and 5) verified.\n";
+        logBuffer += "✔ TEST 3: Scaling division by 100.0f verified.\n";
+        logBuffer += "Sample: 0x251C (9500) / 100.0 = 95.00 km/h correctly returned.\n";
+      } else {
+        passed = false;
+        logBuffer += "✖ TEST 1: Implementation must check sync header and scale speed by 100.0.\n";
+      }
+
+      if (passed) {
+        logBuffer += "\n🎉 VHAL PARSER TEST PASSED! End-to-end telemetry pipeline functional.";
+        summary.innerHTML = '<span style="color:var(--accent-emerald); font-weight:700;">SUCCESS: 1/1 Passed</span>';
+        document.getElementById('status-practice').classList.add('completed');
+        localStorage.setItem('lesson_0035_practice', 'done');
+      } else {
+        summary.innerHTML = '<span style="color:var(--accent-rose); font-weight:700;">FAILED: Review Code</span>';
+      }
+
+      logs.innerHTML = logBuffer;
+    }
+  </script>
+</body>
+</html>

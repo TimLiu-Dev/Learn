@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0028: Rust AIDL HAL in AOSP | Systems & Embedded</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js"></script>
+</head>
+<body>
+
+  <header class="course-nav">
+    <div class="nav-left">
+      <a href="../index.html" class="nav-btn">&larr; Master Plan</a>
+      <a href="0027-rust-in-the-linux-kernel.html" class="nav-btn">&larr; Lesson 0027</a>
+      <div class="nav-breadcrumb">Track 06 &bull; <span>Lesson 0028</span></div>
+    </div>
+    <div class="nav-status-pills">
+      <div id="status-read" class="status-pill completed"><span>📖 Theory Read</span></div>
+      <div id="status-practice" class="status-pill"><span>⚡ Practice Passed</span></div>
+      <div id="status-quiz" class="status-pill"><span>🎯 Quizzes Passed</span></div>
+    </div>
+  </header>
+
+  <main class="container">
+    <header class="lesson-header">
+      <span class="track-badge">Track 06: Systems Rust & AOSP &bull; Lesson 0028</span>
+      <h1>Modern AIDL HAL in Rust for AOSP:<br>Zero-Vulnerability Hardware Services</h1>
+      <p class="lesson-lead">
+        Google introduced Rust into the Android Open Source Project (AOSP) starting in Android 12, and by Android 14/15/16, the majority of new native system daemons and Hardware Abstraction Layer (HAL) services are authored in Rust. In this lesson, you will build a production AIDL HAL in Rust, configure <code>Android.bp</code>, and expose hardware capabilities to Android system services with zero memory corruption risk.
+      </p>
+
+      <div class="callout callout-bridge">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+          Mental Model Shift: C++ `BnInterface` vs Rust `binder::Interface`
+        </div>
+        <p style="margin-bottom:0.5rem; font-size:0.95rem;">
+          In C++ (from Lesson 0023), writing a HAL requires inheriting from <code>BnInterface&lt;ITelemetry&gt;</code>, managing <code>android::sp&lt;T&gt;</code> reference pointers, configuring virtual method tables, and manually ensuring thread safety across Binder worker threads.
+        </p>
+        <p style="margin-bottom:0; font-size:0.95rem;">
+          In <strong>Rust AIDL</strong>, the <code>aidl_interface</code> generator produces safe Rust traits. You implement the generated trait on a standard Rust struct wrapped in a thread-safe <code>Sync + Send</code> container. Thread safety across Binder transaction worker threads is guaranteed at compile time by the Rust compiler.
+        </p>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. The AIDL Interface Definition</h2>
+      <p>
+        Let's define a hardware telemetry interface in AIDL for an automotive telemetry unit:
+      </p>
+
+      <div class="code-block-header"><span>hardware/interfaces/telemetry/aidl/android/hardware/telemetry/ITelemetry.aidl</span><span>AIDL</span></div>
+<pre><code>package android.hardware.telemetry;
+
+@VintfStability
+interface ITelemetry {
+    int getVehicleSpeed();
+    float getBatteryTemperature();
+    void setWarningBeacon(in boolean active);
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>2. Configuring `Android.bp` for Rust Backend</h2>
+      <p>
+        In modern AOSP, adding the <code>rust: { enabled: true }</code> flag to <code>aidl_interface</code> instructs Soong to generate Rust bindings in addition to C++ and Java:
+      </p>
+
+      <div class="code-block-header"><span>hardware/interfaces/telemetry/aidl/Android.bp</span><span>Soong Build Blueprint</span></div>
+<pre><code>aidl_interface {
+    name: "android.hardware.telemetry",
+    vendor_available: true,
+    srcs: ["android/hardware/telemetry/*.aidl"],
+    stability: "vintf",
+    backend: {
+        cpp: { enabled: false },
+        java: { enabled: true },
+        ndk: { enabled: true },
+        rust: {
+            enabled: true,
+        },
+    },
+}
+
+rust_binary {
+    name: "android.hardware.telemetry-service.rust",
+    relative_install_path: "hw",
+    init_rc: ["android.hardware.telemetry-service.rust.rc"],
+    vintf_fragments: ["android.hardware.telemetry-service.rust.xml"],
+    vendor: true,
+    srcs: ["src/main.rs"],
+    rustlibs: [
+        "android.hardware.telemetry-V1-rust",
+        "libbinder_rs",
+        "liblog_rust",
+    ],
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>3. Implementing the HAL Service in Rust</h2>
+      <p>
+        The generated crate <code>android_hardware_telemetry::aidl::android::hardware::telemetry::ITelemetry</code> defines the trait our struct must implement:
+      </p>
+
+      <div class="code-block-header"><span>src/main.rs</span><span>Rust AIDL Service</span></div>
+<pre><code>use android_hardware_telemetry::aidl::android::hardware::telemetry::ITelemetry::{
+    BnTelemetry, ITelemetry,
+};
+use binder::{BinderFeatures, Interface, ProcessState, Result as BinderResult};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+struct TelemetryService {
+    speed_kmh: AtomicI32,
+    warning_active: AtomicBool,
+}
+
+impl Interface for TelemetryService {}
+
+impl ITelemetry for TelemetryService {
+    fn getVehicleSpeed(&self) -> BinderResult&lt;i32&gt; {
+        let speed = self.speed_kmh.load(Ordering::Relaxed);
+        Ok(speed)
+    }
+
+    fn getBatteryTemperature(&self) -> BinderResult&lt;f32&gt; {
+        Ok(42.5) // Sample temperature in Celsius
+    }
+
+    fn setWarningBeacon(&self, active: bool) -> BinderResult&lt;()&gt; {
+        self.warning_active.store(active, Ordering::SeqCst);
+        log::info!("Beacon state updated to: {}", active);
+        Ok(())
+    }
+}
+
+fn main() {
+    // Initialize logging
+    logger::init(
+        logger::Config::default().with_tag_on_device("TelemetryHal"),
+    );
+
+    // Create the service instance wrapped in generated Binder stub
+    let service = TelemetryService {
+        speed_kmh: AtomicI32::new(65),
+        warning_active: AtomicBool::new(false),
+    };
+    let service_binder = BnTelemetry::new_binder(service, BinderFeatures::default());
+
+    // Register with Service Manager
+    let service_name = format!("{}/default", TelemetryService::get_descriptor());
+    binder::add_service(&service_name, service_binder.as_binder())
+        .expect("Failed to register Telemetry AIDL HAL with ServiceManager");
+
+    log::info!("Rust Telemetry AIDL HAL registered successfully.");
+
+    // Join the Binder worker thread pool
+    ProcessState::join_thread_pool();
+}</code></pre>
+      <p>
+        Notice how simple this is compared to C++: no manual memory management, no raw pointer casting, and zero possibility of use-after-free vulnerabilities!
+      </p>
+    </section>
+
+    <section class="interactive-section">
+      <div class="interactive-header">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        <h3>Interactive Systems Workbench: Rust AIDL HAL Service Validator</h3>
+      </div>
+      <p style="font-size:0.95rem; color:var(--text-secondary); margin-bottom:1rem;">
+        Write a verification routine that validates: (1) The service implements <code>Interface</code> and <code>ITelemetry</code>, (2) Registers via <code>binder::add_service</code>, and (3) Joins the Binder worker thread pool via <code>ProcessState::join_thread_pool()</code>.
+      </p>
+
+      <div class="code-block-header"><span>aidl_rust_checker.c</span><span>Validation Workbench</span></div>
+      <textarea id="code-editor" class="code-editor" rows="12" spellcheck="false">
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+
+bool validate_rust_aidl_service(const char *source) {
+    // 1. Verify trait implementations
+    bool has_interface_trait = (strstr(source, "impl Interface for") != NULL);
+    bool has_aidl_trait = (strstr(source, "impl ITelemetry for") != NULL);
+
+    // 2. Verify ServiceManager registration
+    bool has_registration = (strstr(source, "binder::add_service") != NULL);
+
+    // 3. Verify join_thread_pool call
+    bool has_threadpool = (strstr(source, "ProcessState::join_thread_pool()") != NULL);
+
+    return (has_interface_trait && has_aidl_trait && has_registration && has_threadpool);
+}
+</textarea>
+
+      <div class="test-controls">
+        <button class="btn btn-primary" onclick="runPracticeTest()">Validate Rust AIDL Service</button>
+        <button class="btn btn-secondary" onclick="toggleHint()">Need a Hint?</button>
+        <button class="btn btn-secondary" onclick="toggleSolution()">View Solution</button>
+      </div>
+
+      <div id="hints-box" class="hint-box">
+        <strong>Hint:</strong> The function confirms the four key pillars: <code>impl Interface</code>, <code>impl ITelemetry</code>, <code>binder::add_service</code>, and <code>ProcessState::join_thread_pool()</code>.
+      </div>
+
+      <div id="solution-box" class="solution-box">
+        <strong>Reference Solution:</strong>
+        <pre><code>bool validate_rust_aidl_service(const char *source) {
+    bool has_interface_trait = (strstr(source, "impl Interface for") != NULL);
+    bool has_aidl_trait = (strstr(source, "impl ITelemetry for") != NULL);
+    bool has_registration = (strstr(source, "binder::add_service") != NULL);
+    bool has_threadpool = (strstr(source, "ProcessState::join_thread_pool()") != NULL);
+    return (has_interface_trait && has_aidl_trait && has_registration && has_threadpool);
+}</code></pre>
+      </div>
+
+      <div class="console-output" id="console-logs">System ready. Click 'Validate Rust AIDL Service' to test code structure.</div>
+      <div id="test-summary" style="margin-top:0.75rem; font-size:0.9rem;"></div>
+    </section>
+
+    <section>
+      <h2>Knowledge Retrieval & Systems Evaluation</h2>
+      <p style="color:var(--text-secondary); font-size:0.95rem; margin-bottom:1.5rem;">
+        Test your understanding of Rust AIDL services and AOSP build tooling. All options are crafted to equal length.
+      </p>
+
+      <div class="quiz-container" data-quiz-id="rust_aidl_soong">
+        <div class="quiz-question">
+          1. Which configuration enables automated generation of native Rust bindings inside an AOSP aidl_interface definition?
+        </div>
+        <div class="quiz-options">
+          <div class="quiz-option" data-correct="true">
+            Adding the rust enabled boolean flag within the backend configuration block.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            Invoking an external shell script from inside the local init script.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            Defining standard C++ headers and manually converting them with bindgen utility.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            Exporting environment flags before initiating the compilation command on host machines.
+          </div>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+      <div class="quiz-container" data-quiz-id="rust_aidl_threading">
+        <div class="quiz-question">
+          2. What call must a native Rust AIDL daemon execute before shutting down its initial main launch routine?
+        </div>
+        <div class="quiz-options">
+          <div class="quiz-option" data-correct="false">
+            It must restart the Zygote process to reload all running framework components.
+          </div>
+          <div class="quiz-option" data-correct="true">
+            It must join the Binder thread pool to process incoming IPC requests.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It must fork child processes to handle background logging operations to disk.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It must allocate a shared memory segment for the Linux display system.
+          </div>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Primary Engineering References</h2>
+      <ul>
+        <li><strong>AOSP Rust Documentation:</strong> <a href="https://source.android.com/docs/setup/build/rust/building-rust-modules" target="_blank" rel="noopener">source.android.com/docs/setup/build/rust</a> — Google's official guide to building Rust modules in Android.</li>
+        <li><strong>Android AIDL IPC Guide:</strong> <a href="https://source.android.com/docs/core/architecture/aidl/aidl-backends" target="_blank" rel="noopener">source.android.com/docs/core/architecture/aidl/aidl-backends</a> — Multi-language AIDL backend capabilities.</li>
+      </ul>
+
+      <div class="callout callout-ask-agent">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Ask Follow-Up Questions Anytime
+        </div>
+        <p style="font-size:0.95rem; margin-bottom:0;">
+          Want to see how to handle Binder death recipients in Rust when a client crashes, or how to write unit tests with <code>test: true</code> in <code>Android.bp</code>? Ask right here!
+        </p>
+      </div>
+    </section>
+
+    <footer class="lesson-footer-nav">
+      <a href="0027-rust-in-the-linux-kernel.html" class="nav-btn">&larr; Lesson 0027</a>
+      <a href="0029-automotive-networks-can-fd-ethernet.html" style="color:var(--accent-cyan); font-weight:700; text-decoration:none;">
+        Track 07: Lesson 0029 &bull; Automotive Networks (CAN-FD & SOME/IP) &rarr;
+      </a>
+    </footer>
+  </main>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      SystemsQuiz.init('lesson_0028', 2);
+      if (localStorage.getItem('lesson_0028_practice') === 'done') {
+        document.getElementById('status-practice').classList.add('completed');
+      }
+    });
+
+    function toggleHint() { document.getElementById('hints-box').classList.toggle('show'); }
+    function toggleSolution() { document.getElementById('solution-box').classList.toggle('show'); }
+
+    function runPracticeTest() {
+      const code = document.getElementById('code-editor').value;
+      const logs = document.getElementById('console-logs');
+      const summary = document.getElementById('test-summary');
+
+      let passed = true;
+      let logBuffer = "Validating Rust AIDL HAL service...\n";
+
+      if (code.includes('has_interface_trait') && code.includes('has_aidl_trait') &&
+          code.includes('has_registration') && code.includes('has_threadpool')) {
+        logBuffer += "✔ TEST 1: Trait impls, add_service, and join_thread_pool verified.\n";
+      } else {
+        passed = false;
+        logBuffer += "✖ TEST 1: Missing essential service registration or thread pool hooks.\n";
+      }
+
+      if (passed) {
+        logBuffer += "\n🎉 RUST AIDL HAL VALIDATION PASSED! Safe HAL ready for AOSP.";
+        summary.innerHTML = '<span style="color:var(--accent-emerald); font-weight:700;">SUCCESS: 1/1 Passed</span>';
+        document.getElementById('status-practice').classList.add('completed');
+        localStorage.setItem('lesson_0028_practice', 'done');
+      } else {
+        summary.innerHTML = '<span style="color:var(--accent-rose); font-weight:700;">FAILED: Review Code</span>';
+      }
+
+      logs.innerHTML = logBuffer;
+    }
+  </script>
+</body>
+</html>

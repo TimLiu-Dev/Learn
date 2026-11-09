@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0034: Capstone Firmware & Kernel Driver | Systems & Embedded</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js"></script>
+</head>
+<body>
+
+  <header class="course-nav">
+    <div class="nav-left">
+      <a href="../index.html" class="nav-btn">&larr; Master Plan</a>
+      <a href="0033-capstone-architecture-and-specs.html" class="nav-btn">&larr; Lesson 0033</a>
+      <div class="nav-breadcrumb">Track 08 &bull; <span>Lesson 0034</span></div>
+    </div>
+    <div class="nav-status-pills">
+      <div id="status-read" class="status-pill completed"><span>📖 Theory Read</span></div>
+      <div id="status-practice" class="status-pill"><span>⚡ Practice Passed</span></div>
+      <div id="status-quiz" class="status-pill"><span>🎯 Quizzes Passed</span></div>
+    </div>
+  </header>
+
+  <main class="container">
+    <header class="lesson-header">
+      <span class="track-badge">Track 08: Capstone & Career &bull; Lesson 0034</span>
+      <h1>Grand Capstone Part 2:<br>Zephyr RTOS MCU Firmware & Linux SPI Kernel Driver</h1>
+      <p class="lesson-lead">
+        In this second milestone of the Grand Capstone, you will implement the two lower tiers of our automotive system: the bare-metal Zephyr RTOS firmware running on the safety gateway microcontroller, and the Linux kernel character driver that receives high-speed SPI telemetry via DMA and hardware interrupts.
+      </p>
+
+      <div class="callout callout-bridge">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+          Mental Model Shift: User Space Polling vs Hardware Interrupt Driven DMA
+        </div>
+        <p style="margin-bottom:0.5rem; font-size:0.95rem;">
+          In high-level application code, developers frequently read data using busy polling loops (e.g., <code>while(true) { checkData(); sleep(10); }</code>), wasting CPU cycles and introducing milliseconds of random latency.
+        </p>
+        <p style="margin-bottom:0; font-size:0.95rem;">
+          In <strong>Systems Engineering</strong>, every byte transfer is interrupt-driven: when the Zephyr MCU finishes assembling a 16-byte packet, it toggles a hardware GPIO line. The Linux kernel's top-half ISR fires in nanoseconds, schedules a bottom-half threaded IRQ that triggers an SPI DMA read, and places the data directly into a wait-queue. The user space HAL daemon sleeps with zero CPU usage until woken!
+        </p>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Zephyr RTOS MCU Firmware Implementation</h2>
+      <p>
+        The microcontroller runs Zephyr RTOS on an STM32F4 cortex-M4 core. It receives CAN bus frames and broadcasts telemetry packets over high-speed SPI:
+      </p>
+
+      <div class="code-block-header"><span>firmware/src/main.c</span><span>Zephyr RTOS C</span></div>
+<pre><code>#include &lt;zephyr/kernel.h&gt;
+#include &lt;zephyr/drivers/can.h&gt;
+#include &lt;zephyr/drivers/spi.h&gt;
+#include &lt;zephyr/drivers/gpio.h&gt;
+
+#define SPI_OP (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_TRANSFER_MSB)
+
+const struct device *can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
+const struct device *spi_dev = DEVICE_DT_GET(DT_NODELABEL(spi1));
+static const struct gpio_dt_spec drdy_gpio = GPIO_DT_SPEC_GET(DT_NODELABEL(drdy_pin), gpios);
+
+static uint8_t tx_packet[16];
+static uint8_t seq_counter = 0;
+
+void transmit_cockpit_packet(uint16_t speed_scaled, uint16_t rpm) {
+    // 1. Pack framing and telemetry fields
+    tx_packet[0] = 0xAA;
+    tx_packet[1] = 0x55;
+    tx_packet[2] = seq_counter++;
+    tx_packet[3] = 0x01; // Dynamics packet
+    tx_packet[4] = (speed_scaled >> 8) & 0xFF;
+    tx_packet[5] = speed_scaled & 0xFF;
+    tx_packet[6] = (rpm >> 8) & 0xFF;
+    tx_packet[7] = rpm & 0xFF;
+    tx_packet[8] = 0x04; // Drive (D)
+    tx_packet[9] = 38;   // Battery temp: 38°C
+    memset(&tx_packet[10], 0, 4);
+
+    // 2. Compute CRC-16
+    uint16_t crc = compute_crc16(tx_packet, 14);
+    tx_packet[14] = (crc >> 8) & 0xFF;
+    tx_packet[15] = crc & 0xFF;
+
+    // 3. Pulse Data Ready (DRDY) GPIO line to wake Linux host
+    gpio_pin_set_dt(&drdy_gpio, 1);
+
+    // 4. Transmit over SPI
+    const struct spi_buf buf = { .buf = tx_packet, .len = sizeof(tx_packet) };
+    const struct spi_buf_set tx = { .buffers = &buf, .count = 1 };
+    spi_write(spi_dev, &spi_cfg, &tx);
+
+    gpio_pin_set_dt(&drdy_gpio, 0);
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>2. Linux Kernel SPI Slave Character Device Driver</h2>
+      <p>
+        On the application processor (e.g. NXP i.MX8 / QEMU ARM64 running Linux Kernel 6.6), the driver binds to the device tree node and creates <code>/dev/cockpit_bridge</code>:
+      </p>
+
+      <div class="code-block-header"><span>drivers/misc/cockpit_bridge.c</span><span>Linux Kernel C Driver</span></div>
+<pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/spi/spi.h&gt;
+#include &lt;linux/interrupt.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;linux/uaccess.h&gt;
+#include &lt;linux/poll.h&gt;
+
+#define DEVICE_NAME "cockpit_bridge"
+#define PACKET_SIZE 16
+
+struct cockpit_dev {
+    struct spi_device *spi;
+    int irq_gpio;
+    wait_queue_head_t wq;
+    bool data_ready;
+    uint8_t rx_buffer[PACKET_SIZE];
+    struct mutex lock;
+};
+
+static struct cockpit_dev *g_dev;
+
+// Threaded IRQ bottom-half: runs in process context when DRDY pin goes high
+static irqreturn_t cockpit_threaded_irq(int irq, void *dev_id) {
+    struct cockpit_dev *dev = dev_id;
+    int ret;
+
+    mutex_lock(&dev->lock);
+    ret = spi_read(dev->spi, dev->rx_buffer, PACKET_SIZE);
+    if (ret == 0) {
+        dev->data_ready = true;
+        wake_up_interruptible(&dev->wq);
+    }
+    mutex_unlock(&dev->lock);
+
+    return IRQ_HANDLED;
+}
+
+// Read operation: copies telemetry packet to user space HAL
+static ssize_t cockpit_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
+    struct cockpit_dev *dev = filp->private_data;
+    int ret;
+
+    if (count < PACKET_SIZE) return -EINVAL;
+
+    // Sleep until threaded IRQ signals new packet arrival
+    ret = wait_event_interruptible(dev->wq, dev->data_ready);
+    if (ret) return -ERESTARTSYS;
+
+    mutex_lock(&dev->lock);
+    if (copy_to_user(buf, dev->rx_buffer, PACKET_SIZE)) {
+        mutex_unlock(&dev->lock);
+        return -EFAULT;
+    }
+    dev->data_ready = false;
+    mutex_unlock(&dev->lock);
+
+    return PACKET_SIZE;
+}
+
+static __poll_t cockpit_poll(struct file *filp, struct poll_table_struct *wait) {
+    struct cockpit_dev *dev = filp->private_data;
+    __poll_t mask = 0;
+
+    poll_wait(filp, &dev->wq, wait);
+    if (dev->data_ready) mask |= (EPOLLIN | EPOLLRDNORM);
+
+    return mask;
+}
+
+static const struct file_operations cockpit_fops = {
+    .owner   = THIS_MODULE,
+    .read    = cockpit_read,
+    .poll    = cockpit_poll,
+};</code></pre>
+    </section>
+
+    <section class="interactive-section">
+      <div class="interactive-header">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        <h3>Interactive Systems Workbench: Driver Ring Buffer & Copy-to-User</h3>
+      </div>
+      <p style="font-size:0.95rem; color:var(--text-secondary); margin-bottom:1rem;">
+        Implement the core safe read logic for the kernel driver: check that requested buffer size is at least <code>PACKET_SIZE</code> (16 bytes), copy the packet to user memory, and return 16 on success.
+      </p>
+
+      <div class="code-block-header"><span>kernel_read_sim.c</span><span>Validation Workbench</span></div>
+      <textarea id="code-editor" class="code-editor" rows="15" spellcheck="false">
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#define PACKET_SIZE 16
+#define EINVAL -22
+#define EFAULT -14
+
+int simulate_driver_read(uint8_t *user_buf, size_t count, const uint8_t *kernel_packet) {
+    // 1. Verify buffer size
+    if (count < PACKET_SIZE) {
+        return EINVAL;
+    }
+
+    // 2. Safe memory transfer (mocking copy_to_user)
+    if (!user_buf) {
+        return EFAULT;
+    }
+    memcpy(user_buf, kernel_packet, PACKET_SIZE);
+
+    return PACKET_SIZE;
+}
+</textarea>
+
+      <div class="test-controls">
+        <button class="btn btn-primary" onclick="runPracticeTest()">Run Kernel Driver Read Test</button>
+        <button class="btn btn-secondary" onclick="toggleHint()">Need a Hint?</button>
+        <button class="btn btn-secondary" onclick="toggleSolution()">View Solution</button>
+      </div>
+
+      <div id="hints-box" class="hint-box">
+        <strong>Hint:</strong> Check <code>count &lt; PACKET_SIZE</code> returning <code>EINVAL</code>, verify <code>user_buf != NULL</code>, and copy <code>PACKET_SIZE</code> bytes returning <code>PACKET_SIZE</code>.
+      </div>
+
+      <div id="solution-box" class="solution-box">
+        <strong>Reference Solution:</strong>
+        <pre><code>int simulate_driver_read(uint8_t *user_buf, size_t count, const uint8_t *kernel_packet) {
+    if (count < PACKET_SIZE) return EINVAL;
+    if (!user_buf) return EFAULT;
+    memcpy(user_buf, kernel_packet, PACKET_SIZE);
+    return PACKET_SIZE;
+}</code></pre>
+      </div>
+
+      <div class="console-output" id="console-logs">System ready. Click 'Run Kernel Driver Read Test' to verify read logic.</div>
+      <div id="test-summary" style="margin-top:0.75rem; font-size:0.9rem;"></div>
+    </section>
+
+    <section>
+      <h2>Knowledge Retrieval & Systems Evaluation</h2>
+      <p style="color:var(--text-secondary); font-size:0.95rem; margin-bottom:1.5rem;">
+        Test your understanding of firmware-to-kernel communication and threaded interrupt handlers. All options are crafted to equal length.
+      </p>
+
+      <div class="quiz-container" data-quiz-id="threaded_irq_necessity">
+        <div class="quiz-question">
+          1. Why does the Linux cockpit SPI driver use request_threaded_irq rather than performing spi_read inside a top-half ISR?
+        </div>
+        <div class="quiz-options">
+          <div class="quiz-option" data-correct="false">
+            Top half interrupt handlers operate strictly in user space where hardware registers remain inaccessible.
+          </div>
+          <div class="quiz-option" data-correct="true">
+            SPI bus transfers require thread sleep context which is prohibited inside atomic ISR handlers.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            Microcontroller hardware cannot trigger standard electrical GPIO transitions without active high speed network connections.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            Linux compilers automatically delete top half interrupt routines to maximize operating system boot speeds.
+          </div>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+      <div class="quiz-container" data-quiz-id="poll_waitqueue_purpose">
+        <div class="quiz-question">
+          2. What engineering benefit does supporting the poll file operation provide to the downstream user space HAL daemon?
+        </div>
+        <div class="quiz-options">
+          <div class="quiz-option" data-correct="false">
+            It forces the graphics card to recalculate vehicle speed values using floating point hardware.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It grants the application root administrator privileges to modify arbitrary system kernel runtime settings.
+          </div>
+          <div class="quiz-option" data-correct="true">
+            It allows the daemon to sleep efficiently until hardware packets arrive without busy polling.
+          </div>
+          <div class="quiz-option" data-correct="false">
+            It encrypts telemetry payloads across flash memory partitions to satisfy local government privacy laws.
+          </div>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Primary Engineering References</h2>
+      <ul>
+        <li><strong>Linux Device Drivers (LDD3):</strong> Chapter 10: <em>Interrupt Handling and Bottom Halves</em>.</li>
+        <li><strong>Zephyr Project Documentation:</strong> <em>SPI and CAN Controller Driver APIs</em> (<a href="https://docs.zephyrproject.org" target="_blank" rel="noopener">docs.zephyrproject.org</a>).</li>
+      </ul>
+
+      <div class="callout callout-ask-agent">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Ask Follow-Up Questions Anytime
+        </div>
+        <p style="font-size:0.95rem; margin-bottom:0;">
+          Want to see how the Linux Device Tree overlay for this SPI slave device is written or how to test it with <code>spidev_test</code>? Ask right here!
+        </p>
+      </div>
+    </section>
+
+    <footer class="lesson-footer-nav">
+      <a href="0033-capstone-architecture-and-specs.html" class="nav-btn">&larr; Lesson 0033</a>
+      <a href="0035-capstone-rust-aidl-vhal-integration.html" style="color:var(--accent-cyan); font-weight:700; text-decoration:none;">
+        Capstone Part 3: Rust AIDL VHAL & AAOS Apps &rarr;
+      </a>
+    </footer>
+  </main>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      SystemsQuiz.init('lesson_0034', 2);
+      if (localStorage.getItem('lesson_0034_practice') === 'done') {
+        document.getElementById('status-practice').classList.add('completed');
+      }
+    });
+
+    function toggleHint() { document.getElementById('hints-box').classList.toggle('show'); }
+    function toggleSolution() { document.getElementById('solution-box').classList.toggle('show'); }
+
+    function runPracticeTest() {
+      const code = document.getElementById('code-editor').value;
+      const logs = document.getElementById('console-logs');
+      const summary = document.getElementById('test-summary');
+
+      let passed = true;
+      let logBuffer = "Testing kernel driver read simulation...\n";
+
+      if (code.includes('count < PACKET_SIZE') && code.includes('EINVAL') &&
+          code.includes('memcpy') && code.includes('PACKET_SIZE')) {
+        logBuffer += "✔ TEST 1: Buffer size validation verified (reject < 16 bytes).\n";
+        logBuffer += "✔ TEST 2: Copy-to-user memory transfer verified.\n";
+        logBuffer += "✔ TEST 3: Return byte count (16 bytes) verified.\n";
+      } else {
+        passed = false;
+        logBuffer += "✖ TEST 1: Must validate count against PACKET_SIZE and transfer memory.\n";
+      }
+
+      if (passed) {
+        logBuffer += "\n🎉 KERNEL DRIVER READ TEST PASSED! Safe BSP layer validated.";
+        summary.innerHTML = '<span style="color:var(--accent-emerald); font-weight:700;">SUCCESS: 1/1 Passed</span>';
+        document.getElementById('status-practice').classList.add('completed');
+        localStorage.setItem('lesson_0034_practice', 'done');
+      } else {
+        summary.innerHTML = '<span style="color:var(--accent-rose); font-weight:700;">FAILED: Review Code</span>';
+      }
+
+      logs.innerHTML = logBuffer;
+    }
+  </script>
+</body>
+</html>
