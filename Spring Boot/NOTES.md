@@ -31,7 +31,10 @@
 
 ---
 
-## Complete Senior Curriculum (49 Lessons across 15 Architectural Phases)
+## Complete Senior Curriculum — Two-Part 80/20 Structure (64 Lessons across 19 Phases)
+
+### PART 1: Core Senior Backend Engineer (51 Lessons • Phases 0–15B)
+*80/20 high-ROI core: untouched backend foundations (`0001`–`0040` + `0049`), developer-facing observability/container/S3 essentials (`0041`–`0044`, `0046`, `0047`), and core edge/realtime/scaling/security hardening (`0059`–`0062`).*
 
 ### Phase 0: Absolute Foundations
 - `0001-what-is-a-backend-and-how-servers-work.html`: Sockets, ports, Tomcat, 15-line bare-metal server, statelessness.
@@ -97,20 +100,52 @@
 - `0039-integration-testing-testcontainers-service-connection.html`: Banning H2, real PostgreSQL in Docker, Spring Boot 3.1+ `@ServiceConnection`.
 - `0040-automated-cicd-github-actions-docker-testcontainers.html`: Production GitHub Actions CI/CD pipeline, Docker socket mounts, Trivy scans.
 
-### Phase 12: Production Observability: Metrics, Probes & Tracing
+### Phase 12: Core Observability Essentials (Part 1 — 80/20)
 - `0041-spring-boot-actuator-health-probes-and-metrics.html`: Kubernetes liveness/readiness probes, custom HealthIndicators, Micrometer business metrics.
 - `0042-distributed-tracing-micrometer-opentelemetry.html`: W3C `traceparent` header propagation, Slf4j MDC log correlation, OpenTelemetry spans.
 
-### Phase 13: Cloud-Native Packaging, Containers & JVM Ergonomics
+### Phase 13: Container & Production Lifecycle Essentials (Part 1 — 80/20)
 - `0043-docker-multi-stage-builds-and-distroless-containers.html`: Multi-stage Docker builds, Google Distroless non-root runtimes.
 - `0044-cloud-native-buildpacks-and-jvm-memory-tuning.html`: Paketo `bootBuildImage`, container cgroups v2 memory ergonomics (`-XX:MaxRAMPercentage=75.0`), Generational ZGC.
+- `0046-kubernetes-probes-graceful-shutdown-and-secrets.html`: Zero-downtime rolling updates, `server.shutdown=graceful`, `preStop` hooks, External Secrets concept.
 
-### Phase 14: Cloud Infrastructure: Kubernetes & AWS Production Architecture
-- `0045-kubernetes-pods-deployments-and-services.html`: Pods, Deployments (rolling updates), ClusterIP Services, CoreDNS discovery.
-- `0046-kubernetes-probes-graceful-shutdown-and-secrets.html`: Zero-downtime rolling updates, `server.shutdown=graceful`, `preStop` hooks, External Secrets.
+### Phase 14: Essential Cloud Integration (Part 1 — 80/20)
 - `0047-aws-s3-presigned-urls-mobile-upload-pattern.html`: Direct-to-S3 uploads, AWS SDK v2 `S3Presigner`, SigV4 signatures.
-- `0048-aws-rds-postgresql-secrets-manager-localstack.html`: AWS RDS Multi-AZ, RDS Proxy, AWS Secrets Manager rotation, LocalStack Testcontainers.
 
-### Phase 15: Polyglot Mastery & Capstone Architecture
+### Phase 15: Polyglot Mastery & Part 1 Capstone
 - `0049-migrating-spring-boot-to-kotlin-idioms-and-coroutines.html`: Kotlin migration playbook, `all-open`/`no-arg` compiler plugins, Coroutines vs Loom.
-- `reference/capstone-project-spec.html`: **NexusCommerce** full enterprise architecture specification.
+
+### Phase 15B: Core Edge, Real-Time, Data Scale & Security Hardening (Part 1 — roadmap.sh/backend Gaps)
+- `0059-edge-http-reverse-proxies-cors-and-etag-caching.html`: Reverse proxies (`X-Forwarded-*` / `server.forward-headers-strategy`), strict CORS, conditional `ETag` + `304 Not Modified`.
+- `0060-realtime-backends-sse-websockets-and-redis-fanout.html`: SSE (`SseEmitter`) vs. WebSockets, leak-free cleanup callbacks, Redis Pub/Sub multi-pod fan-out.
+- `0061-database-scaling-cap-sharding-and-nosql-tradeoffs.html`: CAP/PACELC theorem, PostgreSQL range partitioning vs. horizontal sharding, consistent hashing, NoSQL matrix.
+- `0062-security-hardening-argon2-bcrypt-and-owasp-api-top-10.html`: Memory-hard `Argon2id`/`BCrypt`, BOLA/IDOR, banning Mass Assignment, and SSRF defense.
+- `reference/capstone-project-spec.html`: **NexusCommerce** Part 1 core backend architecture specification.
+
+---
+
+### PART 2: Professional Cloud, DevOps & Observability Track (13 Lessons • Phases 16–19)
+*20% deep-dive specialization for Staff/Platform autonomy (`0045` & `0048` moved here from Part 1 + 11 new lessons `0050`–`0058`, `0063`–`0064` + Part 2 Capstone).*
+
+### Phase 16: Track 2A — Professional Observability
+- `0050-structured-json-logging-and-cardinality-traps.html`: Spring Boot 3.4+ structured JSON logging (ECS/Logstash), MDC fields, Micrometer high-cardinality tag bombs, and trace exemplars.
+- `0051-slis-slos-error-budgets-and-promql.html`: SLIs, SLOs, error budgets, `serviceLevelObjectives` histograms (P95/P99 vs averages), RED/USE dashboards, PromQL burn-rate alerts.
+- `0052-boot4-native-opentelemetry-and-lgtm-stack.html`: Spring Boot 4.0 `spring-boot-starter-opentelemetry`, `@Observed`, tail-based sampling, and Docker Compose Grafana LGTM stack.
+
+### Phase 17: Track 2B — Professional DevOps & Kubernetes Operations
+- `0045-kubernetes-pods-deployments-and-services.html`: *(Moved from Part 1)* Pods, Deployments (rolling updates), ClusterIP Services, CoreDNS discovery, ConfigMaps.
+- `0053-kubernetes-cpu-throttling-hpa-and-pdbs.html`: `requests` vs `limits` (JVM CFS CPU throttling spikes), Horizontal Pod Autoscaler (HPA), PodDisruptionBudgets (PDB).
+- `0054-zero-downtime-releases-expand-contract-and-canary.html`: Expand-and-Contract Flyway DB migrations, Canary vs Blue-Green deployments, Feature Flags.
+- `0055-helm-kustomize-and-supply-chain-security.html`: Helm/Kustomize parameterization across environments, CycloneDX SBOMs, Cosign image signing & Trivy gates.
+
+### Phase 18: Track 2C — Professional AWS Cloud Architecture
+- `0048-aws-rds-postgresql-secrets-manager-localstack.html`: *(Moved from Part 1)* AWS RDS Multi-AZ, RDS Proxy, Secrets Manager rotation, IAM DB Auth, LocalStack Testcontainers.
+- `0056-aws-vpc-networking-and-iam-pod-identity.html`: VPC public/private subnets, NAT Gateways, Security Groups, IAM least privilege, EKS Pod Identity / IRSA.
+- `0057-aws-managed-messaging-and-compute-tradeoffs.html`: AWS SQS + SNS + EventBridge vs Kafka/MSK tradeoffs, Spring Cloud AWS SQS + DLQs, ECS Fargate vs EKS vs App Runner.
+- `0058-infrastructure-as-code-terraform-for-spring-boot.html`: Declarative Terraform/OpenTofu for RDS, S3, SQS, and IAM roles via Git PRs.
+
+### Phase 19: Track 2D — Advanced Distributed APIs & Search Architecture & Part 2 Capstone
+- `0063-grpc-protobuf-vs-rest-and-graphql-tradeoffs.html`: gRPC/Protobuf binary contracts & HTTP/2 load-balancing pitfalls vs. REST, plus GraphQL `@BatchMapping` N+1 defense.
+- `0064-search-engines-postgres-fts-elasticsearch-and-cqrs.html`: Inverted indexes (`GIN(tsvector)` / `pgvector` vs. Elasticsearch/OpenSearch) and CQRS read-model sync via Kafka/Outbox.
+- `reference/pro-cloud-capstone-spec.html`: **NexusCommerce Production Platform** Part 2 Cloud/DevOps/LGTM Capstone specification.
+- `reference/spring-boot-4-java-25-delta.html`: **2027 Delta Guide** (Spring Boot 4.0 + Spring Framework 7 + Java 25 LTS).

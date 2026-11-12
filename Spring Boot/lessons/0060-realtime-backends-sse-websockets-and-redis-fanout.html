@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0060: Real-Time Backends: SSE vs. WebSockets &amp; Redis Multi-Pod Fan-Out</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Part 1 • Phase 15B: Core Backend Edge, Real-Time, Data Scale &amp; Hardening</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21/25</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0060 • Part 1 Phase 15B</span>
+    <h1 style="margin-top: 8px;">Real-Time Backends: SSE vs. WebSockets &amp; Redis Multi-Pod Fan-Out</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Standard HTTP request-response breaks down for live order-status feeds, real-time notifications, collaborative whiteboards, and <strong>streaming AI/LLM responses</strong>. Choosing between <strong>Long Polling, Server-Sent Events (SSE), and WebSockets</strong>—and scaling persistent connections horizontally across multiple stateless Kubernetes pods via <strong>Redis Pub/Sub fan-out</strong>—is a core Senior System Design skill.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html#mvc-ann-async-sse" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring MVC Async: HTTP Streaming &amp; SseEmitter</a> and <a href="https://docs.spring.io/spring-framework/reference/web/websocket.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring WebSocket Reference</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">On a single laptop, storing an in-memory <code>Map&lt;UserId, SseEmitter&gt;</code> works fine. Behind a Kubernetes Load Balancer with 5 pods, User A connects to Pod 1 while the Kafka/Order update arrives on Pod 4! Without a shared Redis Pub/Sub backplane (or external message broker), Pod 4 drops the live update silently.</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>SSE (Server-Sent Events) vs. WebSockets:</strong> Use <strong>SSE</strong> (<code>text/event-stream</code>, built-in browser auto-reconnect + <code>Last-Event-ID</code>, works cleanly over standard HTTP/2 &amp; proxies) for 1-way server→client streams (notifications, stock tickers, LLM token streaming). Use <strong>WebSockets</strong> only when you need low-latency bidirectional frames (chat, multiplayer games).</li>
+    <li><strong>Virtual Threads Make SSE Cheap:</strong> With Java 21/25 Virtual Threads, holding tens of thousands of idle open SSE streams no longer exhausts Tomcat's OS thread pool—just always register <code>onCompletion</code> / <code>onTimeout</code> / <code>onError</code> callbacks to clean up maps and prevent memory leaks!</li>
+    <li><strong>Multi-Pod Fan-Out via Redis Pub/Sub:</strong> Every pod subscribes to a Redis channel (or user-scoped channel); when any pod publishes an event, the pod holding that user's local <code>SseEmitter</code> pushes it down the wire.</li>
+  </ul>
+
+  <h2>Production Implementation (Java 21/25 vs Kotlin 2.x — SseEmitter + Leak-Free Cleanup)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Leak-Safe SSE Stream + Multi-Pod Redis Pub/Sub Fan-Out</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21/25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>@RestController
+@RequestMapping("/api/v1/orders")
+public class OrderStreamController {
+    private final Map&lt;String, SseEmitter&gt; localEmitters = new ConcurrentHashMap&lt;&gt;();
+    private final StringRedisTemplate redisTemplate;
+
+    public OrderStreamController(StringRedisTemplate redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    @GetMapping(path = "/{orderId}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamOrder(@PathVariable String orderId) {
+        SseEmitter emitter = new SseEmitter(180_000L); // 3-min timeout
+        localEmitters.put(orderId, emitter);
+
+        // Mandatory cleanup callbacks to avoid memory leaks on client disconnect
+        emitter.onCompletion(() -&gt; localEmitters.remove(orderId, emitter));
+        emitter.onTimeout(() -&gt; localEmitters.remove(orderId, emitter));
+        emitter.onError(ex -&gt; localEmitters.remove(orderId, emitter));
+        return emitter;
+    }
+
+    // Invoked by ANY pod when order state changes: broadcasts to all pods via Redis Pub/Sub
+    public void publishOrderUpdate(String orderId, String status) {
+        redisTemplate.convertAndSend("order-updates", orderId + ":" + status);
+    }
+
+    // Invoked by Redis MessageListener on every pod; only the pod holding emitter delivers
+    public void onRedisBroadcast(String orderId, String status) {
+        SseEmitter emitter = localEmitters.get(orderId);
+        if (emitter != null) {
+            try {
+                emitter.send(SseEmitter.event().name("order-status").data(status));
+            } catch (IOException ex) {
+                localEmitters.remove(orderId, emitter);
+                emitter.completeWithError(ex);
+            }
+        }
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>@RestController
+@RequestMapping("/api/v1/orders")
+class OrderStreamController(private val redisTemplate: StringRedisTemplate) {
+    private val localEmitters = ConcurrentHashMap&lt;String, SseEmitter&gt;()
+
+    @GetMapping("/{orderId}/events", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])
+    fun streamOrder(@PathVariable orderId: String): SseEmitter {
+        val emitter = SseEmitter(180_000L)
+        localEmitters[orderId] = emitter
+
+        emitter.onCompletion { localEmitters.remove(orderId, emitter) }
+        emitter.onTimeout { localEmitters.remove(orderId, emitter) }
+        emitter.onError { localEmitters.remove(orderId, emitter) }
+        return emitter
+    }
+
+    fun publishOrderUpdate(orderId: String, status: String) {
+        redisTemplate.convertAndSend("order-updates", "$orderId:$status")
+    }
+
+    fun onRedisBroadcast(orderId: String, status: String) {
+        val emitter = localEmitters[orderId] ?: return
+        try {
+            emitter.send(SseEmitter.event().name("order-status").data(status))
+        } catch (ex: IOException) {
+            localEmitters.remove(orderId, emitter)
+            emitter.completeWithError(ex)
+        }
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to see immediate architectural analysis.</p>
+
+  <div class="quiz-card" id="q0060_1" data-explanation="SSE runs over standard HTTP/1.1 or HTTP/2 with native reconnection and Last-Event-ID support—ideal for one-way server-to-client feeds like order updates or LLM streaming without WebSocket upgrade complexity.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">When pushing one-way real-time order updates or AI token streams to clients, why is SSE preferred over WebSockets?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! SSE uses standard HTTP with automatic reconnect and zero WebSocket upgrade overhead for one-way streams.">
+        SSE uses standard HTTP with automatic client reconnection and zero WebSocket upgrade complexity.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. WebSockets are full-duplex (bidirectional), whereas SSE is strictly server-to-client.">
+        SSE supports faster bidirectional client-to-server binary frame streaming than raw WebSocket connections.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Spring Boot supports both SSE and WebSockets natively.">
+        Spring Boot cannot route WebSocket traffic through embedded Tomcat servers with Virtual Threads.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. SSE connections still require cross-pod fan-out (e.g., Redis Pub/Sub) when scaled horizontally.">
+        SSE automatically synchronizes in-memory Java emitter maps across Kubernetes pods without Redis.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0060_2" data-explanation="In a multi-pod Kubernetes deployment, a user's persistent SSE/WebSocket connection terminates on one specific pod while an async worker or webhook may land on a different pod. Redis Pub/Sub (or Kafka) broadcasts events to all pods so the pod holding the connection delivers it.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">Why does an in-memory <code>Map&lt;UserId, SseEmitter&gt;</code> silently drop live updates in a 4-pod Kubernetes cluster?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. ConcurrentHashMap is thread-safe inside a single JVM, not across separate containers.">
+        Java ConcurrentHashMap throws silent memory corruption errors whenever multiple Kubernetes pods run.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! The client's stream lives on Pod A while the event producer may execute on Pod B.">
+        Client streams stay pinned to one pod while events often arrive on another pod.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Kubernetes ClusterIP Services do not inspect or drop valid SSE payloads.">
+        Kubernetes ClusterIP load balancers automatically strip text/event-stream MIME headers from responses.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. SseEmitter supports sending JSON and plain text cleanly over HTTP.">
+        SseEmitter refuses to serialize JSON strings unless PostgreSQL notifies Hibernate listeners first.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0060_3" data-explanation="If you store SseEmitter references in a map and never remove them on onCompletion, onTimeout, and onError, disconnected clients accumulate indefinitely and cause a JVM heap OutOfMemoryError.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">What failure occurs in production if you store <code>SseEmitter</code> instances in a map without <code>onCompletion</code> / <code>onTimeout</code> / <code>onError</code> cleanup?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Missing callbacks leak heap memory inside the JVM; they do not break PostgreSQL Flyway checksums.">
+        Flyway fails database schema checksum verification whenever any SSE stream disconnects early.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Dead emitters remain retained in the ConcurrentHashMap forever, causing a slow JVM heap memory leak.">
+        Disconnected client emitters remain retained inside the map forever and exhaust JVM heap.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Tomcat does not shut down automatically when emitter maps retain references.">
+        Tomcat shuts down graceful HTTP listeners whenever one SSE connection exceeds sixty seconds.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. CORS headers are unrelated to SseEmitter lifecycle callback registration.">
+        Spring Security disables CORS headers for every subsequent REST endpoint request permanently.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Build a leak-safe <code>SseEmitter</code> subscription method with explicit timeout, completion/timeout/error cleanup, and a Redis Pub/Sub broadcast call.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0060-lab"
+       data-starter-java="public SseEmitter subscribe(String orderId) {
+    // 1. Create SseEmitter(120_000L) and store in emitters map
+    // 2. Register onCompletion, onTimeout, and onError cleanup callbacks
+    return null;
+}
+
+public void broadcast(String orderId, String status) {
+    // 3. Publish update across all pods via redisTemplate.convertAndSend(&quot;order-updates&quot;, ...)
+}"
+       data-starter-kotlin="fun subscribe(orderId: String): SseEmitter {
+    // 1. Create SseEmitter(120_000L) and store in emitters map
+    // 2. Register onCompletion, onTimeout, and onError cleanup callbacks
+    TODO()
+}
+
+fun broadcast(orderId: String, status: String) {
+    // 3. Publish update across all pods via redisTemplate.convertAndSend(&quot;order-updates&quot;, ...)
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0060</span>
+        <span class="practice-title">Leak-Safe SSE &amp; Redis Pub/Sub Fan-Out Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21/25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0060-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Instantiate <code>new SseEmitter(120_000L)</code> (or <code>SseEmitter(120_000L)</code> in Kotlin), register all three cleanup callbacks (<code>onCompletion</code>, <code>onTimeout</code>, <code>onError</code>), and publish cross-pod updates with <code>redisTemplate.convertAndSend(...)</code>.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false"></textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Emitter Timeout</div>
+        <div>Create <code>SseEmitter(120_000L)</code> and put it into <code>emitters</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Three Cleanup Hooks</div>
+        <div>Wire <code>emitter.onCompletion(...)</code>, <code>emitter.onTimeout(...)</code>, and <code>emitter.onError(...)</code> to remove from <code>emitters</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Redis Fan-Out</div>
+        <div>Call <code>redisTemplate.convertAndSend("order-updates", orderId + ":" + status)</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21/25 Implementation:</div>
+      <pre class="solution-code"><code>public SseEmitter subscribe(String orderId) {
+    SseEmitter emitter = new SseEmitter(120_000L);
+    emitters.put(orderId, emitter);
+    emitter.onCompletion(() -&gt; emitters.remove(orderId, emitter));
+    emitter.onTimeout(() -&gt; emitters.remove(orderId, emitter));
+    emitter.onError(ex -&gt; emitters.remove(orderId, emitter));
+    return emitter;
+}
+
+public void broadcast(String orderId, String status) {
+    redisTemplate.convertAndSend("order-updates", orderId + ":" + status);
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>fun subscribe(orderId: String): SseEmitter {
+    val emitter = SseEmitter(120_000L)
+    emitters[orderId] = emitter
+    emitter.onCompletion { emitters.remove(orderId, emitter) }
+    emitter.onTimeout { emitters.remove(orderId, emitter) }
+    emitter.onError { emitters.remove(orderId, emitter) }
+    return emitter
+}
+
+fun broadcast(orderId: String, status: String) {
+    redisTemplate.convertAndSend("order-updates", "$orderId:$status")
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Using the two-argument <code>remove(orderId, emitter)</code> prevents a dying old tab from accidentally deleting a reconnected client's brand-new emitter.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"Why must Nginx / AWS ALB idle timeouts and Spring's SseEmitter timeout be coordinated, and how do SSE heartbeat comments prevent silent proxy drops?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0059-edge-http-reverse-proxies-cors-and-etag-caching.html" class="btn btn-secondary">← Previous: Lesson 0059</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0061-database-scaling-cap-sharding-and-nosql-tradeoffs.html" class="btn btn-primary">Next: Lesson 0061 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0060 (Part 1 Core)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0060-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "SseEmitter Created with Explicit Timeout",
+    passed: /SseEmitter\s*\(\s*120_?000L?\s*\)/.test(code),
+    error: "Must instantiate SseEmitter(120_000L)."
+  });
+  tests.push({
+    name: "All 3 Leak-Prevention Callbacks Registered",
+    passed: /onCompletion/.test(code) && /onTimeout/.test(code) && /onError/.test(code),
+    error: "Must register onCompletion, onTimeout, and onError cleanup handlers."
+  });
+  tests.push({
+    name: "Redis Pub/Sub Multi-Pod Fan-Out",
+    passed: /redisTemplate\.convertAndSend\s*\(/.test(code),
+    error: "Must publish cross-pod events via redisTemplate.convertAndSend(...)."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0053: Kubernetes Sizing: CPU Throttling, HPA &amp; PodDisruptionBudgets</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Part 2 • Phase 17: Track 2B — Professional DevOps &amp; Kubernetes Operations</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21/25</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0053 • Part 2 Phase 17</span>
+    <h1 style="margin-top: 8px;">Kubernetes Sizing: CPU Throttling, HPA &amp; PodDisruptionBudgets</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Why does a Spring Boot pod showing only 35% average CPU suddenly stall for 200–400ms on every P99 request inside Kubernetes? The culprit is almost always Linux <strong>CFS CPU throttling</strong> triggered by overly tight <code>limits.cpu</code>. In this lesson, we distinguish Kubernetes <code>requests</code> from <code>limits</code> for JVM workloads, configure <strong>Horizontal Pod Autoscalers (HPA)</strong> that scale cleanly ahead of traffic spikes, and add <strong>PodDisruptionBudgets (PDB)</strong> so cluster upgrades never kill all your replicas at once.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Kubernetes Resource Management</a> and <a href="https://kubernetes.io/docs/tasks/run-application/configure-pdb/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Kubernetes PodDisruptionBudget (PDB) Guide</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">The JVM is multi-threaded by nature: GC threads, JIT C2 compiler threads, Netty/Tomcat workers, and Virtual Thread carrier pools burst briefly for 10–30ms. A <code>limits.cpu: "500m"</code> quota gives you only 50ms of CPU time per 100ms CFS period—causing the Linux kernel to freeze all JVM threads for the remaining 50ms, crushing P99 latency even when the host node has plenty of idle CPU!</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>Memory vs. CPU Limits Are Fundamentally Different:</strong> Always set <code>requests.memory == limits.memory</code> (Guaranteed memory avoids unpredictable OOM eviction), paired with <code>-XX:MaxRAMPercentage=75.0</code>.</li>
+    <li><strong>Beware Tight <code>limits.cpu</code>:</strong> Set realistic <code>requests.cpu</code> (used for scheduler placement &amp; HPA percentage math), and either omit <code>limits.cpu</code> or leave generous burst headroom so JVM JIT &amp; GC bursts aren't CFS-throttled.</li>
+    <li><strong>Horizontal Pod Autoscaler (HPA):</strong> Scale pods automatically between <code>minReplicas</code> (at least 2 for HA) and <code>maxReplicas</code> using CPU, memory, or custom Prometheus metrics (e.g., Kafka consumer lag or HTTP RPS).</li>
+    <li><strong>PodDisruptionBudget (PDB):</strong> Guarantees Kubernetes voluntary evictions (node upgrades, Spot node drains) keep at least <code>minAvailable</code> pods healthy—never leaving an endpoint with zero ready pods.</li>
+  </ul>
+
+  <h2>Production Implementation (Kubernetes Sizing, HPA &amp; PDB vs Spring Probe Alignment)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Hardened Deployment Sizing, HPA &amp; PodDisruptionBudget</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21/25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code># 1. Container Resource Sizing (JVM-Friendly, No CPU Throttling Trap)
+resources:
+  requests:
+    cpu: "1000m"
+    memory: "1Gi"
+  limits:
+    memory: "1Gi"   # Equal to requests.memory; omit tight limits.cpu on bursty JVM workloads!
+env:
+  - name: JAVA_TOOL_OPTIONS
+    value: "-XX:MaxRAMPercentage=75.0 -XX:+UseZGC"
+
+---
+# 2. HorizontalPodAutoscaler (HPA)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+
+---
+# 3. PodDisruptionBudget (PDB)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: order-service</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code># Kotlin Spring Boot pods share identical JVM + cgroups v2 ergonomics
+# Add Kotlin-specific startup optimization:
+#   - Spring AOT / CDS reduces startup CPU burst during HPA scale-out
+resources:
+  requests:
+    cpu: "1000m"
+    memory: "1Gi"
+  limits:
+    memory: "1Gi"
+env:
+  - name: JAVA_TOOL_OPTIONS
+    value: "-XX:MaxRAMPercentage=75.0 -XX:+UseZGC -Dspring.threads.virtual.enabled=true"
+
+---
+# Startup Probe protects slow JVM JIT warm-up during HPA scale-out:
+startupProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8080
+  failureThreshold: 12
+  periodSeconds: 5   # Up to 60s for cold JVM boot before liveness checks begin</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis.
+  </p>
+
+  <div class="quiz-card" id="q0053_1" data-explanation="Linux CFS enforces CPU limits over short 100ms quota windows. Multi-threaded JVM operations (JIT warmup, GC, Virtual Thread bursts) quickly burn a small quota and get paused for the remainder of the 100ms period, creating tail-latency spikes.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Why can setting a low <code>limits.cpu</code> (such as <code>500m</code>) cause P99 latency spikes even when average CPU usage looks low?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Multi-threaded JVM bursts burn the 100ms CFS quota early and get frozen until the next period.">
+        Multi-threaded JVM bursts consume the short CFS quota early and get frozen until the next window.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. CPU limits trigger CFS throttling delays, whereas memory limit breaches cause Exit Code 137 OOMKills.">
+        Kubernetes kills containers with Exit Code 137 whenever CPU utilization briefly exceeds requested CPU cores.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. HikariCP pool sizing does not dynamically shrink based on Linux cgroup CPU quota changes.">
+        HikariCP closes all database connections whenever Linux CFS detects multi-threaded JVM garbage collection bursts.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Spring Boot does not disable Virtual Threads when CPU limits are configured.">
+        Spring Boot falls back to single-threaded blocking mode whenever container CPU limits drop below one core.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0053_2" data-explanation="A PodDisruptionBudget prevents Kubernetes from draining nodes too aggressively during cluster upgrades or autoscaler scale-ins, ensuring at least minAvailable (or at most maxUnavailable) pods stay healthy.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">What outage scenario does a Kubernetes <code>PodDisruptionBudget</code> (PDB) directly prevent?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. PDBs govern voluntary node drains and evictions, not container OOM kills.">
+        It prevents the Linux kernel from killing containers whose JVM heap exceeds cgroup memory limits.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! PDBs block voluntary node drains from evicting too many healthy replicas simultaneously during cluster maintenance.">
+        Voluntary cluster node drains evicting all healthy replicas at once during Kubernetes node upgrades.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Secrets rotation is handled by External Secrets Operator or CSI drivers, not PDBs.">
+        It prevents AWS Secrets Manager from rotating database credentials before HikariCP refreshes cached pools.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Network access control is handled by NetworkPolicies and Security Groups, not PDBs.">
+        It prevents unauthorized pods in other namespaces from calling internal ClusterIP Spring Boot endpoints.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0053_3" data-explanation="A startupProbe pauses liveness/readiness failure counting while the JVM boots, preventing Kubernetes from killing a slow-starting pod before Spring finishes initializing.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">When HPA scales out new JVM pods under heavy traffic, how does a <code>startupProbe</code> prevent premature pod restarts?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Startup probes do not allocate extra CPU cores; they delay liveness failure checks.">
+        It temporarily doubles container CPU requests until Spring Boot completes Tomcat HTTP port binding.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Traffic only routes once readinessProbe passes, regardless of startupProbe.">
+        It routes customer HTTP requests immediately before Spring Data JPA finishes initializing database pools.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Startup probes hold off liveness checks during slow cold starts so Kubernetes won't crash-loop booting pods.">
+        It holds off liveness probe failures during slow cold starts so booting pods avoid crash loops.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Startup probes never pre-compile Java bytecode or replace GraalVM/CDS.">
+        It pre-compiles Spring Boot JAR classes into native machine binaries inside the container entrypoint script.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Write a production-safe Kubernetes HPA + PodDisruptionBudget manifest with guaranteed memory sizing (matching <code>requests.memory</code> and <code>limits.memory</code>) and no tight CPU throttling limit.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0053-lab"
+       data-starter-java="# Complete the Kubernetes HPA + PDB + Resource sizing spec:
+# 1. Set requests.memory: 1Gi and limits.memory: 1Gi (NO tight limits.cpu!)
+# 2. Define HorizontalPodAutoscaler with minReplicas: 2 and maxReplicas: 10
+# 3. Define PodDisruptionBudget with minAvailable: 1
+
+resources:
+  requests:
+    cpu: &quot;1000m&quot;
+    # TODO: memory
+  limits:
+    # TODO: memory
+---
+kind: HorizontalPodAutoscaler
+spec:
+  # TODO: minReplicas, maxReplicas
+---
+kind: PodDisruptionBudget
+spec:
+  # TODO: minAvailable"
+       data-starter-kotlin="# Complete the Kubernetes HPA + PDB + Resource sizing spec:
+# 1. Set requests.memory: 1Gi and limits.memory: 1Gi (NO tight limits.cpu!)
+# 2. Define HorizontalPodAutoscaler with minReplicas: 2 and maxReplicas: 10
+# 3. Define PodDisruptionBudget with minAvailable: 1
+
+resources:
+  requests:
+    cpu: &quot;1000m&quot;
+    # TODO: memory
+  limits:
+    # TODO: memory
+---
+kind: HorizontalPodAutoscaler
+spec:
+  # TODO: minReplicas, maxReplicas
+---
+kind: PodDisruptionBudget
+spec:
+  # TODO: minAvailable">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0053</span>
+        <span class="practice-title">JVM-Safe Sizing, HPA &amp; PDB Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21/25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0053-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Configure guaranteed memory (<code>1Gi</code> in both <code>requests</code> and <code>limits</code>) without a tight CPU limit, plus <code>HorizontalPodAutoscaler</code> (<code>minReplicas: 2</code>, <code>maxReplicas: 10</code>) and <code>PodDisruptionBudget</code> (<code>minAvailable: 1</code>).</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false"></textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Memory Guarantee</div>
+        <div>Add <code>memory: "1Gi"</code> under both <code>requests:</code> and <code>limits:</code>, and do NOT add <code>limits.cpu</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: HPA Bounds</div>
+        <div>Under <code>HorizontalPodAutoscaler</code> <code>spec:</code> add <code>minReplicas: 2</code> and <code>maxReplicas: 10</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: PDB Protection</div>
+        <div>Under <code>PodDisruptionBudget</code> <code>spec:</code> add <code>minAvailable: 1</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21/25 Manifest:</div>
+      <pre class="solution-code"><code>resources:
+  requests:
+    cpu: "1000m"
+    memory: "1Gi"
+  limits:
+    memory: "1Gi"
+---
+kind: HorizontalPodAutoscaler
+spec:
+  minReplicas: 2
+  maxReplicas: 10
+---
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 1</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Manifest:</div>
+      <pre class="solution-code"><code>resources:
+  requests:
+    cpu: "1000m"
+    memory: "1Gi"
+  limits:
+    memory: "1Gi"
+---
+kind: HorizontalPodAutoscaler
+spec:
+  minReplicas: 2
+  maxReplicas: 10
+---
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 1</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Equal memory requests/limits lock in predictable cgroups heap math, omitting tight CPU limits eliminates CFS stalls, HPA scales dynamically, and PDB protects availability during node maintenance.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"How do you configure KEDA (Kubernetes Event-Driven Autoscaling) to scale a Spring Kafka consumer deployment based on Kafka consumer group lag rather than CPU?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0045-kubernetes-pods-deployments-and-services.html" class="btn btn-secondary">← Previous: Lesson 0045</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0054-zero-downtime-releases-expand-contract-and-canary.html" class="btn btn-primary">Next: Lesson 0054 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0053 (Part 2)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0053-lab'] = function(code, lang) {
+  const tests = [];
+  const memMatches = code.match(/memory\s*:\s*"?1Gi"?/g) || [];
+  tests.push({
+    name: "Guaranteed Memory (requests == limits == 1Gi)",
+    passed: memMatches.length >= 2,
+    error: "Must set memory: 1Gi in both requests and limits."
+  });
+  tests.push({
+    name: "HPA Configured (minReplicas: 2, maxReplicas: 10)",
+    passed: /kind:\s*HorizontalPodAutoscaler/.test(code) && /minReplicas:\s*2/.test(code) && /maxReplicas:\s*10/.test(code),
+    error: "Must configure HorizontalPodAutoscaler with minReplicas: 2 and maxReplicas: 10."
+  });
+  tests.push({
+    name: "PodDisruptionBudget Configured (minAvailable: 1)",
+    passed: /kind:\s*PodDisruptionBudget/.test(code) && /minAvailable:\s*1/.test(code),
+    error: "Must configure PodDisruptionBudget with minAvailable: 1."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

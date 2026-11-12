@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0057: AWS Managed Messaging (SQS/SNS/EventBridge) &amp; Compute Tradeoffs</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Part 2 • Phase 18: Track 2C — Professional AWS Cloud Architecture</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21/25</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0057 • Part 2 Phase 18</span>
+    <h1 style="margin-top: 8px;">AWS Managed Messaging (SQS/SNS/EventBridge) &amp; Compute Tradeoffs</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Running a 3-node Apache Kafka cluster (or Amazon MSK) costs thousands of dollars and nontrivial ops effort when all you really needed was reliable async job queuing or fan-out notifications. On AWS, senior architects match the tool to the workload: <strong>SQS + SNS + EventBridge</strong> for serverless pay-per-message queues vs. <strong>Kafka</strong> for high-throughput event replay, and <strong>ECS Fargate</strong> vs. <strong>EKS</strong> for running Spring Boot containers. In this lesson, we master those architectural tradeoffs and implement an idempotent <strong>Spring Cloud AWS <code>@SqsListener</code></strong> with Dead-Letter Queues.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authority: <a href="https://docs.awspring.io/spring-cloud-aws/docs/3.2.0/reference/html/index.html#sqs-integration" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring Cloud AWS Reference: SQS &amp; SNS Integration</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">Choosing Kafka when you need a simple work queue (like sending receipts or thumbnailing S3 uploads) creates unnecessary partition rebalancing headaches; choosing SQS when you need multi-consumer event replay across 7-day history won't work because SQS deletes messages upon acknowledgement. Knowing <em>when</em> to pick each is a staple Senior System Design question.</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>SQS vs. SNS vs. EventBridge vs. Kafka:</strong>
+      <ul style="margin: 4px 0 4px 20px;">
+        <li><strong>Amazon SQS:</strong> Competing-consumer point-to-point queue; messages deleted after ack; visibility timeout + automatic DLQ after <code>maxReceiveCount</code>. Standard = at-least-once; FIFO = strict ordering per <code>MessageGroupId</code>.</li>
+        <li><strong>SNS + SQS Fan-Out:</strong> Publish one event to SNS, fan out into independent SQS queues per microservice for isolated retries and DLQs.</li>
+        <li><strong>EventBridge:</strong> Content-based JSON event router across AWS services and SaaS webhooks.</li>
+        <li><strong>Apache Kafka / MSK:</strong> Append-only log with consumer-offset replay, stream joins, and high sustained throughput.</li>
+      </ul>
+    </li>
+    <li><strong>Spring Boot Compute on AWS (App Runner vs. ECS Fargate vs. EKS):</strong> Small/medium teams ship Spring Boot faster on <strong>ECS Fargate</strong> (zero node OS patching, native ALB/IAM); large multi-team orgs standardize on <strong>EKS</strong> for Kubernetes ecosystem portability.</li>
+    <li><strong>SQS Visibility Timeout Rule:</strong> Always configure SQS visibility timeout &gt; max processing time + Spring retry backoff, or a second worker picks up the same in-flight message (requiring idempotency!).</li>
+  </ul>
+
+  <h2>Production Implementation (Java 21/25 vs Kotlin 2.x — Spring Cloud AWS SQS Listener)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Idempotent @SqsListener with Explicit Ack Mode</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21/25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.nexus.worker;
+
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import io.awspring.cloud.sqs.listener.acknowledgement.Acknowledgement;
+import org.springframework.stereotype.Component;
+
+@Component
+public class S3UploadEventConsumer {
+
+    // ON_SUCCESS (default) acks only when method returns cleanly;
+    // MANUAL gives explicit control after idempotent DB/Redis commit.
+    @SqsListener(value = "${nexus.sqs.upload-queue}", acknowledgementMode = "MANUAL")
+    public void onFileUploaded(UploadEvent event, Acknowledgement ack) {
+        if (alreadyProcessed(event.eventId())) {
+            ack.acknowledge(); // Deduplicate at-least-once redelivery safely
+            return;
+        }
+        processInvoiceThumbnail(event);
+        ack.acknowledge(); // Delete from SQS; exceptions leave message for DLQ redrive
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.nexus.worker
+
+import io.awspring.cloud.sqs.annotation.SqsListener
+import io.awspring.cloud.sqs.listener.acknowledgement.Acknowledgement
+import org.springframework.stereotype.Component
+
+@Component
+class S3UploadEventConsumer {
+
+    @SqsListener(value = ["\${nexus.sqs.upload-queue}"], acknowledgementMode = "MANUAL")
+    fun onFileUploaded(event: UploadEvent, ack: Acknowledgement) {
+        if (alreadyProcessed(event.eventId)) {
+            ack.acknowledge()
+            return
+        }
+        processInvoiceThumbnail(event)
+        ack.acknowledge()
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis.
+  </p>
+
+  <div class="quiz-card" id="q0057_1" data-explanation="SQS deletes messages once acknowledged, so it cannot replay 3-day-old events to a newly added analytics service. Apache Kafka retains an append-only log by retention time/size so new consumer groups can replay history.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">When must you choose Apache Kafka (or MSK) instead of Amazon SQS?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Kafka retains events in an ordered log so new consumer groups can replay historical events.">
+        Multiple independent services need ordered event retention and historical offset replay across days.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. SQS supports Dead-Letter Queues natively via redrive policies with zero Kafka overhead.">
+        You need basic Dead-Letter Queue support when background email worker jobs fail repeatedly.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. S3 natively pushes ObjectCreated events directly into SQS with zero Kafka clusters.">
+        You want Amazon S3 upload notifications delivered directly to one serverless background thumbnail worker.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. SQS scales horizontally with zero broker cluster sizing or partition management.">
+        You want zero broker operations overhead for a low-volume asynchronous PDF receipt generator queue.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0057_2" data-explanation="If a worker takes 45 seconds to process an SQS message while VisibilityTimeout is 30 seconds, SQS assumes the first worker crashed and redelivers the message to a second worker—causing duplicate execution.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">What happens if your Spring Boot <code>@SqsListener</code> takes 45 seconds to process a message whose SQS Visibility Timeout is 30 seconds?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. SQS does not kill running Spring threads; it makes the unacked message visible again.">
+        AWS forcibly kills the running Spring Boot container with SIGKILL at thirty seconds.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! At 30 seconds the message reappears in the queue so a second worker runs it concurrently.">
+        SQS makes the message visible again at thirty seconds so another worker processes duplicates.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Dead-Letter Queue movement only occurs after maxReceiveCount delivery attempts fail or expire.">
+        SQS immediately purges the message permanently without calling any Dead-Letter Queue redrive policy.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. SQS visibility timeout does not touch PostgreSQL transaction isolation levels.">
+        PostgreSQL rolls back every committed row inside the Spring service transaction at thirty seconds.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0057_3" data-explanation="ECS Fargate runs Docker containers serverless-style with deep ALB/IAM integration and zero Kubernetes control plane or EC2 node patching—ideal when a backend team doesn't need EKS's broader platform ecosystem.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">Why do lean AWS backend teams often pick ECS Fargate over EKS for running 5–10 Spring Boot microservices?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Both ECS Fargate and EKS run standard OCI/Docker containers with JVM apps.">
+        EKS cannot execute Java 21 virtual threads inside Distroless non-root Spring Boot containers.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. ECS Fargate supports VPC private subnets, Security Groups, and RDS Proxy natively.">
+        ECS Fargate bypasses AWS VPC networking and IAM security policies completely for faster setup.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! ECS Fargate eliminates Kubernetes cluster upgrades, add-ons, and worker-node patching overhead.">
+        ECS Fargate eliminates Kubernetes control plane upgrades, CNI plugins, and EC2 node patching overhead.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. EKS and ECS both integrate with Secrets Manager and ALB.">
+        EKS forbids connecting Spring Boot microservices to AWS RDS PostgreSQL or Secrets Manager.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Implement an idempotent <code>@SqsListener</code> consumer using <code>MANUAL</code> acknowledgement mode so redelivered messages are safely deduplicated and failures fall through to the SQS Dead-Letter Queue.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0057-lab"
+       data-starter-java="// Implement idempotent SQS listener:
+// 1. Annotate onOrderEvent with @SqsListener(value = &quot;nexus-orders-queue&quot;, acknowledgementMode = &quot;MANUAL&quot;)
+// 2. Check idempotency store; if duplicate, call ack.acknowledge() and return
+// 3. Process event, then call ack.acknowledge()
+
+@Component
+public class OrderSqsConsumer {
+    public void onOrderEvent(String eventId, Acknowledgement ack) {
+        // TODO: Implement idempotent SQS processing
+    }
+}"
+       data-starter-kotlin="// Implement idempotent SQS listener:
+// 1. Annotate onOrderEvent with @SqsListener(value = [&quot;nexus-orders-queue&quot;], acknowledgementMode = &quot;MANUAL&quot;)
+// 2. Check idempotency store; if duplicate, call ack.acknowledge() and return
+// 3. Process event, then call ack.acknowledge()
+
+@Component
+class OrderSqsConsumer {
+    fun onOrderEvent(eventId: String, ack: Acknowledgement) {
+        // TODO: Implement idempotent SQS processing
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0057</span>
+        <span class="practice-title">Idempotent @SqsListener &amp; DLQ Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21/25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0057-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Configure <code>@SqsListener</code> on <code>"nexus-orders-queue"</code> with <code>acknowledgementMode = "MANUAL"</code>, deduplicate using an idempotency check (calling <code>ack.acknowledge()</code> and returning early on duplicate), and acknowledge only after successful processing.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false"></textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Listener Annotation</div>
+        <div><code>@SqsListener(value = "nexus-orders-queue", acknowledgementMode = "MANUAL")</code> (in Kotlin <code>value = ["nexus-orders-queue"]</code>).</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Deduplication Guard</div>
+        <div>If <code>isDuplicate(eventId)</code> is true, invoke <code>ack.acknowledge(); return;</code> so SQS doesn't retry duplicates into the DLQ.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Final Ack</div>
+        <div>Call <code>process(eventId)</code> followed by <code>ack.acknowledge()</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21/25 Implementation:</div>
+      <pre class="solution-code"><code>@Component
+public class OrderSqsConsumer {
+    @SqsListener(value = "nexus-orders-queue", acknowledgementMode = "MANUAL")
+    public void onOrderEvent(String eventId, Acknowledgement ack) {
+        if (isDuplicate(eventId)) {
+            ack.acknowledge();
+            return;
+        }
+        process(eventId);
+        ack.acknowledge();
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>@Component
+class OrderSqsConsumer {
+    @SqsListener(value = ["nexus-orders-queue"], acknowledgementMode = "MANUAL")
+    fun onOrderEvent(eventId: String, ack: Acknowledgement) {
+        if (isDuplicate(eventId)) {
+            ack.acknowledge()
+            return
+        }
+        process(eventId)
+        ack.acknowledge()
+    }
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Manual acknowledgement plus idempotency ensures SQS at-least-once redeliveries never double-charge or double-emit, while unhandled exceptions leave messages un-acked until SQS moves them to the DLQ.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"How does the SNS-to-SQS fan-out pattern let NexusCommerce add a brand-new Fraud Detection service without modifying Order Service code?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0056-aws-vpc-networking-and-iam-pod-identity.html" class="btn btn-secondary">← Previous: Lesson 0056</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0058-infrastructure-as-code-terraform-for-spring-boot.html" class="btn btn-primary">Next: Lesson 0058 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0057 (Part 2)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0057-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "@SqsListener with MANUAL Acknowledgement Mode",
+    passed: /@SqsListener\s*\(/.test(code) && /nexus-orders-queue/.test(code) && /acknowledgementMode\s*=\s*"MANUAL"/.test(code),
+    error: "Must annotate with @SqsListener targeting nexus-orders-queue and acknowledgementMode = \"MANUAL\"."
+  });
+  tests.push({
+    name: "Idempotent Early Return + Explicit Acknowledgement",
+    passed: /return/.test(code) && (code.match(/ack\.acknowledge\s*\(\s*\)/g) || []).length >= 2,
+    error: "Must acknowledge and return early on duplicates, plus call ack.acknowledge() after processing."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

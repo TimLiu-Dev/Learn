@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0064: Search Engines &amp; CQRS: PostgreSQL FTS / pgvector vs. Elasticsearch</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Part 2 • Phase 19: Track 2D — Advanced Distributed APIs &amp; Search</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21/25</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0064 • Part 2 Phase 19</span>
+    <h1 style="margin-top: 8px;">Search Engines &amp; CQRS: PostgreSQL FTS / <code>pgvector</code> vs. Elasticsearch</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Every e-commerce catalog eventually faces a brutal bottleneck: <code>WHERE title LIKE '%wireless%'</code> ignores standard B-Tree indexes and triggers full table scans across millions of products. In this final Part 2 lesson, we understand inverted indexes, compare <strong>PostgreSQL Full-Text Search (<code>GIN</code> + <code>tsvector</code>) &amp; <code>pgvector</code></strong> against dedicated <strong>Elasticsearch / OpenSearch</strong> clusters, and apply <strong>CQRS</strong> (separating transactional PostgreSQL writes from asynchronous search-index read projections via Kafka/Outbox).
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://www.postgresql.org/docs/current/textsearch.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">PostgreSQL Full-Text Search (tsvector &amp; GIN)</a> and <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Elasticsearch Inverted Index Reference</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">Never spin up a 3-node Elasticsearch cluster if your catalog has 200,000 products—PostgreSQL's built-in <code>GIN(to_tsvector(...))</code> gives sub-10ms stem-aware search with zero sync lag! Save Elasticsearch/OpenSearch for massive scale (10M+ docs, complex faceted aggregations, custom BM25 relevance tuning, and typo-tolerant fuzzy search) synced via <strong>CQRS + Outbox</strong>.</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>Why Leading-Wildcard <code>LIKE '%term%'</code> Dies:</strong> Standard B-Tree indexes sort left-to-right; a leading <code>%</code> forces PostgreSQL into a <code>Seq Scan</code> over every row on disk.</li>
+    <li><strong>Inverted Indexes (Postgres GIN vs. Elasticsearch):</strong> Maps tokenized stems (e.g., <code>"running"</code> → <code>"run"</code>) directly to matching document IDs. Add <code>pg_trgm</code> for substring/typo matching or <code>pgvector</code> (HNSW index) for AI semantic similarity directly inside PostgreSQL.</li>
+    <li><strong>CQRS (Command Query Responsibility Segregation):</strong> Commands (<code>POST /orders</code>, catalog updates) write transactionally to PostgreSQL + Outbox; an async Kafka consumer updates Elasticsearch/OpenSearch read models—avoiding dual-write inconsistencies and accepting brief eventual consistency on search results.</li>
+  </ul>
+
+  <h2>Production Implementation (Postgres GIN Full-Text Index &amp; CQRS Kafka Sync)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">PostgreSQL GIN tsvector Migration + CQRS Search Projection Consumer</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21/25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>-- V25__add_product_fts_gin_index.sql (Zero extra infra up to ~1M products!)
+ALTER TABLE products
+  ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(description, ''))) STORED;
+
+CREATE INDEX CONCURRENTLY idx_products_search_gin ON products USING GIN (search_vector);
+
+-- Query via: WHERE search_vector @@ websearch_to_tsquery('english', :query)
+
+---
+// ProductSearchProjector.java — CQRS Read-Side Sync via Kafka Outbox Event
+@Component
+public class ProductSearchProjector {
+    private final ElasticsearchOperations elasticOps;
+
+    public ProductSearchProjector(ElasticsearchOperations elasticOps) {
+        this.elasticOps = elasticOps;
+    }
+
+    @KafkaListener(topics = "catalog.products.updated", groupId = "search-indexer")
+    public void onProductUpdated(ProductChangedEvent event) {
+        // Idempotent upsert by document ID prevents duplicate entries on Kafka replay
+        elasticOps.save(new ProductSearchDoc(event.productId(), event.title(), event.priceCents()));
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>-- V25__add_product_fts_gin_index.sql
+ALTER TABLE products
+  ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(description, ''))) STORED;
+
+CREATE INDEX CONCURRENTLY idx_products_search_gin ON products USING GIN (search_vector);
+
+---
+// ProductSearchProjector.kt — CQRS Read-Side Sync via Kafka Outbox Event
+@Component
+class ProductSearchProjector(private val elasticOps: ElasticsearchOperations) {
+
+    @KafkaListener(topics = ["catalog.products.updated"], groupId = "search-indexer")
+    fun onProductUpdated(event: ProductChangedEvent) {
+        elasticOps.save(ProductSearchDoc(event.productId, event.title, event.priceCents))
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to see immediate architectural analysis.</p>
+
+  <div class="quiz-card" id="q0064_1" data-explanation="B-Tree indexes require a fixed prefix to traverse sorted tree nodes. A leading wildcard ('%shoes') invalidates prefix lookup and forces a sequential scan across the entire table.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Why does <code>WHERE title LIKE '%shoes'</code> bypass a standard PostgreSQL B-Tree index on <code>title</code>?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! B-Trees sort from left to right, so a leading wildcard disables prefix traversal and triggers a table scan.">
+        B-Tree indexes sort from left to right so leading wildcards prevent prefix lookups.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. PostgreSQL B-Trees index VARCHAR and TEXT columns natively for exact or prefix queries.">
+        PostgreSQL forbids building standard B-Tree indexes on variable-length text columns inside tables.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Like-pattern index behavior depends on prefix ordering, not JDBC pool size.">
+        HikariCP disables PostgreSQL B-Tree index planning whenever parameterized LIKE strings contain spaces.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. B-Tree indexes work independently of Spring Data JPA entity classes.">
+        Hibernate converts all SQL LIKE expressions into client-side Java stream filter loops automatically.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0064_2" data-explanation="Updating PostgreSQL and Elasticsearch in the same HTTP call is a classic dual-write trap—if Elasticsearch times out after Postgres commits, search falls permanently out of sync. Publishing via Outbox + Kafka keeps projections eventually consistent.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">In a CQRS architecture syncing PostgreSQL writes to Elasticsearch, why should a Kafka consumer update Elasticsearch instead of writing directly inside the controller transaction?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Elasticsearch supports synchronous REST writes; the flaw is distributed dual-write partial failure.">
+        Elasticsearch HTTP endpoints refuse incoming JSON indexing requests originating from Spring REST controllers.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Outbox + Kafka decouples writes from search indexing, eliminating dual-write drift on transient outages.">
+        Decoupling via Outbox and Kafka prevents dual-write drift when search nodes fail transiently.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Outbox + Kafka actually introduces brief eventual consistency, not stronger ACID locks.">
+        Kafka guarantees distributed two-phase commit ACID locks across Elasticsearch shards and PostgreSQL rows.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Index mapping and relevance scoring do not depend on whether Kafka is used.">
+        Kafka automatically converts relational SQL tables into Lucene inverted indexes without code.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0064_3" data-explanation="Up to hundreds of thousands or ~1M records, PostgreSQL's built-in tsvector + GIN index (and pg_trgm/pgvector) avoids operating, paying for, and syncing a separate Elasticsearch cluster.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">When is PostgreSQL <code>GIN(tsvector)</code> usually a better architectural choice than deploying an Elasticsearch cluster?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Elasticsearch shines at massive multi-terabyte log analytics and complex distributed faceting.">
+        When ingesting fifty terabytes of daily Kubernetes container logs across hundreds of microservices.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Postgres GIN FTS avoids dual-system sync lag and cluster overhead for moderate product catalogs.">
+        When searching moderate product catalogs where avoiding separate cluster sync overhead brings simplicity.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Neither Postgres FTS nor Elasticsearch replaces primary ACID ledger storage.">
+        When replacing ACID relational foreign keys inside high-contention double-entry financial bank ledgers.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. PostgreSQL GIN indexes require explicit SQL DDL migrations via Flyway.">
+        When you want automatic zero-SQL typo-tolerant fuzzy scoring across twenty global shard clusters.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Create a non-blocking PostgreSQL <code>GIN</code> full-text index on a <code>tsvector</code> column AND implement an idempotent <code>@KafkaListener</code> CQRS search projector.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0064-lab"
+       data-starter-java="// 1. SQL DDL in comment: CREATE INDEX CONCURRENTLY idx_catalog_gin ON products USING GIN (search_vector);
+//    with to_tsvector('english', ...)
+// 2. Implement @KafkaListener(topics = &quot;catalog.products.updated&quot;, groupId = &quot;search-indexer&quot;)
+//    calling elasticOps.save(...)
+
+@Component
+public class CatalogSearchProjector {
+    // TODO: @KafkaListener projection
+}"
+       data-starter-kotlin="// 1. SQL DDL in comment: CREATE INDEX CONCURRENTLY idx_catalog_gin ON products USING GIN (search_vector);
+//    with to_tsvector('english', ...)
+// 2. Implement @KafkaListener(topics = [&quot;catalog.products.updated&quot;], groupId = &quot;search-indexer&quot;)
+//    calling elasticOps.save(...)
+
+@Component
+class CatalogSearchProjector {
+    // TODO: @KafkaListener projection
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0064</span>
+        <span class="practice-title">GIN Full-Text Search &amp; CQRS Projector Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21/25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0064-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Include a <code>CREATE INDEX CONCURRENTLY</code> statement using <code>USING GIN</code> and <code>to_tsvector</code>, and annotate a <code>@KafkaListener</code> handler targeting <code>catalog.products.updated</code> that upserts via <code>elasticOps.save(...)</code>.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false"></textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Non-Blocking Postgres GIN Index</div>
+        <div>Include <code>to_tsvector('english', title)</code> and <code>CREATE INDEX CONCURRENTLY idx_catalog_gin ON products USING GIN (search_vector);</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Kafka CQRS Consumer</div>
+        <div>Annotate with <code>@KafkaListener(topics = "catalog.products.updated", groupId = "search-indexer")</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Idempotent Upsert</div>
+        <div>Invoke <code>elasticOps.save(new ProductSearchDoc(event.id(), event.title()))</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21/25 Implementation:</div>
+      <pre class="solution-code"><code>// to_tsvector('english', title)
+// CREATE INDEX CONCURRENTLY idx_catalog_gin ON products USING GIN (search_vector);
+@Component
+public class CatalogSearchProjector {
+    @KafkaListener(topics = "catalog.products.updated", groupId = "search-indexer")
+    public void onProductUpdated(ProductChangedEvent event) {
+        elasticOps.save(new ProductSearchDoc(event.id(), event.title()));
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>// to_tsvector('english', title)
+// CREATE INDEX CONCURRENTLY idx_catalog_gin ON products USING GIN (search_vector);
+@Component
+class CatalogSearchProjector {
+    @KafkaListener(topics = ["catalog.products.updated"], groupId = "search-indexer")
+    fun onProductUpdated(event: ProductChangedEvent) {
+        elasticOps.save(ProductSearchDoc(event.id, event.title))
+    }
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">PostgreSQL GIN handles moderate full-text search with zero extra infrastructure, while CQRS + Kafka idempotent projection cleanly scales out to Elasticsearch when catalog volume demands it.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"How do you handle a full Elasticsearch re-index (zero-downtime alias swap) when you change analyzer rules or add a new searchable field?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0063-grpc-protobuf-vs-rest-and-graphql-tradeoffs.html" class="btn btn-secondary">← Previous: Lesson 0063</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="../reference/pro-cloud-capstone-spec.html" class="btn btn-primary">Next: Part 2 Production Capstone 🚀</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0064 (Part 2)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0064-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "PostgreSQL Non-Blocking GIN Full-Text Index",
+    passed: /CREATE\s+INDEX\s+CONCURRENTLY/i.test(code) && /USING\s+GIN/i.test(code) && /to_tsvector/i.test(code),
+    error: "Must include CREATE INDEX CONCURRENTLY ... USING GIN and to_tsvector."
+  });
+  tests.push({
+    name: "CQRS @KafkaListener Search Upsert",
+    passed: /@KafkaListener\s*\(/.test(code) && /catalog\.products\.updated/.test(code) && /elasticOps\.save\s*\(/.test(code),
+    error: "Must define @KafkaListener for catalog.products.updated calling elasticOps.save(...)."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

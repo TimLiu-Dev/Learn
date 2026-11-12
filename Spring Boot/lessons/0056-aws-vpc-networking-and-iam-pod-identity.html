@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0056: AWS VPC Networking &amp; Zero-Trust IAM (EKS Pod Identity / IRSA)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Part 2 • Phase 18: Track 2C — Professional AWS Cloud Architecture</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21/25</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0056 • Part 2 Phase 18</span>
+    <h1 style="margin-top: 8px;">AWS VPC Networking &amp; Zero-Trust IAM (EKS Pod Identity / IRSA)</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Two real-world failures stall backend teams moving to AWS: 1) *"My Spring Boot pod times out connecting to RDS PostgreSQL!"* (almost always a VPC subnet route or Security Group rule), and 2) hardcoded long-lived <code>AWS_ACCESS_KEY_ID</code> / <code>AWS_SECRET_ACCESS_KEY</code> credentials leaked in Secrets or CI logs. In this lesson, we build the developer mental model for <strong>AWS VPC public vs. private subnets, NAT Gateways, and Security Group chaining</strong>, and eliminate static AWS keys with <strong>least-privilege IAM Roles via EKS Pod Identity / IRSA</strong>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">AWS EKS Pod Identity Documentation</a> and <a href="https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Amazon VPC Subnets, NAT &amp; Security Groups Guide</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">Think of VPC Security Groups like stateful firewall allow-lists referenced by <em>group ID</em> rather than brittle IP addresses: your RDS PostgreSQL Security Group only accepts TCP 5432 from the <code>order-service</code> Security Group, never <code>0.0.0.0/0</code>. Meanwhile, AWS SDK v2's <code>DefaultCredentialsProvider</code> automatically obtains short-lived STS tokens injected by EKS Pod Identity—zero static keys anywhere.</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>Public vs. Private Subnets:</strong> Only the Application Load Balancer (ALB) sits in <strong>public subnets</strong> (with an Internet Gateway route). Your Spring Boot pods and RDS PostgreSQL instances live in <strong>private subnets</strong> with zero public IPs.</li>
+    <li><strong>NAT Gateway &amp; VPC Endpoints:</strong> Pods in private subnets reach external APIs outbound through a NAT Gateway—or hit S3/Secrets Manager privately at zero NAT bandwidth cost using <strong>VPC Gateway/Interface Endpoints</strong>.</li>
+    <li><strong>Security Group Chaining (Not CIDR IPs):</strong> Reference the App Security Group ID inside the RDS Security Group inbound rule on port <code>5432</code>. Pods scale freely across new IPs without firewall edits.</li>
+    <li><strong>Zero Static AWS Keys:</strong> Bind an IAM Role directly to a Kubernetes <code>ServiceAccount</code> via <strong>EKS Pod Identity</strong> (or IRSA), scoped strictly to exact S3 prefixes / SQS queues (never <code>"Action": "*"</code> or <code>"Resource": "*"</code>).</li>
+  </ul>
+
+  <h2>Production Implementation (Least-Privilege IAM Policy &amp; AWS SDK v2 Credential Chain)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Least-Privilege IAM Policy + Zero-Key Spring Cloud AWS / SDK v2</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21/25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>// Least-Privilege IAM Policy for order-service (EKS Pod Identity Role)
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::nexus-invoices-prod/orders/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["sqs:SendMessage"],
+      "Resource": "arn:aws:sqs:us-east-1:123456789012:nexus-orders-queue"
+    }
+  ]
+}
+
+---
+// AwsClientConfig.java — Use DefaultCredentialsProvider (Pod Identity / IRSA automatic!)
+@Configuration
+public class AwsClientConfig {
+    @Bean
+    S3Client s3Client() {
+        return S3Client.builder()
+            .region(Region.US_EAST_1)
+            .credentialsProvider(DefaultCredentialsProvider.create())
+            .build();
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>// Least-Privilege IAM Policy (Identical JSON policy attached to Pod Identity Role)
+// Kubernetes ServiceAccount bound to role via EKS Pod Identity Association:
+// apiVersion: v1
+// kind: ServiceAccount
+// metadata:
+//   name: order-service-sa
+//   namespace: nexus-prod
+
+---
+// AwsClientConfig.kt — Zero hardcoded keys; uses DefaultCredentialsProvider
+@Configuration
+class AwsClientConfig {
+    @Bean
+    fun s3Client(): S3Client = S3Client.builder()
+        .region(Region.US_EAST_1)
+        .credentialsProvider(DefaultCredentialsProvider.create())
+        .build()
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis.
+  </p>
+
+  <div class="quiz-card" id="q0056_1" data-explanation="AWS Security Groups are stateful and allow referencing another Security Group ID as the source. Allowing TCP 5432 from the order-service Security Group ensures only those pods can connect, regardless of pod IP churn.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">How should an AWS RDS PostgreSQL Security Group restrict inbound port 5432 traffic for an auto-scaling Spring Boot cluster?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Referencing the application Security Group ID allows any auto-scaled pod while blocking all unrelated workloads.">
+        Allow TCP 5432 strictly from the Spring Boot application Security Group ID only.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Opening 0.0.0.0/0 exposes your database port to the entire internet or VPC.">
+        Allow TCP 5432 from 0.0.0.0/0 and rely solely on HikariCP database password checks.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Hardcoding ephemeral pod IP addresses breaks as soon as pods restart or HPA scales.">
+        Hardcode every individual Kubernetes pod IP address manually inside inbound firewall rules daily.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Putting RDS in a public subnet violates defense-in-depth and exposes the database unnecessarily.">
+        Place the RDS database inside a public subnet connected directly to an Internet Gateway.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0056_2" data-explanation="EKS Pod Identity (and IRSA) exchanges Kubernetes service account identity for temporary short-lived AWS STS tokens automatically picked up by DefaultCredentialsProvider—eliminating static long-lived keys.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">Why does EKS Pod Identity eliminate <code>AWS_ACCESS_KEY_ID</code> environment variables in Spring Boot pods?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. S3 and SQS always require IAM authentication; Pod Identity still authenticates via temporary STS tokens.">
+        EKS disables IAM authentication completely for all AWS services inside the same VPC region.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Pod Identity issues automatic, short-lived STS credentials tied to the pod ServiceAccount.">
+        AWS automatically injects short-lived rotating STS credentials tied directly to the pod ServiceAccount.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Secrets Manager stores app secrets like DB passwords, not zero-key STS role assumption.">
+        AWS Secrets Manager embeds permanent root IAM access keys inside every container JAR file.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Spring Boot does not use mTLS client certificates to replace AWS SigV4 IAM signing.">
+        Spring Boot replaces AWS IAM SigV4 signatures with self-signed mutual TLS container certificates.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0056_3" data-explanation="VPC Endpoints (like an S3 Gateway Endpoint) route traffic from private subnets straight to S3 inside the AWS backbone—bypassing the NAT Gateway and saving per-GB NAT data-processing fees.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">When private-subnet Spring Boot pods transfer terabytes of files with S3, how do you avoid expensive NAT Gateway data charges?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Moving pods into public subnets increases attack surface and still incurs internet egress if not routed internally.">
+        Move all Kubernetes worker nodes and RDS databases into public subnets with public IPs.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Disabling TLS violates security standards and does not bypass NAT Gateway routing.">
+        Disable HTTPS TLS encryption so S3 SDK traffic bypasses VPC routing tables completely.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! An S3 VPC Gateway Endpoint routes S3 traffic directly inside the AWS network for free.">
+        Attach an S3 VPC Gateway Endpoint so private traffic stays on the AWS backbone.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. HikariCP manages PostgreSQL JDBC pools and has nothing to do with S3 routing.">
+        Increase HikariCP maximumPoolSize to cache S3 file streams inside JVM heap memory buffers.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Author a least-privilege IAM policy scoped strictly to an S3 bucket prefix and wire an AWS SDK v2 client using <code>DefaultCredentialsProvider</code> (zero hardcoded keys).
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0056-lab"
+       data-starter-java="// 1. Define a least-privilege IAM policy string/comment allowing ONLY s3:PutObject on
+//    arn:aws:s3:::nexus-uploads-prod/invoices/* (NO Action: * or Resource: *)
+// 2. Build S3Client using DefaultCredentialsProvider.create()
+
+@Configuration
+public class SecureAwsConfig {
+    @Bean
+    S3Client s3Client() {
+        // TODO: Build S3Client with DefaultCredentialsProvider
+        return null;
+    }
+}"
+       data-starter-kotlin="// 1. Define a least-privilege IAM policy string/comment allowing ONLY s3:PutObject on
+//    arn:aws:s3:::nexus-uploads-prod/invoices/* (NO Action: * or Resource: *)
+// 2. Build S3Client using DefaultCredentialsProvider.create()
+
+@Configuration
+class SecureAwsConfig {
+    @Bean
+    fun s3Client(): S3Client {
+        // TODO: Build S3Client with DefaultCredentialsProvider
+        TODO()
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0056</span>
+        <span class="practice-title">Least-Privilege IAM &amp; Zero-Key AWS Client Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21/25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0056-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Include a least-privilege IAM policy snippet permitting <code>s3:PutObject</code> strictly on <code>arn:aws:s3:::nexus-uploads-prod/invoices/*</code> (without wildcard <code>Action: "*"</code> or <code>Resource: "*"</code>), and configure <code>S3Client.builder()</code> with <code>DefaultCredentialsProvider.create()</code>.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false"></textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Least-Privilege Action &amp; ARN</div>
+        <div>Include <code>"Action": ["s3:PutObject"]</code> and <code>"Resource": "arn:aws:s3:::nexus-uploads-prod/invoices/*"</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Zero Static Credentials</div>
+        <div>Never use <code>StaticCredentialsProvider</code>. Call <code>.credentialsProvider(DefaultCredentialsProvider.create())</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Concrete Snippet</div>
+        <div><code>return S3Client.builder().region(Region.US_EAST_1).credentialsProvider(DefaultCredentialsProvider.create()).build();</code></div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21/25 Implementation:</div>
+      <pre class="solution-code"><code>// IAM Policy: {"Action": ["s3:PutObject"], "Resource": "arn:aws:s3:::nexus-uploads-prod/invoices/*"}
+@Configuration
+public class SecureAwsConfig {
+    @Bean
+    S3Client s3Client() {
+        return S3Client.builder()
+            .region(Region.US_EAST_1)
+            .credentialsProvider(DefaultCredentialsProvider.create())
+            .build();
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>// IAM Policy: {"Action": ["s3:PutObject"], "Resource": "arn:aws:s3:::nexus-uploads-prod/invoices/*"}
+@Configuration
+class SecureAwsConfig {
+    @Bean
+    fun s3Client(): S3Client = S3Client.builder()
+        .region(Region.US_EAST_1)
+        .credentialsProvider(DefaultCredentialsProvider.create())
+        .build()
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;"><code>DefaultCredentialsProvider</code> transparently picks up LocalStack in tests, your SSO profile locally, and EKS Pod Identity STS tokens in production.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"When a Kubernetes pod in EKS cannot reach RDS PostgreSQL and times out after 30s, what is your exact 4-step VPC debugging checklist?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0048-aws-rds-postgresql-secrets-manager-localstack.html" class="btn btn-secondary">← Previous: Lesson 0048</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0057-aws-managed-messaging-and-compute-tradeoffs.html" class="btn btn-primary">Next: Lesson 0057 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0056 (Part 2)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0056-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Least-Privilege S3 Prefix Scoped (No Wildcard Admin)",
+    passed: /s3:PutObject/.test(code) && /arn:aws:s3:::nexus-uploads-prod\/invoices\/\*/.test(code) && !/"Action"\s*:\s*"\*"/.test(code) && !/"Resource"\s*:\s*"\*"/.test(code),
+    error: "Must scope IAM policy to s3:PutObject and arn:aws:s3:::nexus-uploads-prod/invoices/* without wildcard *."
+  });
+  tests.push({
+    name: "Zero-Key DefaultCredentialsProvider Used",
+    passed: /DefaultCredentialsProvider\.create\s*\(\s*\)/.test(code) && !/StaticCredentialsProvider/.test(code),
+    error: "Must use DefaultCredentialsProvider.create() and never StaticCredentialsProvider."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

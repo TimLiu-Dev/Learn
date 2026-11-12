@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lesson 0009: PostgreSQL Internals, API Design &amp; Operator UI State</title>
+  <link rel="stylesheet" href="../assets/fde-course.css" />
+</head>
+<body>
+  <nav class="course-topbar" aria-label="Course navigation">
+    <div class="topbar-inner">
+      <a class="topbar-brand" href="../master-plan.html">
+        <span class="topbar-badge">Lesson 0009 · Track 1</span>
+        <span>Senior FDE 2027 Curriculum</span>
+      </a>
+      <div class="topbar-links">
+        <a href="../master-plan.html">Master Plan</a>
+        <a href="./0008-production-sql-debugging-window-audits.html">0008</a>
+        <a href="./0009-postgres-internals-api-design-operator-ui.html" class="active">0009</a>
+        <a href="../reference/glossary.html">Glossary</a>
+        <a href="../reference/android-to-fde-bridge.html">Bridge</a>
+      </div>
+      <div class="topbar-progress" data-lesson-progress="0009">
+        <span class="progress-dot"></span>
+        <span class="progress-label">Labs 0/2 · Quiz 0/4</span>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-shell">
+    <header class="doc-header">
+      <p class="doc-eyebrow">Track 1 · Phase 2 · Unit 0009 · Full-Stack &amp; Database Engineering</p>
+      <h1>PostgreSQL Internals, API Design &amp; Operator UI Foundations</h1>
+      <p class="doc-subtitle">
+        Closing the full-stack gap from mobile dev: choosing Postgres B-tree, GIN, and HNSW indexes, avoiding
+        <code>OFFSET</code> pagination collapse, designing idempotent REST/GraphQL APIs, and wiring React operator tables.
+      </p>
+      <div class="meta-strip">
+        <span class="meta-item"><strong>Estimated Time:</strong> 25 min</span>
+        <span class="meta-item"><strong>Prerequisites:</strong> <a href="./0003-mobile-to-multitenant-backend.html">0003</a>, <a href="./0008-production-sql-debugging-window-audits.html">0008</a></span>
+        <span class="meta-item"><strong>Tangible Win:</strong> Build a Keyset Pagination API Builder &amp; Postgres Index Advisor</span>
+      </div>
+    </header>
+
+    <section class="wide-block">
+      <div class="tufte-grid">
+        <div>
+          <h2 class="no-rule">1. Why Android Room Habits Break on Multi-Tenant Postgres &amp; Operator UIs</h2>
+          <p>
+            On Android, SQLite/Room holds a few thousand rows for one user. On an FDE deployment, PostgreSQL holds
+            millions of rows across dozens of enterprise tenants, serving both your Python/TypeScript API and your
+            <a class="glossary-ref" href="../reference/glossary.html#hybrid-search">pgvector hybrid search</a>
+            (<a href="https://www.postgresql.org/docs/current/indexes-types.html" target="_blank" rel="noopener">PostgreSQL Index Docs</a>).
+          </p>
+          <ol>
+            <li><strong>Composite Tenant-First Indexes:</strong> Filtering <code>WHERE tenant_id = $1 AND status = $2</code> needs a composite B-tree index <code>(tenant_id, status, updated_at DESC)</code>—and use <code>GIN</code> for JSONB/<code>tsvector</code> and <code>HNSW</code> for embeddings (<a class="glossary-ref" href="../reference/glossary.html#postgres-indexing">Postgres Indexing</a>).</li>
+            <li><strong>Keyset (Cursor) Pagination Beats <code>OFFSET</code>:</strong> Deep <code>OFFSET 50000</code> scans and discards 50,000 rows while drifting if new webhooks insert mid-scroll. Cursor pagination (<code>(created_at, id) &lt; ($1, $2)</code>) stays O(log N) forever.</li>
+            <li><strong>Zero-Downtime Migrations &amp; Locks:</strong> Creating an index without <code>CONCURRENTLY</code> locks writes on live customer tables!</li>
+            <li><strong>Operator React/TS UI State:</strong> Enterprise users don't just chat—they triage 5,000 rows in filterable tables with server-driven pagination, URL-synced filters, and explicit mutation rollback.</li>
+          </ol>
+        </div>
+        <aside class="margin-note">
+          <strong>Android Bridge:</strong><br />
+          Keyset pagination in REST/GraphQL mirrors Jetpack Paging 3 remote keys—except you must tie-break timestamps with <code>id</code> so two orders created in the same millisecond never get skipped!
+        </aside>
+      </div>
+
+      <div class="compare-grid">
+        <div class="compare-card android">
+          <div class="compare-label">Mobile / Naive Default</div>
+          <h4>Local SQLite + Page Numbers</h4>
+          <ul>
+            <li>Uses <code>LIMIT 25 OFFSET 2500</code> page-number queries.</li>
+            <li>Runs schema migrations on app restart with zero lock concerns.</li>
+            <li>Single index on primary key feels fast on 2,000 local rows.</li>
+          </ul>
+        </div>
+        <div class="compare-card fde">
+          <div class="compare-label">Senior FDE Production</div>
+          <h4>Multi-Tenant Postgres + Keyset APIs</h4>
+          <ul>
+            <li>Uses opaque base64 cursors <code>(sortKey, id)</code> for deterministic O(log N) paging.</li>
+            <li>Deploys additive migrations + <code>CREATE INDEX CONCURRENTLY</code>.</li>
+            <li>Runs <code>EXPLAIN ANALYZE</code> to verify index scans inside every tenant query.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="prose-col">
+      <h2>2. Annotated Code: Postgres Index &amp; Keyset Pagination Pattern</h2>
+      <div class="code-example">
+        <div class="code-example-header">
+          <div class="code-example-title">
+            <span class="lang-pill">SQL / PostgreSQL</span>
+            <span>Tenant-Scoped Composite B-Tree + Deterministic Keyset Cursor</span>
+          </div>
+          <button type="button" class="copy-btn">Copy</button>
+        </div>
+        <pre><code>-- Composite index matches tenant filter + deterministic keyset sort:
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_tenant_cursor
+  ON orders (tenant_id, created_at DESC, id DESC);
+
+-- Keyset page fetch (fast at row #1 and row #1,000,000 alike):
+SELECT id, order_ref, amount, created_at
+FROM orders
+WHERE tenant_id = $1
+  AND (created_at, id) &lt; ($2::timestamptz, $3::text)
+ORDER BY created_at DESC, id DESC
+LIMIT 26; -- Fetch limit+1 to compute hasMore without running expensive COUNT(*)!</code></pre>
+      </div>
+    </section>
+
+    <section class="wide-block" id="practice">
+      <h2>3. Runnable Code Practice</h2>
+      <div class="code-lab" data-lab-id="lab-9a"></div>
+      <div class="code-lab" data-lab-id="lab-9b"></div>
+    </section>
+
+    <section class="prose-col" id="quizzes">
+      <h2>4. Diagnostic Multiple-Choice Quizzes</h2>
+      <div class="quiz-suite" data-quiz-id="quiz-0009"></div>
+    </section>
+
+    <footer class="lesson-footer prose-col">
+      <h2>5. Primary Reading &amp; Next Steps</h2>
+      <div class="callout">
+        <div class="callout-title">Recommended Primary Source</div>
+        <p>
+          Read <a href="https://www.postgresql.org/docs/current/indexes-types.html" target="_blank" rel="noopener"><strong>PostgreSQL Documentation: Index Types (B-Tree, GIN, GiST)</strong></a>
+          and review <a href="https://roadmap.sh/forward-deployed-engineer" target="_blank" rel="noopener"><strong>roadmap.sh FDE Full-Stack &amp; Database Foundations</strong></a>.
+        </p>
+      </div>
+      <div class="teacher-prompt-box">
+        <h3>Ask Your AI Teacher</h3>
+        <p>
+          Phase 2 complete! Ask me to review a real <code>EXPLAIN (ANALYZE, BUFFERS)</code> query plan or sketch a React Query + TypeScript table component before we move into Phase 3 Cloud Networking!
+        </p>
+      </div>
+      <div class="nav-footer-links">
+        <a href="./0008-production-sql-debugging-window-audits.html">&larr; Unit 0008: Production SQL Debugging &amp; Window D...</a>
+        <a href="../master-plan.html">Master Plan</a>
+        <a href="./0010-cloud-networking-vpc-tls-iam-foundations.html">Unit 0010: Cloud Networking, VPCs, TLS/mTLS &amp;... &rarr;</a>
+      </div>
+    </footer>
+  </main>
+
+  <script src="../assets/course-shell.js"></script>
+  <script src="../assets/code-lab.js"></script>
+  <script src="../assets/quiz-engine.js"></script>
+  <script>
+    (function () {
+      const LESSON_ID = "0009";
+      window.FDECourseProgress?.registerLessonTargets(LESSON_ID, 2, 4);
+
+      window.FDECodeLabs.register("lab-9a", {
+        lessonId: LESSON_ID,
+        title: "Lab 9A: Deterministic Multi-Tenant Keyset Pagination",
+        language: "JavaScript",
+        filename: "paginateTenantOrders.js",
+        exportNames: ["paginateTenantOrders"],
+        briefHtml: `
+          <p>Implement <code>paginateTenantOrders(rows, tenantId, cursor, limit)</code> (simulating SQL keyset paging without duplicate/skipped rows):</p>
+          <ul>
+            <li>Filter rows strictly to <code>r.tenantId === tenantId</code>.</li>
+            <li>Sort descending by <code>createdAtMs DESC</code>, tie-breaking by <code>id DESC</code> (string comparison).</li>
+            <li>If <code>cursor</code> is provided (<code>{ createdAtMs, id }</code>), include only rows strictly AFTER the cursor in sort order (i.e. <code>r.createdAtMs &lt; cursor.createdAtMs || (r.createdAtMs === cursor.createdAtMs && r.id &lt; cursor.id)</code>).</li>
+            <li>Clamp <code>limit</code> into <code>[1, 100]</code>. Take <code>items = filtered.slice(0, clampedLimit)</code>, set <code>hasMore = filtered.length &gt; clampedLimit</code>, and <code>nextCursor = hasMore ? { createdAtMs: last.createdAtMs, id: last.id } : null</code>.</li>
+          </ul>`,
+        starterCode: `function paginateTenantOrders(rows, tenantId, cursor, limit) {
+  // TODO: Tenant filter -> sort (createdAtMs DESC, id DESC) -> apply keyset cursor -> slice limit+1
+  return { items: [], hasMore: false, nextCursor: null };
+}`,
+        hints: [
+          "Sort tenant rows first: (b.createdAtMs - a.createdAtMs) || (b.id < a.id ? -1 : b.id > a.id ? 1 : 0).",
+          "When cursor is non-null, filter rows matching r.createdAtMs < cursor.createdAtMs || (r.createdAtMs === cursor.createdAtMs && r.id < cursor.id).",
+          "Use items.length > 0 && afterCursor.length > clampedLimit to set hasMore and nextCursor from items[items.length - 1]."
+        ],
+        solutionCode: `function paginateTenantOrders(rows, tenantId, cursor, limit) {
+  const clampedLimit = Math.max(1, Math.min(100, Number(limit) || 20));
+  const sorted = (Array.isArray(rows) ? rows : [])
+    .filter((r) => r && r.tenantId === tenantId)
+    .slice()
+    .sort((a, b) => {
+      if (b.createdAtMs !== a.createdAtMs) return b.createdAtMs - a.createdAtMs;
+      if (a.id === b.id) return 0;
+      return b.id > a.id ? 1 : -1;
+    });
+
+  const filtered = cursor
+    ? sorted.filter(
+        (r) =>
+          r.createdAtMs < cursor.createdAtMs ||
+          (r.createdAtMs === cursor.createdAtMs && r.id < cursor.id)
+      )
+    : sorted;
+
+  const items = filtered.slice(0, clampedLimit);
+  const hasMore = filtered.length > clampedLimit;
+  const last = items[items.length - 1];
+  const nextCursor = hasMore && last ? { createdAtMs: last.createdAtMs, id: last.id } : null;
+
+  return { items, hasMore, nextCursor };
+}`,
+        solutionExplanationHtml:
+          "<strong>Why this works:</strong> Sorting and tie-breaking by <code>(createdAtMs DESC, id DESC)</code> guarantees zero skipped or duplicated records even when multiple enterprise webhooks share the exact same millisecond timestamp.",
+        tests: [
+          {
+            name: "Pages cleanly across tie-broken millisecond timestamps without skipping rows",
+            run(api, assert) {
+              const rows = [
+                { tenantId: "t1", id: "o1", createdAtMs: 100 },
+                { tenantId: "t1", id: "o2", createdAtMs: 100 },
+                { tenantId: "t1", id: "o3", createdAtMs: 200 },
+                { tenantId: "t2", id: "o9", createdAtMs: 999 }
+              ];
+              const p1 = api.paginateTenantOrders(rows, "t1", null, 2);
+              assert.deepEqual(p1.items.map((x) => x.id), ["o3", "o2"]);
+              assert.equal(p1.hasMore, true);
+              assert.deepEqual(p1.nextCursor, { createdAtMs: 100, id: "o2" });
+
+              const p2 = api.paginateTenantOrders(rows, "t1", p1.nextCursor, 2);
+              assert.deepEqual(p2.items.map((x) => x.id), ["o1"]);
+              assert.equal(p2.hasMore, false);
+              assert.equal(p2.nextCursor, null);
+            }
+          },
+          {
+            name: "Enforces strict tenant isolation and limit clamping",
+            run(api, assert) {
+              const rows = [
+                { tenantId: "t1", id: "a", createdAtMs: 10 },
+                { tenantId: "t2", id: "b", createdAtMs: 20 }
+              ];
+              const res = api.paginateTenantOrders(rows, "t1", null, 500);
+              assert.equal(res.items.length, 1);
+              assert.equal(res.items[0].id, "a");
+            }
+          },
+          {
+            name: "Returns empty page safely when cursor passes all records",
+            run(api, assert) {
+              const res = api.paginateTenantOrders(
+                [{ tenantId: "t1", id: "o1", createdAtMs: 100 }],
+                "t1",
+                { createdAtMs: 50, id: "o0" },
+                10
+              );
+              assert.deepEqual(res, { items: [], hasMore: false, nextCursor: null });
+            }
+          }
+        ]
+      });
+
+      window.FDECodeLabs.register("lab-9b", {
+        lessonId: LESSON_ID,
+        title: "Lab 9B: PostgreSQL Index & Migration Safety Advisor",
+        language: "JavaScript",
+        filename: "recommendPostgresIndex.js",
+        exportNames: ["recommendPostgresIndex"],
+        briefHtml: `
+          <p>Implement <code>recommendPostgresIndex(spec)</code> given <code>{ queryType, tableName, columns, concurrent }</code>:</p>
+          <ul>
+            <li>Map <code>queryType</code> to index method: <code>"vector"</code> &rarr; <code>"hnsw"</code>, <code>"fulltext"</code> or <code>"jsonb"</code> &rarr; <code>"gin"</code>, else <code>"btree"</code>.</li>
+            <li>Validate <code>tableName</code> and every item in <code>columns</code> are non-empty safe identifiers (<code>/^[a-z_][a-z0-9_]*$/i</code>); otherwise throw <code>new Error("INVALID_IDENTIFIER")</code>.</li>
+            <li>Build SQL statement: <code>CREATE INDEX [CONCURRENTLY ]IF NOT EXISTS idx_&lt;table&gt;_&lt;cols&gt; ON &lt;table&gt; USING &lt;method&gt; (&lt;cols&gt;);</code></li>
+            <li>Return <code>{ indexMethod, lockSafe: spec.concurrent === true, sql }</code>.</li>
+          </ul>`,
+        starterCode: `function recommendPostgresIndex(spec) {
+  // TODO: Choose btree/gin/hnsw, validate identifiers, emit safe CREATE INDEX SQL
+  return { indexMethod: "btree", lockSafe: false, sql: "" };
+}`,
+        hints: [
+          "Validate tableName and each column with /^[a-z_][a-z0-9_]*$/i; throw if invalid or empty.",
+          "Include 'CONCURRENTLY ' right after 'CREATE INDEX ' when spec.concurrent === true.",
+          "Join columns with '_' in the index name and ', ' inside the USING (...) clause."
+        ],
+        solutionCode: `function recommendPostgresIndex(spec) {
+  const s = spec || {};
+  const identRe = /^[a-z_][a-z0-9_]*$/i;
+  if (typeof s.tableName !== "string" || !identRe.test(s.tableName)) {
+    throw new Error("INVALID_IDENTIFIER");
+  }
+  const cols = Array.isArray(s.columns) ? s.columns : [];
+  if (cols.length === 0 || cols.some((c) => typeof c !== "string" || !identRe.test(c))) {
+    throw new Error("INVALID_IDENTIFIER");
+  }
+
+  let indexMethod = "btree";
+  if (s.queryType === "vector") indexMethod = "hnsw";
+  else if (s.queryType === "fulltext" || s.queryType === "jsonb") indexMethod = "gin";
+
+  const lockSafe = s.concurrent === true;
+  const conc = lockSafe ? "CONCURRENTLY " : "";
+  const idxName = "idx_" + s.tableName + "_" + cols.join("_");
+  const sql =
+    "CREATE INDEX " + conc + "IF NOT EXISTS " + idxName +
+    " ON " + s.tableName + " USING " + indexMethod + " (" + cols.join(", ") + ");";
+
+  return { indexMethod, lockSafe, sql };
+}`,
+        solutionExplanationHtml:
+          "<strong>Why this works:</strong> Matching index structures (B-tree for tenant/cursor equality+range, GIN for <code>tsvector</code>/JSONB, HNSW for embeddings) while enforcing <code>CONCURRENTLY</code> prevents catastrophic production write locks during client deployments.",
+        tests: [
+          {
+            name: "Builds lock-safe composite B-tree index for multi-tenant cursors",
+            run(api, assert) {
+              const res = api.recommendPostgresIndex({
+                queryType: "range",
+                tableName: "orders",
+                columns: ["tenant_id", "created_at"],
+                concurrent: true
+              });
+              assert.equal(res.indexMethod, "btree");
+              assert.equal(res.lockSafe, true);
+              assert.ok(res.sql.includes("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_tenant_id_created_at"));
+              assert.ok(res.sql.includes("USING btree (tenant_id, created_at)"));
+            }
+          },
+          {
+            name: "Selects GIN for fulltext/JSONB and HNSW for vector columns",
+            run(api, assert) {
+              assert.equal(
+                api.recommendPostgresIndex({ queryType: "fulltext", tableName: "chunks", columns: ["tsv"], concurrent: true }).indexMethod,
+                "gin"
+              );
+              assert.equal(
+                api.recommendPostgresIndex({ queryType: "vector", tableName: "chunks", columns: ["embedding"], concurrent: false }).indexMethod,
+                "hnsw"
+              );
+            }
+          },
+          {
+            name: "Rejects SQL injection identifiers",
+            run(api, assert) {
+              let threw = false;
+              try {
+                api.recommendPostgresIndex({ queryType: "range", tableName: "orders; DROP TABLE users", columns: ["id"] });
+              } catch (_) {
+                threw = true;
+              }
+              assert.ok(threw, "Expected invalid SQL identifier to throw");
+            }
+          }
+        ]
+      });
+
+      window.FDEQuizzes.register("quiz-0009", {
+        lessonId: LESSON_ID,
+        items: [
+          {
+            id: "q1",
+            tag: "Postgres Index Ordering",
+            prompt: "Your API queries `WHERE tenant_id = $1 AND status = 'dlq' ORDER BY created_at DESC LIMIT 25` across 12M rows. Which index eliminates slow sequential scans?",
+            options: [
+              "A composite B-tree index ordered as tenant_id, status, then created_at descending.",
+              "A composite B-tree index starting with created_at before filtering on tenant_id.",
+              "A vector HNSW index built across the raw JSON payload text column.",
+              "Separate single-column hash indexes created without running concurrent index builds."
+            ],
+            correctIndex: 0,
+            summary: "Put equality filters (`tenant_id`, `status`) at the leading prefix of a B-tree index before sort columns (`created_at`).",
+            optionFeedback: [
+              "Leading with equality keys narrows directly to one tenant and status slice, then reads the top 25 rows already sorted by `created_at DESC` in O(log N) time.",
+              "Leading with `created_at` forces Postgres to scan recent rows across unrelated tenants before finding matching tenant rows.",
+              "HNSW indexes optimize floating-point vector similarity search, not exact relational equality predicates.",
+              "Hash indexes cannot satisfy `ORDER BY created_at DESC` sorting and omit multi-column composite filtering."
+            ]
+          },
+          {
+            id: "q2",
+            tag: "Production Migration Safety",
+            prompt: "During business hours on a live customer deployment, you run `CREATE INDEX idx_chunks_tsv ON doc_chunks USING gin(tsv);` on a 40M-row table. What happens immediately?",
+            options: [
+              "Postgres takes a table lock that blocks all customer inserts and updates.",
+              "Postgres silently drops duplicate documents without updating query execution plans.",
+              "Kubernetes triggers an OOMKill before PostgreSQL begins scanning disk blocks.",
+              "Existing B-tree indexes automatically convert themselves into parallel GIN hash tables."
+            ],
+            correctIndex: 0,
+            summary: "Standard `CREATE INDEX` blocks writes (`SHARE` lock); always use `CREATE INDEX CONCURRENTLY` on live customer tables.",
+            optionFeedback: [
+              "Without `CONCURRENTLY`, Postgres holds a `SHARE` lock blocking every `INSERT`, `UPDATE`, and `DELETE` until the entire 40M-row index finishes building—causing an immediate outage.",
+              "Creating an index never deletes or deduplicates existing table records.",
+              "The lock stall happens inside PostgreSQL transactions, not inside the application pod's memory allocator.",
+              "PostgreSQL never mutates existing B-tree indexes when creating a separate GIN index."
+            ]
+          },
+          {
+            id: "q3",
+            tag: "Keyset vs. OFFSET Pagination",
+            prompt: "Why do Senior FDEs replace `?page=400&limit=50` (`OFFSET 20000`) with keyset cursor pagination on live DLQ and webhook event tables?",
+            options: [
+              "OFFSET scans discarded rows slowly and skips items when new events arrive.",
+              "Browser fetch APIs prohibit sending integer page parameters inside REST query strings.",
+              "PostgreSQL restricts OFFSET clauses solely to single-tenant local developer databases.",
+              "Keyset pagination skips authentication checks so React tables render faster."
+            ],
+            correctIndex: 0,
+            summary: "Keyset cursors keep latency flat at any scroll depth and prevent rows from shifting across pages during live ingestion.",
+            optionFeedback: [
+              "With `OFFSET 20000`, Postgres still walks and discards 20,000 rows every page turn, and newly arriving webhook rows shift rows downward so operators see duplicates or miss items.",
+              "REST query strings allow any parameter; the performance and consistency problem lives inside the database scan.",
+              "PostgreSQL supports `OFFSET` on all databases; engineers avoid it voluntarily at scale.",
+              "Every paginated endpoint still enforces strict OIDC session and tenant ACL checks."
+            ]
+          },
+          {
+            id: "q4",
+            tag: "Operator UI Mutation Safety",
+            prompt: "In an operator workbench table, clicking 'Replay DLQ Row' triggers an optimistic UI update before the API responds. What must happen if the API returns 500?",
+            options: [
+              "Roll back the local row state and surface the structured failure reason.",
+              "Keep the row marked completed so operators avoid seeing transient network errors.",
+              "Automatically retry POST replay requests every ten milliseconds in an infinite loop.",
+              "Reload the entire browser window automatically, discarding all active search filters."
+            ],
+            correctIndex: 0,
+            summary: "Optimistic UI mutations must roll back cleanly on failure and display actionable error context to the operator.",
+            optionFeedback: [
+              "Leaving a failed replay marked 'completed' tricks operators into thinking an order synced when it actually failed; clean rollback plus explicit error telemetry preserves trust.",
+              "Hiding failed writes silently violates operational reliability in enterprise back-office tools.",
+              "Unbounded 10ms retry loops DDoS your own backend; use bounded retries with explicit operator feedback.",
+              "Force-reloading the tab destroys operator triage state instead of gracefully updating row status."
+            ]
+          }
+        ]
+      });
+    })();
+  </script>
+</body>
+</html>

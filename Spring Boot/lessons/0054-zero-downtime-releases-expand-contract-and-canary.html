@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0054: Zero-Downtime Releases: Expand-and-Contract Migrations &amp; Canary Rollouts</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Part 2 • Phase 17: Track 2B — Professional DevOps &amp; Kubernetes Operations</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21/25</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0054 • Part 2 Phase 17</span>
+    <h1 style="margin-top: 8px;">Zero-Downtime Releases: Expand-and-Contract Migrations &amp; Canary Rollouts</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Even with Kubernetes rolling updates and graceful shutdown, a single Flyway migration like <code>ALTER TABLE orders RENAME COLUMN total TO amount_cents</code> will crash your old v1 pods mid-rollout while v1 and v2 share the same database! True zero-downtime deployment requires <strong>N-1 backward compatibility</strong>. In this lesson, we master the <strong>Expand-and-Contract</strong> database migration pattern, decouple deployment from release with <strong>Feature Flags</strong>, and compare <strong>Canary</strong> vs. <strong>Blue-Green</strong> traffic shifting.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://martinfowler.com/bliki/ParallelChange.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Martin Fowler: Parallel Change (Expand &amp; Contract)</a> and <a href="https://documentation.red-gate.com/fd/migrations-184127470.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Flyway Documentation: Zero-Downtime Migrations</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Why This Matters in Production</div>
+    <p style="margin-bottom: 0;">Just as a backend API must support old Android app versions that users haven't updated yet, a shared PostgreSQL schema during a rolling or canary deploy must simultaneously satisfy <strong>both v1 and v2</strong> backend pods. Breaking schema changes cannot happen in one release.</p>
+  </div>
+
+  <h2>Key Architectural Takeaways</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>The Expand-and-Contract (Parallel Change) 3-Deploy Rule:</strong>
+      <ol style="margin: 6px 0 6px 20px;">
+        <li><strong>Expand:</strong> Add the new nullable column (<code>ADD COLUMN amount_cents BIGINT</code>); deploy app v2 writing to <em>both</em> old and new columns (reading old or coalescing).</li>
+        <li><strong>Backfill &amp; Switch:</strong> Batch-backfill historical rows safely without locking the table; deploy v3 reading solely from <code>amount_cents</code>.</li>
+        <li><strong>Contract:</strong> Only after 100% of v1/v2 pods are gone, drop the legacy column and enforce <code>NOT NULL</code> (using <code>NOT VALID</code> + <code>VALIDATE CONSTRAINT</code> in PostgreSQL to avoid table-wide write locks).</li>
+      </ol>
+    </li>
+    <li><strong>Canary vs. Blue-Green Deployments:</strong> Blue-Green swaps 100% traffic instantly (fast rollback, 2× compute cost); Canary shifts 5% → 25% → 100% traffic while automated SLO checks abort on error-rate spikes.</li>
+    <li><strong>Deploy ≠ Release (Feature Flags):</strong> Ship dark code behind a runtime flag so turning off a broken feature takes 1 second without rolling back containers or Flyway schemas.</li>
+  </ul>
+
+  <h2>Production Implementation (Java 21/25 vs Kotlin 2.x — Dual-Write Expand Phase)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Expand-Phase Flyway SQL + Dual-Write JPA Entity</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21/25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>-- V12__expand_add_amount_cents.sql (Safe: nullable, metadata-only instant in Postgres)
+ALTER TABLE orders ADD COLUMN amount_cents BIGINT;
+
+-- Later in Contract phase (avoids AccessExclusiveLock scan on million-row table):
+-- ALTER TABLE orders ADD CONSTRAINT chk_amount_not_null CHECK (amount_cents IS NOT NULL) NOT VALID;
+-- ALTER TABLE orders VALIDATE CONSTRAINT chk_amount_not_null;
+
+---
+// OrderEntity.java — Expand Phase: Dual-write to old &amp; new columns so v1 and v2 coexist
+@Entity
+@Table(name = "orders")
+public class OrderEntity {
+    @Id
+    private UUID id;
+
+    @Column(name = "total")
+    private BigDecimal legacyTotal;   // Still read by running v1 pods
+
+    @Column(name = "amount_cents")
+    private Long amountCents;         // Read by v2+ pods
+
+    public void setOrderAmount(long cents) {
+        this.amountCents = cents;
+        this.legacyTotal = BigDecimal.valueOf(cents, 2); // Dual-write keeps v1 safe!
+    }
+
+    public long effectiveAmountCents() {
+        return amountCents != null ? amountCents : legacyTotal.movePointRight(2).longValueExact();
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>-- V12__expand_add_amount_cents.sql
+ALTER TABLE orders ADD COLUMN amount_cents BIGINT;
+
+---
+// OrderEntity.kt — Expand Phase: Dual-write to old &amp; new columns
+@Entity
+@Table(name = "orders")
+class OrderEntity(
+    @Id
+    val id: UUID,
+    @Column(name = "total")
+    var legacyTotal: BigDecimal,
+    @Column(name = "amount_cents")
+    var amountCents: Long? = null
+) {
+    fun setOrderAmount(cents: Long) {
+        this.amountCents = cents
+        this.legacyTotal = BigDecimal.valueOf(cents, 2)
+    }
+
+    fun effectiveAmountCents(): Long =
+        amountCents ?: legacyTotal.movePointRight(2).longValueExact()
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis.
+  </p>
+
+  <div class="quiz-card" id="q0054_1" data-explanation="During a rolling or canary deployment, both old v1 and new v2 pods execute queries against the exact same database simultaneously. Dropping or renaming a column immediately breaks every still-running v1 pod.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Why does running <code>ALTER TABLE orders RENAME COLUMN total TO amount_cents</code> during a zero-downtime deployment cause production errors?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Old v1 pods still serving traffic query the renamed column and fail with SQL errors.">
+        Existing v1 pods still handling live requests query the old column name and fail immediately.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Flyway supports any valid PostgreSQL DDL statement including RENAME COLUMN.">
+        Flyway refuses to execute any ALTER TABLE RENAME COLUMN statement inside versioned SQL migration files.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Hibernate cannot automatically rewrite compiled JPA column mappings at runtime.">
+        Hibernate caches SQL table schemas permanently unless you manually restart every Kubernetes worker host node.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. PostgreSQL supports column renames inside transactions; the issue is v1 application compatibility.">
+        PostgreSQL forbids renaming existing columns unless the entire RDS database instance enters read-only mode.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0054_2" data-explanation="Adding a NOT NULL check constraint with NOT VALID checks only new writes instantly without scanning existing rows under an exclusive table lock; VALIDATE CONSTRAINT then scans rows under a lighter ShareUpdateExclusive lock.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">On a 100-million-row PostgreSQL table, how do you enforce a <code>NOT NULL</code> constraint in the Contract phase without blocking writes?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. SET NOT NULL scans the entire table under an AccessExclusiveLock unless backed by a validated check constraint.">
+        Run ALTER TABLE SET NOT NULL directly inside one single migration during peak checkout hours.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Adding CHECK (...) NOT VALID then running VALIDATE CONSTRAINT avoids blocking concurrent reads and writes.">
+        Add a CHECK constraint marked NOT VALID first and then execute VALIDATE CONSTRAINT separately afterward.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Disabling Flyway leaves schema drift and unverified production tables.">
+        Delete Flyway history tables and edit column nullability manually through a production pgAdmin console session.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. JPA @NotNull validates in Java memory, not PostgreSQL disk constraints.">
+        Place Jakarta @NotNull on the Java field because Hibernate enforces constraints without locking database tables.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0054_3" data-explanation="Canary rollouts route a small percentage (e.g., 5%) of live production traffic to the new version while monitoring error/latency SLOs, limiting blast radius compared to an immediate 100% switch.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">What is the key safety advantage of a Canary rollout over a traditional Blue-Green traffic cutover?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Canary still requires backward-compatible database schemas because old and new pods run together.">
+        Canary removes any need for backward-compatible Flyway database migrations because versions never share databases.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Blue-Green actually uses more idle capacity (2x) than a small 5% canary.">
+        Canary requires running double full-cluster capacity permanently before routing even one single customer request.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Canary exposes a small traffic slice first and aborts automatically if SLO error budgets burn.">
+        Canary limits blast radius to a small traffic slice and aborts automatically on SLO degradation.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Neither Canary nor Blue-Green disables TLS or Spring Security filter chains.">
+        Canary bypasses Spring Security authentication filters so new deployment pods warm JVM caches faster.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Implement the Expand-phase migration and dual-write + fallback-read helper on <code>OrderRecord</code> so v1 and v2 pods run safely side-by-side.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0054-lab"
+       data-starter-java="// Expand Phase Lab:
+// 1. Write Flyway SQL comment: ALTER TABLE orders ADD COLUMN amount_cents BIGINT;
+// 2. Implement updateAmount(long cents) to dual-write both amountCents and legacyTotal
+// 3. Implement readAmountCents() to return amountCents if non-null, else convert legacyTotal
+
+public class OrderMigrationHelper {
+    private BigDecimal legacyTotal;
+    private Long amountCents;
+
+    public void updateAmount(long cents) {
+        // TODO: dual-write
+    }
+
+    public long readAmountCents() {
+        // TODO: null-safe fallback read
+        return 0L;
+    }
+}"
+       data-starter-kotlin="// Expand Phase Lab:
+// 1. Write Flyway SQL comment: ALTER TABLE orders ADD COLUMN amount_cents BIGINT;
+// 2. Implement updateAmount(cents: Long) to dual-write both amountCents and legacyTotal
+// 3. Implement readAmountCents(): Long to return amountCents ?: legacyTotal converted to cents
+
+class OrderMigrationHelper(
+    var legacyTotal: BigDecimal,
+    var amountCents: Long? = null
+) {
+    fun updateAmount(cents: Long) {
+        // TODO: dual-write
+    }
+
+    fun readAmountCents(): Long {
+        // TODO: null-safe fallback read
+        return 0L
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0054</span>
+        <span class="practice-title">Expand-and-Contract Dual-Write Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21/25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0054-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Include the non-blocking Flyway Expand DDL (<code>ALTER TABLE orders ADD COLUMN amount_cents BIGINT</code>), dual-write both <code>amountCents</code> and <code>legacyTotal</code> inside <code>updateAmount</code>, and read with null-safe fallback inside <code>readAmountCents</code>.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false"></textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Safe DDL</div>
+        <div>Add the SQL statement <code>ALTER TABLE orders ADD COLUMN amount_cents BIGINT;</code> (never <code>DROP COLUMN</code> or <code>RENAME COLUMN</code> in Expand!).</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Dual-Write</div>
+        <div>In <code>updateAmount</code>, set <code>this.amountCents = cents</code> and <code>this.legacyTotal = BigDecimal.valueOf(cents, 2)</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Fallback Read</div>
+        <div>In Java: <code>amountCents != null ? amountCents : legacyTotal.movePointRight(2).longValueExact()</code>. In Kotlin: <code>amountCents ?: legacyTotal.movePointRight(2).longValueExact()</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21/25 Implementation:</div>
+      <pre class="solution-code"><code>// ALTER TABLE orders ADD COLUMN amount_cents BIGINT;
+public class OrderMigrationHelper {
+    private BigDecimal legacyTotal;
+    private Long amountCents;
+
+    public void updateAmount(long cents) {
+        this.amountCents = cents;
+        this.legacyTotal = BigDecimal.valueOf(cents, 2);
+    }
+
+    public long readAmountCents() {
+        return amountCents != null ? amountCents : legacyTotal.movePointRight(2).longValueExact();
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>// ALTER TABLE orders ADD COLUMN amount_cents BIGINT;
+class OrderMigrationHelper(
+    var legacyTotal: BigDecimal,
+    var amountCents: Long? = null
+) {
+    fun updateAmount(cents: Long) {
+        this.amountCents = cents
+        this.legacyTotal = BigDecimal.valueOf(cents, 2)
+    }
+
+    fun readAmountCents(): Long =
+        amountCents ?: legacyTotal.movePointRight(2).longValueExact()
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Dual-writing keeps v1 readers intact while v2+ pods populate the new column and tolerate un-backfilled rows cleanly until the Contract release.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"How do you safely backfill 50 million historical rows in PostgreSQL during the Expand-and-Contract transition without causing replication lag or autovacuum bloat?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0053-kubernetes-cpu-throttling-hpa-and-pdbs.html" class="btn btn-secondary">← Previous: Lesson 0053</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0055-helm-kustomize-and-supply-chain-security.html" class="btn btn-primary">Next: Lesson 0055 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0054 (Part 2)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0054-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Safe Expand DDL (No Destructive Drop/Rename)",
+    passed: /ALTER\s+TABLE\s+orders\s+ADD\s+COLUMN\s+amount_cents\s+BIGINT/i.test(code) && !/DROP\s+COLUMN|RENAME\s+COLUMN/i.test(code),
+    error: "Must use ALTER TABLE orders ADD COLUMN amount_cents BIGINT without dropping/renaming columns."
+  });
+  tests.push({
+    name: "Dual-Write in updateAmount",
+    passed: /amountCents\s*=\s*cents/.test(code) && /legacyTotal\s*=\s*BigDecimal\.valueOf/.test(code),
+    error: "updateAmount must dual-write both amountCents and legacyTotal."
+  });
+  tests.push({
+    name: "Null-Safe Fallback Read in readAmountCents",
+    passed: /amountCents\s*(!=\s*null|\?:)/.test(code) && /legacyTotal/.test(code),
+    error: "readAmountCents must check amountCents for null and fall back to legacyTotal."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>
