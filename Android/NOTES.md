@@ -23,11 +23,15 @@
 - **Background Tasks**: Jetpack WorkManager (CoroutineWorker, expedited sync, battery-conscious constraints)
 - **Testing**: JUnit 5, MockK, Turbine, Robolectric, Compose Test Rule, Maestro E2E
 - **Build & Optimization**: Gradle Version Catalogs (`libs.versions.toml`), Kotlin DSL (`build.gradle.kts`), Convention Plugins (`build-logic`), Baseline Profiles, R8 Full Mode
+- **2027 Platform Mandates & Trust**: 16 KB Memory Page alignment, Android 17 mandatory large-screen resizability, Predictive Back (`PredictiveBackHandler`), Credential Manager (Passkeys), Play Integrity API, Foreground Service Types & Photo Picker
+- **Visual Regression & Observability**: Roborazzi / Compose Preview Screenshot Testing, `ApplicationExitInfo` ANR/OOM forensics, Staged Rollouts
+- **Cross-Platform Native & On-Device AI**: Kotlin Multiplatform (KMP `commonMain` shared domain/data with Ktor, Room KMP, Koin), Compose Multiplatform (CMP), Gemini Nano / AICore
 
 ## Current Progress & Curriculum State
-- **Master Plan**: 60 Lessons across 8 Phases fully structured in `MASTER_PLAN.md` and `MASTER_PLAN.html`.
+- **Master Plan**: 68 Lessons across 9 Phases fully structured in `MASTER_PLAN.md` and `MASTER_PLAN.html`.
 - **Reference Cheat Sheets**:
   1. `reference/01-kotlin-coroutines-flow.html`
   2. `reference/02-jetpack-compose-m3.html`
   3. `reference/03-modern-android-architecture.html`
+  4. `reference/04-2027-senior-mandates-and-kmp.html`
 - **Interactive Engine v2**: Universal JS & CSS in `assets/lesson-interactives.js` and `assets/interactives.css` supporting runnable code examples, comment-stripped verification IDEs, progressive hints, solution injection, and dual quizzes (code reading + architectural) with explanations for every choice.

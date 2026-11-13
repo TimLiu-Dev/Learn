@@ -10,6 +10,7 @@ from data_phase4_part2 import PHASE4_PART2
 from data_phase5 import PHASE5_LESSONS
 from data_phase6 import PHASE6_LESSONS
 from data_phase7_and_8 import PHASE7_AND_8_LESSONS
+from data_phase8_frontier import PHASE8_FRONTIER_LESSONS
 
 all_lessons = (
     PHASE1_LESSONS +
@@ -19,6 +20,7 @@ all_lessons = (
     PHASE4_PART2 +
     PHASE5_LESSONS +
     PHASE6_LESSONS +
+    PHASE8_FRONTIER_LESSONS +
     PHASE7_AND_8_LESSONS
 )
 
@@ -67,8 +69,14 @@ phases_meta = [
     },
     {
         "num": 8,
-        "title": "Phase 8: Capstone Portfolio Project ('PulseFlow Enterprise')",
-        "subtitle": "Resume-Worthy End-to-End Multi-Module Production App Blueprint & Practice",
+        "title": "Phase 8: 2027 Senior iOS Frontier & Platform Expansion",
+        "subtitle": "Obj-C Interop, Swift 6.2/6.3 Mutex & ~Copyable, TCA, SQLite/GRDB, XCFrameworks, Liquid Glass, FoundationModels, AppIntents, StoreKit 2 & Xcode Cloud",
+        "badge": "12 Lessons Available"
+    },
+    {
+        "num": 9,
+        "title": "Phase 9: Capstone Portfolio Project ('PulseFlow Enterprise')",
+        "subtitle": "Resume-Worthy End-to-End 2027 Multi-Module Production App Blueprint & Practice",
         "badge": "Capstone Available"
     }
 ]
@@ -163,7 +171,7 @@ with open("MASTER_PLAN.md", "r", encoding="utf-8") as f:
     plan_content = f.read()
 
 # Replace syllabus section
-syllabus_pattern = re.compile(r'### Phase 1: Swift Compiler & Language Internals Through an Android Lens.*?---', re.DOTALL)
+syllabus_pattern = re.compile(r'### Phase 1: Swift Compiler & Language Internals.*?---', re.DOTALL)
 new_syllabus = "\n".join(plan_syllabus_lines) + "---\n"
 plan_content = syllabus_pattern.sub(new_syllabus, plan_content)
 
@@ -174,4 +182,4 @@ plan_content = tracker_pattern.sub(new_tracker, plan_content)
 
 with open("MASTER_PLAN.md", "w", encoding="utf-8") as f:
     f.write(plan_content)
-print("Updated MASTER_PLAN.md with 49-lesson syllabus and reset progress checkboxes!")
+print(f"Updated MASTER_PLAN.md with {len(all_lessons)}-lesson syllabus and reset progress checkboxes!")

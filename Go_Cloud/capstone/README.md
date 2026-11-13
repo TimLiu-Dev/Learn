@@ -1,7 +1,7 @@
 # CloudScale Ledger: Distributed Financial Transaction Engine (2027)
 
 > **Staff/Senior Go Cloud Engineering Capstone Portfolio Project**  
-> An enterprise-grade, distributed double-entry transaction engine and event-streaming pipeline engineered in Go and Kubernetes to sustain 50,000+ rps with sub-5ms p99 latency and zero data loss.
+> A reference distributed double-entry transaction engine and transactional outbox codebase engineered in Go and Kubernetes to demonstrate ACID ledger validation, bounded worker execution, container-aware runtime limits, and reproducible Go microbenchmarks.
 
 ---
 
@@ -17,51 +17,56 @@
    - Asynchronous outbox processor dispatches events to Kafka / Redpanda with exponential backoff and idempotency headers.
 
 3. **High-Performance Memory & Go Runtime Tuning**:
-   - Cache-line padded data structures to eliminate CPU false sharing on multi-core nodes.
-   - Profile-Guided Optimization (PGO) automated compilation via `default.pgo`.
-   - Kubernetes CFS quota protection using `go.uber.org/automaxprocs` to avoid Linux kernel throttling.
-   - Zero-OOMKill guarantee via `GOMEMLIMIT=460MiB` on a 512MiB cgroup boundary (90% threshold).
+   - Cache-line padded counters and bounded queues in `domain/` and `outbox/` to reduce contention on multi-core nodes.
+   - Profile-Guided Optimization (PGO) workflow via `default.pgo`.
+   - Native Go 1.25+ container-aware `GOMAXPROCS` (`containermaxprocs` / `updatemaxprocs` GODEBUG defaults reading Linux cgroup CPU limits automatically), with `go.uber.org/automaxprocs` only needed for legacy Go 1.24 or earlier runtimes.
+   - Zero-OOMKill headroom via `GOMEMLIMIT=460MiB` on a 512MiB cgroup boundary (90% threshold).
 
 4. **Zero-Trust Cloud Security & Distroless Packaging**:
-   - Google Distroless scratch image (<15MB) running as non-root UID 65532.
+   - Multi-stage Google Distroless `static-debian12:nonroot` image (see `Dockerfile`, running as non-root UID 65532).
    - Read-only root filesystem, dropped Linux capabilities, and no static credentials (SPIFFE/SPIRE & Cloud Workload Identity Federation).
 
 ---
 
-## 📊 Benchmark Results
+## 📊 Verification & Benchmark Results
 
-Running parallel load simulation on an 8-core benchmark harness:
+Run the full race-detector test suite and build the service binary locally:
+
+```bash
+cd capstone
+go vet ./...
+go test -v -race ./...
+go build -buildvcs=false -o /tmp/ledger-service ./cmd/server
+```
+
+Run the isolated micro-benchmarks locally (`./benchmark/...`):
 
 ```bash
 go test -bench=. -benchmem ./benchmark/...
 ```
 
-```
-goos: linux
-goarch: amd64
-pkg: gocloud/capstone/benchmark
-cpu: AMD EPYC 7B13 (8 cores)
-BenchmarkLedgerExecution-8            102,481   11.4 ns/op     0 B/op   0 allocs/op
-BenchmarkParallelLedgerExecution-8    542,190   19.8 ns/op     0 B/op   0 allocs/op
-PASS
-ok   gocloud/capstone/benchmark  3.412s
+Baseline run measured on `go1.27.2 darwin/arm64` (`-benchmem` shows pure validation vs stateful execution vs parallel sharded execution):
+
+```text
+BenchmarkValidateDoubleEntry-18      1.749 ns/op    0 B/op    0 allocs/op
+BenchmarkLedgerExecution-18          108.5 ns/op   80 B/op    0 allocs/op
+BenchmarkParallelLedgerExecution-18  148.0 ns/op    0 B/op    0 allocs/op
 ```
 
-- **Throughput**: Sustained **54,200+ transactions/second** in parallel execution.
-- **Memory Hot-Path**: **0 B/op heap allocation** via object reuse and zero-allocation slice buffers.
-- **Latency**: p95: 1.2ms | p99: 4.1ms.
+- **Zero Heap Allocations on Parallel Path**: `0 allocs/op` on balanced validation and parallel sharded ledger execution (note: `80 B/op` on single-goroutine `BenchmarkLedgerExecution` reflects amortizing underlying balance map/slice growth rather than per-tx struct boxing).
+- **Correctness Under Race Detector**: Idempotency keys are stored *after* balance/active validation so failed transfers cannot poison retries, and `outbox.Worker` snapshots batches under mutex before publishing.
 
 ---
 
-## 💼 Senior / Staff Resume Bullet Points
+## 💼 Senior / Staff Resume Bullet Templates
 
-Copy and adapt these directly into your resume:
+Measure your own service throughput, p99 latency, image size, and cost deltas after running load tests on your target environment before inserting concrete numbers:
 
-> **Senior Go Distributed Systems Engineer | CloudScale Ledger (Open Source)**
-> - Architected a high-throughput distributed financial ledger service in Go and Kubernetes sustaining 50,000+ transactions/sec with sub-5ms p99 latency using zero-allocation memory pooling and lock-free concurrency.
-> - Guaranteed ACID transaction consistency and zero event loss across PostgreSQL and Kafka/Redpanda by implementing the Transactional Outbox pattern with idempotency keys and CDC streaming.
-> - Eliminated container CFS quota throttling and Exit 137 OOMKills by configuring `automaxprocs` and `GOMEMLIMIT` memory ballasting, reducing infrastructure spend by 35%.
-> - Implemented Profile-Guided Optimization (PGO) in GitHub Actions CI/CD and packaged services in hardened Distroless containers (<15MB) with SPIFFE/SPIRE workload identity federation.
+> **Senior Go Distributed Systems Engineer | CloudScale Ledger**
+> - Architected a double-entry financial ledger service in Go and Kubernetes achieving `0 allocs/op` on parallel transaction validation/execution paths via integer-cent accounting and bounded concurrency.
+> - Guaranteed local ACID consistency and reliable asynchronous publishing by pairing database state transitions with a race-tested Transactional Outbox worker (`outbox/`) and idempotency keys.
+> - Eliminated container CFS quota throttling and OOMKills by sizing runtime limits with Go 1.25+ container-aware `GOMAXPROCS` (`go.uber.org/automaxprocs` on Go <= 1.24) and `GOMEMLIMIT`.
+> - Packaged static Go services into hardened non-root Distroless container images with multi-stage builds, automated `-race` verification, and PGO build support.
 
 ---
 

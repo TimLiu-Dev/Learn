@@ -16,6 +16,14 @@
   Direct guidance from Apple engineers on new APIs, Instruments profiling, and Swift evolution. Use for: architectural best practices and debugging techniques.
 - [Swift Evolution Proposals (apple/swift-evolution)](https://github.com/apple/swift-evolution)
   Detailed rationale behind Swift language design choices. Use for: understanding why Swift behaves the way it does compared to Kotlin.
+- [Apple Developer: Foundation Models & App Intents](https://developer.apple.com/documentation/foundationmodels)
+  Official Apple documentation for on-device guided generation (`@Generable`), tool calling, and system intelligence (`AppIntents`). Use for: integrating Apple Intelligence and Siri/Spotlight actions.
+- [Apple Developer: StoreKit 2 & AuthenticationServices](https://developer.apple.com/documentation/storekit)
+  Modern async JWS-verified in-app purchases and FIDO2 Passkeys authentication. Use for: subscription entitlements and passwordless sign-in.
+- [GRDB.swift (Gwendal Roué)](https://github.com/groue/GRDB.swift)
+  Production-grade Swift SQLite toolkit for concurrent database access, migrations, and observation. Use for: high-throughput offline-first persistence beyond SwiftData's limits.
+- [swift-format (apple/swift-format)](https://github.com/swiftlang/swift-format)
+  Official Swift toolchain formatter and linter. Use for: automated CI style gates and Xcode Build Tool Plugins.
 
 ## Wisdom (Communities)
 

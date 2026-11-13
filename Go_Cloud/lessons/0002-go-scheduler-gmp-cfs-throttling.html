@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lesson 0002: Go Scheduler (GMP), K8s CFS Quotas, &amp; automaxprocs</title>
+  <title>Lesson 0002: Go Scheduler (GMP), K8s CFS Quotas &amp; GOMAXPROCS</title>
   <link rel="stylesheet" href="../assets/style.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚙️</text></svg>">
 </head>
@@ -41,7 +41,7 @@
       </div>
     </div>
 
-    <h1>Lesson 0002: The Go Scheduler (GMP), K8s CFS Quota Throttling, &amp; automaxprocs</h1>
+    <h1>Lesson 0002: The Go Scheduler (GMP), K8s CFS Quotas &amp; Container GOMAXPROCS</h1>
     <p class="lead-paragraph">
       Deploying Go microservices to Kubernetes without understanding the <strong>GMP runtime scheduler</strong> causes catastrophic production outages. When a pod with a <code>2.0 CPU</code> limit runs on a 64-core node, Go defaults to 64 logical processors (<code>P=64</code>), triggering severe Linux Completely Fair Scheduler (CFS) quota throttling and tail latency spikes. In this lesson, we dissect the internal mechanics of the GMP scheduler and learn how to configure production Go binaries for cloud orchestration.
     </p>
@@ -78,30 +78,27 @@
     <div class="callout callout-warning">
       <div class="callout-title">⚠️ The Quota Multiplication Bug</div>
       <p style="margin-bottom: 0;">
-        Suppose your Kubernetes Pod specifies <code>resources.limits.cpu: "2"</code> on a physical node with 64 physical cores.
-        By default, Go calls <code>runtime.NumCPU()</code>, which returns <strong>64</strong>, setting <code>GOMAXPROCS=64</code>!
-        When high traffic arrives, 64 OS threads (M) spin concurrently across 64 cores. In just <strong>3.125ms</strong>, your pod exhausts its entire 200ms CPU quota for the 100ms window (64 threads &times; 3.125ms = 200ms quota).
-        <strong>Result:</strong> The Linux kernel suspends every thread in your container for the remaining 96.875ms! Your p99 latency skyrockets from 2ms to over 100ms, triggering upstream timeout cascades.
+        Suppose your Kubernetes Pod specifies <code>resources.limits.cpu: "2"</code> on a physical node with 64 cores.
+        On Go 1.24 and earlier, <code>runtime.NumCPU()</code> returns <strong>64</strong>, setting <code>GOMAXPROCS=64</code>! When bursts arrive, 64 threads (M) run concurrently and burn the 200ms quota per 100ms period in <strong>3.125ms</strong>, leaving the Linux kernel throttling the container for the remaining 96.875ms.
+        <strong>The Go 1.25+ Built-In Fix:</strong> Modern Go (>= 1.25) inspects Linux container cgroups natively at startup (<code>containermaxprocs</code>) and updates dynamically as limits change (<code>updatemaxprocs</code>), keeping <code>GOMAXPROCS</code> aligned automatically. On legacy Go &le; 1.24, import <code>go.uber.org/automaxprocs</code>. Always query the effective thread budget with <code>runtime.GOMAXPROCS(0)</code> (not <code>os.Getenv("GOMAXPROCS")</code>).
       </p>
     </div>
 
     <div class="code-header">
       <span>main.go</span>
-      <span>The 2027 Production Fix: automaxprocs</span>
+      <span>Go 1.25+ Native Cgroup Awareness (+ Legacy Fallback)</span>
     </div>
     <pre><code class="language-go">package main
 
 import (
     "log/slog"
-    "os"
-
-    // Automatically inspects Linux cgroups (v1 and v2) and tunes GOMAXPROCS
-    // to match container CPU quota (e.g. 2 cores instead of 64).
-    _ "go.uber.org/automaxprocs"
+    "runtime"
+    // Only required when targeting Go 1.24 or earlier:
+    // _ "go.uber.org/automaxprocs"
 )
 
 func main() {
-    slog.Info("Service booted", "GOMAXPROCS", os.Getenv("GOMAXPROCS"))
+    slog.Info("Service booted", "effective_gomaxprocs", runtime.GOMAXPROCS(0))
 }</code></pre>
 
     <!-- Section 3: Interactive Practice Widget -->
@@ -125,7 +122,12 @@ func main() {
       </div>
 
       <div class="practice-desc">
-        Complete the <code>Dispatcher</code> implementation below. Ensure you acquire and release tokens cleanly using channels as counting semaphores. Click <strong>Run &amp; Verify Code</strong> to test under heavy simulated load.
+        Complete the <code>Dispatcher</code> implementation below. Acquire semaphore tokens <em>before</em> spawning each goroutine and guard against invalid <code>maxConcurrency &lt; 1</code>. Verify syntax statically in-browser, then run the Go race detector test suite.
+      </div>
+
+      <div class="lab-cli-box">
+        <span><strong>Workspace Lab:</strong> Complete <code>labs/m01_02_gmp_dispatcher/lab.go</code> and test under <code>-race</code>.</span>
+        <code>cd labs &amp;&amp; go test -v -race ./m01_02_gmp_dispatcher</code>
       </div>
 
       <div class="editor-wrapper">
@@ -134,7 +136,7 @@ func main() {
 
       <div class="practice-actions">
         <div class="action-group-left">
-          <button id="runCodeBtn" class="btn btn-primary">▶ Run &amp; Verify Code</button>
+          <button id="runCodeBtn" class="btn btn-primary">▶ Run Static Pre-Check</button>
           <button id="resetCodeBtn" class="btn btn-secondary">↺ Reset Template</button>
         </div>
         <div class="action-group-right">
@@ -157,9 +159,7 @@ func main() {
         </div>
         <pre><code id="refSolutionCode" class="language-go">package dispatcher
 
-import (
-    "sync"
-)
+import "sync"
 
 type Dispatcher struct {
     sem chan struct{}
@@ -167,18 +167,21 @@ type Dispatcher struct {
 }
 
 func NewDispatcher(maxConcurrency int) *Dispatcher {
-    return &Dispatcher{
+    if maxConcurrency &lt; 1 {
+        maxConcurrency = 1
+    }
+    return &amp;Dispatcher{
         sem: make(chan struct{}, maxConcurrency),
     }
 }
 
 func (d *Dispatcher) Submit(task func()) {
-    d.sem &lt;- struct{}{} // Acquire semaphore slot
+    d.sem &lt;- struct{}{} // Acquire BEFORE spawning to bound live goroutines
     d.wg.Add(1)
 
     go func() {
         defer func() {
-            &lt;-d.sem // Release semaphore slot
+            &lt;-d.sem
             d.wg.Done()
         }()
         task()
@@ -206,17 +209,21 @@ func (d *Dispatcher) Wait() {
         </div>
 
         <div class="quiz-options">
-          <div class="quiz-option" data-key="A" data-correct="true">
-            <span>Sysmon delivers an asynchronous UNIX signal that interrupts execution registers</span>
+          <div class="quiz-option" data-key="A" data-correct="false">
+            <span class="quiz-option-key">A</span>
+            <span>The Go compiler injects cooperative yield checks into every single loop iteration branch</span>
           </div>
           <div class="quiz-option" data-key="B" data-correct="false">
-            <span>The compiler injects cooperative yield instructions into every iteration branch</span>
+            <span class="quiz-option-key">B</span>
+            <span>The operating system kernel forcibly halts unresponsive user threads every millisecond</span>
           </div>
-          <div class="quiz-option" data-key="C" data-correct="false">
-            <span>The operating system kernel scheduler forcibly freezes running user space threads</span>
+          <div class="quiz-option" data-key="C" data-correct="true">
+            <span class="quiz-option-key">C</span>
+            <span>Sysmon sends an asynchronous UNIX signal interrupting registers to reschedule another goroutine</span>
           </div>
           <div class="quiz-option" data-key="D" data-correct="false">
-            <span>Garbage collection safepoints trigger hardware page faults to halt goroutines</span>
+            <span class="quiz-option-key">D</span>
+            <span>Garbage collector safepoints trigger hardware memory faults to pause long compute loops</span>
           </div>
         </div>
 
@@ -225,16 +232,16 @@ func (d *Dispatcher) Wait() {
 
         <div class="quiz-rationales-data" style="display: none;">
           <div class="rationale-item">
-            <strong style="color: var(--accent-green);">A (CORRECT):</strong> In Go 1.14+, <code>sysmon</code> detects goroutines executing for &gt;10ms without cooperative safepoint checks and sends an asynchronous <code>SIGURG</code> signal to the OS thread (M). The signal handler suspends the thread, saves CPU registers, and rewires the program counter to yield execution to the scheduler.
+            <strong style="color: var(--accent-red);">A (INCORRECT):</strong> Prior to Go 1.14, preemption was cooperative at function prologues, so tight loops without calls starved the scheduler.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> In older Go versions (pre-1.14), preemption was strictly cooperative and relied on compiler-inserted function prologue checks. Tight loops without function calls starved the scheduler.
+            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> The OS kernel schedules OS threads (M), not user-space goroutines (G); preempting a G within an M belongs to the Go runtime.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> The OS kernel knows nothing about Go goroutines; it only manages OS threads (M). Preemption of Gs within an M is controlled entirely by the Go runtime.
+            <strong style="color: var(--accent-green);">C (CORRECT):</strong> Since Go 1.14, <code>sysmon</code> flags goroutines running past ~10ms and emits an asynchronous <code>SIGURG</code> signal to interrupt the OS thread and yield safely.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> The Go runtime does not rely on memory page fault trickery for goroutine preemption; it uses standard OS signal delivery mechanisms.
+            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> Go uses OS signal delivery rather than page-fault traps to asynchronously preempt tight loops.
           </div>
         </div>
       </div>
@@ -248,16 +255,20 @@ func (d *Dispatcher) Wait() {
 
         <div class="quiz-options">
           <div class="quiz-option" data-key="A" data-correct="true">
+            <span class="quiz-option-key">A</span>
             <span>Excess concurrent threads rapidly exhaust the millisecond quota causing kernel freezes</span>
           </div>
           <div class="quiz-option" data-key="B" data-correct="false">
-            <span>The Go runtime garbage collector crashes when thread counts exceed container limits</span>
+            <span class="quiz-option-key">B</span>
+            <span>The Go runtime garbage collector crashes once thread counts pass container limits</span>
           </div>
           <div class="quiz-option" data-key="C" data-correct="false">
-            <span>Kubernetes automatically issues immediate SIGKILL termination when thread limits exceed</span>
+            <span class="quiz-option-key">C</span>
+            <span>Kubernetes immediately triggers SIGKILL termination when runnable OS thread counts climb</span>
           </div>
           <div class="quiz-option" data-key="D" data-correct="false">
-            <span>Excess processors trigger continuous hardware memory bus lock collisions during cache</span>
+            <span class="quiz-option-key">D</span>
+            <span>Extra processors trigger continuous hardware memory bus locks on read-only cache lines</span>
           </div>
         </div>
 
@@ -266,16 +277,16 @@ func (d *Dispatcher) Wait() {
 
         <div class="quiz-rationales-data" style="display: none;">
           <div class="rationale-item">
-            <strong style="color: var(--accent-green);">A (CORRECT):</strong> CFS allocates CPU runtime quota per period (usually 100ms). When too many threads run in parallel, the total cumulative CPU time across all threads exhausts the container's quota in a tiny fraction of the window, causing the kernel to sleep the container for the rest of the period.
+            <strong style="color: var(--accent-green);">A (CORRECT):</strong> CFS budgets cumulative CPU time across all threads in 100ms windows; running too many active threads consumes the entire budget in a few milliseconds and freezes the container until the next period.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> The Go GC does not crash due to thread counts; it simply suffers latency degradation due to OS-level throttling.
+            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> The GC remains stable under throttling, though pause/mark tail latency spikes during stalled windows.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> CFS quota exhaustion causes CPU throttling (scheduling delay), never OOMKills or <code>SIGKILL</code> termination.
+            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> CPU quota exhaustion causes scheduling throttles (latency stalls), whereas OOMKills come from exceeding memory limits.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> Hardware bus lock collisions occur on shared atomic cache lines, not directly as a result of thread quota configuration.
+            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> Shared-cache coherence contention comes from mutating adjacent memory addresses (false sharing), not core quota mismatch alone.
           </div>
         </div>
       </div>
@@ -312,7 +323,7 @@ func (d *Dispatcher) Wait() {
       <div class="footer-agent-reminder">
         <span>💬</span>
         <span>
-          <strong>Pair-Programming Tutor:</strong> Wondering how <code>automaxprocs</code> parses <code>/sys/fs/cgroup/cpu.max</code> in Cgroups v2? Ask me in chat!
+          <strong>Pair-Programming Tutor:</strong> Wondering how Go 1.25+ parses <code>/sys/fs/cgroup/cpu.max</code> natively (or how <code>automaxprocs</code> handled it on earlier Go)? Ask me in chat!
         </span>
       </div>
       <div>
@@ -368,6 +379,9 @@ type Dispatcher struct {
 }
 
 func NewDispatcher(maxConcurrency int) *Dispatcher {
+	if maxConcurrency < 1 {
+		maxConcurrency = 1
+	}
 	return &Dispatcher{
 		sem: make(chan struct{}, maxConcurrency),
 	}
@@ -391,49 +405,30 @@ func (d *Dispatcher) Wait() {
 }
 `;
 
-    async function runDispatcherTests(code) {
-      const hasSemChan = /sem\s+chan\s+struct\{\}/i.test(code) || /make\s*\(\s*chan\s+struct\{\}\s*,\s*maxConcurrency\s*\)/i.test(code);
-      const hasAcquire = /d\.sem\s*<-\s*struct\{\}\{\}/i.test(code) || /sem\s*<-\s*struct/i.test(code);
-      const hasRelease = /<-\s*d\.sem/i.test(code) || /<-\s*sem/i.test(code);
-      const hasWg = /sync\.WaitGroup/i.test(code) && /Wait\s*\(\s*\)/i.test(code);
+    async function runDispatcherTests(code, stripped) {
+      const hasSemChan = /sem\s+chan\s+struct\s*\{\s*\}/.test(stripped) && /make\s*\(\s*chan\s+struct\s*\{\s*\}\s*,\s*maxConcurrency\s*\)/.test(stripped);
+      const hasMinGuard = /maxConcurrency\s*<\s*1|maxConcurrency\s*<=\s*0/.test(stripped);
+      const hasRelease = /<-\s*d\.sem\b/.test(stripped);
+      const hasWg = /wg\.Add\s*\(\s*1\s*\)/.test(stripped) && /wg\.Done\s*\(\)/.test(stripped) && /wg\.Wait\s*\(\)/.test(stripped);
 
-      if (!hasSemChan || !hasAcquire || !hasRelease) {
+      const submitMatch = stripped.match(/func\s*\([^)]*\)\s*Submit\s*\([^)]*\)\s*\{([\s\S]*)/);
+      const submitBody = submitMatch ? submitMatch[1] : "";
+      const acqIdx = submitBody.search(/d\.sem\s*<-\s*struct\s*\{\s*\}\s*\{\s*\}/);
+      const goIdx = submitBody.search(/\bgo\s+func/);
+      const hasAcquireBeforeSpawn = acqIdx !== -1 && goIdx !== -1 && acqIdx < goIdx;
+
+      if (!hasSemChan || !hasMinGuard || !hasAcquireBeforeSpawn || !hasRelease || !hasWg) {
         return {
           passed: false,
-          output: `=== RUN   TestBoundedConcurrencyLimit
-    dispatcher_test.go:45: concurrency limit violated: 100 goroutines spawned simultaneously
-    dispatcher_test.go:46: Expected max in-flight: 4, observed: 100 (Unbounded execution!)
---- FAIL: TestBoundedConcurrencyLimit (0.01s)
-FAIL`,
-          message: "Semaphore pattern not detected. Use buffered chan struct{} to throttle execution."
-        };
-      }
-
-      if (!hasWg) {
-        return {
-          passed: false,
-          output: `=== RUN   TestDispatcherWaitSynchronization
-    dispatcher_test.go:62: Wait() returned prematurely before tasks finished
---- FAIL: TestDispatcherWaitSynchronization (0.00s)
-FAIL`,
-          message: "Ensure sync.WaitGroup is properly incremented with Add(1) and completed with Done()."
+          output: `Static Pre-Check Findings:\n- Buffered semaphore chan struct{} + cap check: ${hasSemChan ? "OK" : "MISSING"}\n- maxConcurrency < 1 guard: ${hasMinGuard ? "OK" : "MISSING"}\n- Acquire token BEFORE go func(): ${hasAcquireBeforeSpawn ? "OK" : "MISSING / OUT OF ORDER"}\n- Release <-d.sem in defer: ${hasRelease ? "OK" : "MISSING"}\n- WaitGroup Add/Done/Wait: ${hasWg ? "OK" : "MISSING"}`,
+          message: "Guard maxConcurrency >= 1, acquire d.sem before spawning go func(), and defer release + Done()."
         };
       }
 
       return {
         passed: true,
-        output: `=== RUN   TestBoundedConcurrencyLimit
-    dispatcher_test.go:42: Stress testing 50,000 tasks across bounded semaphore (cap=8)...
-    dispatcher_test.go:48: Max concurrent in-flight peak: 8 (Exact limit respected)
---- PASS: TestBoundedConcurrencyLimit (0.02s)
-=== RUN   TestDispatcherWaitSynchronization
-    dispatcher_test.go:70: All 50,000 background jobs verified drained cleanly
---- PASS: TestDispatcherWaitSynchronization (0.01s)
-PASS
-BenchmarkDispatcherThroughput-8   5000000   31.2 ns/op   0 B/op   0 allocs/op
-ok      lesson0002/scheduler   0.035s`,
-        message: "Bounded concurrency dispatcher verified! Zero deadlocks and zero quota leaks.",
-        details: "🏆 Bounded semaphore successfully prevents CPU quota throttling under peak load."
+        output: `Static Pre-Check Summary:\n- Safe maxConcurrency >= 1 guard present\n- Semaphore token acquired BEFORE goroutine launch\n- Deferred <-d.sem release and sync.WaitGroup cleanup verified`,
+        message: "Static pre-check passed! Run real concurrency & -race verification in labs/."
       };
     }
 
@@ -443,6 +438,7 @@ ok      lesson0002/scheduler   0.035s`,
         defaultCode: starterCode,
         solutionCode: solution,
         hints: hints,
+        labCommand: "cd labs && go test -v -race ./m01_02_gmp_dispatcher",
         testSuite: runDispatcherTests
       });
     });

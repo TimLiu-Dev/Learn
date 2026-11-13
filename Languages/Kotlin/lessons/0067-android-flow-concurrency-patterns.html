@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Production Android Flow &amp; Concurrency · Idiomatic Kotlin</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/answers.js"></script>
+<script src="../assets/lesson.js"></script>
+</head>
+<body>
+<main>
+
+<nav class="top">
+  <a href="../index.html">← Course index</a>
+  <a href="../reference/coroutines-flow.html">Reference: Coroutines &amp; Flow</a>
+  <a href="../reference/modern-kotlin-tooling.html">Reference: Modern Kotlin &amp; Tooling</a>
+</nav>
+
+<p class="kicker">Section 13 · 2027 Modern Kotlin Track · Lesson 13.2</p>
+<h1>Production Android Flow &amp; Concurrency</h1>
+<p class="subtitle">Writing <code>callbackFlow</code> + <code>awaitClose</code>, <code>stateIn(WhileSubscribed(5_000))</code>, cancelling stale work with <code>flatMapLatest</code>, and guarding shared async state with <code>Mutex.withLock</code>.</p>
+
+<h2>Warm-up: Rapid Recall</h2>
+<ol class="recall">
+  <li>Why must a coroutine catching broad <code>Exception</code> or using <code>runCatching</code> rethrow <code>CancellationException</code>?
+    <details><summary>Check</summary>Structured concurrency relies on <code>CancellationException</code> propagating upward cleanly; swallowing it keeps child jobs running after the scope or screen is destroyed.</details></li>
+  <li>What is the difference between a cold <code>Flow</code> and a hot <code>StateFlow</code>?
+    <details><summary>Check</summary>Cold <code>Flow</code> runs its producer block independently for each collector; hot <code>StateFlow</code> holds one current conflated <code>.value</code> shared across collectors.</details></li>
+</ol>
+
+<h2>The Concept: Four Essential Android Coroutine Patterns</h2>
+
+<h3>1. Bridging Callback APIs Safely: <code>callbackFlow</code> + <code>awaitClose</code></h3>
+<p><span class="sidenote">Calling <code>emit()</code> inside an external listener thread fails because <code>emit</code> is a suspending function. Use thread-safe <code>trySend(...)</code> inside callback lambdas.</span>Android platform APIs (Location, ConnectivityManager, Firebase listeners, Biometrics) report results via register/unregister callbacks. Wrap them in a cold <code>callbackFlow</code>, emit updates with non-blocking <code>trySend</code>, and <strong>always unregister inside <code>awaitClose { ... }</code></strong> so cancellation cleans up resources immediately:</p>
+
+<code class="kt-run">import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.*
+
+class FakeNetworkMonitor {
+    var active = false
+    private var cb: ((Boolean) -&gt; Unit)? = null
+    fun register(onChange: (Boolean) -&gt; Unit) {
+        active = true
+        cb = onChange
+        onChange(true)
+        onChange(false)
+    }
+    fun unregister() { cb = null; active = false }
+}
+
+fun connectivityFlow(monitor: FakeNetworkMonitor): Flow&lt;Boolean&gt; = callbackFlow {
+    monitor.register { isOnline -&gt; trySend(isOnline) }
+    awaitClose { monitor.unregister() } // Guaranteed cleanup when cancelled/completed!
+}
+
+fun main() = runBlocking {
+    val monitor = FakeNetworkMonitor()
+    val seen = connectivityFlow(monitor).take(2).toList()
+    check(seen == listOf(true, false))
+    check(!monitor.active) { "Monitor leaked after collection ended!" }
+    println("callbackFlow events=$seen, active=${monitor.active}")
+}</code>
+
+<h3>2. <code>stateIn</code> with <code>SharingStarted.WhileSubscribed(5_000)</code></h3>
+<p>In an Android <code>ViewModel</code>, convert a cold repository stream to UI state via <code>.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), initialValue)</code>:</p>
+<ul>
+  <li><strong>Laziness trap</strong>: Unlike <code>Eagerly</code>, <code>WhileSubscribed</code> stays at <code>initialValue</code> until the first UI collector subscribes.</li>
+  <li><strong>Why 5 seconds?</strong> When the user rotates the phone, the Activity unsubscribes and re-subscribes within milliseconds; the 5,000 ms grace window keeps the upstream database/network stream alive across rotation without restarting, then stops cleanly when the user leaves the app.</li>
+</ul>
+
+<h3>3. <code>flatMapLatest</code> / <code>collectLatest</code> vs Stale Races &amp; <code>Mutex.withLock</code></h3>
+<ul>
+  <li><strong><code>flatMapLatest</code></strong> (requires <code>@OptIn(ExperimentalCoroutinesApi::class)</code>): When a new search query arrives, the upstream previous flow is immediately cancelled—eliminating out-of-order network response bugs!</li>
+  <li><strong><code>Mutex.withLock</code></strong>: JVM <code>synchronized</code> blocks a carrier thread and forbids calling <code>suspend</code> functions inside the lock. Use <code>kotlinx.coroutines.sync.Mutex</code> with <code>mutex.withLock { ... }</code> for async critical sections—remembering that <code>Mutex</code> is <strong>non-reentrant</strong> (never call a helper that tries to lock the same <code>Mutex</code> while already inside <code>withLock</code>).</li>
+</ul>
+
+<code class="kt-run">import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+@OptIn(ExperimentalCoroutinesApi::class)
+fun main() = runBlocking {
+    val mutex = Mutex()
+    var sharedCounter = 0
+    coroutineScope {
+        repeat(50) {
+            launch(Dispatchers.Default) {
+                mutex.withLock {
+                    val cur = sharedCounter
+                    delay(1) // Allowed inside Mutex.withLock (impossible in synchronized!)
+                    sharedCounter = cur + 1
+                }
+            }
+        }
+    }
+    check(sharedCounter == 50)
+
+    val latest = flowOf("ko", "kot", "kotlin")
+        .flatMapLatest { q -&gt; flowOf("Result($q)") }
+        .toList()
+    println("counter=$sharedCounter, flatMapLatest=$latest")
+}</code>
+
+<h2>Quick Check</h2>
+<p class="quiz-score"></p>
+
+<div class="quiz" data-answer="b">
+  <p class="q">1. What happens in Android if you define a <code>callbackFlow</code> that registers a callback listener and finishes the builder lambda without calling <code>awaitClose { ... }</code>?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="Without awaitClose, the producer coroutine completes right after registration and immediately destroys the channel.">It runs normally until garbage collection frees the callback listener later</button></li>
+    <li><button data-key="b" data-why="Correct: A callbackFlow closes immediately unless kept suspended by awaitClose, and kotlinx.coroutines explicitly throws IllegalStateException if awaitClose is omitted.">It closes prematurely or throws <code>IllegalStateException</code> for missing <code>awaitClose</code> cleanup</button></li>
+    <li><button data-key="c" data-why="callbackFlow catches missing cleanup at runtime with IllegalStateException rather than a compiler warning.">It refuses to compile unless a <code>finally</code> block handles listener cleanup</button></li>
+    <li><button data-key="d" data-why="Omitting awaitClose shuts the stream down right after registering instead of buffering updates forever.">It silently buffers all future callbacks into memory until the app terminates</button></li>
+  </ul>
+  <p class="explain"><code>awaitClose { ... }</code> both suspends the <code>callbackFlow</code> coroutine so it stays open for incoming <code>trySend</code> events and runs deterministic cleanup on close or cancellation.</p>
+</div>
+
+<div class="quiz" data-answer="c">
+  <p class="q">2. Why is <code>SharingStarted.WhileSubscribed(5_000)</code> the standard choice for Android ViewModel <code>stateIn</code> flows?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="WhileSubscribed stops upstream collection 5 seconds after UI unsubscribes rather than waiting 5 seconds before starting.">It delays starting repository queries by five seconds on initial screen launch</button></li>
+    <li><button data-key="b" data-why="WhileSubscribed buffers nothing extra beyond StateFlow's single latest value.">It caches the last five thousand emitted UI states inside SavedStateHandle</button></li>
+    <li><button data-key="c" data-why="Correct: Brief unsubscriptions during rotation finish well inside 5 seconds so upstream stays hot, while backgrounding the app stops producers after 5 seconds.">It survives brief configuration-change reconnections while stopping upstream work when backgrounded</button></li>
+    <li><button data-key="d" data-why="WhileSubscribed works on any CoroutineScope regardless of platform dispatcher.">It forces upstream database emissions onto <code>Dispatchers.Main</code> while subscribers exist</button></li>
+  </ul>
+  <p class="explain">This gives you both zero wasted background work when users switch apps and zero redundant API reloads when rotating the screen.</p>
+</div>
+
+<div class="quiz" data-answer="d">
+  <p class="q">3. Why should a repository caching an async auth token prefer <code>Mutex.withLock</code> over Java's <code>synchronized</code> block?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="Mutex protects shared mutable state cleanly, including calling suspend network functions inside the critical section.">Because JVM <code>synchronized</code> cannot be declared inside Kotlin repository classes cleanly</button></li>
+    <li><button data-key="b" data-why="Mutex is actually non-reentrant; synchronized is reentrant on the same thread.">Because <code>Mutex</code> is reentrant whereas <code>synchronized</code> throws on nested calls</button></li>
+    <li><button data-key="c" data-why="Dispatchers.IO threads allow synchronized when there are no suspend calls inside, though it blocks the thread.">Because calling <code>synchronized</code> on Android background dispatchers triggers a crash</button></li>
+    <li><button data-key="d" data-why="Correct: Mutex.withLock suspends the waiting coroutine without pinning an OS thread, and permits suspending calls like network refreshes inside the lock.">Because <code>Mutex.withLock</code> suspends without blocking threads and allows <code>suspend</code> calls inside</button></li>
+  </ul>
+  <p class="explain"><code>synchronized</code> fails compilation around suspending calls and blocks threads while waiting; <code>Mutex.withLock</code> suspends cleanly.</p>
+</div>
+
+<h2>Practice: Hands-On Exercises</h2>
+
+<section class="exercise">
+  <span class="type">Exercise 1 · Write from blank</span>
+  <h3>Lifecycle-Safe Sensor Stream &amp; <code>Mutex</code> Token Cache</h3>
+  <p>Build two production Android building blocks tested deterministically in <code>main</code>:</p>
+  <ol>
+    <li><code>fun sensorStream(sensor: FakeSensor): Flow&lt;Int&gt;</code> using <code>callbackFlow</code> that calls <code>sensor.start { trySend(it) }</code> and cleans up inside <code>awaitClose { sensor.stop() }</code>.</li>
+    <li><code>class TokenCache(private val fetchToken: suspend () -&gt; String)</code> with a private <code>Mutex()</code> and nullable <code>cachedToken: String? = null</code>. Implement <code>suspend fun getToken(): String</code> using <code>mutex.withLock</code> (double-checked inside the lock so concurrent callers invoke <code>fetchToken()</code> only once!).</li>
+  </ol>
+  <code class="kt-run">import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+class FakeSensor {
+    var running = false
+    fun start(onValue: (Int) -&gt; Unit) {
+        running = true
+        onValue(101)
+        onValue(102)
+        onValue(103)
+    }
+    fun stop() { running = false }
+}
+
+// Write sensorStream(sensor: FakeSensor) and TokenCache(fetchToken) here:
+
+fun main() = runBlocking {
+    val sensor = FakeSensor()
+    val readings = sensorStream(sensor).take(2).toList()
+    check(readings == listOf(101, 102))
+    check(!sensor.running) { "awaitClose must call sensor.stop()!" }
+
+    var networkCalls = 0
+    val cache = TokenCache {
+        delay(20)
+        networkCalls++
+        "tok_$networkCalls"
+    }
+    val tokens = coroutineScope {
+        List(5) { async { cache.getToken() } }.awaitAll()
+    }
+    check(networkCalls == 1 &amp;&amp; tokens.all { it == "tok_1" })
+    println("sensorStream=$readings stopped=${!sensor.running} networkCalls=$networkCalls")
+}</code>
+  <ul class="checklist">
+    <li><label><input type="checkbox"><span>Used <code>callbackFlow</code> + <code>trySend</code> + <code>awaitClose { sensor.stop() }</code></span></label></li>
+    <li><label><input type="checkbox"><span>Guarded shared async fetch with <code>Mutex.withLock</code> so 5 concurrent callers share 1 network call</span></label></li>
+    <li><label><input type="checkbox"><span>All <code>check(...)</code> assertions pass</span></label></li>
+  </ul>
+  <details class="hint"><summary>Hint 1: callbackFlow cleanup</summary>Write <code>callbackFlow { sensor.start { trySend(it) }; awaitClose { sensor.stop() } }</code> so cancelling collection after <code>take(2)</code> triggers <code>sensor.stop()</code>.</details>
+  <details class="hint"><summary>Hint 2: Mutex single-flight cache</summary>Inside <code>getToken()</code>, wrap both the null check and <code>fetchToken()</code> in <code>mutex.withLock { cachedToken ?: fetchToken().also { cachedToken = it } }</code>.</details>
+</section>
+
+<section class="exercise">
+  <span class="type">Exercise 2 · Refactor</span>
+  <h3>Cancel Stale Searches with <code>flatMapLatest</code> &amp; Fix <code>WhileSubscribed</code> State</h3>
+  <p>Refactor this racy search coordinator so typing a new query cancels stale slow requests using <code>flatMapLatest</code>, and expose UI results via <code>stateIn(..., SharingStarted.WhileSubscribed(5_000), "Idle")</code>.</p>
+  <code class="kt-run">@file:OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+
+// Slow search query: earlier slow query "a" must be cancelled when "android" arrives!
+suspend fun runSearchQuery(
+    q: String,
+    onStarted: (String) -&gt; Unit,
+    onFinished: (String) -&gt; Unit
+): String {
+    onStarted(q)
+    if (q == "a") delay(150) else delay(10)
+    val result = "Hits:$q"
+    onFinished(result)
+    return result
+}
+
+// REFACTOR: Use flatMapLatest so stale slow queries are cancelled instead of completing late!
+fun buildResultsFlow(
+    queries: Flow&lt;String&gt;,
+    onStarted: (String) -&gt; Unit,
+    onFinished: (String) -&gt; Unit
+): Flow&lt;String&gt; = flow {
+    queries.collect { q -&gt;
+        emit(runSearchQuery(q, onStarted, onFinished))
+    }
+}
+
+fun main() = runBlocking {
+    val completed = mutableListOf&lt;String&gt;()
+    val aStarted = CompletableDeferred&lt;Unit&gt;()
+    val queryTrigger = MutableSharedFlow&lt;String&gt;(extraBufferCapacity = 4)
+
+    val scope = CoroutineScope(coroutineContext + SupervisorJob())
+    val uiState: StateFlow&lt;String&gt; = buildResultsFlow(
+        queries = queryTrigger,
+        onStarted = { if (it == "a") aStarted.complete(Unit) },
+        onFinished = { completed.add(it) }
+    ).stateIn(scope, SharingStarted.WhileSubscribed(5_000), "Idle")
+
+    // Verify WhileSubscribed starts lazily from initialValue "Idle"
+    check(uiState.value == "Idle")
+
+    val collected = mutableListOf&lt;String&gt;()
+    val collector = launch {
+        uiState.take(2).toList(collected) // Collects "Idle" then latest hit
+    }
+    queryTrigger.subscriptionCount.first { it &gt; 0 } // Wait until WhileSubscribed upstream subscribes
+    queryTrigger.emit("a")
+    aStarted.await() // Deterministic hook proving slow query "a" is in-flight before cancellation
+    queryTrigger.emit("android") // Must cancel slow "a"!
+    collector.join()
+
+    check(collected.last() == "Hits:android") { "Expected latest 'Hits:android' but got $collected (completed=$completed)" }
+    check("Hits:a" !in completed) { "Stale query 'a' was NOT cancelled: $completed" }
+    scope.cancel()
+    println("Collected=$collected completed=$completed")
+}</code>
+  <ul class="checklist">
+    <li><label><input type="checkbox"><span>Replaced blocking <code>collect</code> inside <code>flow { ... }</code> with <code>queries.flatMapLatest { q -&gt; flow { emit(runSearchQuery(q, onStarted, onFinished)) } }</code></span></label></li>
+    <li><label><input type="checkbox"><span>Confirmed stale query <code>"a"</code> cancels cleanly before appending to <code>completed</code></span></label></li>
+  </ul>
+  <details class="hint"><summary>Hint</summary>Make <code>buildResultsFlow</code> a single-expression chain: <code>queries.flatMapLatest { q -&gt; flow { emit(runSearchQuery(q, onStarted, onFinished)) } }</code>.</details>
+</section>
+
+<div class="source">
+  <span class="tag">Primary source</span>
+  <p><a href="https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/callback-flow.html">kotlinx.coroutines: callbackFlow</a>, <a href="https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/state-in.html">stateIn</a>, and <a href="https://developer.android.com/kotlin/flow">Android Developers: Kotlin Flows on Android</a>.</p>
+</div>
+
+<div class="ask">
+  <span class="tag">Stuck or curious?</span>
+  <p>Ask your teacher in the workspace: “Look closely at <code>Exercise 2</code>: why did waiting on <code>subscriptionCount.first { it &gt; 0 }</code> make the <code>WhileSubscribed</code> test deterministic whereas <code>yield()</code> alone can miss early <code>SharedFlow</code> emissions?”</p>
+</div>
+
+<nav class="lesson-nav">
+  <a href="0066-modern-kotlin-dsls-recursion.html">← 13.1 Modern Kotlin 2.2–2.4 &amp; DSLs</a>
+  <a href="0068-gradle-kts-serialization-interop.html">13.3 Gradle Kotlin DSL, Serialization &amp; Interop →</a>
+</nav>
+
+</main>
+</body>
+</html>

@@ -66,7 +66,7 @@ To be evaluated and hired as a **Senior iOS Developer**, you must operate across
 
 ## 3. Curriculum Syllabus & Lesson Sequence
 
-The curriculum is structured into 8 progressive phases designed to take you from Android fundamentals to Senior iOS mastery.
+The curriculum is structured into 9 progressive phases (60 lessons + flagship capstone) designed to take you from Android fundamentals to 2027 Senior iOS mastery.
 
 ### Phase 1: Swift Compiler & Language Internals
 - **Lesson 1.1**: The Swift Type System, Mutability & Optionals (Memory layout of Optionals, Spare Bit Optimization, Transitive Value Immutability, mutating semantics, and the Law of Exclusivity.)
@@ -130,21 +130,36 @@ The curriculum is structured into 8 progressive phases designed to take you from
 - **Lesson 7.4**: Provisioning, Certificates, Code Signing & App Attest (Apple Developer Program, App IDs, Provisioning Profiles, Entitlements, codesign CLI, and Apple App Attest security.)
 - **Lesson 7.5**: Enterprise CI/CD Pipelines & TestFlight Automation (Automated build and test workflows with Fastlane, GitHub Actions, match certificate synchronization, and TestFlight deployment trains.)
 
-### Phase 8: Capstone Portfolio Project ('PulseFlow Enterprise')
-- **Milestone 8.1**: Capstone Showcase: PulseFlow Enterprise Architecture (The definitive, interview-winning portfolio project: multi-package SPM, SwiftData, Swift 6 strict concurrency, widgets, and MetricKit telemetry.)
+### Phase 8: 2027 Senior iOS Frontier & Platform Expansion
+- **Lesson 8.1**: Objective-C Interoperability & Legacy Runtime Bridging (Bridging headers, @objc / dynamic dispatch, NSError** bridging, Unmanaged memory ownership, and wrapping legacy Obj-C SDKs for Swift 6.)
+- **Lesson 8.2**: Swift 6.2/6.3 Approachable Concurrency & Mutex (SE-0461 nonisolated(nonsending), @concurrent opt-in, default @MainActor isolation, and Synchronization.Mutex for synchronous critical sections.)
+- **Lesson 8.3**: Zero-Copy & Noncopyable Swift: ~Copyable, InlineArray & Span (Unique ownership with ~Copyable (consuming/borrowing/deinit), fixed-size stack InlineArray, and lifetime-safe Span<T> views.)
+- **Lesson 8.4**: The Composable Architecture (TCA) vs. @Observable UDF (Point-Free's @Reducer, @ObservableState, Effect cancellation, DependencyKey, TestStore exhaustive assertions, and senior architecture trade-offs.)
+- **Lesson 8.5**: File System Sandboxing, Data Protection & Direct SQLite / GRDB (Documents vs Application Support vs Caches, iCloud backup exclusion, NSFileProtectionCompleteUnlessOpen, and SQLite/GRDB vs SwiftData.)
+- **Lesson 8.6**: XCFrameworks, Library Evolution & Mergeable Libraries (Static vs Dynamic vs Mergeable binaries, BUILD_LIBRARY_FOR_DISTRIBUTION (.swiftinterface), and xcodebuild -create-xcframework.)
+- **Lesson 8.7**: Code Quality Gates: swift-format, SwiftLint & Xcode Test Plans (Toolchain swift-format, SwiftLint SPM Build Tool Plugins, and .xctestplan matrices (TSan, randomization, and localization).)
+- **Lesson 8.8**: iOS 26 Liquid Glass, Modern Animators & String Catalogs (Apple's Liquid Glass material rules, PhaseAnimator & KeyframeAnimator, @Animatable, and .xcstrings String Catalogs at scale.)
+- **Lesson 8.9**: On-Device AI: FoundationModels Framework & Core ML (Apple Intelligence FoundationModels (@Generable guided generation, Tool calling, multimodal prompts) and Core ML Neural Engine profiling.)
+- **Lesson 8.10**: AppIntents, Siri, Spotlight & System Intelligence (Exposing domain actions & AppEntities to Siri, Apple Intelligence on-screen awareness, Spotlight, Control Center, and interactive Widgets.)
+- **Lesson 8.11**: Monetization & Passwordless Auth: StoreKit 2 & Passkeys (Async JWS-verified StoreKit 2 subscriptions, Transaction.updates listeners, local .storekit testing, and AuthenticationServices Passkeys.)
+- **Lesson 8.12**: Xcode Cloud & Multi-Channel Release Engineering (Apple's native Xcode Cloud (ci_post_clone.sh), headless xcodebuild + xcresulttool, phased App Store rollouts, and Fastlane vs. Xcode Cloud.)
+
+### Phase 9: Capstone Portfolio Project ('PulseFlow Enterprise')
+- **Milestone 9.1**: Capstone Showcase: PulseFlow Enterprise Architecture (The definitive, interview-winning 2027 portfolio project: multi-package SPM & XCFramework, SwiftData/SQLite, Swift 6.3 concurrency, AppIntents, FoundationModels, StoreKit 2, and MetricKit telemetry.)
 ---
+
 
 
 ## 4. The Senior Capstone Project Specification ("PulseFlow Enterprise")
 
 ### Architecture & Key Senior Deliverables
-1. **Multi-Module SPM Architecture**: Completely decoupled modules (`AppFeature`, `CoreNetwork`, `CoreDatabase`, `DomainModels`, `DesignSystem`, `Telemetry`) with zero circular dependencies and static linkage for sub-400ms launch times.
-2. **Swift 6 Strict Concurrency**: Compiled under `-strict-concurrency=complete` with zero data races, custom actor executors, and actor-isolated background data ingestion.
-3. **Resilient Offline-First Engine**: Real-time REST & WebSocket pipelines paired with SwiftData persistence, `VersionedSchema` migration plans, and deterministic conflict resolution.
-4. **Custom Copy-on-Write Storage**: Custom data structures utilizing `isKnownUniquelyReferenced` for zero-allocation cache reads.
-5. **Interactive Widgets & Dynamic Island**: WidgetKit extension with AppIntents and live activity updates.
+1. **Multi-Module SPM + Binary SDK Architecture**: Completely decoupled modules (`FeatureAuth`, `FeatureDashboard`, `CoreNetwork`, `CoreDatabase`, `DesignSystem`, `Telemetry`) with zero circular dependencies, static linkage for sub-400ms launch times, and a distributable `XCFramework` boundary (`PulseAnalyticsSDK`).
+2. **Swift 6.3 Strict & Approachable Concurrency**: Compiled under strict data-race safety with zero warnings, `Mutex` for fast synchronous critical sections, `~Copyable` resource guards, and actor-isolated background data ingestion.
+3. **Resilient Offline-First Engine**: Protected sandbox storage (`FileProtectionType`) paired with SwiftData (`VersionedSchema`) / SQLite/GRDB sync queues and deterministic conflict resolution.
+4. **Custom Copy-on-Write & Zero-Copy Storage**: Custom CoW data structures utilizing `isKnownUniquelyReferenced` alongside `InlineArray` and `Span<T>` on tight telemetry loops.
+5. **System Intelligence, On-Device AI & Liquid Glass UI**: WidgetKit + `AppIntents` (`AppEntity`), `FoundationModels` (`@Generable` triage), Passkeys auth, `StoreKit 2` entitlements, and `.xcstrings` localization.
 6. **Telemetry & Production Observability**: MetricKit (`MXMetricManager`) reporting hang rates, CPU consumption, and dirty memory metrics, paired with `os.Logger` structured subsystems.
-7. **Comprehensive Test Suite & CI/CD**: >85% unit test coverage via Swift Testing, snapshot UI tests, and a fully automated GitHub Actions / Fastlane pipeline with TestFlight deployment.
+7. **Comprehensive Test Suite & CI/CD**: >85% unit test coverage via Swift Testing (`@Test`/`#expect`), `.xctestplan` randomized + TSan matrices, `swift-format` + SwiftLint gates, and automated Xcode Cloud / GitHub Actions + Fastlane pipelines.
 
 ---
 
@@ -225,5 +240,18 @@ Every lesson follows this rigorous Senior pedagogical feedback loop:
   - [ ] Lesson 7.3: App Extensions, WidgetKit, Live Activities & App Groups
   - [ ] Lesson 7.4: Provisioning, Certificates, Code Signing & App Attest
   - [ ] Lesson 7.5: Enterprise CI/CD Pipelines & TestFlight Automation
-- [ ] **Phase 8: Capstone Portfolio Project ('PulseFlow Enterprise')**
-  - [ ] Milestone 8.1: Capstone Showcase: PulseFlow Enterprise Architecture
+- [ ] **Phase 8: 2027 Senior iOS Frontier & Platform Expansion**
+  - [ ] Lesson 8.1: Objective-C Interoperability & Legacy Runtime Bridging
+  - [ ] Lesson 8.2: Swift 6.2/6.3 Approachable Concurrency & Mutex
+  - [ ] Lesson 8.3: Zero-Copy & Noncopyable Swift: ~Copyable, InlineArray & Span
+  - [ ] Lesson 8.4: The Composable Architecture (TCA) vs. @Observable UDF
+  - [ ] Lesson 8.5: File System Sandboxing, Data Protection & Direct SQLite / GRDB
+  - [ ] Lesson 8.6: XCFrameworks, Library Evolution & Mergeable Libraries
+  - [ ] Lesson 8.7: Code Quality Gates: swift-format, SwiftLint & Xcode Test Plans
+  - [ ] Lesson 8.8: iOS 26 Liquid Glass, Modern Animators & String Catalogs
+  - [ ] Lesson 8.9: On-Device AI: FoundationModels Framework & Core ML
+  - [ ] Lesson 8.10: AppIntents, Siri, Spotlight & System Intelligence
+  - [ ] Lesson 8.11: Monetization & Passwordless Auth: StoreKit 2 & Passkeys
+  - [ ] Lesson 8.12: Xcode Cloud & Multi-Channel Release Engineering
+- [ ] **Phase 9: Capstone Portfolio Project ('PulseFlow Enterprise')**
+  - [ ] Milestone 9.1: Capstone Showcase: PulseFlow Enterprise Architecture

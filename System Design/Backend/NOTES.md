@@ -18,3 +18,11 @@
   - Focus on storage strength over mere fluency strength (active retrieval, desirable difficulty).
   - Emphasize trade-offs (CAP, PACELC, latency vs consistency, cost vs redundancy) rather than reciting boilerplate diagrams.
   - Modernized for 2027: cloud-native, distributed SQL, active-active multi-region, zero-trust, event mesh, AI-assisted workload patterns.
+
+
+## 2026-11-12 — Learner background update
+- User describes themselves as a **junior Android developer starting backend system design from scratch**, aiming to "master" it during 2027.
+- Mission confirmed and rewritten (LR-0005): Part 1 = pass L3/L4 backend system design in 2027; Part 2 = pass senior in 2027. The "Goal" bullet at the top of this file is outdated — MISSION.md wins.
+- Stack: **Kotlin + Spring Boot primary; Java + Spring Boot on the side.** Show Kotlin first, Java equivalent in a collapsed/secondary block.
+- Real-world "do it on your machine" steps are allowed alongside in-browser JS sandboxes (Kotlin can't run in the browser sandbox).
+- Leverage Android strengths: Kotlin (→ Ktor/Spring Boot), API consumption, pagination, push notifications, offline sync, BFF.

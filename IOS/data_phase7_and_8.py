@@ -1,5 +1,5 @@
 # Phase 7: App Store Readiness, Ecosystem & DevOps (Lessons 0044 - 0048)
-# Phase 8: Capstone Portfolio Project (Lesson 0049)
+# Phase 9: Capstone Portfolio Project (Lesson 0061)
 
 PHASE7_AND_8_LESSONS = [
     # 0044: Lesson 7.1
@@ -476,7 +476,7 @@ runTests()""",
         "title": "Enterprise CI/CD Pipelines & TestFlight Automation",
         "subtitle": "Automated build and test workflows with Fastlane, GitHub Actions, match certificate synchronization, and TestFlight deployment trains.",
         "prev_url": "0047-provisioning-certificates-and-code-signing.html",
-        "next_url": "0049-capstone-portfolio-blueprint.html",
+        "next_url": "0049-objc-interop-and-runtime-bridging.html",
         "cheatsheet_url": "../reference/release-and-ecosystem-cheatsheet.html",
         "cheatsheet_title": "Release & Ecosystem Cheatsheet",
         "android_anchor_html": """
@@ -578,43 +578,44 @@ runTests()""",
             {"title": "Fastlane Documentation: iOS Deployment", "url": "https://docs.fastlane.tools", "desc": "Official guide on match, gym, scan, and pilot automation."},
             {"title": "Apple Developer: TestFlight Overview", "url": "https://developer.apple.com/testflight/", "desc": "Managing internal and external beta testing groups."}
         ],
-        "coaching_prompt": "Congratulations! You have completed Phase 7: App Store Readiness, Ecosystem & DevOps! You are now fully prepared for the final phase: Milestone 8.1 PulseFlow Enterprise Capstone Architecture!"
+        "coaching_prompt": "Congratulations! You have completed Phase 7: App Store Readiness, Ecosystem & DevOps! Next up is Phase 8: 2027 Senior iOS Frontier & Platform Expansion, covering Swift 6.2/6.3, Obj-C interop, TCA, SQLite/GRDB, XCFrameworks, Liquid Glass, FoundationModels, AppIntents, StoreKit 2, and Xcode Cloud!"
     },
 
-    # 0049: Lesson 8.1
+    # 0061: Milestone 9.1
     {
-        "id": "0049",
-        "slug": "0049-capstone-portfolio-blueprint",
-        "phase_num": 8,
-        "phase_title": "Phase 8: Capstone Portfolio Project",
-        "lesson_num": "Milestone 8.1",
+        "id": "0061",
+        "slug": "0061-capstone-portfolio-blueprint",
+        "phase_num": 9,
+        "phase_title": "Phase 9: Capstone Portfolio Project",
+        "lesson_num": "Milestone 9.1",
         "title": "Capstone Showcase: PulseFlow Enterprise Architecture",
-        "subtitle": "The definitive, interview-winning portfolio project: multi-package SPM, SwiftData, Swift 6 strict concurrency, widgets, and MetricKit telemetry.",
-        "prev_url": "0048-cicd-pipelines-and-release-automation.html",
+        "subtitle": "The definitive, interview-winning 2027 portfolio project: multi-package SPM & XCFramework, SwiftData/SQLite, Swift 6.3 concurrency, AppIntents, FoundationModels, StoreKit 2, and MetricKit telemetry.",
+        "prev_url": "0060-xcode-cloud-and-release-engineering.html",
         "next_url": "../index.html",
         "cheatsheet_url": "../reference/architecture-and-modularization-cheatsheet.html",
         "cheatsheet_title": "Architecture Cheatsheet",
         "android_anchor_html": """
         <p>In Android, senior portfolio showcases demonstrate modular architecture (Compose + Hilt + Room + Coroutines + WorkManager + Gradle convention plugins).</p>
-        <p>In iOS, <strong>PulseFlow Enterprise</strong> is architected specifically to secure Senior iOS engineering offers. It demonstrates low-level compiler mechanics, multi-package SPM modularization with static linkage, complete Swift 6 data-race immunity, offline-first sync with vector clocks, WidgetKit extensions, and production MetricKit telemetry.</p>
+        <p>In iOS, <strong>PulseFlow Enterprise</strong> is architected specifically to secure Senior iOS engineering offers in 2027. It demonstrates low-level compiler mechanics, multi-package SPM modularization with static linkage and an <code>XCFramework</code> SDK boundary, Swift 6.3 data-race immunity, offline-first sync, WidgetKit + <code>AppIntents</code>, on-device <code>FoundationModels</code> triage, <code>StoreKit 2</code> entitlements, and MetricKit telemetry.</p>
         """,
         "core_sections_html": """
-        <h3>1. The 6-Module SPM Architecture</h3>
-        <pre><code>PulseFlowEnterprise (Xcode Project / App Runner Target)
-    ├── FeatureAuth (SwiftUI, ViewModels, UDF Reducer)
-    ├── FeatureDashboard (Swift Charts, Interactive Micro-Interactions)
+        <h3>1. The Modular SPM + Binary SDK Architecture</h3>
+        <pre><code>PulseFlowEnterprise (Xcode Project / App Runner Target + .xctestplan)
+    ├── FeatureAuth (SwiftUI Liquid Glass, Passkeys, ViewModels, UDF/TCA)
+    ├── FeatureDashboard (Swift Charts, PhaseAnimator, FoundationModels Triage)
     ├── CoreNetwork (URLSession, Actor OAuth Token Refresh, Lossy Codable)
-    ├── CoreDatabase (SwiftData, VersionedSchema, ModelActor)
-    ├── DesignSystem (Typography tokens, ViewModifiers, ButtonStyles)
-    └── Telemetry (MetricKit subscriber, os.Logger subsystems)</code></pre>
+    ├── CoreDatabase (SwiftData VersionedSchema + SQLite/GRDB Sync Queue)
+    ├── DesignSystem (Liquid Glass tokens, ViewModifiers, .xcstrings)
+    ├── PulseAnalyticsSDK (Distributable XCFramework with .swiftinterface)
+    └── Telemetry (MetricKit subscriber, os.Logger subsystems, StoreKit 2)</code></pre>
 
-        <h3>2. Senior Technical Deliverables Checklist</h3>
+        <h3>2. 2027 Senior Technical Deliverables Checklist</h3>
         <ul>
-          <li><strong>Swift 6 Strict Concurrency:</strong> Compiled under <code>-strict-concurrency=complete</code> with 0 warnings.</li>
+          <li><strong>Swift 6.3 Strict &amp; Approachable Concurrency:</strong> Zero warnings, <code>Mutex</code> for short critical sections, <code>~Copyable</code> resource guards.</li>
           <li><strong>Sub-400ms Pre-Main Launch Time:</strong> Static linkage (<code>type: .static</code>) eliminating dyld dylib rebasing overhead.</li>
-          <li><strong>Resilient Offline-First Sync:</strong> SwiftData local caching with Last-Write-Wins conflict resolution.</li>
-          <li><strong>Production Observability:</strong> MetricKit reporting daily hang rates, CPU consumption, and dirty memory limits.</li>
-          <li><strong>Swift Testing Suite:</strong> >85% test coverage using <code>@Test</code>, <code>#expect</code>, and parameterization.</li>
+          <li><strong>Resilient Offline-First Sync:</strong> Protected sandbox storage + SQLite/SwiftData local caching with Last-Write-Wins conflict resolution.</li>
+          <li><strong>System Intelligence &amp; On-Device AI:</strong> <code>AppIntents</code> for Siri/Shortcuts/Widgets and <code>@Generable</code> on-device triage.</li>
+          <li><strong>Production Observability &amp; CI:</strong> MetricKit telemetry, <code>swift-format</code> + SwiftLint, <code>.xctestplan</code> matrices, and Xcode Cloud / Fastlane release trains.</li>
         </ul>
         """,
         "failure_mode_html": """
@@ -656,7 +657,7 @@ struct PulseFlowEngine {
 }
 
 func runTests() {
-    print("🧪 Running Milestone 8.1 Verification Tests...")
+    print("🧪 Running Milestone 9.1 Verification Tests...")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: true, isTelemetryActive: true) == true, "Test 1 Failed")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: false, isDatabaseReady: true, isTelemetryActive: true) == false, "Test 2 Failed")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: false, isTelemetryActive: true) == false, "Test 3 Failed")
@@ -675,21 +676,21 @@ struct PulseFlowEngine {
 }
 
 func runTests() {
-    print("🧪 Running Milestone 8.1 Verification Tests...")
+    print("🧪 Running Milestone 9.1 Verification Tests...")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: true, isTelemetryActive: true) == true)
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: false, isDatabaseReady: true, isTelemetryActive: true) == false)
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: false, isTelemetryActive: true) == false)
     print("  ✅ All tests passed!")
 }
 runTests()""",
-            "solution_explanation": "Coordinating component readiness across isolated SPM modules (CoreNetwork, CoreDatabase, Telemetry) provides a clean, decoupled foundation for the flagship PulseFlow Enterprise capstone application."
+            "solution_explanation": "Coordinating component readiness across isolated SPM modules (CoreNetwork, CoreDatabase, Telemetry, PulseAnalyticsSDK) provides a clean, decoupled foundation for the flagship 2027 PulseFlow Enterprise capstone application."
         },
         "primary_sources": [
             {"title": "PulseFlow Enterprise Architecture Specification", "url": "../index.html#capstone-card", "desc": "Complete senior portfolio project technical specification and milestone legend."},
             {"title": "The Swift Programming Language", "url": "https://docs.swift.org/swift-book/", "desc": "Canonical language reference for modern Swift 6 platform engineering."}
         ],
-        "coaching_prompt": "Congratulations! You have completed the entire 49-lesson Senior iOS Engineering syllabus! You are now equipped with deep systems mastery of the Swift compiler, Swift 6 concurrency, SwiftUI performance, offline architectures, Instruments profiling, and commercial release engineering!"
+        "coaching_prompt": "Congratulations! You have completed the entire 61-lesson Senior iOS Engineering syllabus! You are now equipped with deep systems mastery of the Swift compiler, Swift 6.3 concurrency, zero-copy Swift, SwiftUI Liquid Glass, offline architectures, FoundationModels, AppIntents, StoreKit 2, Instruments profiling, and commercial release engineering!"
     }
 ]
 
-print("Phase 7 and 8 data loaded (Lessons 7.1 - 7.5 and Milestone 8.1).")
+print("Phase 7 and 9 data loaded (Lessons 7.1 - 7.5 and Milestone 9.1).")

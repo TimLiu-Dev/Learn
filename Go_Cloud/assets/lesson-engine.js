@@ -1,15 +1,19 @@
 /**
- * Reusable Lesson Engine for Senior Go Cloud Engineering Course
- * Handles interactive code execution, test verification, progressive hints,
- * solution reveals, and comprehensive quiz scoring with rationales.
+ * Reusable Lesson Engine for Go Cloud Engineering Course (2027 Edition)
+ * Handles themes, interactive code pre-checks, progressive hints,
+ * solution toggles, balanced A/B/C/D quizzes with rationales, and progress tracking.
  */
 
 class LessonEngine {
   constructor(config = {}) {
     this.lessonId = config.lessonId || "default-lesson";
+    this.trackProgress = config.trackProgress !== undefined
+      ? config.trackProgress
+      : !["master-plan", "capstone", "ref-01", "ref-02", "default-lesson"].includes(this.lessonId);
     this.testSuite = config.testSuite || null;
     this.defaultCode = config.defaultCode || "";
     this.solutionCode = config.solutionCode || "";
+    this.labCommand = config.labCommand || "";
     this.currentHintIndex = 0;
     this.hints = config.hints || [];
 
@@ -19,6 +23,19 @@ class LessonEngine {
     this.initSolution();
     this.initQuizzes();
     this.loadProgress();
+  }
+
+  /**
+   * Strips Go line and block comments while preserving string literals so
+   * browser static pre-checks cannot be fooled by commented-out tokens.
+   */
+  static stripComments(code) {
+    if (!code) return "";
+    return code
+      .replace(/`[\s\S]*?`/g, (m) => m)
+      .replace(/"(?:\\.|[^"\\])*"/g, (m) => m)
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "");
   }
 
   // --- Theme Management ---
@@ -52,27 +69,26 @@ class LessonEngine {
 
     if (!this.editor) return;
 
-    // Load saved code or default
     const savedCode = localStorage.getItem(`gocloud_code_${this.lessonId}`);
-    if (savedCode) {
+    if (savedCode !== null && savedCode !== "") {
       this.editor.value = savedCode;
     } else if (this.defaultCode) {
       this.editor.value = this.defaultCode;
     }
 
-    // Auto-save on edit
     this.editor.addEventListener("input", () => {
       localStorage.setItem(`gocloud_code_${this.lessonId}`, this.editor.value);
     });
 
-    // Handle Tab key inside textarea
     this.editor.addEventListener("keydown", (e) => {
       if (e.key === "Tab") {
         e.preventDefault();
         const start = this.editor.selectionStart;
         const end = this.editor.selectionEnd;
-        this.editor.value = this.editor.value.substring(0, start) + "\t" + this.editor.value.substring(end);
+        this.editor.value =
+          this.editor.value.substring(0, start) + "\t" + this.editor.value.substring(end);
         this.editor.selectionStart = this.editor.selectionEnd = start + 1;
+        localStorage.setItem(`gocloud_code_${this.lessonId}`, this.editor.value);
       }
     });
 
@@ -82,7 +98,7 @@ class LessonEngine {
 
     if (this.resetBtn) {
       this.resetBtn.addEventListener("click", () => {
-        if (confirm("Reset code to starter template? All unsaved edits will be replaced.")) {
+        if (confirm("Reset code to starter template? Your edits for this lesson will be replaced.")) {
           this.editor.value = this.defaultCode;
           localStorage.setItem(`gocloud_code_${this.lessonId}`, this.defaultCode);
           this.hideTerminal();
@@ -91,7 +107,7 @@ class LessonEngine {
     }
   }
 
-  // --- Test Execution & Verification ---
+  // --- Static Pre-Check Execution ---
   async runAndVerifyCode() {
     if (!this.editor || !this.outputTerminal) return;
 
@@ -99,53 +115,56 @@ class LessonEngine {
     this.outputTerminal.className = "output-terminal active";
     this.outputTerminal.innerHTML = `
       <div class="output-status-bar output-status-running">
-        <span>⚡ Compiling & Running Verification Suite...</span>
+        <span>⚡ Running Browser Static Pre-Check...</span>
       </div>
-      <div>Analyzing Go semantics, memory boundaries, and test assertions...</div>
+      <div>Checking Go syntax structure, required contracts, and common pitfalls...</div>
     `;
 
-    // Simulate async compilation & test latency
-    await new Promise((res) => setTimeout(res, 500));
+    await new Promise((res) => setTimeout(res, 220));
 
     try {
       if (this.testSuite && typeof this.testSuite === "function") {
-        const result = await this.testSuite(userCode);
+        const result = await this.testSuite(userCode, LessonEngine.stripComments(userCode));
         this.renderTestResult(result);
       } else {
         this.renderTestResult({
           passed: true,
-          output: `=== RUN   TestCodeExecution\n--- PASS: TestCodeExecution (0.01s)\nPASS\nBenchmarkExecution-8   5000000   24.5 ns/op   0 B/op   0 allocs/op`,
-          message: "Code verification passed successfully!"
+          output: "Static pre-check complete. Run real Go tests locally via `go test -v -race ./...`.",
+          message: "Browser static pre-check passed."
         });
       }
     } catch (err) {
       this.renderTestResult({
         passed: false,
-        output: `runtime error: ${err.message}`,
-        message: "Execution or validation failed."
+        output: `pre-check error: ${err.message}`,
+        message: "Browser static pre-check failed."
       });
     }
   }
 
   renderTestResult(result) {
-    const isPass = result.passed;
+    const isPass = Boolean(result.passed);
     const statusClass = isPass ? "output-status-pass" : "output-status-fail";
-    const statusIcon = isPass ? "✅ PASS" : "❌ FAIL";
+    const statusIcon = isPass ? "✅ STATIC PRE-CHECK PASS" : "❌ STATIC PRE-CHECK FAIL";
 
     let html = `
       <div class="output-status-bar ${statusClass}">
-        <span>${statusIcon}: ${result.message || (isPass ? "All assertions verified!" : "Assertions failed")}</span>
+        <span>${statusIcon}: ${this.escapeHtml(result.message || (isPass ? "Checks passed!" : "Checks failed"))}</span>
       </div>
-      <pre style="margin:0; background:transparent; border:none; padding:0; color: inherit;">${this.escapeHtml(result.output || "")}</pre>
+      <pre style="margin:0; background:transparent; border:none; padding:0; color: inherit; box-shadow: none;">${this.escapeHtml(result.output || "")}</pre>
     `;
 
     if (result.details) {
-      html += `<div style="margin-top: 0.75rem; color: var(--text-secondary); font-size: 0.82rem;">${result.details}</div>`;
+      html += `<div style="margin-top: 0.75rem; color: var(--text-secondary); font-size: 0.82rem;">${this.escapeHtml(result.details)}</div>`;
+    }
+
+    if (this.labCommand) {
+      html += `<div style="margin-top: 0.75rem; padding-top: 0.65rem; border-top: 1px solid var(--border-color); color: var(--accent-cyan); font-size: 0.82rem;">Real compiler &amp; race check: <code>${this.escapeHtml(this.labCommand)}</code></div>`;
     }
 
     this.outputTerminal.innerHTML = html;
 
-    if (isPass) {
+    if (isPass && this.trackProgress) {
       this.markLessonComplete();
     }
   }
@@ -170,7 +189,7 @@ class LessonEngine {
         const hintText = this.hints[this.currentHintIndex];
         const stepEl = document.createElement("div");
         stepEl.className = "hint-step";
-        stepEl.innerHTML = `<strong>💡 Hint ${stepNum} of ${this.hints.length}:</strong> ${hintText}`;
+        stepEl.innerHTML = `<strong>💡 Hint ${stepNum} of ${this.hints.length}:</strong> ${this.escapeHtml(hintText)}`;
         this.hintPanel.appendChild(stepEl);
         this.currentHintIndex++;
 
@@ -215,6 +234,14 @@ class LessonEngine {
       let selectedOption = null;
 
       options.forEach((opt) => {
+        const key = opt.getAttribute("data-key") || "";
+        if (key && !opt.querySelector(".quiz-option-key")) {
+          const badge = document.createElement("span");
+          badge.className = "quiz-option-key";
+          badge.textContent = key;
+          opt.insertBefore(badge, opt.firstChild);
+        }
+
         opt.addEventListener("click", () => {
           options.forEach((o) => o.classList.remove("selected"));
           opt.classList.add("selected");
@@ -230,8 +257,9 @@ class LessonEngine {
           const isCorrect = selectedOption.getAttribute("data-correct") === "true";
           const chosenKey = selectedOption.getAttribute("data-key");
 
-          // Highlight choices
+          // Reset previous grading highlights before applying current attempt
           options.forEach((opt) => {
+            opt.classList.remove("correct", "incorrect");
             if (opt.getAttribute("data-correct") === "true") {
               opt.classList.add("correct");
             } else if (opt === selectedOption && !isCorrect) {
@@ -239,14 +267,12 @@ class LessonEngine {
             }
           });
 
-          // Show rich rationale
           if (feedback) {
             feedback.className = `quiz-feedback active ${isCorrect ? "success" : "failure"}`;
             const summaryTitle = isCorrect
-              ? `✅ <strong>Correct!</strong> Choice ${chosenKey} is the accurate architectural analysis.`
-              : `❌ <strong>Incorrect.</strong> Choice ${chosenKey} reflects a common misconception.`;
+              ? `✅ <strong>Correct!</strong> Choice ${this.escapeHtml(chosenKey)} is accurate.`
+              : `❌ <strong>Incorrect.</strong> Choice ${this.escapeHtml(chosenKey)} reflects a common misconception.`;
 
-            // Extract rationales from data attributes or child elements
             const rationalesContainer = card.querySelector(".quiz-rationales-data");
             let rationaleHtml = "";
             if (rationalesContainer) {
@@ -261,7 +287,6 @@ class LessonEngine {
             feedback.innerHTML = `<div>${summaryTitle}</div>${rationaleHtml}`;
           }
 
-          // Persist quiz completion
           this.recordQuizResult(card.id, isCorrect);
         });
       }
@@ -274,6 +299,7 @@ class LessonEngine {
   }
 
   markLessonComplete() {
+    if (!this.trackProgress) return;
     const progress = JSON.parse(localStorage.getItem("gocloud_progress") || "{}");
     progress[this.lessonId] = {
       completed: true,
@@ -283,24 +309,25 @@ class LessonEngine {
 
     const checkmark = document.getElementById("lessonStatusIndicator");
     if (checkmark) {
-      checkmark.innerHTML = "✅ Lesson Mastered";
+      checkmark.innerHTML = "✅ Pre-Check Passed";
       checkmark.className = "badge-pill badge-bench";
     }
   }
 
   loadProgress() {
+    if (!this.trackProgress) return;
     const progress = JSON.parse(localStorage.getItem("gocloud_progress") || "{}");
     if (progress[this.lessonId] && progress[this.lessonId].completed) {
       const checkmark = document.getElementById("lessonStatusIndicator");
       if (checkmark) {
-        checkmark.innerHTML = "✅ Lesson Mastered";
+        checkmark.innerHTML = "✅ Pre-Check Passed";
         checkmark.className = "badge-pill badge-bench";
       }
     }
   }
 
   escapeHtml(str) {
-    return str
+    return String(str)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
@@ -309,11 +336,11 @@ class LessonEngine {
   }
 }
 
-// Global helper for code copying
 window.copyToClipboard = function (elementId, btnElement) {
   const codeEl = document.getElementById(elementId);
   if (!codeEl) return;
-  const text = codeEl.innerText || codeEl.textContent;
+  const text = "value" in codeEl ? codeEl.value : (codeEl.innerText || codeEl.textContent || "");
+  if (!navigator.clipboard) return;
   navigator.clipboard.writeText(text).then(() => {
     const origText = btnElement.innerText;
     btnElement.innerText = "Copied!";

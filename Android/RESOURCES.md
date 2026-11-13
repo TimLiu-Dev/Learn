@@ -16,6 +16,16 @@
   Official deep-dives from the Android engineering team at Google. Use for: System internals, runtime optimizations, and Compose internals.
 - [ProAndroidDev & AndroidPub](https://proandroiddev.com)
   High-signal community articles by Google Developer Experts (GDEs) and staff engineers. Use for: Case studies, architectural benchmarks, and real-world migrations.
+- [Android Developers: 16 KB Page Sizes & Adaptive Apps](https://developer.android.com/guide/practices/page-sizes)
+  Official Android 15/16/17 compliance guides for 16 KB ELF alignment, `WindowSizeClass` resizability, and Predictive Back. Use for: Play Store compliance and multi-form-factor architecture.
+- [Android Developers: Credential Manager & Play Integrity](https://developer.android.com/identity/sign-in/credential-manager)
+  Primary guides for Passkeys, unified sign-in, and server-verified app/device attestation. Use for: Authentication and anti-abuse engineering.
+- [Android Developers: Android Vitals & ApplicationExitInfo](https://developer.android.com/topic/performance/vitals)
+  Official production health metrics, ANR/LMK/OOM exit reason diagnostics, and staged rollout playbooks. Use for: Production observability and incident triage.
+- [JetBrains & Google: Kotlin Multiplatform & Compose Multiplatform](https://kotlinlang.org/docs/multiplatform.html)
+  Official KMP documentation and Android Jetpack KMP library guides (Room KMP, DataStore, Ktor, Koin). Use for: Sharing business logic and UI natively across Android and iOS.
+- [Android Developers: Gemini Nano & On-Device AI](https://developer.android.com/ai/gemini-nano)
+  Official AICore and ML Kit GenAI documentation for local inference. Use for: Privacy-first, offline-capable AI features.
 
 ## Wisdom (Communities)
 

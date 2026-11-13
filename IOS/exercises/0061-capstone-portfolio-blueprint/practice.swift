@@ -9,7 +9,7 @@ struct PulseFlowEngine {
 }
 
 func runTests() {
-    print("🧪 Running Milestone 8.1 Verification Tests...")
+    print("🧪 Running Milestone 9.1 Verification Tests...")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: true, isTelemetryActive: true) == true, "Test 1 Failed")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: false, isDatabaseReady: true, isTelemetryActive: true) == false, "Test 2 Failed")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: false, isTelemetryActive: true) == false, "Test 3 Failed")

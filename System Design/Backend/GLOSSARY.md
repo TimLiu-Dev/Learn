@@ -55,3 +55,22 @@ _Avoid_: Binary search tree, Balanced index
 **Outbox Pattern**:
 A reliability pattern where database updates and corresponding event messages are written to the same relational database in a single atomic ACID transaction, then published asynchronously.
 _Avoid_: Dual-write bridge, Event queue sync
+
+
+## Backend Foundations (Part 1)
+
+**Endpoint**:
+One HTTP method plus a route that a server handles, e.g. `GET /notes/{id}`.
+_Avoid_: API (too broad), URL (leaves out the method)
+
+**Controller**:
+The server class whose methods handle endpoints. In Spring it's annotated `@RestController`. It's the server-side counterpart of a Retrofit interface.
+_Avoid_: Handler class, Router
+
+**Status Code**:
+The three-digit result the *server chooses* for each response (200, 201, 400, 404…). Its meaning is defined by RFC 9110 §15.
+_Avoid_: Error code (most status codes aren't errors)
+
+**Stateless Service**:
+A service instance that keeps no client or data state in its own memory between requests. Any instance can serve any request, which is what makes horizontal scaling work.
+_Avoid_: Sessionless, Pure service

@@ -1,5 +1,7 @@
 # Stages 5 & 6: I/O, Networking & Concurrency Mastered
 
+> **Status:** Superseded by [0009-audit-and-readiness-reset.md](0009-audit-and-readiness-reset.md). Historical curriculum-generation log — Stages 5 & 6 mastery has NOT yet been demonstrated by the learner.
+
 The learner completed Stages 5 and 6 (Lessons 0023 through 0029):
 1. **NIO.2 & Modern File Systems (Lesson 0023):** `Path.of()`, `Files` API, atomic replacement via `StandardCopyOption.ATOMIC_MOVE`, and safe stream closing inside `try-with-resources`.
 2. **Modern HTTP Client (Lesson 0024):** HTTP/2 negotiation, immutable `HttpRequest`, asynchronous non-blocking dispatch with `sendAsync()`, timeouts, and standard `BodyHandlers`.

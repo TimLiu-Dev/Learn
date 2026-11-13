@@ -104,6 +104,12 @@ Items marked ➕ were added to expand the language scope.
 - **12.3** ➕ Testing Flows & hot state: `StateFlow` conflation, `Channel` effects, `backgroundScope`, and `Turbine`
 - **R12** ➕ Mixed review & Senior Production Bug Hunt: race conditions, unmockable singletons, and dispatcher leaks
 
+## 13 · Modern Kotlin 2.2–2.4, Production Flow & Android Tooling (2027 Track — Built & Live)
+- **13.1** ➕ Modern Kotlin 2.2–2.4 syntax, DSLs & deep recursion (`when` guards, non-local `break`/`continue`, context parameters, `@DslMarker`, `fun interface` SAM, `tailrec`, `DeepRecursiveFunction`)
+- **13.2** ➕ Production Android Flow & Concurrency (`callbackFlow` + `awaitClose`, `stateIn(WhileSubscribed(5_000))`, `flatMapLatest`, `Mutex.withLock`)
+- **13.3** ➕ Gradle Kotlin DSL (`build.gradle.kts` & `libs.versions.toml`), resilient `kotlinx.serialization`, and JVM interop (`@JvmOverloads`, `@JvmName`, `@JvmStatic`, `@Throws`)
+- **R13** ➕ 2027 Android Mastery Review: Capstone offline-sync engine & 4-bug production PR audit
+
 ---
 
 ## Senior Deep-Dive Expansion Queue (Section-by-Section)
@@ -119,7 +125,7 @@ Items marked ➕ were added to expand the language scope.
 ---
 
 ## Reference sheets built along the way (`reference/`)
-- **Language Reference Sheets**: Foundations (1.x) · Null-safety (2.x) · Functions (3.x) · Classes & Modeling (4.x) · Lambdas (5.x) · Scope functions (6.x) · Collections & DSA (7.x) · Delegation (8.x) · Generics (9.x) · Coroutines & Flow (10.x) · Smell catalogue (11.x).
+- **Language Reference Sheets**: Foundations (1.x) · Null-safety (2.x) · Functions (3.x) · Classes & Modeling (4.x) · Lambdas (5.x) · Scope functions (6.x) · Collections & DSA (7.x) · Delegation (8.x) · Generics (9.x) · Coroutines & Flow (10.x) · Smell catalogue (11.x) · Testing & Coroutines (12.x) · Modern Kotlin & Tooling (13.x).
 - **The Four Production Pillar Playbooks**:
   1. **Android & Jetpack Compose Playbook** (`reference/android.html`): UDF state, `collectAsStateWithLifecycle`, one-off effect channels, Compose stability contracts.
   2. **Spring Boot & Server-Side Kotlin Playbook** (`reference/spring-boot.html`): Compiler plugins (`kotlin-spring`/`all-open`, `kotlin-jpa`/`no-arg`), use-site target annotations (`@field:NotBlank`), JPA entity patterns, and non-blocking WebFlux coroutines.

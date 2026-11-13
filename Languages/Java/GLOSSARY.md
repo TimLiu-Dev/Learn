@@ -12,6 +12,18 @@ _Avoid_: Java compiler, Java runtime environment.
 The JVM tiered compilation engine (C1 client + C2 server compilers) that profiles bytecode execution at runtime, inlines hot methods, performs Escape Analysis, and emits optimized native CPU instructions.
 _Avoid_: AOT compiler, bytecode interpreter.
 
+**Compact Source File & `java.lang.IO` (JEP 512)**:
+A single-file Java 25 source program omitting an explicit enclosing `class` declaration and launching via an instance `void main()` method with `IO.println(...)` / `IO.readln(...)`.
+_Avoid_: Untyped scripting language, reflective runner.
+
+**Flexible Constructor Body (JEP 513)**:
+Java 25 language rule allowing prologue statements (argument validation, local computations, field initialization) before `super(...)` or `this(...)` inside a constructor, provided they do not read `this` before superclass construction.
+_Avoid_: Unbounded helper factory methods only.
+
+**Stream Gatherer (`JEP 485`)**:
+A composable intermediate operation (`Stream.gather(Gatherer)`) introduced cleanly in Java 24/25 via `java.util.stream.Gatherers` for windowing, batching, stateful scanning, and short-circuiting mid-pipeline.
+_Avoid_: Terminal Collector misuse.
+
 **Escape Analysis & Scalar Replacement**:
 A C2 JIT optimization determining whether an object's reference escapes the current method or thread; non-escaping objects can have their fields decomposed onto CPU registers/stack slots instead of allocating on the heap.
 _Avoid_: Stack allocation keyword, manual free.
@@ -37,12 +49,24 @@ The compile-time process where `javac` translates generic type parameters into t
 _Avoid_: Dynamic typing, runtime duck typing.
 
 **Structured Concurrency (`StructuredTaskScope`)**:
-A concurrency model tying the lifetimes of concurrent subtasks spawned on virtual threads to a lexical lexical block, ensuring automatic cancellation on failure (`ShutdownOnFailure`) and zero leaked child threads.
+A concurrency model tying the lifetimes of concurrent subtasks spawned on virtual threads to a lexical block, ensuring automatic cancellation on failure and zero leaked child threads (JDK 21 preview `ShutdownOnFailure`; JDK 25 JEP 505 `StructuredTaskScope.open()`).
 _Avoid_: Unbounded fire-and-forget futures.
 
 **ScopedValue**:
 An immutable, lexically-scoped context carrier designed for Project Loom virtual threads, replacing mutable `ThreadLocal` variables without unbounded inheritance copying or forgotten `.remove()` memory leaks.
 _Avoid_: Mutable global state, pooled ThreadLocal.
+
+**KDF (`javax.crypto.KDF`, JEP 510)**:
+The Java 25 standard Key Derivation Function API supporting HKDF-SHA256 extraction and expansion of high-entropy symmetric `SecretKey` material from shared secrets or contexts.
+_Avoid_: Rolling raw ad-hoc XOR/SHA concatenation for key expansion.
+
+**ReDoS (Regular Expression Denial of Service)**:
+Catastrophic CPU stalling triggered when a backtracking NFA regex engine (`java.util.regex.Pattern`) encounters nested quantifiers (`(a+)+`) on crafted non-matching input.
+_Avoid_: Unbounded regexes on untrusted user strings without possessive/atomic groups or length limits.
+
+**JSpecify Nullness (`@NullMarked` / `@Nullable`)**:
+The standardized JVM nullability annotation set adopted across Spring Boot 4, Spring Framework 7, and NullAway to distinguish non-null defaults from explicit nullable parameters and return values.
+_Avoid_: Mixing conflicting JSR-305, JetBrains, and legacy Spring `@NonNull` annotations.
 
 ---
 
@@ -99,6 +123,10 @@ _Avoid_: Infinite retries without backoff/jitter.
 **W-TinyLFU (`Caffeine`)**:
 A modern cache eviction and admission algorithm combining recency (Window LRU) with frequency sketching (Count-Min Sketch) to achieve near-optimal hit rates in bounded JVM heap memory.
 _Avoid_: Unbounded `ConcurrentHashMap` cache.
+
+**Jackson 3 (`tools.jackson`)**:
+Major release of the Jackson JSON/data-binding library used by default in Spring Boot 4 / Framework 7, relocating core packages to `tools.jackson.*` and emphasizing immutable `JsonMapper` builders.
+_Avoid_: Importing legacy `com.fasterxml.jackson.databind.ObjectMapper` on Boot 4 greenfield code unless maintaining compatibility bridges.
 
 ---
 

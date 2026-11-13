@@ -1,39 +1,50 @@
-# Senior Go with Cloud Resources
+# Go Cloud Engineering Resources (2027)
 
 ## Knowledge
 
-### Go Internals, Performance & Architecture
+### Go Language, Idioms & Toolchain (`roadmap.sh/golang` + Modern Go 1.23–1.27)
+- [A Tour of Go](https://go.dev/tour/) & [Effective Go](https://go.dev/doc/effective_go)
+  Official interactive language tour and idiomatic style guide. Use for: bridging Kotlin/Java syntax into Go zero values, slices, interfaces, and error values.
 - [The Go Programming Language Specification](https://go.dev/ref/spec)
-  The definitive source of truth for language grammar, type semantics, channel behavior, and evaluation order. Use for: resolving ambiguities in syntax, type assertions, and semantics.
-- [The Go Memory Model](https://go.dev/ref/mem)
-  Official specification of happens-before relationships, synchronization guarantees, atomics, and data race semantics. Use for: verifying correctness of lock-free and concurrent algorithms.
-- [Ardan Labs: Ultimate Go Series — Bill Kennedy](https://www.ardanlabs.com/blog/)
-  In-depth architectural breakdowns of escape analysis, mechanical sympathy, garbage collector pacing, and value vs. pointer semantics. Use for: deep mechanical understanding and low-allocation design.
+  Definitive grammar and semantics specification (slice capacity rules, channel axioms, evaluation order). Use for: resolving edge-case language questions.
+- [Official Go Release Notes (1.23–1.27)](https://go.dev/doc/devel/release)
+  Authoritative changelog for `iter.Seq` (1.23), Swiss Tables & `weak.Pointer` (1.24), container-aware `GOMAXPROCS` & `testing/synctest` (1.25), `new(expr)` & `errors.AsType` (1.26), and generic methods (1.27).
+- [Go Diagnostics, Testing & Race Detector Guide](https://go.dev/doc/diagnostics)
+  Official guide to `testing`, `-race`, `pprof`, execution traces (`go tool trace`), and memory profiling. Use for: correctness verification and hot-path profiling.
+- [Testing Concurrent Code with testing/synctest — Go Blog](https://go.dev/blog/testing-time)
+  Guide to virtualized-time concurrency testing bubbles in Go 1.25+. Use for: writing deterministic tests for timeouts, backoff, and goroutine lifecycles.
+- [Routing Enhancements for Go 1.22 net/http — Go Blog](https://go.dev/blog/routing-enhancements)
+  Official guide to method/path routing and `r.PathValue` in standard library `net/http`. Use for: building HTTP microservices without heavy frameworks.
 - [100 Go Mistakes and How to Avoid Them — Teiva Harsanyi (Manning)](https://www.manning.com/books/100-go-mistakes-and-how-to-avoid-them)
-  Comprehensive catalog of subtle production bugs, concurrency hazards, memory leaks, and performance anti-patterns. Use for: defensive coding and code reviews.
-- [Go Diagnostics & Profiling Guide](https://go.dev/doc/diagnostics)
-  Official documentation on `pprof`, execution tracer (`go tool trace`), race detector (`-race`), and memory allocation profiling. Use for: performance bottleneck diagnosis and tuning.
+  Catalog of subtle Go bugs (slice aliasing, loop closures, context leaks, false sharing). Use for: defensive code reviews.
 
-### Cloud-Native Systems & Distributed Architecture
-- [Cloud Native Go: Building Reliable Services in Unreliable Environments — Matthew Titmus (O'Reilly)](https://www.oreilly.com/library/view/cloud-native-go/9781492076322/)
-  Pragmatic blueprint for fault-tolerance, circuit breakers, rate limiting, and observability in Go services. Use for: resilient service orchestration.
+### Go Internals & Performance
+- [The Go Memory Model](https://go.dev/ref/mem)
+  Formal specification of happens-before edges, channels, mutexes, and `sync/atomic`. Use for: verifying lock-free and concurrent algorithms.
+- [Faster Go Maps with Swiss Tables — Michael Pratt (Go Blog)](https://go.dev/blog/swisstable)
+  Official deep dive into Go 1.24's 8-slot control-byte hash map implementation. Use for: understanding map memory and probe efficiency.
+- [Profile-Guided Optimization (PGO) User Guide — Go.dev](https://go.dev/doc/pgo)
+  Official guide to feeding production CPU profiles (`default.pgo`) into `go build`. Use for: devirtualization and cross-package inlining in CI/CD.
+- [Ardan Labs: Ultimate Go Series — William Kennedy](https://www.ardanlabs.com/blog/)
+  Deep breakdowns of escape analysis, value vs. pointer semantics, and GC pacing. Use for: mechanical sympathy.
+
+### Cloud-Native Systems, SQL & Distributed Architecture
+- [Cloud Native Go — Matthew Titmus (O'Reilly)](https://www.oreilly.com/library/view/cloud-native-go/9781492076322/)
+  Blueprints for circuit breakers, rate limiters, retries, and graceful degradation in Go. Use for: Module 03 resilience patterns.
 - [Designing Data-Intensive Applications — Martin Kleppmann (O'Reilly)](https://dataintensive.net/)
-  The gold standard for distributed consensus, replication, partitioning, and transactional isolation. Use for: grounding distributed systems design in Go.
-- [OpenTelemetry Go SDK Documentation](https://opentelemetry.io/docs/languages/go/)
-  Standard guidelines for instrumenting traces, baggage propagation, and metrics with OpenTelemetry. Use for: distributed observability.
-- [Kubernetes Best Practices: Up and Running — Brendan Burns et al.](https://www.oreilly.com/library/view/kubernetes-best-practices/9781492056461/)
-  Foundational rules for container resource management, pod lifecycles, graceful shutdowns, and health checks. Use for: deploying Go binaries in Kubernetes.
+  Gold standard for consistency, replication, transactional outbox, and distributed consensus. Use for: Module 04 & Capstone architecture.
+- [sqlc Documentation](https://docs.sqlc.dev/) & [pgx PostgreSQL Driver](https://pkg.go.dev/github.com/jackc/pgx/v5)
+  Type-safe SQL code generation and high-performance PostgreSQL pooling in Go. Use for: replacing mobile Room/ORM mental models with production Go SQL.
+- [ConnectRPC Go Documentation](https://connectrpc.com/docs/go/getting-started/)
+  Modern Protobuf RPC over `net/http` supporting gRPC, gRPC-Web, and HTTP/JSON simultaneously. Use for: Module 02 inter-service communication.
+- [Structured Logging with slog — Jonathan Amsterdam (Go Blog)](https://go.dev/blog/slog)
+  Official guide to `log/slog`, `slog.LevelVar`, `ReplaceAttr`, and allocation-free `LogAttrs`. Use for: production observability.
+- [OpenTelemetry Go SDK](https://opentelemetry.io/docs/languages/go/) & [Kubernetes Best Practices — Brendan Burns et al.](https://www.oreilly.com/library/view/kubernetes-best-practices/9781492056461/)
+  Standards for distributed tracing, probes, `GOMEMLIMIT`, and pod lifecycles. Use for: Modules 05–06.
+- [roadmap.sh Go Developer Roadmap](https://roadmap.sh/golang)
+  Ecosystem topic reference used to audit and align this workspace's Go fundamentals, tooling, and backend coverage.
 
 ## Wisdom (Communities)
-
-- [Gophers Slack](https://gophers.slack.com/)
-  The global community of professional Go developers; channels like `#performance`, `#internals`, and `#cloud` feature Go compiler contributors and cloud architects. Use for: peer review on complex architecture and concurrency dilemmas.
-- [r/golang on Reddit](https://www.reddit.com/r/golang)
-  Active community discussing releases, production war stories, open-source libraries, and job market trends. Use for: staying attuned to industry tooling shifts.
-- [Go Forum](https://forum.golangbridge.org/)
-  Constructive discussion board for nuanced language and library architecture queries. Use for: deep conceptual questions.
-- [CNCF Slack](https://cloud-native.slack.com/)
-  The hub of cloud-native engineering (#kubernetes-dev, #opentelemetry, #envoy). Use for: production cloud deployments and ecosystem updates.
-
-## Gaps
-- Interactive in-browser micro-benchmarking with real-time hardware counter visualization (addressed via our custom interactive simulation suite in `./assets/lesson-engine.js`).
+- [Gophers Slack](https://gophers.slack.com/) (`#newbies`, `#performance`, `#cloud`, `#testing`)
+- [r/golang](https://www.reddit.com/r/golang) & [Go Forum](https://forum.golangbridge.org/)
+- [CNCF Slack](https://cloud-native.slack.com/) (`#kubernetes-dev`, `#opentelemetry`)

@@ -29,6 +29,12 @@ Curated, high-trust sources grounding the idiomatic Kotlin curriculum across And
   Why `collectAsStateWithLifecycle()` is mandatory to prevent background battery drain.
 - [Android Kotlin Style Guide](https://developer.android.com/kotlin/style-guide)
   Google's rules for Android codebases and library APIs.
+- [Kotlin 2.2+ What's New & Context Parameters](https://kotlinlang.org/docs/whatsnew22.html)
+  `when` guard conditions, non-local `break`/`continue`, and modern DSL / context APIs.
+- [Gradle Version Catalogs (`libs.versions.toml`)](https://docs.gradle.org/current/userguide/platforms.html)
+  Official reference for dependency aliases, bundles, and Kotlin DSL plugin blocks.
+- [kotlinx.serialization JSON Configuration Guide](https://github.com/Kotlin/kotlinx.serialization/blob/master/docs/json.md)
+  Production JSON tolerance (`ignoreUnknownKeys`, `coerceInputValues`, `@SerialName`).
 
 ### Pillar 2: Spring Boot Backend & Server-Side Kotlin
 - [Spring Framework Reference: Kotlin Support](https://docs.spring.io/spring-framework/reference/languages/kotlin.html)

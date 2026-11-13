@@ -1,27 +1,21 @@
 # Learner Preferences & Workspace Notes
 
 ## Learner Profile & Objectives
-- **Target Role**: Senior / Staff Go Cloud Engineer or Distributed Systems Backend Engineer (2026/2027 Hiring Standard).
-- **Background**: Experienced Senior Software Developer transitioning to Go and Cloud-native architectures.
-- **Pacing**: Rapid, dense, high mechanical sympathy; skip junior introductory explanations (e.g., "what is a loop").
-- **Key Pedagogical Priorities**:
-  - Deep mechanics: Memory layout, stack/heap escape analysis, Go scheduler (GMP), GC tricolor concurrent sweep, zero-allocation patterns, CSP concurrency, atomics.
-  - 2027 Modern Additions:
-    - Profile-Guided Optimization (PGO) in CI/CD pipelines.
-    - Go 1.22–1.24+ runtime innovations: `iter.Seq` range-over-func, Swiss Tables map architecture, `weak.Pointer` for zero-leak caches, `testing/synctest` for deterministic virtual-time concurrency testing.
-    - Kubernetes production tuning: `go.uber.org/automaxprocs` to prevent CFS quota throttling, `GOMEMLIMIT` to eliminate Exit Code 137 OOMKills.
-    - Cloud Identity: SPIFFE/SPIRE & Workload Identity Federation replacing static secrets.
-    - Continuous profiling with eBPF (Pyroscope/Parca).
-    - Streaming & LLM Gateways: Server-Sent Events (SSE) backpressure and chunked transfer.
-  - Interactive verification: In-browser code runner & automated checks, progressive multi-level hints, final solution code with diff, and multiple-choice quizzes with comprehensive rationales for BOTH correct and incorrect answers.
-  - Resume & Portfolio: End-to-end Capstone project ("CloudScale Distributed Financial Ledger & Event Stream") with production architecture, CI/CD, benchmarks, and deployment manifests.
+- **Current Baseline**: Junior Android Developer (familiar with Kotlin/Java, basic OOP, Gradle, Retrofit/JSON clients, Room/SQLite, basic coroutines; new to Go, server-side Linux/cgroups, SQL pooling/migrations, and Kubernetes).
+- **Target Role**: Senior Go Cloud Engineer / Distributed Systems Backend Engineer (2027 Hiring Standard).
+- **Roadmap Calibration (`https://roadmap.sh/golang`)**:
+  - **Added**: Module 00 bridge (Go toolchain & modules, Kotlin→Go mental model, slices/maps/structs/pointers, errors as values & generics, table-driven testing/`-race`/`testing/synctest`, Go 1.22+ `net/http` routing & graceful shutdown, Linux/cgroups + `sqlc`/migrations + Redis basics), plus 2025–2027 Go features (`weak.Pointer`, native container `GOMAXPROCS`, `new(expr)`, `errors.AsType`, generic methods).
+  - **Removed / Trimmed**: Overlapping web framework churn (`Beego`/`Buffalo`/`Fiber`/`Echo`), heavy ORMs (`GORM`/`Ent`), deep CLI/TUI frameworks (`Bubble Tea`/`Lip Gloss`), `plugin`, `encoding/xml`, SSR `html/template`, deep `CGO`.
+- **Verification Preference**:
+  - Browser lessons provide interactive code editors with honest **static semantic pre-checks** (never faking `go test` output) plus balanced A/B/C/D quizzes with all-options rationales.
+  - Every live lesson is backed by real runnable `.go` + `_test.go` packages in `./labs/` verified with real `go test -v -race -bench=. -benchmem` on macOS.
+- **Rollout Preference**:
+  - Module 00 (`0000-1`..`0000-6`), Module 01 (`0001`–`0005`), Module 02 (`0006`–`0010`), Reference sheets, and Capstone ready upfront for Day 1.
+  - Modules 03–06 (`0011`–`0026+`) generated dynamically step-by-step as learning progresses per ZPD (`./learning-records/`).
 
-## Architectural Conventions for Lessons
-- Reusable components stored strictly in `./assets/` (`style.css`, `lesson-engine.js`).
-- Lessons stored in `./lessons/0001-<name>.html` with sequential numbering and bidirectional navigation (`← Previous` and `Next →`).
-- Master plan and curriculum directory in `index.html` and `master-plan.html`.
-- Compressed reference sheets in `./reference/`.
-- Quizzes adhere to the teach-skill rule: answer choices have balanced length/word-count to prevent unintentional formatting bias.
-- Detailed rationale explanations provided for all options (A, B, C, D) detailing why correct and why wrong.
-- Primary source citations included in every lesson.
-- Capstone Project housed in `./capstone/` with interactive portal at `capstone/index.html` and runnable Go codebase, tests, benchmarks, Dockerfile, and K8s manifests.
+## Architectural Conventions for Lessons & Assets
+- Reusable components live strictly in `./assets/` (`style.css`, `lesson-engine.js`).
+- Light and Dark themes must both remain high-contrast across editors, terminals, and callouts.
+- Quizzes strictly distribute correct keys across A/B/C/D, include `.quiz-option-key` badges, balance option lengths, and provide itemized rationales for every option.
+- `GLOSSARY.md` is built incrementally—only add terms once the learner demonstrates mastery of them (per `GLOSSARY-FORMAT.md`).
+- Master plan & syllabus live in `index.html`; progress tracker tracks only actual lessons (never non-lesson pages like `capstone` or `ref-01`).

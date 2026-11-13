@@ -12,6 +12,7 @@ class CodeRunner {
     this.solutionCode = (options.solutionCode || '').trim();
     this.hints = options.hints || [];
     this.testSuite = options.tests || [];
+    this.successMessage = options.successMessage || 'Superb work! Your implementation accurately satisfies the concurrency, rolling window, and accuracy invariants.';
     this.storageKey = `coderunner_${this.id}`;
 
     if (this.container) {
@@ -283,7 +284,7 @@ class CodeRunner {
       summaryEl.innerHTML = `
         <div class="callout callout-tip" style="margin: 0;">
           <div class="callout-title">🎉 All ${passedCount} Tests Passing!</div>
-          <p>Superb work! Your implementation accurately satisfies the concurrency, rolling window, and accuracy invariants.</p>
+          <p>${this.successMessage}</p>
         </div>
       `;
     } else {

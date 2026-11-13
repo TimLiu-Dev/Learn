@@ -57,7 +57,7 @@
       return;
     }
     const script = document.createElement("script");
-    script.src = location.pathname.includes("/lessons/") ? "../assets/answers.js" : "assets/answers.js";
+    script.src = (location.pathname.includes("/lessons/") || location.pathname.includes("/reference/")) ? "../assets/answers.js" : "assets/answers.js";
     script.onload = () => { if (callback) callback(); };
     script.onerror = () => { if (callback) callback(); };
     document.head.appendChild(script);
@@ -393,7 +393,7 @@
       const exIndex = index + 1;
       const exKey = `${lessonNum}-ex${exIndex}`;
 
-      const codeEl = section.querySelector("code.kt-run") || section.querySelector("main code.kt-show");
+      const codeEl = section.querySelector("code.kt-run") || section.querySelector("code.kt-show");
       const rawStarter = codeEl ? stripSampleMarkers(codeEl.textContent) : "fun main() {\n    // Write your solution here\n}";
       const expectedOutput = section.dataset.expectedOutput || (codeEl && codeEl.dataset.expectedOutput) || null;
 

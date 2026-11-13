@@ -30,6 +30,20 @@
 - [Blog: _Cloudflare The Cloudflare Blog_](https://blog.cloudflare.com/)
   Edge compute, DDoS mitigation, and distributed rate limiting at 50M+ RPS. Use for: Anycast, edge caching, and eBPF network filtering.
 
+### Part 1 Foundations (Junior → Mid, Kotlin + Spring Boot)
+- [Roadmap: roadmap.sh System Design](https://roadmap.sh/system-design) ([source](https://github.com/kamranahmedse/developer-roadmap))
+  Vocabulary checklist (132 nodes). Use for: coverage checks only — not as a learning order. Audited 2026-11-12, see LR-0005.
+- [Guide: _The System Design Primer_ — Donne Martin](https://github.com/donnemartin/system-design-primer)
+  Source of roadmap.sh's fundamentals section. Use for: scalability basics, CAP, caching, DB scaling, worked interview problems.
+- [Docs: Azure Cloud Design Patterns](https://learn.microsoft.com/en-us/azure/architecture/patterns/) and [Performance Antipatterns](https://learn.microsoft.com/en-us/azure/architecture/antipatterns/)
+  Source of roadmap.sh's patterns section. Use for: retry, circuit breaker, queue-based load leveling, chatty I/O, retry storm.
+- [Tutorial: Building web applications with Spring Boot and Kotlin — spring.io](https://spring.io/guides/tutorials/spring-boot-kotlin)
+  Official Kotlin-first Spring Boot walkthrough. Use for: Phase 0 project setup, controllers, Spring Data, testing.
+- [Tool: Spring Initializr](https://start.spring.io/)
+  Official project generator. Use for: bootstrapping Kotlin/Java Spring Boot projects.
+- [Spec: RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) and [MDN: HTTP response status codes](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status)
+  Authoritative HTTP method and status semantics. Use for: choosing 200/201/204/400/404/409, Location header.
+
 ## Wisdom (Communities)
 
 - [Reddit: r/ExperiencedDevs](https://reddit.com/r/ExperiencedDevs)
@@ -42,4 +56,5 @@
   Active mock interview community for Senior and Staff practice sessions. Use for: peer mock interviews and live feedback calibration.
 
 ## Gaps
+- Mobile-to-backend bridge material (offline-first sync, FCM fan-out at scale) from a high-trust source: not yet found.
 - Concrete 2027 AI-augmented backend design (LLM caching, semantic rate limiting, RAG latency budgets): rapidly evolving; must monitor emerging papers from Anthropic/OpenAI on inference infrastructure.

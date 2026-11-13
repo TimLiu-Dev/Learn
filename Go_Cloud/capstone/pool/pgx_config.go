@@ -1,7 +1,6 @@
 package pool
 
 import (
-	"context"
 	"fmt"
 	"time"
 )
@@ -36,12 +35,18 @@ func DefaultProductionSettings() PgxPoolSettings {
 
 // ValidatePoolConfig validates pool constraints against common Kubernetes anti-patterns.
 func ValidatePoolConfig(s PgxPoolSettings, containerCPUQuota float64) error {
+	if s.MaxConns <= 0 {
+		return fmt.Errorf("maxConns (%d) must be positive", s.MaxConns)
+	}
+	if s.MinConns < 0 {
+		return fmt.Errorf("minConns (%d) cannot be negative", s.MinConns)
+	}
 	if s.MinConns > s.MaxConns {
 		return fmt.Errorf("minConns (%d) cannot exceed maxConns (%d)", s.MinConns, s.MaxConns)
 	}
 
-	// Heuristic: If CPU quota is small (e.g. 1 core) and MaxConns is huge (>100),
-	// goroutines will suffer severe lock contention waiting on database connection checkouts.
+	// Heuristic: If CPU quota is small (e.g. 1 core) and MaxConns is huge (>50 per core),
+	// goroutines suffer pool checkout contention and DB context-switching overhead.
 	if containerCPUQuota > 0 && float64(s.MaxConns)/containerCPUQuota > 50 {
 		return fmt.Errorf("danger: maxConns (%d) is disproportionately large for %.1f CPU cores, causing severe pool mutex contention", s.MaxConns, containerCPUQuota)
 	}

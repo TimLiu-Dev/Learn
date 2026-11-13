@@ -81,3 +81,33 @@ _Avoid_: Key identifier, element tag
 **MetricKit**:
 Apple's first-party telemetry framework delivering aggregated production diagnostics (hang rate, CPU time, thermal throttling, dirty memory) directly on-device.
 _Avoid_: APM analytics, crash reporter
+
+## 2027 Frontier & Platform Systems
+
+**`nonisolated(nonsending)` (SE-0461)**:
+Swift 6.2+ default behavior where nonisolated async functions execute in the caller's actor/isolation context rather than hopping to the global concurrent executor unless marked `@concurrent`.
+_Avoid_: Implicit background thread, auto-dispatch
+
+**Noncopyable Type (`~Copyable`)**:
+A value type whose ownership cannot be implicitly duplicated; enforces unique ownership via `consuming` and `borrowing` parameters and deterministic `deinit` cleanup.
+_Avoid_: Singleton struct, move-only class
+
+**`InlineArray` & `Span<T>`**:
+Fixed-size stack-allocated array (`InlineArray`) and non-escapable zero-copy contiguous buffer view (`Span<T>`) eliminating heap allocation and ARC overhead in hot loops.
+_Avoid_: UnsafeBufferPointer wrapper, raw C array
+
+**XCFramework**:
+Apple's multi-architecture binary bundle format packaging device (`arm64`) and simulator (`arm64`/`x86_64`) slices with optional `.swiftinterface` files for module stability.
+_Avoid_: Fat binary, universal lipo framework
+
+**FoundationModels (`@Generable`)**:
+Apple's Swift framework for invoking on-device and Private Cloud Compute LLMs with compile-time schema constraints (`@Generable`) and Swift tool calling.
+_Avoid_: Cloud REST wrapper, local weights loader
+
+**AppIntent & AppEntity**:
+Declarative Swift types exposing app capabilities and domain objects to Siri, Spotlight, Shortcuts, Widgets, and Control Center.
+_Avoid_: Deep link URL handler, SiriKit legacy intent
+
+**StoreKit 2 `VerificationResult` (JWS)**:
+Cryptographically signed JSON Web Signature payload verified locally by StoreKit 2 without requiring a custom receipt-validation server.
+_Avoid_: Legacy receipt ASN.1 blob

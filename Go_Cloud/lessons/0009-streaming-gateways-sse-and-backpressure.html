@@ -42,25 +42,24 @@
 
     <h1>Lesson 0009: LLM &amp; Event Gateways: Server-Sent Events (SSE) &amp; Backpressure</h1>
     <p class="lead-paragraph">
-      In 2027 cloud architectures, Go microservices frequently serve as high-concurrency API gateways for AI inference, real-time market feeds, and distributed event streams. Serving streaming tokens via <strong>Server-Sent Events (SSE)</strong> requires precise mastery of HTTP response flushing (<code>http.Flusher</code>), client disconnect propagation, and TCP window backpressure.
+      In 2027 cloud architectures, Go microservices frequently serve as high-concurrency API gateways for AI inference, real-time market feeds, and distributed event streams. Serving streaming tokens via <strong>Server-Sent Events (SSE)</strong> requires Go 1.20+ <code>http.NewResponseController</code> flushing, client disconnect propagation, and TCP backpressure deadlines.
     </p>
 
     <div class="callout callout-mechanics">
-      <div class="callout-title">⚙️ Senior Architecture Principle: The Flusher Contract</div>
+      <div class="callout-title">⚙️ Senior Architecture Principle: <code>http.NewResponseController</code></div>
       <p style="margin-bottom: 0;">
-        By default, Go's <code>net/http</code> buffers outbound response writes in 4KB chunks before flushing to the TCP socket. For real-time streaming (such as LLM tokens or financial quotes), buffering completely destroys the user experience. You must cast <code>http.ResponseWriter</code> to <strong><code>http.Flusher</code></strong> and explicitly flush after each event frame.
+        By default, Go's <code>net/http</code> buffers outbound writes before flushing to the socket, destroying token-by-token latency. Legacy Go code asserted <code>w.(http.Flusher)</code>—which silently breaks when logging or metrics middleware wraps <code>http.ResponseWriter</code> without forwarding <code>Flush()</code>. Modern Go (1.20+) provides <strong><code>rc := http.NewResponseController(w)</code></strong> to unwrap middleware cleanly and manage per-chunk write deadlines.
       </p>
     </div>
 
     <!-- Section 1: Anatomy of SSE -->
     <h2>1. Anatomy of the Server-Sent Events Protocol</h2>
     <p>
-      SSE is an ultra-lightweight, unidirectional text-based protocol over standard HTTP/1.1 or HTTP/2:
+      SSE is a lightweight unidirectional event protocol over HTTP/1.1, HTTP/2, or HTTP/3 (note: omit hop-by-hop <code>Connection: keep-alive</code> on HTTP/2+, where RFC 9113 forbids connection-specific headers):
     </p>
-    <pre><code class="language-http">HTTP/1.1 200 OK
+    <pre><code class="language-http">HTTP/2 200 OK
 Content-Type: text/event-stream
 Cache-Control: no-cache
-Connection: keep-alive
 X-Accel-Buffering: no
 
 data: {"token": "The", "index": 0}
@@ -71,28 +70,33 @@ data: [DONE]
 </code></pre>
 
     <!-- Section 2: Disconnection & Leak Prevention -->
-    <h2>2. Immediate Upstream Cancellation on Client Disconnect</h2>
+    <h2>2. Immediate Upstream Cancellation &amp; Write Error Exit</h2>
     <p>
-      If a user closes their browser tab or mobile app, the Go HTTP server closes <code>r.Context().Done()</code>. Your gateway must listen to this signal and abort the upstream LLM inference call immediately:
+      If a client disconnects or stalls past its write deadline, <code>r.Context().Done()</code> closes or <code>fmt.Fprintf</code> returns an error. Always inspect write/flush errors so slow consumers cannot pin server goroutines indefinitely:
     </p>
 
     <div class="code-header">
       <span>sse_gateway_loop.go</span>
-      <span>Select Loop with Client Cancellation</span>
+      <span>ResponseController Select Loop</span>
     </div>
-    <pre><code class="language-go">for {
+    <pre><code class="language-go">rc := http.NewResponseController(w)
+for {
     select {
     case &lt;-r.Context().Done():
-        // Client aborted! Abort upstream inference immediately to save GPU dollars
-        return
+        return // Client aborted: halt upstream work immediately
     case token, ok := &lt;-tokenStream:
         if !ok {
-            fmt.Fprintf(w, "data: [DONE]\n\n")
-            flusher.Flush()
+            _, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+            _ = rc.Flush()
             return
         }
-        fmt.Fprintf(w, "data: %s\n\n", token)
-        flusher.Flush()
+        _ = rc.SetWriteDeadline(time.Now().Add(5 * time.Second))
+        if _, err := fmt.Fprintf(w, "data: %s\n\n", token); err != nil {
+            return
+        }
+        if err := rc.Flush(); err != nil {
+            return
+        }
     }
 }</code></pre>
 
@@ -102,8 +106,8 @@ data: [DONE]
       Implement an HTTP handler that streams tokens as Server-Sent Events:
     </p>
     <ul style="margin: 0 0 1.5rem 1.5rem; color: var(--text-secondary);">
-      <li><strong>Task 1:</strong> Set standard SSE headers (<code>Content-Type: text/event-stream</code>, <code>Cache-Control: no-cache</code>, <code>Connection: keep-alive</code>).</li>
-      <li><strong>Task 2:</strong> Cast <code>w</code> to <code>http.Flusher</code>. Stream tokens from the channel, formatting each as <code>data: &lt;token&gt;\n\n</code> and flushing immediately. Abort if <code>r.Context().Done()</code> fires.</li>
+      <li><strong>Task 1:</strong> Set headers (<code>Content-Type: text/event-stream</code>, <code>Cache-Control: no-cache</code>), construct <code>rc := http.NewResponseController(w)</code>, and flush initial headers.</li>
+      <li><strong>Task 2:</strong> Stream tokens as <code>data: &lt;token&gt;\n\n</code> (flushing every chunk and aborting on write errors or <code>r.Context().Done()</code>), and emit <code>data: [DONE]\n\n</code> when <code>tokenStream</code> closes.</li>
     </ul>
 
     <div class="practice-container">
@@ -112,12 +116,17 @@ data: [DONE]
           <span>🛠️ Interactive Lab: Production SSE Streaming Gateway</span>
         </div>
         <div>
-          <span class="badge-pill badge-senior">Target: Low Latency Flush</span>
+          <span class="badge-pill badge-senior">Target: ResponseController Flush</span>
         </div>
       </div>
 
       <div class="practice-desc">
-        Complete the SSE handler below. Ensure proper headers, flusher assertion, and context cancellation handling. Click <strong>Run &amp; Verify Code</strong> to test.
+        Complete <code>StreamHandler</code> below using <code>http.NewResponseController(w)</code> (compatible with wrapped middleware), then verify flushing and client disconnects in <code>labs/</code>.
+      </div>
+
+      <div class="lab-cli-box">
+        <span><strong>Workspace Lab:</strong> Complete <code>labs/m02_04_sse_streaming/lab.go</code> and test with <code>-race</code>.</span>
+        <code>cd labs &amp;&amp; go test -v -race ./m02_04_sse_streaming</code>
       </div>
 
       <div class="editor-wrapper">
@@ -126,7 +135,7 @@ data: [DONE]
 
       <div class="practice-actions">
         <div class="action-group-left">
-          <button id="runCodeBtn" class="btn btn-primary">▶ Run &amp; Verify Code</button>
+          <button id="runCodeBtn" class="btn btn-primary">▶ Run Static Pre-Check</button>
           <button id="resetCodeBtn" class="btn btn-secondary">↺ Reset Template</button>
         </div>
         <div class="action-group-right">
@@ -151,31 +160,32 @@ import (
 )
 
 func StreamHandler(w http.ResponseWriter, r *http.Request, tokenStream &lt;-chan string) {
-    flusher, ok := w.(http.Flusher)
-    if !ok {
-        http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
-        return
-    }
-
     w.Header().Set("Content-Type", "text/event-stream")
     w.Header().Set("Cache-Control", "no-cache")
-    w.Header().Set("Connection", "keep-alive")
     w.WriteHeader(http.StatusOK)
-    flusher.Flush()
+
+    rc := http.NewResponseController(w)
+    if err := rc.Flush(); err != nil {
+        return
+    }
 
     ctx := r.Context()
     for {
         select {
         case &lt;-ctx.Done():
-            return // Client disconnected
+            return
         case token, ok := &lt;-tokenStream:
             if !ok {
-                fmt.Fprintf(w, "data: [DONE]\n\n")
-                flusher.Flush()
+                _, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+                _ = rc.Flush()
                 return
             }
-            fmt.Fprintf(w, "data: %s\n\n", token)
-            flusher.Flush()
+            if _, err := fmt.Fprintf(w, "data: %s\n\n", token); err != nil {
+                return
+            }
+            if err := rc.Flush(); err != nil {
+                return
+            }
         }
     }
 }</code></pre>
@@ -188,23 +198,27 @@ func StreamHandler(w http.ResponseWriter, r *http.Request, tokenStream &lt;-chan
 
       <!-- Quiz 1 -->
       <div class="quiz-card" id="quiz-1">
-        <div class="quiz-question-number">Question 1 of 2 &bull; http.Flusher Role</div>
+        <div class="quiz-question-number">Question 1 of 2 &bull; Flushing &amp; ResponseController</div>
         <div class="quiz-question-title">
-          Why must a streaming HTTP SSE gateway verify that http.ResponseWriter implements http.Flusher?
+          Why should a Go streaming SSE handler prefer <code>http.NewResponseController(w).Flush()</code> over manual casting?
         </div>
 
         <div class="quiz-options">
-          <div class="quiz-option" data-key="A" data-correct="true">
-            <span>Without flushing the buffer every event is delayed until request completion</span>
+          <div class="quiz-option" data-key="A" data-correct="false">
+            <span class="quiz-option-key">A</span>
+            <span>The OS kernel drops un-flushed TCP packets silently after ten idle seconds</span>
           </div>
-          <div class="quiz-option" data-key="B" data-correct="false">
-            <span>The operating system kernel drops uncompressed network frames after ten seconds</span>
+          <div class="quiz-option" data-key="B" data-correct="true">
+            <span class="quiz-option-key">B</span>
+            <span>It unwraps middleware decorators and flushes chunk buffers immediately per token</span>
           </div>
           <div class="quiz-option" data-key="C" data-correct="false">
-            <span>The garbage collector purges active response sockets during concurrent mark sweeps</span>
+            <span class="quiz-option-key">C</span>
+            <span>The garbage collector evicts idle response sockets during concurrent mark phases</span>
           </div>
           <div class="quiz-option" data-key="D" data-correct="false">
-            <span>Without flushing the runtime compiler converts streaming payloads into static memory</span>
+            <span class="quiz-option-key">D</span>
+            <span>It switches runtime compilation statically so streaming payloads skip kernel writes</span>
           </div>
         </div>
 
@@ -213,16 +227,16 @@ func StreamHandler(w http.ResponseWriter, r *http.Request, tokenStream &lt;-chan
 
         <div class="quiz-rationales-data" style="display: none;">
           <div class="rationale-item">
-            <strong style="color: var(--accent-green);">A (CORRECT):</strong> Standard Go HTTP handlers buffer output in internal chunk buffers (typically 4KB). Without invoking <code>flusher.Flush()</code> after writing an SSE frame, events sit queued in memory until the buffer fills or the entire request finishes, defeating the purpose of real-time streaming.
+            <strong style="color: var(--accent-red);">A (INCORRECT):</strong> TCP manages transmission buffers independently and never discards written streams silently due to a 10s rule.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> The OS kernel manages TCP buffers via window sizes; it does not drop uncompressed frames due to timeouts.
+            <strong style="color: var(--accent-green);">B (CORRECT):</strong> Go HTTP buffers responses unless flushed per event, and <code>http.NewResponseController</code> unwraps middleware wrappers cleanly to locate underlying flush support.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> Active network connections are referenced root descriptors, never purged by GC cycles.
+            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> Active network connections remain live runtime descriptors never discarded by GC cycles.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> The compiler has no awareness of runtime HTTP buffer management.
+            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> Compiler passes never remove kernel socket writes from streaming handlers.
           </div>
         </div>
       </div>
@@ -235,17 +249,21 @@ func StreamHandler(w http.ResponseWriter, r *http.Request, tokenStream &lt;-chan
         </div>
 
         <div class="quiz-options">
-          <div class="quiz-option" data-key="A" data-correct="true">
-            <span>Monitor request context cancellation and immediately terminate upstream inference streaming pipelines</span>
+          <div class="quiz-option" data-key="A" data-correct="false">
+            <span class="quiz-option-key">A</span>
+            <span>Continue streaming remaining tokens internally until inference completes cleanly</span>
           </div>
           <div class="quiz-option" data-key="B" data-correct="false">
-            <span>Continue streaming tokens until the completion payload is fully generated internally</span>
+            <span class="quiz-option-key">B</span>
+            <span>Raise a runtime panic to reset server socket pools automatically</span>
           </div>
           <div class="quiz-option" data-key="C" data-correct="false">
-            <span>Trigger a runtime panic to restart the HTTP server connection pool</span>
+            <span class="quiz-option-key">C</span>
+            <span>Buffer unsent tokens indefinitely in package slices for future retries</span>
           </div>
-          <div class="quiz-option" data-key="D" data-correct="false">
-            <span>Store undelivered tokens in global memory buffers for later client retrieval</span>
+          <div class="quiz-option" data-key="D" data-correct="true">
+            <span class="quiz-option-key">D</span>
+            <span>Watch <code>r.Context().Done()</code> and abort upstream work and writes immediately</span>
           </div>
         </div>
 
@@ -254,16 +272,16 @@ func StreamHandler(w http.ResponseWriter, r *http.Request, tokenStream &lt;-chan
 
         <div class="quiz-rationales-data" style="display: none;">
           <div class="rationale-item">
-            <strong style="color: var(--accent-green);">A (CORRECT):</strong> When a client disconnects, <code>r.Context().Done()</code> is closed. The gateway must catch this and immediately terminate upstream processing (such as LLM generation or database queries) to free GPU/CPU compute and prevent server waste.
+            <strong style="color: var(--accent-red);">A (INCORRECT):</strong> Continuing to stream or run LLM inference for an absent caller wastes GPU and CPU capacity.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> Continuing to process tokens for a disconnected client wastes valuable GPU and compute resources.
+            <strong style="color: var(--accent-red);">B (INCORRECT):</strong> Panicking inside request handlers causes dropped alerts and unstable worker loops rather than clean shutdowns.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> Panicking on client disconnect is an extreme anti-pattern that crashes the handler and destabilizes the server.
+            <strong style="color: var(--accent-red);">C (INCORRECT):</strong> Caching abandoned tokens in global memory causes unbounded OOM heap growth.
           </div>
           <div class="rationale-item">
-            <strong style="color: var(--accent-red);">D (INCORRECT):</strong> Storing discarded tokens in memory for SSE leads to rapid memory leaks.
+            <strong style="color: var(--accent-green);">D (CORRECT):</strong> When clients close connections, Go closes <code>r.Context().Done()</code>; selecting on it alongside write error checks frees backend compute promptly.
           </div>
         </div>
       </div>
@@ -314,21 +332,19 @@ import (
 	"net/http"
 )
 
-// StreamHandler streams tokens from tokenStream to the client as Server-Sent Events.
-// It must set proper headers, flush each event, and abort if the client disconnects.
+// StreamHandler streams tokens as Server-Sent Events using Go's http.NewResponseController.
 func StreamHandler(w http.ResponseWriter, r *http.Request, tokenStream <-chan string) {
-	// TODO: Assert w implements http.Flusher
-	// TODO: Set headers: Content-Type: text/event-stream, Cache-Control: no-cache, Connection: keep-alive
-	// TODO: Flush initial headers
-	// TODO: Loop over tokenStream, format as "data: %s\\n\\n", and flush
-	// TODO: Abort immediately on r.Context().Done()
+	// TODO: Set Content-Type: text/event-stream and Cache-Control: no-cache
+	// TODO: Create rc := http.NewResponseController(w) and flush initial headers
+	// TODO: Loop with select on <-r.Context().Done() and <-tokenStream, emit [DONE] on close
+	_ = fmt.Fprintf
 }
 `;
 
     const hints = [
-      "Assert flusher: flusher, ok := w.(http.Flusher); if !ok { http.Error(w, \"Streaming unsupported\", 500); return }.",
-      "Set headers: w.Header().Set(\"Content-Type\", \"text/event-stream\"); w.Header().Set(\"Cache-Control\", \"no-cache\"); w.Header().Set(\"Connection\", \"keep-alive\"); flusher.Flush().",
-      "In the loop, select on <-r.Context().Done() and case token, ok := <-tokenStream. If !ok, send data: [DONE]\\n\\n, flush, and return."
+      "Set headers first: w.Header().Set(\"Content-Type\", \"text/event-stream\") and w.Header().Set(\"Cache-Control\", \"no-cache\"), then call rc := http.NewResponseController(w) and rc.Flush().",
+      "Inside select, exit immediately on <-r.Context().Done() so disconnected clients abort upstream generation.",
+      "When !ok on tokenStream, write data: [DONE]\\n\\n, call rc.Flush(), and return; otherwise write data: %s\\n\\n (checking err) and flush."
     ];
 
     const solution = `package sse
@@ -339,16 +355,14 @@ import (
 )
 
 func StreamHandler(w http.ResponseWriter, r *http.Request, tokenStream <-chan string) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher.Flush()
+	w.WriteHeader(http.StatusOK)
+
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		return
+	}
 
 	ctx := r.Context()
 	for {
@@ -357,59 +371,48 @@ func StreamHandler(w http.ResponseWriter, r *http.Request, tokenStream <-chan st
 			return
 		case token, ok := <-tokenStream:
 			if !ok {
-				fmt.Fprintf(w, "data: [DONE]\\n\\n")
-				flusher.Flush()
+				_, _ = fmt.Fprintf(w, "data: [DONE]\\n\\n")
+				_ = rc.Flush()
 				return
 			}
-			fmt.Fprintf(w, "data: %s\\n\\n", token)
-			flusher.Flush()
+			if _, err := fmt.Fprintf(w, "data: %s\\n\\n", token); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
 		}
 	}
 }
 `;
 
-    async function runSSETests(code) {
-      const hasFlusher = /w\.\(http\.Flusher\)/i.test(code);
-      const hasHeaderSet = /text\/event-stream/i.test(code);
-      const hasFlushCall = /flusher\.Flush\s*\(\s*\)/i.test(code);
-      const hasCtxDone = /r\.Context\s*\(\s*\)\.Done\s*\(\s*\)/i.test(code) || /ctx\.Done\s*\(\s*\)/i.test(code);
+    async function runSSETests(code, stripped) {
+      const hasRespCtrl = /http\.NewResponseController\s*\(\s*w\s*\)/.test(stripped);
+      const hasHeaderSet = /text\/event-stream/.test(stripped);
+      const hasFlushCall = /\.Flush\s*\(\s*\)/.test(stripped);
+      const hasCtxDone = /(?:r\.Context\s*\(\s*\)|ctx)\.Done\s*\(\s*\)/.test(stripped);
+      const hasDoneMarker = /\[DONE\]/.test(stripped);
 
-      if (!hasFlusher || !hasFlushCall) {
+      if (!hasRespCtrl || !hasFlushCall) {
         return {
           passed: false,
-          output: `=== RUN   TestFlusherContract
-    sse_test.go:28: http.Flusher interface assertion or Flush() call missing
---- FAIL: TestFlusherContract (0.00s)
-FAIL`,
-          message: "Assert w.(http.Flusher) and invoke flusher.Flush() after writes."
+          output: `Static Pre-Check Findings:\n- http.NewResponseController(w): ${hasRespCtrl ? "OK" : "MISSING"}\n- rc.Flush() per chunk: ${hasFlushCall ? "OK" : "MISSING"}`,
+          message: "Use rc := http.NewResponseController(w) and invoke rc.Flush() after writing frames."
         };
       }
 
-      if (!hasHeaderSet || !hasCtxDone) {
+      if (!hasHeaderSet || !hasCtxDone || !hasDoneMarker) {
         return {
           passed: false,
-          output: `=== RUN   TestClientDisconnectCancellation
-    sse_test.go:49: handler does not exit when request context is cancelled
---- FAIL: TestClientDisconnectCancellation (0.00s)
-FAIL`,
-          message: "Listen to r.Context().Done() and set Content-Type: text/event-stream."
+          output: `Static Pre-Check Findings:\n- ResponseController + Flush: OK\n- Content-Type text/event-stream: ${hasHeaderSet ? "OK" : "MISSING"}\n- Context Done() abort branch: ${hasCtxDone ? "OK" : "MISSING"}\n- data: [DONE] sentinel on close: ${hasDoneMarker ? "OK" : "MISSING"}`,
+          message: "Set Content-Type: text/event-stream, select on Context().Done(), and emit data: [DONE] on channel close."
         };
       }
 
       return {
         passed: true,
-        output: `=== RUN   TestFlusherContract
---- PASS: TestFlusherContract (0.00s)
-=== RUN   TestSSETokenStreaming
-    sse_test.go:42: 128 streaming LLM tokens flushed in real-time chunks.
---- PASS: TestSSETokenStreaming (0.01s)
-=== RUN   TestClientDisconnectCancellation
-    sse_test.go:58: Client abort detected; upstream token pipeline terminated instantly.
---- PASS: TestClientDisconnectCancellation (0.00s)
-PASS
-ok      lesson0009/sse   0.019s`,
-        message: "SSE streaming gateway verified! Immediate flushes and zero zombie upstream calls.",
-        details: "🏆 Flusher validation, event formatting, and client cancellation all passing."
+        output: `Static Pre-Check Summary:\n- http.NewResponseController(w) unwrapping + Flush() present\n- text/event-stream headers configured\n- r.Context().Done() cancellation and [DONE] terminator handled`,
+        message: "Static pre-check passed! Verify SSE recorder flush & client abort in labs/."
       };
     }
 
@@ -419,6 +422,7 @@ ok      lesson0009/sse   0.019s`,
         defaultCode: starterCode,
         solutionCode: solution,
         hints: hints,
+        labCommand: "cd labs && go test -v -race ./m02_04_sse_streaming",
         testSuite: runSSETests
       });
     });

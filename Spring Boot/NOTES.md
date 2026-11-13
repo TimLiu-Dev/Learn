@@ -31,10 +31,10 @@
 
 ---
 
-## Complete Senior Curriculum — Two-Part 80/20 Structure (64 Lessons across 19 Phases)
+## Complete Senior Curriculum — Two-Part 80/20 Structure (70 Lessons across 20 Phases)
 
-### PART 1: Core Senior Backend Engineer (51 Lessons • Phases 0–15B)
-*80/20 high-ROI core: untouched backend foundations (`0001`–`0040` + `0049`), developer-facing observability/container/S3 essentials (`0041`–`0044`, `0046`, `0047`), and core edge/realtime/scaling/security hardening (`0059`–`0062`).*
+### PART 1: Core Senior Backend Engineer (52 Lessons • Phases 0–15B)
+*80/20 high-ROI core: untouched backend foundations (`0001`–`0040` + `0049`), developer-facing observability/container/S3 essentials (`0041`–`0044`, `0046`, `0047`), and core edge/realtime/scaling/security/AOP hardening (`0059`–`0062`, `0065`).*
 
 ### Phase 0: Absolute Foundations
 - `0001-what-is-a-backend-and-how-servers-work.html`: Sockets, ports, Tomcat, 15-line bare-metal server, statelessness.
@@ -120,12 +120,13 @@
 - `0060-realtime-backends-sse-websockets-and-redis-fanout.html`: SSE (`SseEmitter`) vs. WebSockets, leak-free cleanup callbacks, Redis Pub/Sub multi-pod fan-out.
 - `0061-database-scaling-cap-sharding-and-nosql-tradeoffs.html`: CAP/PACELC theorem, PostgreSQL range partitioning vs. horizontal sharding, consistent hashing, NoSQL matrix.
 - `0062-security-hardening-argon2-bcrypt-and-owasp-api-top-10.html`: Memory-hard `Argon2id`/`BCrypt`, BOLA/IDOR, banning Mass Assignment, and SSRF defense.
+- `0065-spring-profiles-and-custom-aop-aspects.html`: Spring Profiles (`@Profile("!prod")`, runtime env parity) and custom `@Aspect`/`@Around` interceptors.
 - `reference/capstone-project-spec.html`: **NexusCommerce** Part 1 core backend architecture specification.
 
 ---
 
-### PART 2: Professional Cloud, DevOps & Observability Track (13 Lessons • Phases 16–19)
-*20% deep-dive specialization for Staff/Platform autonomy (`0045` & `0048` moved here from Part 1 + 11 new lessons `0050`–`0058`, `0063`–`0064` + Part 2 Capstone).*
+### PART 2: Professional Cloud, DevOps & Observability Track (18 Lessons • Phases 16–20)
+*20% deep-dive specialization for Staff/Platform autonomy (`0045` & `0048` moved here from Part 1 + 16 new lessons `0050`–`0058`, `0063`–`0064`, `0066`–`0070` + Part 2 Capstone).*
 
 ### Phase 16: Track 2A — Professional Observability
 - `0050-structured-json-logging-and-cardinality-traps.html`: Spring Boot 3.4+ structured JSON logging (ECS/Logstash), MDC fields, Micrometer high-cardinality tag bombs, and trace exemplars.
@@ -144,8 +145,15 @@
 - `0057-aws-managed-messaging-and-compute-tradeoffs.html`: AWS SQS + SNS + EventBridge vs Kafka/MSK tradeoffs, Spring Cloud AWS SQS + DLQs, ECS Fargate vs EKS vs App Runner.
 - `0058-infrastructure-as-code-terraform-for-spring-boot.html`: Declarative Terraform/OpenTofu for RDS, S3, SQS, and IAM roles via Git PRs.
 
-### Phase 19: Track 2D — Advanced Distributed APIs & Search Architecture & Part 2 Capstone
+### Phase 19: Track 2D — Advanced Distributed APIs & Search Architecture
 - `0063-grpc-protobuf-vs-rest-and-graphql-tradeoffs.html`: gRPC/Protobuf binary contracts & HTTP/2 load-balancing pitfalls vs. REST, plus GraphQL `@BatchMapping` N+1 defense.
 - `0064-search-engines-postgres-fts-elasticsearch-and-cqrs.html`: Inverted indexes (`GIN(tsvector)` / `pgvector` vs. Elasticsearch/OpenSearch) and CQRS read-model sync via Kafka/Outbox.
+
+### Phase 20: Track 2E — Modern Spring Ecosystem Extensions & Part 2 Capstone
+- `0066-graalvm-native-images-vs-appcds-aot.html`: GraalVM Native Images + `@RegisterReflectionForBinding` vs. HotSpot JVM + AppCDS/Leyden AOT tradeoffs.
+- `0067-spring-ai-chatclient-rag-and-tool-calling.html`: Spring AI `ChatClient`, `.entity(...)` structured output, `QuestionAnswerAdvisor` (`pgvector` RAG), and `@Tool` outside `@Transactional`.
+- `0068-spring-data-jdbc-and-jooq-alternatives.html`: Immutable Java Records / Kotlin data classes in Spring Data JDBC + compile-time type-safe SQL via jOOQ `DSLContext`.
+- `0069-spring-cloud-gateway-routing-and-token-relay.html`: Spring Cloud Gateway Server WebMvc edge routing, header sanitization, `TokenRelay`, and CircuitBreaker fallbacks.
+- `0070-spring-batch-chunk-processing-and-retries.html`: Chunk-oriented batch streaming, `JobRepository` checkpoint restartability, and `faultTolerant()` retry/skip policies.
 - `reference/pro-cloud-capstone-spec.html`: **NexusCommerce Production Platform** Part 2 Cloud/DevOps/LGTM Capstone specification.
 - `reference/spring-boot-4-java-25-delta.html`: **2027 Delta Guide** (Spring Boot 4.0 + Spring Framework 7 + Java 25 LTS).

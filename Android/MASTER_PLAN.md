@@ -39,7 +39,7 @@ This curriculum follows the **2026/2027 Google Modern Android Architecture (Now 
 
 ---
 
-## 2. Master Curriculum Index (60 Lessons)
+## 2. Master Curriculum Index (68 Lessons)
 
 ```mermaid
 flowchart TD
@@ -50,6 +50,7 @@ flowchart TD
     P5 --> P6["Phase VI: Profiling, Security & Optimization<br/>(Lessons 0044–0049)"]
     P6 --> P7["Phase VII: Capstone Project: Aether<br/>(Lessons 0050–0055)"]
     P7 --> P8["Phase VIII: Career & System Design<br/>(Lessons 0056–0060)"]
+    P8 --> P9["Phase IX: 2027 Senior Frontier & KMP<br/>(Lessons 0061–0068)"]
 ```
 
 ---
@@ -222,6 +223,28 @@ flowchart TD
 
 ---
 
+### Phase IX: 2027 Senior Frontier — Platform Mandates, Trust, Observability & KMP (Lessons 0061–0068)
+*Closing every gap between `roadmap.sh/android` and 2027 Senior Android + Kotlin Multiplatform engineering.*
+
+- **[Lesson 0061: Android 16/17 Mandates: 16 KB Pages & Adaptive Resizability](lessons/0061-android-16-17-mandates-16kb-adaptive.html)**  
+  *Concepts:* 16 KB ELF page alignment (Feb 2027 Play Store block), Android 17 mandatory large-screen resizability ($\ge 600\text{dp}$), `WindowSizeClass`.
+- **[Lesson 0062: Predictive Back, Modern Permissions & Foreground Service Types](lessons/0062-predictive-back-permissions-foreground-services.html)**  
+  *Concepts:* `PredictiveBackHandler`, System Photo Picker (`PickVisualMedia`), typed Foreground Services (`foregroundServiceType`).
+- **[Lesson 0063: Unified Auth & Trust: Credential Manager & Play Integrity](lessons/0063-credential-manager-play-integrity.html)**  
+  *Concepts:* Passkeys via `CredentialManager`, migrating off `EncryptedSharedPreferences` to DataStore + Tink/Keystore, server-verified Play Integrity API.
+- **[Lesson 0064: Visual Regression & Screenshot Testing (Roborazzi / Paparazzi)](lessons/0064-screenshot-testing-roborazzi-paparazzi.html)**  
+  *Concepts:* Deterministic JVM screenshot testing, font-scale/dark-mode/tablet matrices, CI golden PNG workflows.
+- **[Lesson 0065: Production Observability: ApplicationExitInfo, ANRs & Staged Rollouts](lessons/0065-production-observability-exit-info-anrs.html)**  
+  *Concepts:* `getHistoricalProcessExitReasons()`, silent LMK/OOM/ANR forensics, staged Play rollouts, remote kill switches.
+- **[Lesson 0066: Kotlin Multiplatform (KMP): Architecture, expect/actual & Shared Logic](lessons/0066-kotlin-multiplatform-architecture-shared-logic.html)**  
+  *Concepts:* `:shared` (`commonMain`, `androidMain`, `iosMain`), interface injection vs `expect`/`actual`, Swift interop.
+- **[Lesson 0067: KMP Production Stack: Ktor, Room KMP, DataStore & Koin](lessons/0067-kmp-production-stack-ktor-room-koin.html)**  
+  *Concepts:* Ktor engines (`OkHttp`/`Darwin`), Room KMP (`BundledSQLiteDriver`), DataStore KMP, Koin vs Hilt boundaries.
+- **[Lesson 0068: Compose Multiplatform (CMP) & On-Device AI (Gemini Nano)](lessons/0068-compose-multiplatform-and-on-device-ai.html)**  
+  *Concepts:* Shared Compose UI tradeoffs (`composeApp`), Android AICore / Gemini Nano capability probing and cloud fallback strategies.
+
+---
+
 ## 3. Printable Cheat Sheets & Reference Sheets
 
 The `./reference/` directory contains standalone, printable cheat sheets for your desk:
@@ -229,3 +252,4 @@ The `./reference/` directory contains standalone, printable cheat sheets for you
 1. **[01-kotlin-coroutines-flow.html](reference/01-kotlin-coroutines-flow.html)**: Scope functions decision matrix, Dispatchers, Cold vs Hot Flows, and reactive pipelines.
 2. **[02-jetpack-compose-m3.html](reference/02-jetpack-compose-m3.html)**: Side-effects guide, Modifier order golden rule, Strong Skipping matrix, and WindowInsets checklist.
 3. **[03-modern-android-architecture.html](reference/03-modern-android-architecture.html)**: Dagger Hilt scopes, Single Source of Truth flow, WorkManager rules, and multi-module dependency boundaries.
+4. **[04-2027-senior-mandates-and-kmp.html](reference/04-2027-senior-mandates-and-kmp.html)**: 16 KB alignment & Android 17 checks, Credential Manager & Play Integrity trust stack, `ApplicationExitInfo` codes, and KMP stack mapping.
