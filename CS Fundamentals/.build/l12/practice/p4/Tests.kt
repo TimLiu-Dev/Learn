@@ -3,6 +3,10 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+// A plain message: the page's test view hides text written inside <…>, which assertEquals uses.
+fun assertText(expected: String, actual: String?, what: String = "") =
+    assertTrue("$what expected \"$expected\" but was \"$actual\"".trim(), expected == actual)
+
 class MergeTest {
     // main: c1 - c3, fix: c1 - c2 (diverged)
     fun diverged() = Repo().apply {
@@ -14,24 +18,24 @@ class MergeTest {
         val repo = Repo()
         repo.createBranch("fix"); repo.switch("fix"); repo.commit()
         repo.switch("main")
-        assertEquals("fast-forward", repo.merge("fix"))
-        assertEquals("c2", repo.branches["main"])
+        assertText("fast-forward", repo.merge("fix"))
+        assertText("c2", repo.branches["main"])
         assertEquals("a fast-forward makes no commit", 2, repo.parents.size)
     }
 
     @Test fun `diverged branches get a merge commit with two parents`() {
         val repo = diverged()
-        assertEquals("merge commit", repo.merge("fix"))
-        assertEquals("c4", repo.branches["main"])
+        assertText("merge commit", repo.merge("fix"))
+        assertText("c4", repo.branches["main"])
         assertEquals("parents: your tip, then theirs", listOf("c3", "c2"), repo.parents["c4"])
-        assertEquals("the merged branch doesn't move", "c2", repo.branches["fix"])
+        assertText("c2", repo.branches["fix"], "the merged branch doesn't move")
     }
 
     @Test fun `merging what you already have changes nothing`() {
         val repo = diverged()
         repo.merge("fix")
-        assertEquals("up to date", repo.merge("fix"))
-        assertEquals("c4", repo.branches["main"])
+        assertText("up to date", repo.merge("fix"))
+        assertText("c4", repo.branches["main"])
         assertEquals(4, repo.parents.size)
     }
 
@@ -39,8 +43,8 @@ class MergeTest {
         val repo = diverged()
         repo.merge("fix")             // c4 = merge of c3 and c2, on main
         repo.switch("fix")
-        assertEquals("fast-forward", repo.merge("main"))
-        assertEquals("c4", repo.branches["fix"])
+        assertText("fast-forward", repo.merge("main"))
+        assertText("c4", repo.branches["fix"])
     }
 
     @Test fun `isAncestor follows every parent`() {

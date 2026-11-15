@@ -1,24 +1,17 @@
-# Mission: Computer Networking Master Curriculum
+# Learning Mission — From Junior Android Dev to Senior Network Engineer (2027)
 
-## Why
-Master how data moves across computer networks from physical packets and hardware switching to high-concurrency developer sockets, enterprise BGP routing, and modern cloud/Kubernetes software-defined infrastructure. Grounding knowledge in deep physical and protocol realities eliminates guesswork when designing, deploying, and debugging distributed software.
+## Target Outcome
+Transition systematically from **Junior Android Developer** to **Senior Software Developer &amp; Senior Network Engineer in 2027** across a two-part, 87-session interactive curriculum calibrated against [`roadmap.sh/network-engineer`](https://roadmap.sh/network-engineer) and modern production systems:
 
-## Success looks like
-- Confidently answer any networking question across software engineering, systems design, network engineering, and cloud architecture interviews.
-- Dissect any Wireshark capture and identify TCP handshakes, window drops, DNS resolutions, TLS 1.3 exchanges, 802.1Q tags, and HTTP/3 streams.
-- Write high-performance TCP/UDP clients and servers in Kotlin/Java, including building an HTTP/1.1 server from raw sockets.
-- Architect and troubleshoot enterprise network fabrics: VLANs, Spanning Tree, OSPF routing, BGP peering, and stateful firewalls.
-- Design resilient cloud networks: AWS/GCP VPCs, subnets, route tables, Transit Gateways, ALBs/NLBs, PrivateLink, and Kubernetes CNI/eBPF.
-- Diagnose live production failures (connection refused vs timeout vs reset vs TLS error vs MTU black hole) with surgical precision using CLI tools (`ping`, `traceroute`, `dig`, `curl`, `netstat`, `lsof`, `tcpdump`).
-- Deliver the definitive, end-to-end technical explanation of "what happens when you type a URL and hit Enter."
+1. **Part 1 — Senior Software Developer &amp; Systems Networking (Sessions 0001–0035, 0073–0074, 0066–0069 · 41 sessions):**
+   - Packet physics, TCP/IP, CIDR, ARP, DHCP, routing, NAT, IPv6, TCP sockets &amp; congestion control, DNS, HTTP/1.1–HTTP/3, TLS 1.3, gRPC, client resilience, mobile/Android edge networking (`OkHttp`, Happy Eyeballs RFC 8305, QUIC migration, cert pinning), and L7 reverse proxies (`X-Forwarded-For`, anti-smuggling, `SIGTERM` draining).
+   - **Capstone 1 (Sessions 0068–0069):** Raw-Socket HTTP/1.1 Server, Threading, Reverse Proxy Forwarding (`/api/*`), `/healthz`, and Zero-502 Graceful Draining in Java 25.
 
-## Constraints
-- CS student / professional software engineer perspective: prioritize conceptual depth, protocol mechanics, and diagnostic causality over vendor memorization.
-- Hands-on terminal tools on macOS (curl, dig, ping, traceroute, netstat, lsof, tcpdump, Wireshark).
-- Code implementations in Kotlin and modern Java (JDK 26).
-- One concept per session; mixed review sessions at the end of every module.
-- Never give exercise answers directly unless requested; foster active retrieval.
+2. **Part 2 — Senior Network Engineer, Cloud &amp; NetDevOps (Sessions 0075–0087, 0036–0065, 0070–0072 · 46 sessions):**
+   - Linux `iproute2`/`netns`/`nftables`, Containerlab + FRRouting, optics/LACP, VLANs/STP/RSTP, FHRP/Anycast GW, OSPF, IS-IS/BFD/ECMP/Segment Routing, BGP + RPKI, VXLAN + MP-BGP EVPN Clos fabrics, firewalls, IPsec/WireGuard, QoS, SNMP/gNMI telemetry, 802.1X/RADIUS/TACACS+/DAI, IP Multicast, Cloud VPC/TGW/K8s/Cilium eBPF, YANG/NETCONF/RESTCONF/gNMI, Python (Netmiko/NAPALM/Nornir), Ansible, Terraform/Batfish GitOps, and 3 Real-World Outage Autopsies.
+   - **Capstone 2 (Session 0087) + Final Exam (Session 0072):** Automated Multi-Site Hybrid Spine-Leaf (EVPN-VXLAN + BFD + IPsec) &amp; Cloud VPC/TGW Fabric with chaos failover verification.
 
-## Out of scope
-- Deep electrical engineering of physical transceivers (quantum optoelectronics, radio wave propagation physics).
-- Legacy obsolete protocols (Token Ring, AppleTalk, IPX/SPX, Telnet, FTP) except as historical context.
+## Learner Profile &amp; Environment
+- **Background:** Junior Android / JVM developer comfortable with Kotlin, Java, HTTP clients, and REST APIs; building deep L1–L7 hardware, OS kernel, routing, and automation mastery.
+- **OS &amp; Toolchain:** macOS (Apple Silicon) with OpenJDK 25 (`javac -Xlint:all`), Kotlin/Android concepts, Docker/OrbStack (for Linux `netns` &amp; Containerlab/FRR labs), `curl`, `dig`, `nc`, `tcpdump`, `traceroute`, `lsof`, `netstat`, `openssl`, `Wireshark`.
+- **Method:** Interactive browser course (`index.html`), hands-on macOS CLI diagnostics, Java 25 verified coding labs (`scripts/validate_labs.py`), zero optional skipped fundamentals—all 87 lessons are core required.

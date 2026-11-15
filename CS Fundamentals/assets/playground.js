@@ -56,6 +56,54 @@
       document.head.appendChild(s);
     });
   }
+  // The Playground inserts JUnit failure messages into the page as raw HTML, so "expected:<vehicle with…>"
+  // loses everything that looks like a tag, and it never shows what a failing test printed. Fix the
+  // test response before the Playground reads it: escape the messages, name the exception type, and
+  // append the test's printed output.
+  function fixTestResults(data) {
+    const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    Object.values(data.testResults || {}).forEach((tests) => tests.forEach((t) => {
+      if (t.status === "OK") return;
+      const out = (t.output || "").replace(/<\/?(outStream|errStream)>/g, "").trim();
+      const printed = out ? " · printed: " + out.replace(/\n/g, " ⏎ ") : "";
+      if (t.comparisonFailure) t.comparisonFailure.message = esc((t.comparisonFailure.message || "assertion failed") + printed);
+      if (t.exception) {
+        const type = (t.exception.fullName || "").split(".").pop();
+        t.exception.message = esc((type ? type + ": " : "") + (t.exception.message || "") + printed);
+      }
+    }));
+    return data;
+  }
+  // The Playground's bundled fetch() is a polyfill built on XMLHttpRequest, so the fix goes there:
+  // for test requests, rewrite the response text before the polyfill reads it.
+  if (!XMLHttpRequest.prototype.csfPatched) {
+    const proto = XMLHttpRequest.prototype;
+    const open = proto.open;
+    proto.open = function (method, url) {
+      this.csfTest = typeof url === "string" && /api\.kotlinlang\.org\/api\/[^/]+\/compiler\/test/.test(url);
+      return open.apply(this, arguments);
+    };
+    ["responseText", "response"].forEach((prop) => {
+      const d = Object.getOwnPropertyDescriptor(proto, prop);
+      Object.defineProperty(proto, prop, {
+        configurable: true,
+        get() {
+          const raw = d.get.call(this);
+          if (!this.csfTest || this.readyState !== 4 || typeof raw !== "string") return raw;
+          try { return JSON.stringify(fixTestResults(JSON.parse(raw))); } catch (e) { return raw; }
+        },
+      });
+    });
+    // The polyfill asks for a Blob; keep test responses as text so the getters above can rewrite them.
+    const rt = Object.getOwnPropertyDescriptor(proto, "responseType");
+    Object.defineProperty(proto, "responseType", {
+      configurable: true,
+      get() { return rt.get.call(this); },
+      set(v) { if (!(this.csfTest && v === "blob")) rt.set.call(this, v); },
+    });
+    proto.csfPatched = true;
+  }
+
   let playground = null;
   function playgroundReady() {
     if (FROM_DISK) return Promise.reject(new Error("file://"));
@@ -281,6 +329,8 @@
 
   // Compare values only (column names may differ). Row order matters only if the solution sorts.
   function sameResult(got, want, ordered) {
+    // sql.js omits a statement's result entirely when it returns no rows, so "no columns" means "no rows"
+    if (!got.columns.length) return `Your query returned no rows; the task wants ${want.values.length}.`;
     if (got.columns.length !== want.columns.length) return `Your result has ${got.columns.length} column(s); the task wants ${want.columns.length}.`;
     if (got.values.length !== want.values.length) return `Your result has ${got.values.length} row(s); the task wants ${want.values.length}.`;
     const key = (r) => JSON.stringify(r);
@@ -353,7 +403,7 @@
     runBtn.after(" ", reset);
   }
 
-  document.querySelectorAll(".practice").forEach((box) =>
+  document.querySelectorAll("div.practice[data-id]").forEach((box) =>
     box.dataset.lang === "sql" ? setupSqlPractice(box) : setupPractice(box));
 
   // pg-runnable.js sets window.PG_RUNNABLE to an array of listing hashes.

@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0035 — ElastiCache (Redis/Valkey) Cluster Mode &amp; Choosing RDS vs DynamoDB vs ElastiCache</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0035</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0035-elasticache-redis-valkey-db-choice.html" class="active">Lesson 0035</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.5</span>
+      <span class="pill">Est. Time: 30 mins</span>
+    </div>
+
+    <h1>ElastiCache (Redis/Valkey) Cluster Mode &amp; Choosing RDS vs DynamoDB vs ElastiCache</h1>
+    <p class="lead">
+      Sub-millisecond caching can drop p99 API latency by 10x&mdash;or take down production with <code>CROSSSLOT</code> errors, silent cache evictions, and thundering-herd database meltdowns. A senior engineer knows how Redis/Valkey partitions keys across 16,384 hash slots, how Multi-AZ failover breaks naive connection pools, and when a workload belongs in RDS/Aurora, DynamoDB, or ElastiCache.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, you separate ephemeral RAM caches from durable disk storage: an in-memory <code>LruCache</code> or <code>StateFlow</code> inside a <code>ViewModel</code> delivers instant UI reads but disappears when the OS kills your process, whereas <code>Room</code> (SQLite) persists structured records across restarts. On AWS, <strong>Amazon ElastiCache (Valkey or Redis OSS)</strong> is your fleet-wide shared RAM layer&mdash;delivering sub-millisecond reads across stateless ECS containers and Lambda functions&mdash;while <strong>RDS/Aurora</strong> and <strong>DynamoDB</strong> serve as your durable sources of truth. Treating ElastiCache like Room is the fastest way to lose production data during a failover or memory eviction.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Valkey vs. Redis OSS, Memory Headroom &amp; Eviction Traps</h2>
+        <p>
+          <a href="https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/WhatIs.html" target="_blank" rel="noopener">Amazon ElastiCache</a> manages two wire-compatible in-memory engines&mdash;<strong>Valkey</strong> (the Linux Foundation open-source fork of Redis 7.2, offered at lower AWS node and serverless pricing) and <strong>Redis OSS</strong> (up to 7.1 in ElastiCache)&mdash;alongside simpler multi-threaded <strong>Memcached</strong>. Because Valkey and Redis OSS speak the same RESP protocol, standard clients such as <code>Lettuce</code>, <code>Jedis</code>, <code>ioredis</code>, and <code>redis-py</code> work identically against both.
+        </p>
+        <p>
+          Unlike Memcached, Valkey/Redis provides rich atomic data structures (Strings, Hashes, Lists, Sets, Sorted Sets for leaderboards, HyperLogLog, and Streams) and executes commands on a <strong>single main thread per shard</strong>. That single-threaded command loop eliminates lock contention and guarantees atomic operations like <code>INCR</code> or Lua scripts, but it also means one slow <code>KEYS *</code> scan or a 2 MB big-key read stalls every other client queued on that shard.
+        </p>
+        <p>
+          Three production configuration details determine whether your cache stays healthy under memory pressure:
+        </p>
+        <ul>
+          <li><strong>Reserved Memory (<code>reserved-memory-percent</code>):</strong> ElastiCache defaults to reserving <strong>25% of node RAM</strong> (leaving 75% for user keys) so background <code>BGSAVE</code> copy-on-write forks and replication output buffers do not trigger the Linux OOM killer.</li>
+          <li><strong>Eviction Policy (<code>maxmemory-policy</code>):</strong> ElastiCache defaults to <strong><code>volatile-lru</code></strong>, which evicts least-recently-used keys <em>only among keys that have an explicit <code>EXPIRE</code> TTL</em>. If your team writes keys without TTLs and memory hits max, <code>volatile-lru</code> refuses writes with <code>OOM command not allowed when used memory &gt; 'maxmemory'</code>! Use <strong><code>allkeys-lru</code></strong> (or <code>allkeys-lfu</code>) for pure caches, and reserve <code>noeviction</code> strictly for queues or locks where silent eviction would corrupt state.</li>
+          <li><strong>Stampede &amp; Penetration Protection:</strong> When a hot key expires at peak mobile traffic, thousands of concurrent cache misses slam RDS/DynamoDB simultaneously (a <strong>cache stampede</strong>). Mitigate with <strong>jittered TTLs</strong> (e.g., <code>300s + random(0..60s)</code>) and singleflight/mutex locks. For queries targeting missing IDs (<strong>cache penetration</strong>), store a short-lived <code>NULL</code> sentinel (e.g., 30s TTL) so attackers cannot bypass the cache on every request.</li>
+        </ul>
+
+        <!-- SECTION 2 -->
+        <h2>2. Cluster Mode Disabled vs. Enabled &amp; the 16,384 Hash Slots</h2>
+        <p>
+          ElastiCache for Valkey/Redis deploys in two distinct topologies (plus <strong>ElastiCache Serverless</strong>, which abstracts shards behind a single VPC endpoint and scales storage and ECPUs automatically):
+        </p>
+        <ul>
+          <li><strong>Cluster Mode Disabled (CMD):</strong> One shard total (1 primary write node + up to 5 async read replicas). You scale writes and memory <strong>vertically</strong> (larger <code>cache.r7g</code> node) and scale reads horizontally via replicas. Because every key lives on the single primary, multi-key commands (<code>MGET</code>, <code>SUNION</code>, Lua scripts) work across any keys.</li>
+          <li><strong>Cluster Mode Enabled (CME):</strong> Data is horizontally sharded across up to <strong>500 shards</strong> (each with 1 primary and 0&ndash;5 replicas). CME scales both memory and write throughput linearly, capped only by per-shard single-thread CPU on hot keys.</li>
+        </ul>
+        <p>
+          According to the <a href="https://valkey.io/topics/cluster-spec/" target="_blank" rel="noopener">Valkey / Redis Cluster Specification</a>, CME divides the entire keyspace into exactly <strong>16,384 hash slots</strong> (<code>0</code> through <code>16383</code>). Every key maps deterministically to a slot via:
+        </p>
+        <p>
+          <code>slot = CRC16(hash_key) mod 16384</code>
+        </p>
+        <p>
+          Crucially, CME supports <strong>hash tags</strong>: if a key contains a non-empty substring inside its first <code>{...}</code> pair (for example, <code>user:{42}:profile</code> and <code>user:{42}:cart</code>), only <code>42</code> is passed to <code>CRC16</code>. If the braces are empty (<code>user:{}:profile</code>) or missing, the entire key is hashed. Because CME nodes do <strong>not</strong> proxy multi-key commands across shards, calling <code>MGET user:42:profile user:42:cart</code> without hash tags throws <code>CROSSSLOT Keys in request don't hash to the same slot</code> whenever those two keys land on different shards.
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 275" width="100%" height="auto" role="img" aria-label="Redis and Valkey Cluster Mode Enabled 16384 Hash Slot Routing">
+            <rect x="0" y="0" width="680" height="275" fill="#fdfcf8" rx="6" />
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Cluster Mode Enabled (CME): 16,384 Hash Slots &amp; Hash Tag Co-Location</text>
+
+            <!-- Client / Router Box -->
+            <rect x="16" y="48" width="215" height="190" rx="6" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="123" y="70" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f4c81">Cluster-Aware Client</text>
+            <text x="123" y="88" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#1b1d21">slot = CRC16(tag) % 16384</text>
+
+            <rect x="28" y="102" width="191" height="44" rx="4" fill="#ffffff" stroke="#93c5fd" />
+            <text x="36" y="120" font-family="monospace" font-size="10.5" fill="#1b1d21">session:99</text>
+            <text x="36" y="136" font-family="monospace" font-size="10" fill="#575c66">hashes full key &rarr; slot 2140</text>
+
+            <rect x="28" y="156" width="191" height="68" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="36" y="174" font-family="monospace" font-size="10.5" font-weight="700" fill="#166534">user:{42}:profile</text>
+            <text x="36" y="190" font-family="monospace" font-size="10.5" font-weight="700" fill="#166534">user:{42}:cart</text>
+            <text x="36" y="210" font-family="monospace" font-size="10" fill="#166534">both hash "42" &rarr; same slot</text>
+
+            <!-- Arrows -->
+            <line x1="231" y1="124" x2="310" y2="82" stroke="#0f4c81" stroke-width="1.8" />
+            <polygon points="310,82 301,82 305,90" fill="#0f4c81" />
+
+            <line x1="231" y1="188" x2="310" y2="152" stroke="#166534" stroke-width="1.8" />
+            <polygon points="310,152 301,152 305,160" fill="#166534" />
+
+            <!-- Shard 1 -->
+            <rect x="314" y="48" width="348" height="58" rx="6" fill="#fef3c7" stroke="#b45309" />
+            <text x="328" y="69" font-family="sans-serif" font-size="12" font-weight="700" fill="#92400e">Shard 1 &middot; Slots 0 &ndash; 5460</text>
+            <text x="328" y="89" font-family="monospace" font-size="10.5" fill="#1b1d21">Primary (AZ-a) &rarr; Async Replica (AZ-b)</text>
+
+            <!-- Shard 2 -->
+            <rect x="314" y="116" width="348" height="58" rx="6" fill="#dcfce7" stroke="#166534" />
+            <text x="328" y="137" font-family="sans-serif" font-size="12" font-weight="700" fill="#166534">Shard 2 &middot; Slots 5461 &ndash; 10922</text>
+            <text x="328" y="157" font-family="monospace" font-size="10.5" fill="#1b1d21">Primary (AZ-b) &rarr; Async Replica (AZ-c) [MGET OK]</text>
+
+            <!-- Shard 3 -->
+            <rect x="314" y="184" width="348" height="58" rx="6" fill="#f3f4f6" stroke="#6b7280" />
+            <text x="328" y="205" font-family="sans-serif" font-size="12" font-weight="700" fill="#374151">Shard 3 &middot; Slots 10923 &ndash; 16383</text>
+            <text x="328" y="225" font-family="monospace" font-size="10.5" fill="#1b1d21">Primary (AZ-c) &rarr; Async Replica (AZ-a)</text>
+
+            <!-- Error note -->
+            <rect x="16" y="246" width="646" height="22" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="339" y="261" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#991b1b">Without {42}, MGET user:42:profile user:42:cart across shards fails with CROSSSLOT</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Cluster Mode Enabled partitions 16,384 slots across shards. Cluster-aware clients fetch the slot map via <code>CLUSTER SLOTS</code>, route in 1 network hop, and refresh on <code>-MOVED</code> or <code>-ASK</code> redirects.
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Multi-AZ Auto-Failover &amp; Stale Client Traps</h2>
+        <p>
+          Enabling <strong>Multi-AZ with Automatic Failover</strong> places replicas in separate Availability Zones from each primary. Writes acknowledge as soon as the primary commits to RAM, and commands replicate <strong>asynchronously</strong> to replicas. That async gap gives ElastiCache sub-millisecond writes, at the cost of a small window of potential data loss if a primary dies before its replication buffer drains.
+        </p>
+        <p>
+          When a primary fails, ElastiCache detects the outage, promotes the replica with the least replication lag (typically within <strong>15&ndash;60 seconds</strong>), and updates cluster state. Two failure modes catch teams off guard during failover:
+        </p>
+        <ol>
+          <li><strong>JVM / Client DNS Caching (CMD):</strong> In Cluster Mode Disabled, ElastiCache flips the Primary Endpoint DNS CNAME (low 5-second TTL) to the newly promoted replica. If your Java/Kotlin backend caches DNS for too long or holds open pooled TCP sockets to the old primary (which restarts as a read-only replica), writes fail with <code>READONLY You can't write against a read only replica</code> until connections recycle and DNS refreshes.</li>
+          <li><strong>Non-Cluster Clients Against CME:</strong> Using a standard non-cluster Redis client against a CME Configuration Endpoint fails immediately with <code>MOVED &lt;slot&gt; &lt;ip:port&gt;</code> because CME nodes return redirect responses instead of proxying traffic. Always enable cluster topology refresh in your client (and enable TLS in-transit + KMS at-rest encryption + RBAC/IAM Auth in private subnets).</li>
+        </ol>
+
+        <div class="callout warning">
+          <div class="callout-title">Never Over-Tag Keys in CME</div>
+          <p style="margin: 0;">
+            Hash tags solve <code>CROSSSLOT</code>, but putting the same coarse tag on millions of keys (for example, <code>tenant:{acme}:*</code> for your largest enterprise customer) pins every key for that tenant onto a <strong>single shard</strong>, destroying horizontal scaling and creating a hot-shard bottleneck.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. Choosing RDS/Aurora vs. DynamoDB vs. ElastiCache</h2>
+        <p>
+          Senior cloud architects rarely ask <em>"Which database is best?"</em> Instead, they match workload invariants to the storage engine&mdash;and frequently pair a durable database with ElastiCache in front.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 18%;">Dimension</th>
+              <th style="width: 28%;">Amazon RDS / Aurora</th>
+              <th style="width: 27%;">Amazon DynamoDB</th>
+              <th style="width: 27%;">ElastiCache (Valkey / Redis)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Data Model &amp; Queries</strong></td>
+              <td>Relational tables, foreign keys, ad-hoc SQL joins, aggregations, window functions.</td>
+              <td>Key-value &amp; wide-column; fast PK/SK lookups + GSIs for pre-known access patterns.</td>
+              <td>In-memory key-value plus Sorted Sets, Hashes, Bitmaps, HyperLogLog, Streams.</td>
+            </tr>
+            <tr>
+              <td><strong>Typical Latency</strong></td>
+              <td>Low milliseconds to tens of ms (query &amp; index dependent).</td>
+              <td>Consistent single-digit ms at any table size (sub-ms with DAX).</td>
+              <td><strong>Sub-millisecond</strong> (&lt;1 ms inside VPC).</td>
+            </tr>
+            <tr>
+              <td><strong>Durability &amp; ACID</strong></td>
+              <td>Full ACID; Multi-AZ sync standby (RDS) or 6-copy quorum storage (Aurora).</td>
+              <td>3-AZ durable storage; <code>TransactWriteItems</code> ACID across up to 100 items.</td>
+              <td>In-memory with async replication &amp; snapshots; <strong>not</strong> a sole ACID source of truth.</td>
+            </tr>
+            <tr>
+              <td><strong>Scaling Ceiling</strong></td>
+              <td>Vertical primary + read replicas (Aurora Serverless v2 auto-scales ACUs).</td>
+              <td>Serverless auto-partitioning to millions of RPS with zero cluster ops.</td>
+              <td>Vertical (CMD) or up to 500 shards (CME) / ElastiCache Serverless.</td>
+            </tr>
+            <tr>
+              <td><strong>Sweet-Spot Workloads</strong></td>
+              <td>Financial ledgers, orders, ERP, complex reporting &amp; ad-hoc analytics.</td>
+              <td>Mobile user profiles, session/cart state, IoT telemetry, high-scale APIs.</td>
+              <td>DB query caching, sliding-window rate limiters, real-time leaderboards, pub/sub.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- SECTION 5: CODE EXAMPLE -->
+        <h2>5. Production Code: Multi-AZ Valkey Cluster &amp; Jittered Cache-Aside</h2>
+        <p>
+          Below is a production AWS CDK definition for a Cluster Mode Enabled, Multi-AZ Valkey replication group alongside a Kotlin/TypeScript-style backend cache-aside helper using hash tags and TTL jitter:
+        </p>
+<pre><code>// 1. AWS CDK (TypeScript) — Multi-AZ, Encrypted, Cluster Mode Enabled Valkey Group
+const cacheSubnetGroup = new elasticache.CfnSubnetGroup(this, "ValkeySubnets", {
+  description: "Private isolated subnets for Valkey",
+  subnetIds: vpc.isolatedSubnets.map((s) =&gt; s.subnetId),
+});
+
+const valkeyCluster = new elasticache.CfnReplicationGroup(this, "AppValkey", {
+  replicationGroupDescription: "Production CME Valkey cache",
+  engine: "valkey",
+  engineVersion: "8.0",
+  cacheNodeType: "cache.r7g.large",
+  numNodeGroups: 3,                 // 3 shards across 16,384 slots
+  replicasPerNodeGroup: 1,          // 1 replica per shard in a different AZ
+  multiAzEnabled: true,
+  automaticFailoverEnabled: true,   // Requires Multi-AZ + replicasPerNodeGroup &gt;= 1
+  transitEncryptionEnabled: true,   // TLS between ECS/Lambda and Valkey
+  atRestEncryptionEnabled: true,
+  cacheParameterGroupName: "default.valkey8.cluster.on",
+  cacheSubnetGroupName: cacheSubnetGroup.ref,
+  securityGroupIds: [valkeySg.securityGroupId],
+});
+
+// 2. Application Cache-Aside Pattern (Hash Tags + Jittered TTL + Negative Caching)
+async function getUserBundle(userId: string) {
+  const profileKey = `user:{${userId}}:profile`; // Co-located on same shard
+  const cartKey    = `user:{${userId}}:cart`;    // Safe for MGET &amp; Lua scripts
+
+  const cached = await valkeyCluster.mget(profileKey, cartKey);
+  if (cached[0] === "__NULL__") return null;     // Penetration guard
+  if (cached[0] &amp;&amp; cached[1]) return { profile: JSON.parse(cached[0]), cart: JSON.parse(cached[1]) };
+
+  const dbBundle = await rdsRepo.loadUserBundle(userId);
+  const jitter = Math.floor(Math.random() * 60); // Stampede guard: 300s..359s
+  if (!dbBundle) {
+    await valkeyCluster.set(profileKey, "__NULL__", "EX", 30);
+    return null;
+  }
+  await valkeyCluster
+    .multi()
+    .set(profileKey, JSON.stringify(dbBundle.profile), "EX", 300 + jitter)
+    .set(cartKey, JSON.stringify(dbBundle.cart), "EX", 300 + jitter)
+    .exec();
+  return dbBundle;
+}</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build the two core engines behind this lesson: (1) a Redis/Valkey Cluster <strong>16,384-hash-slot router</strong> that extracts hash tags, computes <code>CRC16 % 16384</code>, and detects <code>CROSSSLOT</code> errors, and (2) an <strong>AWS database selection scoring engine</strong> that chooses between RDS/Aurora, DynamoDB, and ElastiCache while flagging when to pair a durable database with an ElastiCache read layer.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your judgment on Cluster Mode routing, Multi-AZ failover behavior, and AWS database selection tradeoffs.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCES & TEACHER CHECK-IN -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Replication.Redis.Groups.html" target="_blank" rel="noopener">Amazon ElastiCache &mdash; High Availability Using Replication Groups &amp; Multi-AZ</a> (Cluster Mode Disabled vs. Enabled, failover, and endpoints).
+          </li>
+          <li>
+            <strong>Protocol Spec:</strong> <a href="https://valkey.io/topics/cluster-spec/" target="_blank" rel="noopener">Valkey Cluster Specification</a> (16,384 hash slots, hash tags <code>{...}</code>, <code>MOVED</code>/<code>ASK</code> redirections, and async replication).
+          </li>
+          <li>
+            <strong>Architecture Guide:</strong> <a href="https://docs.aws.amazon.com/decision-guides/latest/databases-on-aws-how-to-choose/databases-on-aws-how-to-choose.html" target="_blank" rel="noopener">AWS Decision Guide &mdash; Choosing an AWS Database Service</a> (Relational, key-value, and in-memory caching criteria).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0036 (API Gateway HTTP API vs REST API)</strong>, ask me anything that feels fuzzy&mdash;for example: <em>"When should I pick ElastiCache Serverless over provisioned CME node groups?"</em> or <em>"How does DynamoDB Accelerator (DAX) compare to putting ElastiCache in front of DynamoDB?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0034-dynamodb-single-table-streams.html">&larr; Lesson 0034: DynamoDB Production Patterns: Single-Table Design, Optimistic Locking &amp; Streams</a>
+          <a href="./0036-api-gateway-http-vs-rest-vs-alb.html">Lesson 0036: API Gateway (HTTP API vs REST API): Authorizers, Throttling &amp; ALB Tradeoffs &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why 16,384 Slots?</strong>
+          Redis Cluster nodes gossip slot ownership bitmaps in every heartbeat packet. At 16,384 bits (2 KB per heartbeat), cluster gossip stays compact while easily partitioning up to ~1,000 nodes; 65,536 slots would bloat every heartbeat to 8 KB.
+        </div>
+        <div class="sidenote">
+          <strong>Why Not Memcached?</strong>
+          Memcached scales across threads on a single node and fits dead-simple string caching, but it lacks Multi-AZ replication, automatic failover, Lua scripts, Sorted Sets, and persistence snapshots&mdash;making Valkey/Redis the default choice on AWS.
+        </div>
+        <div class="sidenote">
+          <strong>Check the Glossary</strong>
+          Review crisp networking and caching foundations anytime in <a href="../reference/glossary.html">reference/glossary.html</a>.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0035",
+      title: "Lab 0035: Valkey/Redis 16,384-Slot Router & Database Selection Engine",
+      filename: "cache-and-db-router.js",
+      description:
+        "Implement three functions (using the provided <code>crc16Ccitt</code> helper):<br>" +
+        "1) <code>extractHashKey(key)</code>: Find the first <code>{</code> and the first <code>}</code> after it. If both exist and the substring between them is non-empty, return that substring; otherwise return <code>key</code>.<br>" +
+        "2) <code>routeClusterCommand(keys, shards)</code>: Compute <code>crc16Ccitt(extractHashKey(k)) % 16384</code> for every key. Deduplicate slots (preserving order). If more than 1 unique slot exists, return <code>{ ok: false, error: \"CROSSSLOT\", slots, shardId: null, primaryNode: null }</code>. Otherwise find the shard with <code>slot &gt;= shard.startSlot &amp;&amp; slot &lt;= shard.endSlot</code>; if missing return <code>error: \"CLUSTERDOWN\"</code>, else return <code>{ ok: true, error: null, slots, shardId: shard.shardId, primaryNode: shard.primaryNode }</code>.<br>" +
+        "3) <code>recommendDatabase(workload)</code>: Score <code>RDS_AURORA</code> (+5 if <code>needsJoinsOrAdHocSql</code>, +4 if <code>needsFullAcidTransactions</code>, -3 if <code>massiveWriteScale &amp;&amp; predictableKeyAccessOnly</code>, -2 if <code>subMillisecondLatency</code>), <code>DYNAMODB</code> (+4 if <code>predictableKeyAccessOnly</code>, +4 if <code>massiveWriteScale</code>, +2 if <code>needsFullAcidTransactions &amp;&amp; !needsJoinsOrAdHocSql</code>, -5 if <code>needsJoinsOrAdHocSql</code>), and <code>ELASTICACHE_VALKEY</code> (+4 if <code>ephemeralCacheOk</code>, +3 if <code>subMillisecondLatency</code>, +3 if <code>advancedStructures</code>, -10 if <code>!ephemeralCacheOk &amp;&amp; needsFullAcidTransactions</code>). Pick highest score (tie-break: <code>RDS_AURORA</code>, <code>DYNAMODB</code>, <code>ELASTICACHE_VALKEY</code>) and set <code>pairWithCache: primary !== \"ELASTICACHE_VALKEY\" &amp;&amp; (workload.subMillisecondLatency || workload.advancedStructures)</code>.",
+      exports: ["extractHashKey", "routeClusterCommand", "recommendDatabase"],
+      starterCode: `// Provided CRC16-CCITT (XMODEM, poly 0x1021, init 0x0000) matching Redis/Valkey Cluster
+function crc16Ccitt(str) {
+  let crc = 0;
+  for (let i = 0; i < str.length; i++) {
+    crc ^= str.charCodeAt(i) << 8;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xffff;
+    }
+  }
+  return crc;
+}
+
+function extractHashKey(key) {
+  // TODO 1: return substring inside first non-empty {...} or full key
+  return key;
+}
+
+function routeClusterCommand(keys, shards) {
+  // shards: [{ shardId, startSlot, endSlot, primaryNode }]
+  // TODO 2: map keys -> unique slots, detect CROSSSLOT or CLUSTERDOWN, else route to shard
+  return { ok: false, error: "NOT_IMPLEMENTED", slots: [], shardId: null, primaryNode: null };
+}
+
+function recommendDatabase(workload) {
+  // workload: {
+  //   needsJoinsOrAdHocSql, needsFullAcidTransactions, ephemeralCacheOk,
+  //   subMillisecondLatency, predictableKeyAccessOnly, advancedStructures, massiveWriteScale
+  // }
+  // TODO 3: compute scores for RDS_AURORA, DYNAMODB, ELASTICACHE_VALKEY, pick primary, set pairWithCache
+  return {
+    primary: "RDS_AURORA",
+    pairWithCache: false,
+    scores: { RDS_AURORA: 0, DYNAMODB: 0, ELASTICACHE_VALKEY: 0 }
+  };
+}
+
+const sampleShards = [
+  { shardId: "shard-1", startSlot: 0, endSlot: 5460, primaryNode: "10.0.1.10:6379" },
+  { shardId: "shard-2", startSlot: 5461, endSlot: 10922, primaryNode: "10.0.2.10:6379" },
+  { shardId: "shard-3", startSlot: 10923, endSlot: 16383, primaryNode: "10.0.3.10:6379" }
+];
+console.log("Tagged MGET:", routeClusterCommand(["user:{42}:profile", "user:{42}:cart"], sampleShards));`,
+      hints: [
+        "In <code>extractHashKey(key)</code>, check <code>const open = key.indexOf(\"{\");</code> and <code>const close = key.indexOf(\"}\", open + 1);</code>. Only slice if <code>open !== -1 &amp;&amp; close &gt; open + 1</code>.",
+        "In <code>routeClusterCommand</code>, build <code>const slots = [];</code> and push each <code>crc16Ccitt(extractHashKey(k)) % 16384</code> only if <code>!slots.includes(slot)</code>. If <code>slots.length &gt; 1</code>, return <code>CROSSSLOT</code>.",
+        "In <code>recommendDatabase</code>, iterate over <code>[\"RDS_AURORA\", \"DYNAMODB\", \"ELASTICACHE_VALKEY\"]</code> using strictly greater (<code>&gt;</code>) comparison so ties automatically preserve the required order."
+      ],
+      solutionExplanation:
+        "Redis/Valkey Cluster hashes only the first non-empty {...} tag so related keys land in the same 16,384-slot bucket and avoid CROSSSLOT failures. For database choice, durable ACID/join workloads anchor on RDS/Aurora, predictable high-write workloads anchor on DynamoDB, and ElastiCache acts either as the primary engine for ephemeral/advanced data structures or as a paired sub-millisecond read layer.",
+      solutionCode: `function crc16Ccitt(str) {
+  let crc = 0;
+  for (let i = 0; i < str.length; i++) {
+    crc ^= str.charCodeAt(i) << 8;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xffff;
+    }
+  }
+  return crc;
+}
+
+function extractHashKey(key) {
+  const open = key.indexOf("{");
+  if (open === -1) return key;
+  const close = key.indexOf("}", open + 1);
+  if (close === -1 || close === open + 1) return key;
+  return key.slice(open + 1, close);
+}
+
+function routeClusterCommand(keys, shards) {
+  const slots = [];
+  for (let i = 0; i < keys.length; i++) {
+    const slot = crc16Ccitt(extractHashKey(keys[i])) % 16384;
+    if (!slots.includes(slot)) slots.push(slot);
+  }
+  if (slots.length > 1) {
+    return { ok: false, error: "CROSSSLOT", slots, shardId: null, primaryNode: null };
+  }
+  const slot = slots[0];
+  const shard = shards.find((s) => slot >= s.startSlot && slot <= s.endSlot);
+  if (!shard) {
+    return { ok: false, error: "CLUSTERDOWN", slots, shardId: null, primaryNode: null };
+  }
+  return {
+    ok: true,
+    error: null,
+    slots,
+    shardId: shard.shardId,
+    primaryNode: shard.primaryNode
+  };
+}
+
+function recommendDatabase(workload) {
+  const scores = {
+    RDS_AURORA:
+      (workload.needsJoinsOrAdHocSql ? 5 : 0) +
+      (workload.needsFullAcidTransactions ? 4 : 0) +
+      (workload.massiveWriteScale && workload.predictableKeyAccessOnly ? -3 : 0) +
+      (workload.subMillisecondLatency ? -2 : 0),
+    DYNAMODB:
+      (workload.predictableKeyAccessOnly ? 4 : 0) +
+      (workload.massiveWriteScale ? 4 : 0) +
+      (workload.needsFullAcidTransactions && !workload.needsJoinsOrAdHocSql ? 2 : 0) +
+      (workload.needsJoinsOrAdHocSql ? -5 : 0),
+    ELASTICACHE_VALKEY:
+      (workload.ephemeralCacheOk ? 4 : 0) +
+      (workload.subMillisecondLatency ? 3 : 0) +
+      (workload.advancedStructures ? 3 : 0) +
+      (!workload.ephemeralCacheOk && workload.needsFullAcidTransactions ? -10 : 0)
+  };
+
+  const order = ["RDS_AURORA", "DYNAMODB", "ELASTICACHE_VALKEY"];
+  let primary = order[0];
+  for (let i = 1; i < order.length; i++) {
+    if (scores[order[i]] > scores[primary]) {
+      primary = order[i];
+    }
+  }
+
+  const pairWithCache =
+    primary !== "ELASTICACHE_VALKEY" &&
+    Boolean(workload.subMillisecondLatency || workload.advancedStructures);
+
+  return { primary, pairWithCache, scores };
+}`,
+      tests: [
+        {
+          name: "extractHashKey extracts first non-empty {...} tag and ignores empty {}",
+          run: (scope) => {
+            const a = scope.extractHashKey("user:{42}:profile");
+            const b = scope.extractHashKey("user:{}:profile");
+            const c = scope.extractHashKey("{alpha}:{beta}");
+            const d = scope.extractHashKey("plain-key");
+            const pass = a === "42" && b === "user:{}:profile" && c === "alpha" && d === "plain-key";
+            return { pass, message: `got a=${a}, b=${b}, c=${c}, d=${d}` };
+          }
+        },
+        {
+          name: "routeClusterCommand co-locates hash-tagged multi-key commands onto one shard",
+          run: (scope) => {
+            const shards = [
+              { shardId: "shard-1", startSlot: 0, endSlot: 5460, primaryNode: "10.0.1.10:6379" },
+              { shardId: "shard-2", startSlot: 5461, endSlot: 10922, primaryNode: "10.0.2.10:6379" },
+              { shardId: "shard-3", startSlot: 10923, endSlot: 16383, primaryNode: "10.0.3.10:6379" }
+            ];
+            const out = scope.routeClusterCommand(["user:{42}:profile", "user:{42}:cart"], shards);
+            const pass =
+              out.ok === true &&
+              out.error === null &&
+              out.slots.length === 1 &&
+              out.slots[0] === 8000 &&
+              out.shardId === "shard-2" &&
+              out.primaryNode === "10.0.2.10:6379";
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "routeClusterCommand returns CROSSSLOT for untagged multi-key mismatch and CLUSTERDOWN when slot unowned",
+          run: (scope) => {
+            const shards = [
+              { shardId: "shard-1", startSlot: 0, endSlot: 5460, primaryNode: "10.0.1.10:6379" },
+              { shardId: "shard-2", startSlot: 5461, endSlot: 10922, primaryNode: "10.0.2.10:6379" },
+              { shardId: "shard-3", startSlot: 10923, endSlot: 16383, primaryNode: "10.0.3.10:6379" }
+            ];
+            const cross = scope.routeClusterCommand(["user:42:profile", "user:42:cart"], shards);
+            const down = scope.routeClusterCommand(["user:{42}:profile"], [shards[0]]);
+            const pass =
+              cross.ok === false &&
+              cross.error === "CROSSSLOT" &&
+              cross.slots.length === 2 &&
+              down.ok === false &&
+              down.error === "CLUSTERDOWN";
+            return { pass, message: `cross=${cross.error}, down=${down.error}` };
+          }
+        },
+        {
+          name: "recommendDatabase selects RDS_AURORA + ElastiCache pair for ACID joins with sub-ms reads",
+          run: (scope) => {
+            const out = scope.recommendDatabase({
+              needsJoinsOrAdHocSql: true,
+              needsFullAcidTransactions: true,
+              ephemeralCacheOk: false,
+              subMillisecondLatency: true,
+              predictableKeyAccessOnly: false,
+              advancedStructures: false,
+              massiveWriteScale: false
+            });
+            const pass = out.primary === "RDS_AURORA" && out.pairWithCache === true && out.scores.RDS_AURORA === 7;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "recommendDatabase picks DYNAMODB for massive predictable writes and ELASTICACHE_VALKEY for ephemeral rate limits",
+          run: (scope) => {
+            const ddb = scope.recommendDatabase({
+              needsJoinsOrAdHocSql: false,
+              needsFullAcidTransactions: true,
+              ephemeralCacheOk: false,
+              subMillisecondLatency: true,
+              predictableKeyAccessOnly: true,
+              advancedStructures: false,
+              massiveWriteScale: true
+            });
+            const cache = scope.recommendDatabase({
+              needsJoinsOrAdHocSql: false,
+              needsFullAcidTransactions: false,
+              ephemeralCacheOk: true,
+              subMillisecondLatency: true,
+              predictableKeyAccessOnly: true,
+              advancedStructures: true,
+              massiveWriteScale: true
+            });
+            const pass =
+              ddb.primary === "DYNAMODB" &&
+              ddb.pairWithCache === true &&
+              cache.primary === "ELASTICACHE_VALKEY" &&
+              cache.pairWithCache === false;
+            return { pass, message: `ddb=${ddb.primary}/${ddb.pairWithCache}, cache=${cache.primary}/${cache.pairWithCache}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0035",
+      title: "Quiz 0035: ElastiCache Cluster Mode & AWS Database Selection",
+      questions: [
+        {
+          id: "q1",
+          prompt: "You migrate a session service from Cluster Mode Disabled to a 3-shard Cluster Mode Enabled Valkey cluster. Immediately, MGET calls for [\"user:42:profile\", \"user:42:cart\"] fail with CROSSSLOT errors. What is the clean architectural fix?",
+          options: [
+            "Change the Valkey cluster eviction policy from volatile-lru to allkeys-lru right now",
+            "Wrap the shared user ID in curly braces like user:{42}:profile and user:{42}:cart",
+            "Point every application client directly at the primary endpoint of shard one",
+            "Raise reserved memory percent to fifty percent across every primary and replica"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Eviction policy governs which keys are dropped when memory reaches maxmemory; it has no effect on CRC16 hash-slot routing or CROSSSLOT errors.",
+            "Valkey/Redis Cluster hashes only the first non-empty {...} tag, mapping both keys via \"42\" into the exact same hash slot and shard so MGET succeeds.",
+            "In Cluster Mode Enabled, shard one only owns one-third of the 16,384 slots; sending commands for other slots there simply returns -MOVED redirects.",
+            "Reserved memory protects fork and replication buffers from Linux OOM kills, not multi-key hash-slot distribution across shards."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "During a Multi-AZ failover on a Cluster Mode Disabled ElastiCache Redis group, a replica in AZ-b promotes to primary within 20 seconds, yet your JVM backend keeps failing writes with READONLY errors for several minutes. Why?",
+          options: [
+            "Valkey snapshots lock all cluster hash slots for five minutes during recovery",
+            "JVM DNS caching or pooled sockets still route writes to demoted primary",
+            "Async replication deletes every cache key lacking a TTL during primary failover",
+            "ElastiCache Multi-AZ blocks writes until an operator approves the replica promotion"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Cluster Mode Disabled uses a single shard rather than CME hash-slot migration, and snapshots do not impose a five-minute cluster write lock.",
+            "When the old primary restarts as a read-only replica, clients holding stale DNS entries or pooled TCP sockets to that IP receive READONLY errors on writes.",
+            "Keys without TTLs stay intact across normal replica promotion; only volatile-lru eviction or an unshipped async buffer window loses keys.",
+            "Automatic failover promotes the healthiest replica and opens it for writes automatically without manual operator approval."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "A mobile banking team needs strict multi-account ACID transfers, complex monthly SQL audit joins, and sub-millisecond balance lookups for the Android home screen. Which AWS storage design fits best?",
+          options: [
+            "Store ledger accounts in ElastiCache noeviction mode and run monthly joins in Lambda",
+            "Store ledger accounts in DynamoDB and run ad-hoc SQL joins across global indexes",
+            "Store ledger accounts in RDS Aurora and pair ElastiCache for fast balance reads",
+            "Store ledger accounts in Amazon Memcached and replicate daily snapshots into S3 buckets"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "ElastiCache is an in-memory store with asynchronous replication and lacks relational ACID guarantees and SQL join engines; it should never hold a bank ledger alone.",
+            "DynamoDB excels at predictable key-value lookups and bounded transactions, but it cannot execute ad-hoc relational SQL joins across tables.",
+            "RDS/Aurora provides durable ACID transactions and full SQL audit joins as the source of truth, while ElastiCache serves sub-millisecond home-screen balance reads.",
+            "Memcached has no replication, no durability, and no ACID transactions, making it wholly unsuitable as a financial ledger."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

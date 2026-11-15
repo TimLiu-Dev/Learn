@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0011 — Queues, At-Least-Once Delivery, Idempotency Keys, Outbox Pattern &amp; DLQs</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0011</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0011-queues-idempotency-outbox-dlq.html" class="active">Lesson 0011</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part1">Part 1 &middot; Module 1.4</span>
+      <span class="pill verified">Distributed Messaging</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>Queues, At-Least-Once Delivery, Idempotency Keys, Outbox Pattern &amp; DLQs</h1>
+    <p class="lead">
+      In Android, <code>WorkManager.enqueueUniqueWork()</code> relies on a single device's SQLite database to guarantee a background job runs once. Across distributed cloud producers, Amazon SQS queues, and auto-scaling worker fleets, <em>exactly-once delivery is a trap</em>—so senior systems combine <strong>at-least-once delivery</strong>, <strong>idempotency key stores</strong>, the <strong>transactional outbox</strong>, and <strong>Dead-Letter Queues (DLQs)</strong> to stay consistent under crashes and retries.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            On Android, when you schedule an offline upload with <code>WorkManager.getInstance(ctx).enqueueUniqueWork("order-42", ExistingWorkPolicy.KEEP, request)</code>, WorkManager stores the work row inside its local Room/SQLite table and enforces uniqueness on one CPU. In AWS, your API servers, message broker (Amazon SQS), and consumer containers run on separate machines across Availability Zones. If a worker crashes after charging a credit card—or simply pauses longer than the queue's <strong>visibility timeout</strong>—SQS assumes the job failed and hands the exact same message to another container.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. At-Least-Once Delivery &amp; the Visibility Timeout Trap</h2>
+        <p>
+          In distributed messaging, brokers make a deliberate CAP/latency tradeoff: <strong>at-least-once delivery</strong> guarantees no acknowledged message is lost, at the cost of occasionally delivering the same message two or more times.
+        </p>
+        <p>
+          In <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html" target="_blank" rel="noopener">Amazon SQS</a>, messages stay in the queue until a consumer explicitly calls <code>DeleteMessage</code>:
+        </p>
+        <ol>
+          <li><strong>Receive &amp; Lease:</strong> Worker A calls <code>ReceiveMessage</code>. SQS hands out the message and hides it from other workers for the <code>VisibilityTimeout</code> (default <strong>30 seconds</strong>, configurable from <strong>0s to 12 hours</strong>).</li>
+          <li><strong>The Slow-Consumer Duplicate:</strong> Suppose Worker A hits a GC pause or slow third-party API call and takes <strong>38 seconds</strong>. At second 30.000, the visibility lease expires. SQS makes the message visible again, increments <code>ApproximateReceiveCount</code>, and delivers it to Worker B.</li>
+          <li><strong>Concurrent Execution:</strong> Worker A and Worker B now process the same order simultaneously unless your consumer enforces idempotency at the data layer.</li>
+        </ol>
+
+        <div class="callout warning">
+          <div class="callout-title">Standard vs. FIFO SQS Throughput &amp; Guarantees</div>
+          <p style="margin: 0;">
+            <strong>SQS Standard</strong> offers nearly unlimited transactions per second (TPS), best-effort ordering, and occasional duplicates by design. <strong>SQS FIFO</strong> preserves strict ordering per <code>MessageGroupId</code> and deduplicates identical <code>MessageDeduplicationId</code> sends within a <strong>5-minute window</strong> (up to <strong>300 TPS</strong> unbatched, <strong>3,000 TPS</strong> with 10-message batches, or higher with High Throughput FIFO). Crucially, FIFO <em>still</em> redelivers on visibility timeout expiry—so neither queue type excuses non-idempotent consumers.
+          </p>
+        </div>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 250" width="100%" height="auto" role="img" aria-label="Transactional Outbox, Idempotent Consumer, and DLQ Architecture">
+            <rect x="0" y="0" width="680" height="250" fill="#fdfcf8" rx="6" />
+
+            <!-- Header -->
+            <text x="16" y="26" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">End-to-End Safe Pipeline: Transactional Outbox &rarr; SQS &rarr; Idempotent Consumer &rarr; DLQ</text>
+
+            <!-- Step 1: API + DB -->
+            <rect x="16" y="44" width="152" height="92" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="92" y="64" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f4c81">1. API + Postgres TX</text>
+            <text x="92" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">INSERT orders</text>
+            <text x="92" y="100" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">INSERT outbox_events</text>
+            <text x="92" y="122" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#166534">Atomic COMMIT (0 I/O)</text>
+
+            <!-- Arrow 1 -> 2 -->
+            <line x1="168" y1="90" x2="196" y2="90" stroke="#575c66" stroke-width="1.5" />
+            <polygon points="196,86 204,90 196,94" fill="#575c66" />
+
+            <!-- Step 2: Outbox Relay -> SQS -->
+            <rect x="204" y="44" width="136" height="92" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="272" y="64" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#b45309">2. Relay &rarr; SQS</text>
+            <text x="272" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Poll / WAL CDC</text>
+            <text x="272" y="100" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Visibility: 6x p99</text>
+            <text x="272" y="122" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#b45309">At-Least-Once Queue</text>
+
+            <!-- Arrow 2 -> 3 -->
+            <line x1="340" y1="90" x2="368" y2="90" stroke="#575c66" stroke-width="1.5" />
+            <polygon points="368,86 376,90 368,94" fill="#575c66" />
+
+            <!-- Step 3: Idempotent Consumer -->
+            <rect x="376" y="44" width="148" height="92" rx="5" fill="#dcfce7" stroke="#166534" />
+            <text x="450" y="64" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#166534">3. Worker + Key Store</text>
+            <text x="450" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Claim key atomically</text>
+            <text x="450" y="100" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Check payload_hash</text>
+            <text x="450" y="122" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#166534">Commit + DeleteMessage</text>
+
+            <!-- Arrow 3 -> 4 (DLQ) -->
+            <line x1="524" y1="90" x2="552" y2="90" stroke="#991b1b" stroke-width="1.5" />
+            <polygon points="552,86 560,90 552,94" fill="#991b1b" />
+
+            <!-- Step 4: DLQ -->
+            <rect x="560" y="44" width="104" height="92" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="612" y="64" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#991b1b">4. SQS DLQ</text>
+            <text x="612" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">receive &gt; max</text>
+            <text x="612" y="100" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">14d retention</text>
+            <text x="612" y="122" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#991b1b">Alarm + Redrive</text>
+
+            <!-- Bottom comparison strip -->
+            <line x1="16" y1="156" x2="664" y2="156" stroke="#dfd9cc" stroke-dasharray="4 4" />
+            <text x="16" y="178" font-family="sans-serif" font-size="12" font-weight="700" fill="#991b1b">Why Naive Dual Writes Fail (Without Outbox):</text>
+            <rect x="16" y="190" width="314" height="44" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="173" y="209" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#991b1b">DB COMMIT ok &rarr; Pod crashes before SQS send</text>
+            <text x="173" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#1b1d21">Order saved, event lost forever (silent drift)</text>
+
+            <rect x="350" y="190" width="314" height="44" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="507" y="209" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#b45309">SQS send ok &rarr; DB ROLLBACK on constraint</text>
+            <text x="507" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#1b1d21">Phantom event ships unpurchased inventory</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Every hop tolerates crashes without losing or duplicating side effects: local ACID transactions feed the outbox relay, SQS retries transiently, idempotency keys guard side effects, and poison pills isolate into the DLQ.
+          </div>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. Idempotency Keys &amp; Atomic Deduplication Stores</h2>
+        <p>
+          An operation is <strong>idempotent</strong> when executing it multiple times with the same key produces the same final state as executing it once. As detailed in the <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/" target="_blank" rel="noopener">Amazon Builders' Library guide on idempotent APIs</a>, a naive <code>if (!seen) { chargeCard(); markSeen(); }</code> check fails under concurrency because two workers can both pass <code>!seen</code> before either writes <code>markSeen()</code> (a <strong>TOCTOU</strong> race).
+        </p>
+        <p>
+          Production idempotency stores use a <strong>two-phase atomic claim</strong> backed by a unique constraint (PostgreSQL <code>PRIMARY KEY</code> or DynamoDB <code>ConditionExpression: "attribute_not_exists(idempotency_key)"</code>):
+        </p>
+        <ul>
+          <li>
+            <strong>Phase 1 — Atomic Claim (<code>IN_PROGRESS</code>):</strong> Before running side effects, insert <code>(key, status='IN_PROGRESS', payload_hash, locked_until)</code> with <code>ON CONFLICT DO NOTHING</code>. If 0 rows are inserted, another worker already owns or finished the key.
+          </li>
+          <li>
+            <strong>Payload Hash Guard:</strong> Always store a SHA-256 hash of the canonical payload. If a client or bug reuses <code>key = "order-42"</code> with <code>amount = $99</code> after previously sending <code>amount = $49</code>, fail loudly with a non-retryable <code>PAYLOAD_MISMATCH</code> error rather than returning stale success.
+          </li>
+          <li>
+            <strong>Phase 2 — Finalize or Release:</strong> On success, update the row to <code>status = 'SUCCEEDED'</code> along with the serialized result (same transaction as your DB business mutation if both live in PostgreSQL). On transient failure, <em>delete</em> the <code>IN_PROGRESS</code> lock so the next SQS retry can claim and succeed.
+          </li>
+          <li>
+            <strong>Retention Horizon:</strong> Keep idempotency records longer than your maximum retry + DLQ redrive window. Because SQS retention maxes out at <strong>14 days</strong>, retain idempotency keys for at least <strong>14–30 days</strong> before DynamoDB TTL or Postgres partition cleanup reclaims them.
+          </li>
+        </ul>
+
+        <!-- SECTION 3 -->
+        <h2>3. The Transactional Outbox Pattern</h2>
+        <p>
+          Suppose your Checkout service needs to record an order in PostgreSQL and notify a fulfillment queue in SQS. Calling SQS inside the database transaction blocks a precious PostgreSQL connection and holds row locks for <strong>20–500 ms</strong> of remote network I/O (or full timeout failures). Calling SQS <em>after</em> <code>COMMIT</code> creates the <strong>dual-write gap</strong>: if the container is OOM-killed or loses network connectivity in the 2 milliseconds between <code>COMMIT</code> and <code>sqs.sendMessage()</code>, the order exists with no event.
+        </p>
+        <p>
+          The <strong>Transactional Outbox</strong> solves both problems using the database's own ACID atomicity:
+        </p>
+        <ol>
+          <li>Inside one local transaction, insert into <code>orders</code> <em>and</em> insert an event row into <code>outbox_events(id, aggregate_id, payload, created_at, published_at)</code>. Either both commit or both roll back.</li>
+          <li>A separate <strong>Outbox Relay</strong> worker (polling via <code>SELECT ... FOR UPDATE SKIP LOCKED LIMIT 100</code> every 200 ms, or streaming PostgreSQL WAL changes via Debezium / AWS DMS) reads unpublished rows, calls <code>sqs.sendMessageBatch()</code>, and updates <code>published_at = NOW()</code>.</li>
+          <li>If the relay crashes after <code>sendMessageBatch()</code> but before updating <code>published_at</code>, it republishes that row on restart—which is completely safe because your downstream consumer uses the event's <code>id</code> as its <strong>idempotency key</strong>.</li>
+        </ol>
+
+        <!-- SECTION 4 -->
+        <h2>4. Dead-Letter Queues (DLQs), Poison Pills &amp; Redrive</h2>
+        <p>
+          What happens when a message is structurally broken—a <strong>poison pill</strong> such as invalid JSON, a missing required field, or a bug in consumer code? Without a boundary, SQS delivers that message endlessly until retention expires, burning worker concurrency and starving healthy traffic (and in FIFO queues, blocking every later message in the same <code>MessageGroupId</code>).
+        </p>
+        <p>
+          Attach an SQS <strong>Redrive Policy</strong> (<code>deadLetterTargetArn</code> + <code>maxReceiveCount</code>, typically <strong>3 to 5</strong> for event-driven workloads):
+        </p>
+        <ul>
+          <li><strong>How <code>maxReceiveCount</code> Works:</strong> Each time SQS hands a message to a consumer, <code>ApproximateReceiveCount</code> increments. When a message exceeds <code>maxReceiveCount</code> (i.e., fails or expires visibility again), SQS automatically moves it to the DLQ.</li>
+          <li><strong>Fail Fast on Non-Retryable Errors:</strong> If your consumer catches a deterministic schema/validation error (<code>retryable: false</code>), don't waste 4 more visibility cycles—explicitly send or route it to the DLQ and delete it from the source queue immediately.</li>
+          <li><strong>Retention Clock Gotcha:</strong> SQS preserves the message's <strong>original enqueue timestamp</strong> when moving it to a DLQ. If your source queue has a 4-day retention and your DLQ also has 4-day retention, a message moved on day 3.9 expires in 2 hours! Always configure DLQ <code>MessageRetentionPeriod</code> to <strong>14 days</strong> (<code>1209600</code> seconds) and set a CloudWatch alarm on <code>ApproximateNumberOfMessagesVisible &gt; 0</code>.</li>
+          <li><strong>Safe Replay (DLQ Redrive):</strong> Once a fix is deployed, use SQS <code>StartMessageMoveTask</code> to drain the DLQ back into the source queue at a controlled rate (e.g., 50 msg/sec) so replay doesn't trigger a thundering herd.</li>
+        </ul>
+
+        <div class="card">
+          <h3>Pattern Cheat Sheet: Reliability Guarantees &amp; Tradeoffs</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Mechanism</th>
+                <th>Failure Mode Solved</th>
+                <th>AWS Implementation</th>
+                <th>Production Gotcha</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Visibility Timeout</strong></td>
+                <td>Crashed worker leaves job unfinished</td>
+                <td>SQS <code>VisibilityTimeout</code> &ge; 6&times; p99</td>
+                <td>Too short causes duplicate concurrent runs; too long delays crash recovery</td>
+              </tr>
+              <tr>
+                <td><strong>Idempotency Store</strong></td>
+                <td>Duplicate SQS deliveries &amp; retries</td>
+                <td>Postgres <code>UNIQUE</code> / DynamoDB conditional put</td>
+                <td>Must check <code>payload_hash</code> and retain &ge; 14d SQS max retention</td>
+              </tr>
+              <tr>
+                <td><strong>Transactional Outbox</strong></td>
+                <td>DB commit succeeds, SQS publish crashes</td>
+                <td>Same SQL TX + <code>SKIP LOCKED</code> relay or WAL CDC</td>
+                <td>Relay can still double-publish on crash; pair with idempotent consumers</td>
+              </tr>
+              <tr>
+                <td><strong>Dead-Letter Queue</strong></td>
+                <td>Poison pills starving workers / FIFO head-of-line</td>
+                <td>SQS <code>RedrivePolicy</code> (<code>maxReceiveCount: 3-5</code>)</td>
+                <td>DLQ inherits original <code>SentTimestamp</code>; keep DLQ retention at 14 days</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- SECTION 5 -->
+        <h2>5. Production Code: Outbox Schema, Idempotent Consumer &amp; SQS Redrive</h2>
+        <p>
+          Notice how three short pieces fit together: an atomic PostgreSQL transaction writes both order and outbox event, the consumer claims the idempotency key with <code>ON CONFLICT DO NOTHING</code>, and Terraform enforces a 14-day DLQ with <code>maxReceiveCount = 5</code>.
+        </p>
+<pre><code>-- 1. PostgreSQL Transactional Outbox + Idempotency Key Store
+BEGIN;
+  INSERT INTO orders (id, user_id, total_cents, status)
+  VALUES ($1, $2, $3, 'CONFIRMED');
+
+  INSERT INTO outbox_events (id, aggregate_id, event_type, payload)
+  VALUES ($4, $1, 'ORDER_CONFIRMED', $5::jsonb);
+COMMIT;
+
+-- Consumer-side atomic claim (prevents TOCTOU race across ECS tasks)
+INSERT INTO idempotency_keys (key, payload_hash, status, expires_at)
+VALUES ($1, $2, 'IN_PROGRESS', NOW() + INTERVAL '30 days')
+ON CONFLICT (key) DO NOTHING
+RETURNING key;
+
+# 2. Terraform SQS Source Queue + 14-Day DLQ Redrive Policy
+resource "aws_sqs_queue" "orders_dlq" {
+  name                      = "orders-events-dlq"
+  message_retention_seconds = 1209600 # 14 days (exceeds source retention)
+}
+
+resource "aws_sqs_queue" "orders" {
+  name                       = "orders-events"
+  visibility_timeout_seconds = 180     # >= 6x max 30s worker runtime
+  message_retention_seconds  = 345600  # 4 days
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.orders_dlq.arn
+    maxReceiveCount     = 5
+  })
+}</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement <code>processQueueMessage(message, store, handler, policy)</code> to build a production-grade SQS consumer wrapper with atomic idempotency deduplication, payload hash verification, concurrent lock protection, and <code>maxReceiveCount</code> DLQ routing.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your architecture instincts on real AWS production incidents. Every option provides immediate feedback on why the right choice works and why each distractor fails.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>AWS SQS Docs:</strong> <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html" target="_blank" rel="noopener">Amazon SQS Dead-Letter Queues &amp; Redrive</a> (Retention timestamps, <code>maxReceiveCount</code>, and DLQ redrive tasks).
+          </li>
+          <li>
+            <strong>AWS SQS FIFO Docs:</strong> <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues.html" target="_blank" rel="noopener">Amazon SQS FIFO Queues &amp; Deduplication</a> (5-minute deduplication window, <code>MessageGroupId</code> ordering, and throughput quotas).
+          </li>
+          <li>
+            <strong>Amazon Builders' Library:</strong> <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/" target="_blank" rel="noopener">Making retries safe with idempotent APIs</a> — Malcolm Featonby.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0012 (Docker Multi-Stage Builds, Non-Root Security &amp; Health Checks)</strong>, ask me anything that feels fuzzy—for example: <em>"How does <code>SELECT ... FOR UPDATE SKIP LOCKED</code> let multiple outbox relay workers scale horizontally?"</em> or <em>"When should I use DynamoDB vs. PostgreSQL for my idempotency store?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0010-timeouts-backoff-jitter-circuit-breakers.html">&larr; Lesson 0010: Timeouts, Exponential Backoff with Jitter &amp; Circuit Breakers</a>
+          <a href="./0012-docker-multistage-nonroot-healthchecks.html">Lesson 0012: Docker Multi-Stage Builds, Non-Root Security &amp; Health Checks &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>WorkManager vs. SQS Leases</strong>
+          Android's <code>WorkManager</code> explicitly cancels a <code>CoroutineWorker</code> on constraint loss. SQS cannot cancel a remote container; when <code>VisibilityTimeout</code> expires, SQS simply leases the message to another worker while the first may still be running.
+        </div>
+        <div class="sidenote">
+          <strong>FIFO Deduplication Scope</strong>
+          SQS FIFO's 5-minute <code>MessageDeduplicationId</code> only drops duplicate <em>producer</em> <code>SendMessage</code> calls. It does not prevent consumer-side duplicates caused by slow processing or worker crashes.
+        </div>
+        <div class="sidenote">
+          <strong>DLQ Retention Clock</strong>
+          A message moved into a DLQ keeps its original <code>SentTimestamp</code> from the source queue. Keep DLQ retention at 14 days so aged messages don't vanish right after arriving.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0011",
+      title: "Lab 0011: Idempotent SQS Consumer & DLQ Router",
+      filename: "message-processor.js",
+      description:
+        "Complete <code>processQueueMessage(message, store, handler, policy)</code>. Inputs: <code>message = { messageId, idempotencyKey, payloadHash, receiveCount, body }</code>, <code>store</code> (object keyed by <code>idempotencyKey</code>), <code>handler(body)</code>, and <code>policy = { maxReceiveCount }</code>. Rules: (1) If <code>message.receiveCount &gt; policy.maxReceiveCount</code>, return <code>{ action: \"ROUTED_TO_DLQ\", reason: \"MAX_RECEIVE_EXCEEDED\", deleteFromSource: true }</code> without calling <code>handler</code>. (2) Inspect <code>existing = store[message.idempotencyKey]</code>: if present and <code>existing.payloadHash !== message.payloadHash</code>, return <code>{ action: \"ROUTED_TO_DLQ\", reason: \"PAYLOAD_MISMATCH\", deleteFromSource: true }</code>; if <code>existing.status === \"SUCCEEDED\"</code>, return <code>{ action: \"DEDUPLICATED\", reason: \"ALREADY_SUCCEEDED\", deleteFromSource: true, result: existing.result }</code>; if <code>existing.status === \"IN_PROGRESS\"</code>, return <code>{ action: \"SKIP_IN_FLIGHT\", reason: \"CONCURRENT_EXECUTION\", deleteFromSource: false }</code>. (3) Otherwise claim <code>store[message.idempotencyKey] = { status: \"IN_PROGRESS\", payloadHash: message.payloadHash }</code> and invoke <code>handler(message.body)</code>. On success, store <code>{ status: \"SUCCEEDED\", payloadHash: message.payloadHash, result }</code> and return <code>{ action: \"PROCESSED\", reason: \"SUCCEEDED\", deleteFromSource: true, result }</code>. On error <code>err</code>, delete the <code>IN_PROGRESS</code> key from <code>store</code>; if <code>err.retryable === false</code> return <code>{ action: \"ROUTED_TO_DLQ\", reason: \"NON_RETRYABLE_ERROR\", deleteFromSource: true, error: err.message }</code>; else if <code>message.receiveCount &gt;= policy.maxReceiveCount</code> return <code>{ action: \"ROUTED_TO_DLQ\", reason: \"MAX_RECEIVE_REACHED\", deleteFromSource: true, error: err.message }</code>; else return <code>{ action: \"RETRY_LATER\", reason: \"TRANSIENT_FAILURE\", deleteFromSource: false, error: err.message }</code>.",
+      exports: ["processQueueMessage"],
+      starterCode: `function processQueueMessage(message, store, handler, policy) {
+  // message: { messageId, idempotencyKey, payloadHash, receiveCount, body }
+  // store:   { [idempotencyKey]: { status: "IN_PROGRESS" | "SUCCEEDED", payloadHash, result } }
+  // policy:  { maxReceiveCount: number }
+
+  // TODO 1: Route immediately to DLQ if receiveCount > policy.maxReceiveCount
+
+  // TODO 2: Check existing entry in store for PAYLOAD_MISMATCH, SUCCEEDED, or IN_PROGRESS
+
+  // TODO 3: Claim key as IN_PROGRESS, run handler(message.body), finalize SUCCEEDED or clean up on error
+
+  return { action: "RETRY_LATER", reason: "NOT_IMPLEMENTED", deleteFromSource: false };
+}
+
+const sampleStore = {};
+console.log(
+  "First run:",
+  processQueueMessage(
+    { messageId: "m1", idempotencyKey: "ord-42", payloadHash: "sha-abc", receiveCount: 1, body: { orderId: 42 } },
+    sampleStore,
+    (body) => ({ chargedOrderId: body.orderId }),
+    { maxReceiveCount: 3 }
+  )
+);`,
+      hints: [
+        "Check <code>if (message.receiveCount &gt; policy.maxReceiveCount)</code> before reading or mutating <code>store</code> so already-exhausted messages route straight to the DLQ.",
+        "Inside the <code>existing</code> check, validate <code>existing.payloadHash !== message.payloadHash</code> first—otherwise a mismatched retry could accidentally return a cached <code>SUCCEEDED</code> result.",
+        "In the <code>catch (err)</code> block, always run <code>delete store[message.idempotencyKey]</code> before checking <code>err &amp;&amp; err.retryable === false</code> or <code>message.receiveCount &gt;= policy.maxReceiveCount</code> so transient failures release the in-flight lock."
+      ],
+      solutionExplanation:
+        "Checking receiveCount and claiming the idempotency key as IN_PROGRESS before calling handler prevents concurrent duplicate execution (TOCTOU). Releasing the IN_PROGRESS lock in catch allows transient retries while non-retryable poison pills or exhausted attempts route immediately to the DLQ.",
+      solutionCode: `function processQueueMessage(message, store, handler, policy) {
+  if (message.receiveCount > policy.maxReceiveCount) {
+    return {
+      action: "ROUTED_TO_DLQ",
+      reason: "MAX_RECEIVE_EXCEEDED",
+      deleteFromSource: true
+    };
+  }
+
+  const existing = store[message.idempotencyKey];
+  if (existing) {
+    if (existing.payloadHash !== message.payloadHash) {
+      return {
+        action: "ROUTED_TO_DLQ",
+        reason: "PAYLOAD_MISMATCH",
+        deleteFromSource: true
+      };
+    }
+    if (existing.status === "SUCCEEDED") {
+      return {
+        action: "DEDUPLICATED",
+        reason: "ALREADY_SUCCEEDED",
+        deleteFromSource: true,
+        result: existing.result
+      };
+    }
+    if (existing.status === "IN_PROGRESS") {
+      return {
+        action: "SKIP_IN_FLIGHT",
+        reason: "CONCURRENT_EXECUTION",
+        deleteFromSource: false
+      };
+    }
+  }
+
+  store[message.idempotencyKey] = {
+    status: "IN_PROGRESS",
+    payloadHash: message.payloadHash
+  };
+
+  try {
+    const result = handler(message.body);
+    store[message.idempotencyKey] = {
+      status: "SUCCEEDED",
+      payloadHash: message.payloadHash,
+      result
+    };
+    return {
+      action: "PROCESSED",
+      reason: "SUCCEEDED",
+      deleteFromSource: true,
+      result
+    };
+  } catch (err) {
+    delete store[message.idempotencyKey];
+    const errorMsg = err && err.message ? err.message : "Unknown error";
+
+    if (err && err.retryable === false) {
+      return {
+        action: "ROUTED_TO_DLQ",
+        reason: "NON_RETRYABLE_ERROR",
+        deleteFromSource: true,
+        error: errorMsg
+      };
+    }
+
+    if (message.receiveCount >= policy.maxReceiveCount) {
+      return {
+        action: "ROUTED_TO_DLQ",
+        reason: "MAX_RECEIVE_REACHED",
+        deleteFromSource: true,
+        error: errorMsg
+      };
+    }
+
+    return {
+      action: "RETRY_LATER",
+      reason: "TRANSIENT_FAILURE",
+      deleteFromSource: false,
+      error: errorMsg
+    };
+  }
+}`,
+      tests: [
+        {
+          name: "Processes fresh message once, persists SUCCEEDED record, and deletes duplicate without re-running handler",
+          run: (scope) => {
+            const store = {};
+            let handlerCalls = 0;
+            const handler = (body) => {
+              handlerCalls++;
+              return { receipt: "rcpt-" + body.orderId };
+            };
+            const first = scope.processQueueMessage(
+              { messageId: "m1", idempotencyKey: "k-100", payloadHash: "h1", receiveCount: 1, body: { orderId: 100 } },
+              store,
+              handler,
+              { maxReceiveCount: 3 }
+            );
+            const dup = scope.processQueueMessage(
+              { messageId: "m1-dup", idempotencyKey: "k-100", payloadHash: "h1", receiveCount: 2, body: { orderId: 100 } },
+              store,
+              handler,
+              { maxReceiveCount: 3 }
+            );
+            const pass =
+              handlerCalls === 1 &&
+              first.action === "PROCESSED" &&
+              first.deleteFromSource === true &&
+              dup.action === "DEDUPLICATED" &&
+              dup.reason === "ALREADY_SUCCEEDED" &&
+              dup.deleteFromSource === true &&
+              dup.result &&
+              dup.result.receipt === "rcpt-100";
+            return { pass, message: `calls=${handlerCalls}, dup=${JSON.stringify(dup)}` };
+          }
+        },
+        {
+          name: "Skips concurrent IN_PROGRESS message without invoking handler or deleting from source queue",
+          run: (scope) => {
+            const store = {
+              "k-lock": { status: "IN_PROGRESS", payloadHash: "h2" }
+            };
+            let called = false;
+            const out = scope.processQueueMessage(
+              { messageId: "m2", idempotencyKey: "k-lock", payloadHash: "h2", receiveCount: 2, body: {} },
+              store,
+              () => { called = true; },
+              { maxReceiveCount: 3 }
+            );
+            const pass =
+              !called &&
+              out.action === "SKIP_IN_FLIGHT" &&
+              out.reason === "CONCURRENT_EXECUTION" &&
+              out.deleteFromSource === false;
+            return { pass, message: `got ${JSON.stringify(out)}, called=${called}` };
+          }
+        },
+        {
+          name: "Routes key reuse with different payloadHash to DLQ with PAYLOAD_MISMATCH",
+          run: (scope) => {
+            const store = {
+              "k-mismatch": { status: "SUCCEEDED", payloadHash: "hash-v1", result: { ok: true } }
+            };
+            let called = false;
+            const out = scope.processQueueMessage(
+              { messageId: "m3", idempotencyKey: "k-mismatch", payloadHash: "hash-v2", receiveCount: 1, body: {} },
+              store,
+              () => { called = true; },
+              { maxReceiveCount: 3 }
+            );
+            const pass =
+              !called &&
+              out.action === "ROUTED_TO_DLQ" &&
+              out.reason === "PAYLOAD_MISMATCH" &&
+              out.deleteFromSource === true;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Releases IN_PROGRESS lock on transient failure and retries later before maxReceiveCount",
+          run: (scope) => {
+            const store = {};
+            const out = scope.processQueueMessage(
+              { messageId: "m4", idempotencyKey: "k-transient", payloadHash: "h4", receiveCount: 1, body: {} },
+              store,
+              () => {
+                const err = new Error("DB connection timeout");
+                err.retryable = true;
+                throw err;
+              },
+              { maxReceiveCount: 3 }
+            );
+            const pass =
+              out.action === "RETRY_LATER" &&
+              out.reason === "TRANSIENT_FAILURE" &&
+              out.deleteFromSource === false &&
+              out.error === "DB connection timeout" &&
+              store["k-transient"] === undefined;
+            return { pass, message: `got ${JSON.stringify(out)}, storeEntry=${JSON.stringify(store["k-transient"])}` };
+          }
+        },
+        {
+          name: "Routes non-retryable poison pill immediately to DLQ and clears IN_PROGRESS lock",
+          run: (scope) => {
+            const store = {};
+            const out = scope.processQueueMessage(
+              { messageId: "m5", idempotencyKey: "k-poison", payloadHash: "h5", receiveCount: 1, body: {} },
+              store,
+              () => {
+                const err = new Error("Invalid JSON schema");
+                err.retryable = false;
+                throw err;
+              },
+              { maxReceiveCount: 5 }
+            );
+            const pass =
+              out.action === "ROUTED_TO_DLQ" &&
+              out.reason === "NON_RETRYABLE_ERROR" &&
+              out.deleteFromSource === true &&
+              store["k-poison"] === undefined;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Routes to DLQ when receiveCount reaches or exceeds maxReceiveCount",
+          run: (scope) => {
+            const store = {};
+            const onLastTry = scope.processQueueMessage(
+              { messageId: "m6", idempotencyKey: "k-max", payloadHash: "h6", receiveCount: 3, body: {} },
+              store,
+              () => { throw new Error("Downstream 503"); },
+              { maxReceiveCount: 3 }
+            );
+            let calledAfterMax = false;
+            const pastMax = scope.processQueueMessage(
+              { messageId: "m7", idempotencyKey: "k-past", payloadHash: "h7", receiveCount: 4, body: {} },
+              store,
+              () => { calledAfterMax = true; },
+              { maxReceiveCount: 3 }
+            );
+            const pass =
+              onLastTry.action === "ROUTED_TO_DLQ" &&
+              onLastTry.reason === "MAX_RECEIVE_REACHED" &&
+              onLastTry.deleteFromSource === true &&
+              !calledAfterMax &&
+              pastMax.action === "ROUTED_TO_DLQ" &&
+              pastMax.reason === "MAX_RECEIVE_EXCEEDED" &&
+              pastMax.deleteFromSource === true;
+            return { pass, message: `onLastTry=${onLastTry.reason}, pastMax=${pastMax.reason}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0011",
+      title: "Quiz 0011: Delivery Guarantees, Outbox & DLQs",
+      questions: [
+        {
+          id: "q1",
+          prompt: "An ECS consumer reads payment events from an SQS FIFO queue with <code>VisibilityTimeout = 30s</code> and <code>MessageDeduplicationId</code> enabled on the producer. During a database slowdown, one worker takes 45 seconds to charge a card and commit, and customers are charged twice. What caused the duplicate charge?",
+          options: [
+            "Visibility timeout expired before commit, so SQS redelivered the message to another worker",
+            "FIFO deduplication windows expire after thirty seconds whenever producer message group IDs rotate",
+            "Database connection pools automatically replay uncommitted SQL writes across healthy ECS worker containers",
+            "SQS FIFO queues intentionally deliver every message twice unless batch size equals one"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "SQS FIFO's MessageDeduplicationId only deduplicates producer SendMessage calls; once VisibilityTimeout (30s) expires before DeleteMessage, SQS assumes the first worker died and leases the message to a second worker.",
+            "SQS FIFO deduplication lasts 5 minutes (300 seconds), not 30 seconds, and applies to producer enqueueing rather than consumer visibility leases.",
+            "Database connection pools never replay uncommitted queries to different containers; the duplicate execution came from SQS redelivering the expired message.",
+            "SQS FIFO queues do not intentionally deliver every message twice; duplicates occurred because processing exceeded the 30-second visibility timeout without an idempotency store."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "Your Checkout service writes an order to PostgreSQL inside a <code>BEGIN ... COMMIT</code> block, then calls <code>sqs.sendMessage</code> immediately afterward. Under pod restarts or network blips, some paid orders never reach fulfillment. Which architectural fix eliminates this dual-write gap without holding database locks during network I/O?",
+          options: [
+            "Call SQS inside the SQL transaction and roll back on network timeouts",
+            "Persist an outbox row inside the same transaction and relay it asynchronously",
+            "Increase PostgreSQL statement timeouts so remote SQS calls finish before transaction commits",
+            "Retry the SQS publish from Android clients whenever checkout responses feel slow"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Calling SQS inside an open SQL transaction holds row locks and connection pool slots during unpredictable network I/O, and an SQS failure after network partition can still leave both systems out of sync.",
+            "The Transactional Outbox writes the business row and the outbox event row atomically in one local ACID transaction with zero network I/O, then relays events to SQS asynchronously.",
+            "Lengthening PostgreSQL statement timeouts only allows slow queries to run longer; it does nothing to prevent dual-write crashes or reduce lock-hold duration.",
+            "Mobile clients should never be trusted to bridge internal backend event buses; if the phone loses connectivity after checkout, the fulfillment event would still be lost."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "An SQS queue has <code>maxReceiveCount = 3</code> pointing to a Dead-Letter Queue (DLQ), and a bug causes 500 messages with malformed JSON to fail validation on every attempt. Why should the DLQ's <code>MessageRetentionPeriod</code> be at least as long as the source queue's retention?",
+          options: [
+            "SQS resets the retention clock only after an engineer inspects the queue",
+            "SQS preserves the original source enqueue timestamp when moving messages into DLQs",
+            "DLQs compress failed messages every hour until the source queue drains completely",
+            "Redrive tasks double message timestamps whenever payloads fail JSON schema validation checks"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Inspecting or polling a queue in the AWS console or via ReceiveMessage does not reset the message's retention clock.",
+            "Amazon SQS retains the original SentTimestamp from when the message entered the source queue; if the DLQ retention is shorter or equal to an aged message's lifetime, messages can expire immediately upon entering the DLQ.",
+            "SQS Dead-Letter Queues are standard/FIFO SQS queues and do not perform hourly compression or wait for the source queue to drain.",
+            "DLQ redrive tasks replay stored messages back to a destination queue without doubling timestamps or inspecting application-level JSON schemas."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

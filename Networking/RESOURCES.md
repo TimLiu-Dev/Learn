@@ -1,68 +1,24 @@
-# Computer Networking Resources
+# Primary Resources &amp; References
 
-## Knowledge
+## Core Networking Textbooks &amp; Roadmaps
+- **Roadmap Benchmark:** [`roadmap.sh/network-engineer`](https://roadmap.sh/network-engineer)
+- **Kurose &amp; Ross:** *Computer Networking: A Top-Down Approach* (Application-down foundation)
+- **Richard Stevens / Kevin Fall:** *TCP/IP Illustrated, Vol. 1* (Protocol wire behavior)
+- **Peterson &amp; Davie:** *Computer Networks: A Systems Approach* ([book.systemsapproach.org](https://book.systemsapproach.org/))
+- **High Performance Browser Networking (Ilya Grigorik):** [hpbn.co](https://hpbn.co/) (Mobile radio, TCP/TLS, HTTP/2–3)
 
-### Textbooks and foundational courses
-- [Book: _Computer Networking: A Top-Down Approach_ by Kurose & Ross — author site with lecture videos and slides](https://gaia.cs.umass.edu/kurose_ross/index.php)
-  The standard university text; teaches from the application layer down, which matches how a programmer meets networks. Use for: layering, TCP internals, routing, the "why" behind every layer.
-- [Kurose & Ross Wireshark Labs](https://gaia.cs.umass.edu/kurose_ross/wireshark.php)
-  Free guided labs (HTTP, DNS, TCP, UDP, IP, ARP, DHCP, TLS). Use for: hands-on exercises that match the textbook chapters.
-- [Kurose & Ross Interactive Problems](https://gaia.cs.umass.edu/kurose_ross/interactive/)
-  Auto-generated end-of-chapter problems with worked solutions (delay, layering, subnetting, longest-prefix match, NAT, TCP, DNS…). Use for: extra spaced practice in review sessions.
-- [Book: _Computer Networks: A Systems Approach_ by Peterson & Davie (free online)](https://book.systemsapproach.org/)
-  Rigorous, open-licensed second opinion with more systems/implementation depth. Use for: congestion control, IP/routing details, QUIC.
-- [Book: _High Performance Browser Networking_ by Ilya Grigorik (free online)](https://hpbn.co/)
-  Performance-focused tour of TCP, UDP, TLS, HTTP/1.1, HTTP/2, WebSockets, from a web engineer at Google. Use for: latency, HTTP versions, TLS cost, WebSockets/SSE.
-- [Book: _Routing TCP/IP, Volumes 1 & 2_ by Jeff Doyle (Cisco Press)](https://www.ciscopress.com/)
-  The definitive bible of enterprise and ISP routing. Use for: OSPF link-state databases, BGP attributes, route reflection, and traffic engineering.
-- [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/)
-  The classic sockets programming guide (C, but the concepts map 1:1 onto Java/Kotlin sockets). Use for: what socket calls actually do — bind, listen, accept, connect, send/recv.
-- [Oracle Java Tutorial: All About Sockets](https://docs.oracle.com/javase/tutorial/networking/sockets/index.html)
-  Official Java socket tutorial. Use for: `Socket`/`ServerSocket` API basics in the code lessons.
+## Authoritative IETF RFCs &amp; IEEE Standards
+- **IPv4 / ARP / DHCP / ICMP:** RFC 791, RFC 792, RFC 826, RFC 2131, RFC 3021 (`/31` P2P links)
+- **Multicast:** RFC 1112 (Class D &amp; MAC mapping), RFC 3376 (IGMPv3), RFC 7761 (PIM-SM)
+- **TCP / QUIC / HTTP:** RFC 9293 (TCP), RFC 9000 (QUIC), RFC 9110–9114 (HTTP Semantics, HTTP/1.1, HTTP/2, HTTP/3)
+- **Mobile &amp; Edge:** RFC 8305 (Happy Eyeballs v2), RFC 6146/6147 (NAT64/DNS64)
+- **Routing, FHRP &amp; Overlays:** RFC 2328 (OSPFv2), RFC 4271 (BGP-4), RFC 5880 (BFD), RFC 7938 (BGP in Data Centers), RFC 7348 (VXLAN), RFC 8365 (EVPN), RFC 8402 (Segment Routing), RFC 9568 (VRRP v3)
+- **Security &amp; AAA:** RFC 8446 (TLS 1.3), IEEE 802.1X, RFC 8907 (TACACS+), RFC 8915 (NTS)
+- **NetDevOps Modeling:** RFC 7950 (YANG 1.1), RFC 6241 (NETCONF), RFC 8040 (RESTCONF)
 
-### Specifications (primary sources)
-- [RFC 9293 — TCP](https://www.rfc-editor.org/rfc/rfc9293) — the current consolidated TCP spec. Use for: handshake, states, sequence numbers.
-- [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) — methods, status codes, headers, shared by all HTTP versions.
-- [RFC 9113 — HTTP/2](https://www.rfc-editor.org/rfc/rfc9113) · [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114) · [RFC 9000 — QUIC](https://www.rfc-editor.org/rfc/rfc9000)
-- [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446)
-- Link/internet layer (Part 1): [RFC 791 — IPv4](https://www.rfc-editor.org/rfc/rfc791) · [RFC 792 — ICMP](https://www.rfc-editor.org/rfc/rfc792) · [RFC 826 — ARP](https://www.rfc-editor.org/rfc/rfc826) · [RFC 2131 — DHCP](https://www.rfc-editor.org/rfc/rfc2131) · [RFC 4632 — CIDR](https://www.rfc-editor.org/rfc/rfc4632) · [RFC 1918 — private addresses](https://www.rfc-editor.org/rfc/rfc1918) · [RFC 3022 — NAT](https://www.rfc-editor.org/rfc/rfc3022) · [RFC 8200 — IPv6](https://www.rfc-editor.org/rfc/rfc8200) · [RFC 4291 — IPv6 addressing](https://www.rfc-editor.org/rfc/rfc4291) · [RFC 4861 — NDP](https://www.rfc-editor.org/rfc/rfc4861) · [RFC 5952 — IPv6 text form](https://www.rfc-editor.org/rfc/rfc5952) · [RFC 1122 — host requirements](https://www.rfc-editor.org/rfc/rfc1122)
-- Enterprise & ISP Routing (Part 4): [RFC 2328 — OSPF v2](https://www.rfc-editor.org/rfc/rfc2328) · [RFC 4271 — BGP-4](https://www.rfc-editor.org/rfc/rfc4271) · [RFC 7348 — VXLAN](https://www.rfc-editor.org/rfc/rfc7348) · [RFC 4301 — IPsec](https://www.rfc-editor.org/rfc/rfc4301)
-- [RFC 6265 — Cookies](https://www.rfc-editor.org/rfc/rfc6265) · [RFC 6455 — WebSocket](https://www.rfc-editor.org/rfc/rfc6455)
-
-### Cloud & Modern Infrastructure Documentation
-- [AWS VPC Documentation & User Guide](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html)
-  Authoritative reference for VPC CIDR blocks, route tables, Internet Gateways, NAT Gateways, Security Groups vs NACLs, and Transit Gateway architecture.
-- [Kubernetes Official Networking Documentation](https://kubernetes.io/docs/concepts/services-networking/)
-  Covers the IP-per-Pod network model, CNI plugin specifications, kube-proxy, Services (ClusterIP, NodePort, LoadBalancer), and Ingress controllers.
-- [Cilium & eBPF Documentation](https://docs.cilium.io/)
-  How modern Linux kernel eBPF replaces iptables for high-scale container routing, observability, and network security policies.
-
-### Reference docs and explainers
-- [MDN Web Docs: HTTP](https://developer.mozilla.org/en-US/docs/Web/HTTP)
-  The best practitioner reference for HTTP, cookies, CORS, caching. Use for: everything in the web section.
-- [The Illustrated TLS 1.3 Connection](https://tls13.xargs.org/) · [The Illustrated QUIC Connection](https://quic.xargs.org/)
-  Every byte of a real handshake, annotated. Use for: TLS and HTTP/3 lessons.
-- [Cloudflare Learning Center](https://www.cloudflare.com/learning/)
-  Clear explainers on Anycast, BGP, DNS, CDNs, DDoS, and load balancing.
-- [Wireshark User's Guide](https://www.wireshark.org/docs/wsug_html_chunked/)
-  Official manual. Use for: capture filters, display filters, following streams.
-- [Julia Evans (jvns.ca)](https://jvns.ca/) and [Zines: _Networking! ACK!_](https://wizardzines.com/zines/networking/)
-  Short, tool-first explanations of networking concepts. Use for: intuition and debugging mindset.
-
-### Interview preparation & Capstone
-- [alex/what-happens-when (GitHub)](https://github.com/alex/what-happens-when)
-  Deep answer to the classic "what happens when you type google.com" interview question. Use for: the capstone synthesis lesson.
-
-## Wisdom (Communities)
-- [Network Engineering Stack Exchange](https://networkengineering.stackexchange.com/)
-  Moderated Q&A; strict about on-topic questions (enterprise networking, protocols). Use for: protocol-behaviour questions.
-- [Server Fault](https://serverfault.com/)
-  Q&A for sysadmin/ops problems. Use for: "my server/proxy/load balancer behaves weirdly" questions.
-- [Wireshark Q&A](https://ask.wireshark.org/)
-  Official Wireshark community. Use for: "what am I looking at in this capture?"
-- [r/networking](https://www.reddit.com/r/networking/)
-  Large, professional-network-engineer audience. Use for: reading how practitioners think.
-
-## Gaps
-- No Kotlin-first networking text found yet; using Java resources (the APIs are identical in Kotlin).
-- Section numbers in Kurose & Ross (8th edition) may vary across reprints. Systems Approach and RFC citations were verified against official sources.
+## Linux, Cloud, Kubernetes &amp; NetDevOps Tooling
+- **Linux `iproute2` &amp; `nftables`:** `man 8 ip`, `man 8 ip-netns`, `man 8 ss`, [nftables Wiki](https://wiki.nftables.org/)
+- **Virtual Labs &amp; NOS:** [Containerlab](https://containerlab.dev/), [FRRouting (FRR) Docs](https://docs.frrouting.org/)
+- **Automation &amp; Verification:** [NAPALM](https://napalm.readthedocs.io/), [Nornir](https://nornir.readthedocs.io/), [Ansible Network Docs](https://docs.ansible.com/ansible/latest/network/), [Terraform Docs](https://developer.hashicorp.com/terraform), [Batfish](https://batfish.org/)
+- **Cloud &amp; eBPF:** AWS VPC / Transit Gateway Docs, [Cilium eBPF &amp; XDP Reference](https://docs.cilium.io/), [Kubernetes Network Model](https://kubernetes.io/docs/concepts/services-networking/)
+- **Engineering Blogs &amp; Zines:** Cloudflare Blog, Julia Evans Network Zines ([wizardzines.com](https://wizardzines.com/)), [Google SRE Book — Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)

@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0024 — EC2 Deep Dive: AMIs, Graviton/ARM64, IMDSv2 &amp; SSM Session Manager</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0024</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0024-ec2-amis-graviton-imdsv2-ssm.html" class="active">Lesson 0024</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.3</span>
+      <span class="pill">Est. Time: 30 mins</span>
+    </div>
+
+    <h1>EC2 Deep Dive: AMIs, Graviton/ARM64, IMDSv2 &amp; SSM Session Manager</h1>
+    <p class="lead">
+      Running modern workloads on Amazon EC2 is no longer about SSHing into mutable Ubuntu boxes and running <code>apt-get</code> by hand. A senior AWS engineer builds immutable Golden AMIs, cuts compute bills by ~20%+ on ARM64 AWS Graviton processors, defeats SSRF credential theft with IMDSv2, and eliminates SSH bastions entirely using AWS Systems Manager (SSM) Session Manager.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            Every Android engineer already ships for ARM64: your production APK/AAB splits native <code>.so</code> libraries into <code>arm64-v8a</code> vs <code>x86_64</code> because ARM64 dominates mobile performance-per-watt. On AWS, <strong>Graviton (ARM64)</strong> brings that exact silicon shift to the data center &mdash; and shares the exact same JNI/native-binary compatibility trap if an <code>x86_64</code> library sneaks in. Meanwhile, <strong>Golden AMIs</strong> work like a pre-compiled Android system image rather than downloading dependencies on first boot, <strong>IMDSv2</strong> guards instance credentials like Android Keystore guards tokens against untrusted inputs, and <strong>SSM Session Manager</strong> replaces open TCP port 22 SSH bastions the way an authenticated <code>adb shell</code> debug bridge replaces exposing an unencrypted telnet port on a phone.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Graviton (ARM64) vs. x86_64: Silicon, Cost-Performance &amp; Traps</h2>
+        <p>
+          For decades, cloud servers meant Intel or AMD <code>x86_64</code>. Today, AWS's custom 64-bit Arm Neoverse processors &mdash; <strong>Graviton2</strong> (<code>m6g</code>/<code>c6g</code>/<code>r6g</code>), <strong>Graviton3</strong> (<code>m7g</code>/<code>c7g</code>/<code>r7g</code>), and <strong>Graviton4</strong> (<code>r8g</code>/<code>m8g</code>/<code>c8g</code>) &mdash; are the default cost-performance choice for general-purpose Linux, JVM/Kotlin, Go, Python, Node.js, and containerized microservices.
+        </p>
+        <p>
+          Two architectural facts explain why Graviton wins benchmarks and lowers bills:
+        </p>
+        <ul>
+          <li><strong>~20% lower On-Demand hourly rate:</strong> Comparing equivalent-generation Linux instances in <code>us-east-1</code>, an <code>m7g.large</code> (2 vCPU, 8 GiB RAM, Graviton3) runs around <strong>$0.0816/hr</strong> (~$59.57/mo) versus <strong>$0.1008/hr</strong> (~$73.58/mo) for <code>m7i.large</code> (Intel) &mdash; roughly <strong>19% cheaper</strong> before Savings Plans, with up to <strong>40% better price-performance</strong> on CPU-bound APIs.</li>
+          <li><strong>No Simultaneous Multithreading (SMT / Hyper-Threading):</strong> On x86 instances, 2 vCPUs are typically 2 hardware threads sharing one physical core's execution pipelines and L1/L2 caches. On Graviton, <strong>1 vCPU = 1 full physical core</strong>, eliminating sibling-thread noisy-neighbor contention under high tail concurrency.</li>
+        </ul>
+
+        <h3>Real Graviton Migration Traps</h3>
+        <p>
+          Moving a fleet from <code>x86_64</code> to <code>arm64</code> is trivial for pure bytecode/interpreted code (JVM, Go, Python, Node) <em>until</em> native machine code enters the picture:
+        </p>
+        <ol>
+          <li><strong>QEMU silent emulation cliff:</strong> If you deploy a single-arch <code>linux/amd64</code> Docker image onto an ARM64 node with <code>binfmt_misc</code>/QEMU enabled, the service may actually boot &mdash; and suffer a <strong>5&times; to 10&times; throughput collapse</strong> as every x86 instruction is translated in software. Always publish multi-arch OCI manifests via <code>docker buildx build --platform linux/amd64,linux/arm64</code> and verify <code>uname -m</code> reports <code>aarch64</code>.</li>
+          <li><strong>JNI, C/C++ extensions &amp; hardcoded CLI downloads:</strong> Just as an Android APK crashes with <code>UnsatisfiedLinkError</code> if <code>arm64-v8a</code> lacks a compiled <code>.so</code>, backend dependencies like <code>grpc</code>, <code>sharp</code>, <code>sqlite3</code>, <code>bcrypt</code>, or a <code>UserData</code> script running <code>curl .../kubectl-amd64</code> will fail or segfault on Graviton.</li>
+          <li><strong>Nitro NVMe &amp; ENA drivers:</strong> All Graviton instances run on the <strong>AWS Nitro System</strong>, which exposes EBS volumes as NVMe block devices (<code>/dev/nvme0n1</code> instead of <code>/dev/xvda</code>) and requires the Elastic Network Adapter (ENA) driver. Old pre-Nitro x86 AMIs cannot be booted on Graviton.</li>
+        </ol>
+
+        <!-- SECTION 2 -->
+        <h2>2. Golden AMIs vs. Runtime <code>UserData</code> Bootstrapping</h2>
+        <p>
+          An <strong>Amazon Machine Image (AMI)</strong> packages the root EBS snapshot (OS + software), block device mappings, and architecture flag (<code>x86_64</code> or <code>arm64</code>). When an Auto Scaling Group scales out during a traffic spike, you face a fundamental design split:
+        </p>
+        <ul>
+          <li><strong>Mutable / <code>UserData</code> bootstrapping:</strong> Launch a bare base OS AMI and run a shell script via EC2 <code>UserData</code> (processed by <code>cloud-init</code>) to install Java, Node, Docker, the CloudWatch Agent, and your app artifact on every boot.</li>
+          <li><strong>Immutable Golden AMI pipeline:</strong> Pre-bake OS security patches, CIS hardening, SSM Agent, CloudWatch Agent, runtime libraries, and base tooling into a versioned AMI using <strong>EC2 Image Builder</strong> or <strong>HashiCorp Packer</strong> in CI/CD. <code>UserData</code> shrinks to 5 lines that inject runtime environment tags or fetch config from SSM Parameter Store.</li>
+        </ul>
+
+        <div class="callout warning">
+          <div class="callout-title">Four Production Rules for <code>UserData</code> &amp; AMIs</div>
+          <p style="margin: 0;">
+            <strong>1. Size limit:</strong> EC2 <code>UserData</code> is hard-capped at <strong>16 KB</strong> (prior to base64 encoding; use gzip or pull scripts from S3 if larger). <strong>2. Never store secrets in <code>UserData</code>:</strong> Anyone with <code>ec2:DescribeInstanceAttribute</code> or local access to IMDS can read <code>UserData</code> in plaintext &mdash; pass a KMS-encrypted Secrets Manager ARN or SSM parameter path instead. <strong>3. First-boot only:</strong> By default, <code>cloud-init</code> executes <code>UserData</code> once per instance ID, not on stop/start reboots. <strong>4. Encrypt AMI snapshots:</strong> Always enable EBS encryption with a KMS CMK so cross-account AMI sharing never leaks unencrypted root disks.
+          </p>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. IMDSv2: Defeating SSRF &amp; The Docker Hop-Limit Trap</h2>
+        <p>
+          Every EC2 instance reaches the <strong>Instance Metadata Service (IMDS)</strong> at the link-local IPv4 address <code>http://169.254.169.254</code> (or IPv6 <code>[fd00:ec2::254]</code>) to discover its AZ, instance ID, and &mdash; critically &mdash; short-lived IAM credentials from its attached <strong>IAM Instance Profile</strong>.
+        </p>
+        <p>
+          Under legacy <strong>IMDSv1</strong>, any process or attacker who tricks your app into issuing an HTTP <code>GET</code> (via <strong>Server-Side Request Forgery / SSRF</strong>, an open HTTP proxy, or a leaky reverse proxy header) can immediately read <code>/latest/meta-data/iam/security-credentials/&lt;role-name&gt;</code> and exfiltrate valid AWS STS temporary keys.
+        </p>
+        <p>
+          According to the <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html" target="_blank" rel="noopener">AWS EC2 Instance Metadata Service documentation</a>, <strong>IMDSv2</strong> defeats SSRF and open proxies with four defense-in-depth controls:
+        </p>
+        <ol>
+          <li><strong>Session-oriented <code>PUT</code> handshake:</strong> Clients must first send <code>PUT /latest/api/token</code> with header <code>X-aws-ec2-metadata-token-ttl-seconds</code> (1 to 21,600 seconds / 6 hours) to obtain a secret token, then supply <code>X-aws-ec2-metadata-token: $TOKEN</code> on every subsequent <code>GET</code>. Most SSRF vulnerabilities only allow <code>GET</code> requests without arbitrary custom headers.</li>
+          <li><strong>Rejects forwarded requests:</strong> IMDSv2 explicitly rejects any <code>PUT /latest/api/token</code> request containing an <code>X-Forwarded-For</code> header, blocking misconfigured Nginx/Envoy reverse proxies from minting tokens on behalf of external callers.</li>
+          <li><strong>Enforce <code>HttpTokens = required</code>:</strong> Leaving <code>HttpTokens = optional</code> allows IMDSv1 fallback, meaning an attacker simply skips the <code>PUT</code> step and still steals credentials via <code>GET</code>! Always enforce <code>required</code> via Launch Templates and an IAM/SCP guard rail checking <code>ec2:MetadataHttpTokens</code>.</li>
+          <li><strong>The Container Hop-Limit Trap (<code>HttpPutResponseHopLimit</code>):</strong> IMDSv2 enforces an IP Time-To-Live (TTL) on the token <code>PUT</code> response, defaulting to <strong><code>1</code> hop</strong>. On a bare EC2 Linux host, host &harr; IMDS is 1 hop, so <code>HopLimit = 1</code> works. Inside a <strong>Docker bridge container</strong> (<code>docker0</code> / ECS bridge mode), packets traverse <em>two</em> L3 hops (container &rarr; host bridge &rarr; IMDS), causing the <code>PUT</code> response to drop before reaching the container! For Docker bridge workloads, set <code>HttpPutResponseHopLimit = 2</code> (or use <code>awsvpc</code> / host networking where the container shares the ENI directly and <code>HopLimit = 1</code> holds).</li>
+        </ol>
+
+        <!-- SECTION 4 -->
+        <h2>4. SSM Session Manager vs. SSH Bastions</h2>
+        <p>
+          Traditional cloud setups exposed a hardened "jump box" (SSH bastion) in a public subnet with TCP port 22 open, distributed static PEM keys across laptops, and hoped nobody leaked a private key or forgot to revoke access when an engineer left.
+        </p>
+        <p>
+          <strong>AWS Systems Manager (SSM) Session Manager</strong> flips the network direction and replaces static SSH keys with IAM:
+        </p>
+        <ul>
+          <li><strong>Zero inbound ports:</strong> The <code>amazon-ssm-agent</code> running inside the EC2 instance initiates an <strong>outbound HTTPS (TCP 443)</strong> WebSocket connection to AWS SSM endpoints. Your EC2 Security Group requires <strong>zero inbound rules</strong> &mdash; no port 22, no public IP, and no bastion host to patch.</li>
+          <li><strong>Private subnet reachability:</strong> Instances in completely air-gapped private subnets (no IGW, no NAT Gateway) connect to SSM through three <strong>VPC Interface Endpoints</strong> (Lesson 0022): <code>com.amazonaws.&lt;region&gt;.ssm</code>, <code>ssmmessages</code>, and <code>ec2messages</code>.</li>
+          <li><strong>IAM-gated &amp; fully audited:</strong> Access is authorized via IAM policies (<code>ssm:StartSession</code>, optionally scoped by resource tag <code>aws:ResourceTag/Env</code>), encrypted with KMS, recorded in <strong>CloudTrail</strong>, and streamed keystroke-by-keystroke to <strong>S3</strong> or <strong>CloudWatch Logs</strong>. You can even tunnel local ports (e.g., RDS PostgreSQL port 5432) over SSM using <code>AWS-StartPortForwardingSessionToRemoteHost</code>.</li>
+        </ul>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 700 285" width="100%" height="auto" role="img" aria-label="Legacy SSH Bastion and IMDSv1 vs Hardened Private Graviton EC2 with IMDSv2 and SSM Session Manager">
+            <rect x="0" y="0" width="700" height="285" fill="#fdfcf8" rx="6" />
+
+            <!-- Left Panel: Legacy -->
+            <text x="165" y="24" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#991b1b">Legacy: SSH Bastion + IMDSv1 (High Risk)</text>
+
+            <rect x="20" y="42" width="120" height="44" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="80" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#991b1b">Public Bastion</text>
+            <text x="80" y="76" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">Inbound TCP 22</text>
+
+            <line x1="140" y1="64" x2="188" y2="64" stroke="#dc2626" stroke-width="1.6" />
+            <text x="164" y="57" text-anchor="middle" font-family="monospace" font-size="9" fill="#991b1b">SSH Key</text>
+
+            <rect x="188" y="42" width="132" height="44" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="254" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#991b1b">Private EC2 (x86)</text>
+            <text x="254" y="76" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">Port 22 + PEM Sprawl</text>
+
+            <!-- SSRF attack box -->
+            <rect x="20" y="115" width="300" height="146" rx="6" fill="#fff5f5" stroke="#fca5a5" />
+            <text x="170" y="136" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#991b1b">IMDSv1 SSRF Credential Theft</text>
+            <text x="34" y="158" font-family="monospace" font-size="10.5" fill="#1b1d21">1. Attacker injects SSRF URL into app</text>
+            <text x="34" y="178" font-family="monospace" font-size="10.5" fill="#991b1b">2. App runs GET 169.254.169.254/...</text>
+            <text x="34" y="198" font-family="monospace" font-size="10.5" fill="#991b1b">3. No token required -&gt; STS keys leaked</text>
+            <text x="34" y="222" font-family="sans-serif" font-size="10.5" fill="#575c66">Plus: 4-min UserData yum install on scale-out</text>
+            <text x="34" y="242" font-family="sans-serif" font-size="10.5" fill="#575c66">&amp; no per-command SSH session transcript</text>
+
+            <!-- Divider -->
+            <line x1="348" y1="16" x2="348" y2="269" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Right Panel: Modern Hardened -->
+            <text x="524" y="24" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#166534">Hardened: Graviton + IMDSv2 + SSM</text>
+
+            <rect x="372" y="42" width="146" height="48" rx="5" fill="#dcfce7" stroke="#166534" />
+            <text x="445" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#166534">Private EC2 (m7g)</text>
+            <text x="445" y="77" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">0 Inbound Ports!</text>
+
+            <line x1="518" y1="66" x2="564" y2="66" stroke="#166534" stroke-width="1.8" />
+            <text x="541" y="59" text-anchor="middle" font-family="monospace" font-size="9" fill="#166534">443 Out</text>
+
+            <rect x="564" y="40" width="120" height="52" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="624" y="58" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#0f4c81">VPC Endpoints</text>
+            <text x="624" y="72" text-anchor="middle" font-family="monospace" font-size="9" fill="#0f4c81">ssm / ssmmessages</text>
+            <text x="624" y="84" text-anchor="middle" font-family="monospace" font-size="9" fill="#0f4c81">ec2messages</text>
+
+            <!-- IMDSv2 + Audit box -->
+            <rect x="372" y="115" width="312" height="146" rx="6" fill="#f0fdf4" stroke="#86efac" />
+            <text x="528" y="136" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#166534">IMDSv2 + Golden AMI + SSM Audit</text>
+            <text x="386" y="158" font-family="monospace" font-size="10.5" fill="#1b1d21">1. HttpTokens=required (IMDSv1 off)</text>
+            <text x="386" y="178" font-family="monospace" font-size="10.5" fill="#166534">2. PUT /api/token -&gt; X-aws-ec2-token</text>
+            <text x="386" y="198" font-family="monospace" font-size="10.5" fill="#166534">3. HopLimit=1 (host) / 2 (Docker NAT)</text>
+            <text x="386" y="222" font-family="sans-serif" font-size="10.5" fill="#575c66">Golden ARM64 AMI (~20% lower compute cost)</text>
+            <text x="386" y="242" font-family="sans-serif" font-size="10.5" fill="#575c66">SSM sessions logged to S3, CW Logs &amp; CloudTrail</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Replacing SSH bastions and IMDSv1 with SSM Session Manager over VPC Interface Endpoints, Golden ARM64 AMIs, and IMDSv2 token enforcement eliminates port 22 exposure and blocks SSRF credential theft.
+          </div>
+        </div>
+
+        <!-- SECTION 5 -->
+        <h2>5. Production IaC &amp; Guardrails: Launch Template, SCP &amp; SSM CLI</h2>
+        <p>
+          In production, you never rely on engineers remembering security flags in the EC2 Console. You bake Graviton + IMDSv2 + SSM directly into your Terraform Launch Template and enforce IMDSv2 organization-wide with an IAM/SCP guardrail:
+        </p>
+<pre><code># 1. Terraform: Hardened Graviton3 Launch Template (No SSH, IMDSv2 Required, Encrypted gp3)
+resource "aws_launch_template" "api_arm64" {
+  name_prefix   = "orders-api-arm64-"
+  image_id      = data.aws_ami.golden_al2023_arm64.id # Built via EC2 Image Builder
+  instance_type = "m7g.large"                         # Graviton3 ARM64 (~20% cheaper than m7i)
+
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.ec2_ssm_profile.arn # Attaches AmazonSSMManagedInstanceCore
+  }
+
+  vpc_security_group_ids = [aws_security_group.private_api.id] # Zero port 22 ingress rules!
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required" # Disables IMDSv1 completely
+    http_put_response_hop_limit = 2          # Set 2 if running Docker bridge containers; 1 for host-only
+  }
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size           = 30
+      volume_type           = "gp3"
+      encrypted             = true
+      kms_key_id            = aws_kms_key.ebs_cmk.arn
+      delete_on_termination = true
+    }
+  }
+}
+
+# 2. IAM / SCP Guardrail: Deny launching EC2 unless IMDSv2 is required
+# {
+#   "Sid": "RequireIMDSv2OnLaunch",
+#   "Effect": "Deny",
+#   "Action": "ec2:RunInstances",
+#   "Resource": "arn:aws:ec2:*:*:instance/*",
+#   "Condition": { "StringNotEquals": { "ec2:MetadataHttpTokens": "required" } }
+# }
+
+# 3. Engineer Workflow: Zero-bastion shell &amp; RDS port-forward via SSM Session Manager
+aws ssm start-session --target i-0a1b2c3d4e5f67890
+aws ssm start-session --target i-0a1b2c3d4e5f67890 \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["orders-db.internal"],"portNumber":["5432"],"localPortNumber":["15432"]}'</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build an automated EC2 fleet security &amp; cost-optimization auditor that checks every instance for IMDSv2 enforcement, Docker bridge hop-limit safety, SSH port 22 removal, SSM readiness, and Graviton ARM64 migration savings.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your judgment on IMDSv2 hop limits, Graviton binary execution, and air-gapped SSM connectivity.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCES & TEACHER CHECK-IN -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>IMDSv2 Specification:</strong> <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html" target="_blank" rel="noopener">Configure the Instance Metadata Service (IMDSv2)</a> (Review <code>HttpTokens</code>, <code>HttpPutResponseHopLimit</code>, and IAM enforcement conditions).
+          </li>
+          <li>
+            <strong>SSM Session Manager Docs:</strong> <a href="https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html" target="_blank" rel="noopener">AWS Systems Manager Session Manager</a> &amp; <a href="https://docs.aws.amazon.com/systems-manager/latest/userguide/setup-create-vpc.html" target="_blank" rel="noopener">VPC Interface Endpoints for Systems Manager</a>.
+          </li>
+          <li>
+            <strong>AWS Graviton Guide:</strong> <a href="https://aws.amazon.com/ec2/graviton/" target="_blank" rel="noopener">AWS Graviton Processors</a> &amp; <a href="https://github.com/aws/aws-graviton-getting-started" target="_blank" rel="noopener">AWS Graviton Getting Started (JVM, Go, Docker Multi-Arch)</a>.
+          </li>
+          <li>
+            <strong>EC2 User Data Reference:</strong> <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html" target="_blank" rel="noopener">Run commands when you launch an EC2 instance with user data</a> (16 KB cap &amp; execution lifecycle).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0025 (ALB vs NLB, Target Groups, Health Checks, Deregistration Delay &amp; Auto Scaling)</strong>, ask anything that feels fuzzy &mdash; for example: <em>"How do we share a KMS-encrypted Golden AMI across dev, staging, and prod AWS accounts?"</em> or <em>"Why does ECS <code>awsvpc</code> mode work safely with <code>HopLimit = 1</code> while Docker bridge mode needs <code>2</code>?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0023-transit-gateway-hybrid-dns-ipv6.html">&larr; Lesson 0023: Multi-VPC Hub-and-Spoke with Transit Gateway, Hybrid DNS & IPv6 Readiness</a>
+          <a href="./0025-alb-nlb-target-groups-asg.html">Lesson 0025: ALB vs NLB, Target Groups, Health Checks, Deregistration Delay & Auto Scaling &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>1 Graviton vCPU = 1 Physical Core</strong>
+          Unlike Intel/AMD x86 instances where 2 vCPUs share one Hyper-Threaded core, each Graviton vCPU is an isolated physical core &mdash; cutting p99 CPU contention under load.
+        </div>
+        <div class="sidenote">
+          <strong>16 KB UserData Cap</strong>
+          EC2 <code>UserData</code> maxes out at 16 KB (raw before base64). Never put API keys or DB passwords inside it &mdash; any local process or caller with <code>ec2:DescribeInstanceAttribute</code> can read it.
+        </div>
+        <div class="sidenote">
+          <strong>IMDSv2 + Docker Trap</strong>
+          Leave <code>HttpPutResponseHopLimit = 1</code> on a Docker bridge host and containers silently fail to reach <code>169.254.169.254</code>. Raise it to <code>2</code> for bridge NAT, or keep <code>1</code> when using host/<code>awsvpc</code> ENIs.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0024",
+      title: "Lab 0024: EC2 Security & Graviton Fleet-Sizing Auditor",
+      filename: "ec2-fleet-auditor.js",
+      description:
+        "Complete <code>auditEc2Fleet(instances)</code>. Each instance has <code>{ id, instanceType, arch, hourlyUsd, imdsv2Required, hopLimit, usesBridgeContainers, ingressPorts, ssmManaged, hasNativeX86LockIn }</code>. Rules per instance: (1) Push findings in order: <code>\"IMDSV1_ENABLED\"</code> if <code>!imdsv2Required</code>; <code>\"HOP_LIMIT_TOO_LOW\"</code> if <code>usesBridgeContainers &amp;&amp; hopLimit &lt; 2</code>; <code>\"SSH_PORT_22_EXPOSED\"</code> if <code>ingressPorts.includes(22)</code>; <code>\"SSM_NOT_CONFIGURED\"</code> if <code>!ssmManaged</code>. (2) <code>compliant</code> is <code>findings.length === 0</code>. (3) <code>gravitonEligible</code> is <code>arch === \"x86_64\" &amp;&amp; !hasNativeX86LockIn</code>; when eligible, <code>estimatedHourlySavingsUsd = Number((hourlyUsd * 0.2).toFixed(4))</code>, otherwise <code>0</code>. (4) Return fleet summary: <code>{ totalInstances, compliantCount, nonCompliantIds, gravitonCandidateIds, monthlySavingsUsd, results }</code> where <code>monthlySavingsUsd</code> sums <code>estimatedHourlySavingsUsd * 730</code> across the fleet rounded to 2 decimal places.",
+      exports: ["auditEc2Fleet"],
+      starterCode: `function auditEc2Fleet(instances) {
+  const results = [];
+  const nonCompliantIds = [];
+  const gravitonCandidateIds = [];
+  let compliantCount = 0;
+  let totalHourlySavings = 0;
+
+  for (const inst of instances) {
+    const findings = [];
+    // TODO 1: check IMDSV1_ENABLED, HOP_LIMIT_TOO_LOW, SSH_PORT_22_EXPOSED, SSM_NOT_CONFIGURED
+
+    const compliant = findings.length === 0;
+    if (compliant) {
+      compliantCount++;
+    } else {
+      nonCompliantIds.push(inst.id);
+    }
+
+    // TODO 2: evaluate Graviton migration eligibility and 20% hourly cost savings
+    const gravitonEligible = false;
+    const estimatedHourlySavingsUsd = 0;
+
+    if (gravitonEligible) {
+      gravitonCandidateIds.push(inst.id);
+      totalHourlySavings += estimatedHourlySavingsUsd;
+    }
+
+    results.push({
+      id: inst.id,
+      compliant,
+      findings,
+      gravitonEligible,
+      estimatedHourlySavingsUsd
+    });
+  }
+
+  const monthlySavingsUsd = Number((totalHourlySavings * 730).toFixed(2));
+
+  return {
+    totalInstances: instances.length,
+    compliantCount,
+    nonCompliantIds,
+    gravitonCandidateIds,
+    monthlySavingsUsd,
+    results
+  };
+}
+
+console.log(
+  "Sample audit:",
+  auditEc2Fleet([
+    {
+      id: "i-legacy-web",
+      instanceType: "m6i.large",
+      arch: "x86_64",
+      hourlyUsd: 0.096,
+      imdsv2Required: false,
+      hopLimit: 1,
+      usesBridgeContainers: true,
+      ingressPorts: [22, 443],
+      ssmManaged: false,
+      hasNativeX86LockIn: false
+    }
+  ])
+);`,
+      hints: [
+        "Check the four compliance rules in exact order: <code>if (!inst.imdsv2Required) findings.push(\"IMDSV1_ENABLED\")</code>; <code>if (inst.usesBridgeContainers && inst.hopLimit < 2) findings.push(\"HOP_LIMIT_TOO_LOW\")</code>; <code>if (inst.ingressPorts.includes(22)) findings.push(\"SSH_PORT_22_EXPOSED\")</code>; <code>if (!inst.ssmManaged) findings.push(\"SSM_NOT_CONFIGURED\")</code>.",
+        "An instance is <code>gravitonEligible</code> only when <code>inst.arch === \"x86_64\" && !inst.hasNativeX86LockIn</code>. Compute <code>Number((inst.hourlyUsd * 0.2).toFixed(4))</code> for eligible instances and <code>0</code> otherwise.",
+        "Sum each instance's <code>estimatedHourlySavingsUsd</code> into <code>totalHourlySavings</code>, then compute <code>Number((totalHourlySavings * 730).toFixed(2))</code> for <code>monthlySavingsUsd</code>."
+      ],
+      solutionExplanation:
+        "Checking IMDSv2 enforcement alongside container bridge hop limits catches the subtle outage where IMDSv2 drops tokens after 1 hop inside Docker NAT. Combining SSH port 22 checks with SSM readiness verifies bastion elimination, while filtering x86 instances by native binary lock-in yields realistic 20% Graviton fleet savings.",
+      solutionCode: `function auditEc2Fleet(instances) {
+  const results = [];
+  const nonCompliantIds = [];
+  const gravitonCandidateIds = [];
+  let compliantCount = 0;
+  let totalHourlySavings = 0;
+
+  for (const inst of instances) {
+    const findings = [];
+    if (!inst.imdsv2Required) {
+      findings.push("IMDSV1_ENABLED");
+    }
+    if (inst.usesBridgeContainers && inst.hopLimit < 2) {
+      findings.push("HOP_LIMIT_TOO_LOW");
+    }
+    if (inst.ingressPorts.includes(22)) {
+      findings.push("SSH_PORT_22_EXPOSED");
+    }
+    if (!inst.ssmManaged) {
+      findings.push("SSM_NOT_CONFIGURED");
+    }
+
+    const compliant = findings.length === 0;
+    if (compliant) {
+      compliantCount++;
+    } else {
+      nonCompliantIds.push(inst.id);
+    }
+
+    const gravitonEligible = inst.arch === "x86_64" && !inst.hasNativeX86LockIn;
+    const estimatedHourlySavingsUsd = gravitonEligible
+      ? Number((inst.hourlyUsd * 0.2).toFixed(4))
+      : 0;
+
+    if (gravitonEligible) {
+      gravitonCandidateIds.push(inst.id);
+      totalHourlySavings += estimatedHourlySavingsUsd;
+    }
+
+    results.push({
+      id: inst.id,
+      compliant,
+      findings,
+      gravitonEligible,
+      estimatedHourlySavingsUsd
+    });
+  }
+
+  const monthlySavingsUsd = Number((totalHourlySavings * 730).toFixed(2));
+
+  return {
+    totalInstances: instances.length,
+    compliantCount,
+    nonCompliantIds,
+    gravitonCandidateIds,
+    monthlySavingsUsd,
+    results
+  };
+}`,
+      tests: [
+        {
+          name: "Hardened Graviton + IMDSv2 + SSM instance passes with zero findings and zero extra savings",
+          run: (scope) => {
+            const out = scope.auditEc2Fleet([
+              {
+                id: "i-graviton-ok",
+                instanceType: "m7g.large",
+                arch: "arm64",
+                hourlyUsd: 0.0816,
+                imdsv2Required: true,
+                hopLimit: 2,
+                usesBridgeContainers: true,
+                ingressPorts: [443],
+                ssmManaged: true,
+                hasNativeX86LockIn: false
+              }
+            ]);
+            const r = out.results[0];
+            const pass =
+              out.compliantCount === 1 &&
+              out.nonCompliantIds.length === 0 &&
+              r.compliant === true &&
+              r.findings.length === 0 &&
+              r.gravitonEligible === false &&
+              out.monthlySavingsUsd === 0;
+            return { pass, message: `compliant=${r.compliant}, findings=${JSON.stringify(r.findings)}, savings=${out.monthlySavingsUsd}` };
+          }
+        },
+        {
+          name: "Legacy x86 instance flags IMDSv1, port 22, missing SSM, and qualifies for Graviton",
+          run: (scope) => {
+            const out = scope.auditEc2Fleet([
+              {
+                id: "i-legacy-1",
+                instanceType: "m6i.large",
+                arch: "x86_64",
+                hourlyUsd: 0.096,
+                imdsv2Required: false,
+                hopLimit: 1,
+                usesBridgeContainers: false,
+                ingressPorts: [22, 443],
+                ssmManaged: false,
+                hasNativeX86LockIn: false
+              }
+            ]);
+            const r = out.results[0];
+            const expectedFindings = ["IMDSV1_ENABLED", "SSH_PORT_22_EXPOSED", "SSM_NOT_CONFIGURED"];
+            const pass =
+              r.compliant === false &&
+              JSON.stringify(r.findings) === JSON.stringify(expectedFindings) &&
+              r.gravitonEligible === true &&
+              r.estimatedHourlySavingsUsd === 0.0192 &&
+              out.monthlySavingsUsd === 14.02;
+            return { pass, message: `findings=${JSON.stringify(r.findings)}, monthlySavings=${out.monthlySavingsUsd}` };
+          }
+        },
+        {
+          name: "Docker bridge container host with hopLimit=1 flags HOP_LIMIT_TOO_LOW even when IMDSv2 is required",
+          run: (scope) => {
+            const out = scope.auditEc2Fleet([
+              {
+                id: "i-docker-trap",
+                instanceType: "c7g.large",
+                arch: "arm64",
+                hourlyUsd: 0.0725,
+                imdsv2Required: true,
+                hopLimit: 1,
+                usesBridgeContainers: true,
+                ingressPorts: [8080],
+                ssmManaged: true,
+                hasNativeX86LockIn: false
+              }
+            ]);
+            const r = out.results[0];
+            const pass =
+              r.compliant === false &&
+              JSON.stringify(r.findings) === JSON.stringify(["HOP_LIMIT_TOO_LOW"]) &&
+              out.nonCompliantIds[0] === "i-docker-trap";
+            return { pass, message: `findings=${JSON.stringify(r.findings)}` };
+          }
+        },
+        {
+          name: "Closed-source x86 lock-in prevents Graviton candidacy and adds $0 savings",
+          run: (scope) => {
+            const out = scope.auditEc2Fleet([
+              {
+                id: "i-x86-locked",
+                instanceType: "c6i.xlarge",
+                arch: "x86_64",
+                hourlyUsd: 0.17,
+                imdsv2Required: true,
+                hopLimit: 1,
+                usesBridgeContainers: false,
+                ingressPorts: [],
+                ssmManaged: true,
+                hasNativeX86LockIn: true
+              }
+            ]);
+            const r = out.results[0];
+            const pass =
+              r.compliant === true &&
+              r.gravitonEligible === false &&
+              r.estimatedHourlySavingsUsd === 0 &&
+              out.gravitonCandidateIds.length === 0 &&
+              out.monthlySavingsUsd === 0;
+            return { pass, message: `gravitonEligible=${r.gravitonEligible}, savings=${out.monthlySavingsUsd}` };
+          }
+        },
+        {
+          name: "Multi-instance fleet aggregates compliantCount, nonCompliantIds, gravitonCandidateIds, and 730h monthly savings",
+          run: (scope) => {
+            const out = scope.auditEc2Fleet([
+              {
+                id: "i-1",
+                instanceType: "m7g.large",
+                arch: "arm64",
+                hourlyUsd: 0.0816,
+                imdsv2Required: true,
+                hopLimit: 1,
+                usesBridgeContainers: false,
+                ingressPorts: [],
+                ssmManaged: true,
+                hasNativeX86LockIn: false
+              },
+              {
+                id: "i-2",
+                instanceType: "m6i.xlarge",
+                arch: "x86_64",
+                hourlyUsd: 0.192,
+                imdsv2Required: true,
+                hopLimit: 2,
+                usesBridgeContainers: true,
+                ingressPorts: [443],
+                ssmManaged: true,
+                hasNativeX86LockIn: false
+              },
+              {
+                id: "i-3",
+                instanceType: "r6i.large",
+                arch: "x86_64",
+                hourlyUsd: 0.126,
+                imdsv2Required: false,
+                hopLimit: 1,
+                usesBridgeContainers: true,
+                ingressPorts: [22],
+                ssmManaged: false,
+                hasNativeX86LockIn: false
+              }
+            ]);
+            // i-2 saves 0.0384/hr, i-3 saves 0.0252/hr -> 0.0636 * 730 = 46.428 -> 46.43
+            const pass =
+              out.totalInstances === 3 &&
+              out.compliantCount === 2 &&
+              JSON.stringify(out.nonCompliantIds) === JSON.stringify(["i-3"]) &&
+              JSON.stringify(out.gravitonCandidateIds) === JSON.stringify(["i-2", "i-3"]) &&
+              out.monthlySavingsUsd === 46.43;
+            return {
+              pass,
+              message: `compliant=${out.compliantCount}, nonCompliant=${JSON.stringify(out.nonCompliantIds)}, candidates=${JSON.stringify(out.gravitonCandidateIds)}, monthly=${out.monthlySavingsUsd}`
+            };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0024",
+      title: "Quiz 0024: Graviton, IMDSv2 & SSM Session Manager",
+      questions: [
+        {
+          id: "q1",
+          prompt: "A platform team enforces IMDSv2 (HttpTokens=required) with the default hop limit of 1 on EC2 hosts running Docker containers in bridge mode. Host CLI calls succeed, but containerized apps fail to fetch IAM credentials from 169.254.169.254. Why?",
+          options: [
+            "Docker bridge networking adds an extra hop that drops TTL-1 IMDSv2 responses",
+            "Legacy IMDSv1 fallback must stay active for bridge containers to read credentials",
+            "Security Groups block local metadata requests sent from container bridge IP ranges",
+            "ECS and Docker tasks need dedicated secondary ENIs to query metadata endpoints"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "In Docker bridge mode, traffic crosses container -> bridge -> host -> IMDS (2 IP hops). Because IMDSv2 defaults HttpPutResponseHopLimit to 1, the token response expires in transit unless raised to 2.",
+            "Leaving IMDSv1 fallback active (HttpTokens=optional) defeats SSRF protection entirely; raising HttpPutResponseHopLimit to 2 fixes bridge containers while keeping IMDSv2 strictly required.",
+            "Instance Security Groups do not filter link-local 169.254.169.254 traffic on the host; the kernel IP TTL hop limit enforces the boundary.",
+            "Bridge containers share the host ENI without secondary ENIs once HttpPutResponseHopLimit is set to 2 (only awsvpc mode gives each task its own ENI)."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "An engineering team migrates a Kotlin microservice from m6i.large (x86_64) to m7g.large (Graviton3 ARM64) and deploys their existing container image tag. The service starts, yet throughput drops 7x and CPU pins at 100%. What most likely caused this regression?",
+          options: [
+            "Graviton3 CPUs lack hardware floating-point units needed by modern JVM garbage collectors",
+            "The Graviton3 host executes an amd64 container binary under slow QEMU emulation",
+            "AWS Nitro hypervisors throttle ARM64 vCPUs when EBS volumes exceed baseline throughput",
+            "ARM64 Linux kernels disable JVM JIT compilation unless enabled inside EC2 UserData"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Graviton3 (Arm Neoverse V1) includes full hardware floating-point and SIMD/NEON pipelines; modern JVMs run natively with strong GC performance.",
+            "Deploying a single-architecture linux/amd64 container image onto an ARM64 node with binfmt_misc/QEMU enabled silently translates x86 instructions in user space, causing severe CPU overhead.",
+            "EBS throughput limits throttle disk I/O latency rather than pegging CPU at 100% under emulation; Nitro gives Graviton3 dedicated physical cores per vCPU.",
+            "ARM64 Linux JVMs enable C1/C2 JIT compilation automatically by default without any EC2 UserData kernel flags."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "You eliminate SSH bastions and delete inbound port 22 from every Security Group in an isolated private subnet without a NAT Gateway. Engineers now report TargetNotConnected errors when running aws ssm start-session. Which missing component blocks SSM?",
+          options: [
+            "An outbound Security Group rule allowing TCP 22 toward the corporate VPN",
+            "A VPC Gateway Endpoint routing SSM session tunnels privately through Amazon S3",
+            "VPC Interface Endpoints for ssm, ssmmessages, and ec2messages allowing HTTPS egress",
+            "An Elastic IP attached directly to each private instance primary network interface"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "SSM Session Manager never uses SSH or TCP port 22; it communicates exclusively over outbound TLS/HTTPS on port 443.",
+            "VPC Gateway Endpoints exist only for Amazon S3 and DynamoDB and cannot proxy Systems Manager control-plane WebSocket traffic.",
+            "Without a NAT Gateway or internet route, amazon-ssm-agent requires VPC Interface Endpoints for com.amazonaws.<region>.ssm, ssmmessages, and ec2messages plus outbound TCP 443.",
+            "Attaching Elastic IPs to private subnet instances without an Internet Gateway still cannot route to public AWS endpoints and defeats private-subnet isolation."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

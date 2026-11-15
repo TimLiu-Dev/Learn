@@ -68,6 +68,14 @@ _Avoid_: Unbounded regexes on untrusted user strings without possessive/atomic g
 The standardized JVM nullability annotation set adopted across Spring Boot 4, Spring Framework 7, and NullAway to distinguish non-null defaults from explicit nullable parameters and return values.
 _Avoid_: Mixing conflicting JSR-305, JetBrains, and legacy Spring `@NonNull` annotations.
 
+**Foreign Function & Memory (FFM) API (`java.lang.foreign`, JEP 454)**:
+The standard Java API (`Arena`, `MemorySegment`, `ValueLayout`, `Linker`) providing deterministic 64-bit off-heap memory management with spatial/temporal safety and zero-JNI C library downcalls.
+_Avoid_: `sun.misc.Unsafe`, uncleaned `ByteBuffer.allocateDirect`.
+
+**Project Leyden AOT Cache (`-XX:AOTCache`, JEP 483/514/515)**:
+The OpenJDK HotSpot capability that caches pre-loaded, pre-linked classes and warm method execution profiles in an AOT cache file (`app.aot`), cutting startup time by 50–70% while retaining full JIT and dynamic reflection.
+_Avoid_: Confusing Leyden AOT Cache with closed-world GraalVM Native Image binaries.
+
 ---
 
 ## Data Structures & Algorithmic Patterns
@@ -127,6 +135,14 @@ _Avoid_: Unbounded `ConcurrentHashMap` cache.
 **Jackson 3 (`tools.jackson`)**:
 Major release of the Jackson JSON/data-binding library used by default in Spring Boot 4 / Framework 7, relocating core packages to `tools.jackson.*` and emphasizing immutable `JsonMapper` builders.
 _Avoid_: Importing legacy `com.fasterxml.jackson.databind.ObjectMapper` on Boot 4 greenfield code unless maintaining compatibility bridges.
+
+**Modular Monolith (`Spring Modulith`) & `ArchUnit`**:
+Structuring a single deployable Spring Boot application around strictly encapsulated domain modules (`@ApplicationModule`, `@ApplicationModuleListener` backed by the transactional Event Publication Registry) with architectural boundaries verified in JUnit via `ApplicationModules.verify()` and `ArchUnit`.
+_Avoid_: Premature microservices or unverified package-by-layer spaghetti.
+
+**Spring AI (`ChatClient`, `BeanOutputConverter`, `@Tool`)**:
+The enterprise Spring abstraction for orchestrating LLMs, mapping responses into strongly-typed Java `record`s via JSON Schema, executing Retrieval-Augmented Generation (RAG) over `PgVectorStore`, and exposing deterministic Java `@Tool` methods.
+_Avoid_: Raw prompt string concatenation or trusting LLM-supplied security/tenant parameters.
 
 ---
 

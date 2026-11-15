@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0039 — AWS Step Functions: Standard vs Express, Saga Pattern &amp; Callback Tokens</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0039</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0039-step-functions-saga-compensations.html" class="active">Lesson 0039</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.6</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>AWS Step Functions: Standard vs. Express, Saga Pattern &amp; Callback Tokens</h1>
+    <p class="lead">
+      A single checkout request touches inventory, fraud scoring, payment authorization, 3D Secure mobile verification, and shipping—yet distributed services cannot share an ACID database transaction. Learn when to orchestrate with Step Functions instead of choreographing events, how Standard and Express workflows differ on durability and cost, and how to build crash-proof Sagas and zero-polling <code>.waitForTaskToken</code> callbacks.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, a multi-screen checkout wizard pairs Jetpack Navigation with <code>SavedStateHandle</code> and <code>WorkManager</code> so that if the OS kills your app process while the user approves 3D Secure in their banking app, the flow resumes cleanly at the exact step where it paused. On AWS, an API Gateway + Lambda invocation dies after at most 29 seconds (or 15 minutes async) and loses all local stack memory. <strong>AWS Step Functions</strong> is your cloud-side durable state machine—persisting every transition so multi-step workflows and external callbacks survive process restarts, transient outages, and hours of waiting.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Orchestration vs. Choreography: Where Control Belongs</h2>
+        <p>
+          After learning <a href="./0038-eventbridge-buses-pipes-ses.html">EventBridge event buses</a>, it is tempting to wire every multi-step workflow as a chain of loosely coupled events (<em>choreography</em>): <code>OrderPlaced</code> triggers Inventory, which emits <code>InventoryReserved</code>, which triggers Payment, and so on. Choreography shines across independent <a href="../reference/glossary.html">bounded contexts</a> because adding a new consumer (like Analytics or Loyalty) requires zero edits to the producer.
+        </p>
+        <p>
+          Inside a single transactional business flow like checkout, however, pure choreography hides the workflow across half a dozen EventBridge rules and SQS queues. Answering <em>"Which step failed for order #8492, and did we void the card authorization?"</em> requires stitching distributed traces manually.
+        </p>
+        <ul>
+          <li><strong>Orchestration (Step Functions):</strong> A central Amazon States Language (ASL) state machine explicitly defines step order, <code>Retry</code> policies, <code>Catch</code> rollback branches, parallel fan-out, and timeouts in one inspectable graph.</li>
+          <li><strong>Choreography (EventBridge / SNS):</strong> Producers publish domain facts without knowing downstream subscribers. Best for decoupling separate teams and domains.</li>
+          <li><strong>Senior Architecture Rule:</strong> <em>Orchestrate inside a bounded context</em> (e.g., an Order Checkout Saga), and <em>choreograph across bounded contexts</em> (the workflow's final state emits <code>OrderConfirmed</code> to EventBridge for shipping analytics, email, and warehouse projection).</li>
+        </ul>
+
+        <!-- SECTION 2 -->
+        <h2>2. Standard vs. Express Workflows (Semantics, Quotas &amp; Cost)</h2>
+        <p>
+          Step Functions offers two distinct execution engines behind the same ASL syntax. Choosing the wrong one either blows up your AWS bill by 10&times; on high-throughput traffic or silently breaks long-running human callbacks and auditability.
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Standard Workflows</th>
+              <th>Express Workflows (Async / Sync)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Max Duration</strong></td>
+              <td>Up to <strong>1 year</strong> (365 days)</td>
+              <td>Up to <strong>5 minutes</strong></td>
+            </tr>
+            <tr>
+              <td><strong>Execution Semantics</strong></td>
+              <td><strong>Exactly-once</strong> workflow execution (each state transition persisted durably)</td>
+              <td>Async: <strong>At-least-once</strong> (can duplicate on internal retry)<br />Sync: <strong>At-most-once</strong> (<code>StartSyncExecution</code>)</td>
+            </tr>
+            <tr>
+              <td><strong>Pricing Model</strong></td>
+              <td><strong>Per state transition</strong> ($0.025 per 1,000 transitions after 4,000/mo free)</td>
+              <td><strong>Executions + duration + memory</strong> ($1.00 per 1M requests + GB-second)</td>
+            </tr>
+            <tr>
+              <td><strong>Service Integrations</strong></td>
+              <td>Supports <strong>all</strong> patterns, including <code>.waitForTaskToken</code> and <code>.sync</code></td>
+              <td>Fire-and-forget / Request-Response only (<strong>no</strong> <code>.waitForTaskToken</code> or <code>.sync</code>)</td>
+            </tr>
+            <tr>
+              <td><strong>Audit &amp; History</strong></td>
+              <td>90-day visual &amp; API execution history (<code>GetExecutionHistory</code>)</td>
+              <td>No Step Functions history API; must ship logs to CloudWatch Logs</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p>
+          Two hard quotas govern real production designs according to the <a href="https://docs.aws.amazon.com/step-functions/latest/dg/limits-overview.html" target="_blank" rel="noopener">AWS Step Functions Service Quotas</a>:
+        </p>
+        <ul>
+          <li><strong>256 KB State Payload Cap:</strong> Every state input and output is capped at <strong>256 KB</strong> (262,144 bytes of UTF-8 JSON). Returning a large catalog list or PDF bytes triggers <code>States.DataLimitExceeded</code> and aborts the execution—use the <em>Claim Check pattern</em> (write payload to S3, pass <code>{ bucket, key }</code> through states).</li>
+          <li><strong>25,000 Execution History Events (Standard):</strong> Every Standard state entry/exit appends history events up to a hard limit of <strong>25,000 events</strong> per execution. Unbounded polling loops eventually crash; use <code>.waitForTaskToken</code> or restart via an outer workflow when processing massive batches.</li>
+        </ul>
+
+        <!-- SECTION 3 -->
+        <h2>3. The Saga Pattern: Forward Execution &amp; Reverse Compensation</h2>
+        <p>
+          When your Android user taps <em>Place Order</em>, you cannot wrap DynamoDB inventory updates, Stripe card charges, and a third-party carrier API inside a database <code>BEGIN ... COMMIT</code>. Two-Phase Commit (2PC) locks external services indefinitely and collapses under partial network partitions. Instead, distributed systems use the <strong>Saga Pattern</strong>: a sequence of local transactions <code>T<sub>1</sub>, T<sub>2</sub>, &hellip;, T<sub>n</sub></code>, each paired with a semantic <strong>compensating action</strong> <code>C<sub>k</sub></code>.
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 700 245" width="100%" height="auto" role="img" aria-label="Step Functions Saga Forward Path and Reverse Compensation Flow">
+            <rect x="0" y="0" width="700" height="245" fill="#fdfcf8" rx="6" />
+
+            <!-- Forward Row Title -->
+            <text x="16" y="26" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">Forward Execution Path (Push Completed Steps to Compensation Stack)</text>
+
+            <!-- T1 -->
+            <rect x="16" y="42" width="142" height="44" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="87" y="61" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#0f4c81">1. ReserveStock</text>
+            <text x="87" y="77" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Succeeded</text>
+
+            <line x1="158" y1="64" x2="184" y2="64" stroke="#0f4c81" stroke-width="1.5" />
+            <polygon points="184,60 192,64 184,68" fill="#0f4c81" />
+
+            <!-- T2 -->
+            <rect x="192" y="42" width="142" height="44" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="263" y="61" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#0f4c81">2. AuthorizeCard</text>
+            <text x="263" y="77" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Succeeded</text>
+
+            <line x1="334" y1="64" x2="360" y2="64" stroke="#0f4c81" stroke-width="1.5" />
+            <polygon points="360,60 368,64 360,68" fill="#0f4c81" />
+
+            <!-- T3 -->
+            <rect x="368" y="42" width="150" height="44" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="443" y="61" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#b45309">3. Await3DS (.wait)</text>
+            <text x="443" y="77" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#991b1b">Fails / Times Out</text>
+
+            <line x1="518" y1="64" x2="544" y2="64" stroke="#c2b9a7" stroke-width="1.5" stroke-dasharray="4 3" />
+            <polygon points="544,60 552,64 544,68" fill="#c2b9a7" />
+
+            <!-- T4 skipped -->
+            <rect x="552" y="42" width="132" height="44" rx="5" fill="#f5f2ea" stroke="#c2b9a7" stroke-dasharray="4 3" />
+            <text x="618" y="61" text-anchor="middle" font-family="monospace" font-size="11" fill="#575c66">4. CreateLabel</text>
+            <text x="618" y="77" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Never Executed</text>
+
+            <!-- Catch down arrow -->
+            <line x1="443" y1="86" x2="443" y2="144" stroke="#991b1b" stroke-width="1.5" />
+            <polygon points="439,144 443,152 447,144" fill="#991b1b" />
+            <text x="452" y="121" font-family="monospace" font-size="10" font-weight="700" fill="#991b1b">Catch: States.ALL</text>
+
+            <!-- Reverse Row Title -->
+            <text x="16" y="138" font-family="sans-serif" font-size="12" font-weight="700" fill="#991b1b">Reverse Compensation Path (LIFO Rollback)</text>
+
+            <!-- C2 -->
+            <rect x="368" y="152" width="150" height="44" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="443" y="171" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#991b1b">VoidCardAuth</text>
+            <text x="443" y="187" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Compensates Step 2</text>
+
+            <!-- Arrow C2 -> C1 -->
+            <line x1="368" y1="174" x2="342" y2="174" stroke="#991b1b" stroke-width="1.5" />
+            <polygon points="342,170 334,174 342,178" fill="#991b1b" />
+
+            <!-- C1 -->
+            <rect x="192" y="152" width="142" height="44" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="263" y="171" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#991b1b">ReleaseStock</text>
+            <text x="263" y="187" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Compensates Step 1</text>
+
+            <!-- Arrow C1 -> FailOrder -->
+            <line x1="192" y1="174" x2="166" y2="174" stroke="#991b1b" stroke-width="1.5" />
+            <polygon points="166,170 158,174 166,178" fill="#991b1b" />
+
+            <!-- Fail End -->
+            <rect x="16" y="152" width="142" height="44" rx="5" fill="#181a1f" stroke="#181a1f" />
+            <text x="87" y="171" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#fdfcf8">OrderFailed</text>
+            <text x="87" y="187" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#c2b9a7">Emit Event + Fail</text>
+
+            <!-- DLQ note -->
+            <text x="16" y="224" font-family="sans-serif" font-size="11" fill="#575c66">If VoidCardAuth or ReleaseStock fails after retries: record failure to SQS DLQ / PagerDuty and still run earlier compensations.</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: When Step 3 fails, Step Functions catches the error and unwinds only previously completed compensatable steps in strict reverse (LIFO) order—never touching unexecuted Step 4.
+          </div>
+        </div>
+
+        <p>
+          Three production rules separate toy Sagas from battle-tested ones:
+        </p>
+        <ol>
+          <li><strong>Retry transient faults before compensating:</strong> Configure <code>Retry</code> with exponential backoff and <code>JitterStrategy: "FULL"</code> on transient errors (<code>States.Timeout</code>, HTTP <code>503</code>, DynamoDB throttling), while immediately falling through to <code>Catch</code> on business errors like <code>CardDeclined</code>.</li>
+          <li><strong>Respect the Pivot Transaction:</strong> Steps before the irreversible pivot (e.g., <code>ReserveStock</code>, <code>AuthorizeCard</code>) are compensatable. Once the <em>pivot transaction</em> commits (e.g., <code>CapturePayment</code> or printing a non-voidable customs manifest), subsequent steps (e.g., <code>SendReceipt</code>) are <em>retriable</em>—you retry forward rather than trying to un-ring the bell.</li>
+          <li><strong>Never abort rollback if one compensation fails:</strong> If <code>VoidCardAuth</code> fails permanently, still execute <code>ReleaseStock</code> so inventory does not leak, and route the failed compensation metadata to an SQS Dead Letter Queue (DLQ) for operator reconciliation.</li>
+        </ol>
+
+        <div class="callout warning">
+          <div class="callout-title">Critical Rule: Every Compensating Action Must Be Idempotent</div>
+          <p style="margin: 0;">
+            Compensations can run twice—for example, when Step Functions retries a <code>ReleaseStock</code> Lambda after a response timeout, or when an operator replays a DLQ record. Key every compensation with a deterministic token (such as <code>orderId + "#" + stepName</code>) using a DynamoDB conditional write (<code>attribute_not_exists(compensationKey)</code>) so a duplicate invocation never double-increments inventory or double-refunds a customer.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. Callback Pattern (<code>.waitForTaskToken</code>) &amp; Production Code</h2>
+        <p>
+          Mobile checkouts frequently pause for asynchronous human or third-party events: 3D Secure banking verification, Stripe webhook confirmation, or warehouse pick-and-pack scans. Polling a database inside a Lambda every 10 seconds wastes compute and burns Step Functions state transitions.
+        </p>
+        <p>
+          Instead, append <code>.waitForTaskToken</code> to an integrated service ARN (such as <code>arn:aws:states:::sqs:sendMessage.waitForTaskToken</code>). Step Functions injects the opaque <code>$$.Task.Token</code> from the <a href="https://docs.aws.amazon.com/step-functions/latest/dg/connect-to-resource.html#connect-wait-token" target="_blank" rel="noopener">Context Object</a> and <strong>freezes the Standard execution at zero compute cost</strong> until an external worker calls <code>SendTaskSuccess</code> or <code>SendTaskFailure</code>.
+        </p>
+        <p>
+          <strong>Always set <code>TimeoutSeconds</code></strong> (and <code>HeartbeatSeconds</code> for active workers). Without <code>TimeoutSeconds</code>, a dropped webhook leaves the workflow dangling in <code>RUNNING</code> state for up to a full year before timing out.
+        </p>
+
+<pre><code>// 1. ASL State Machine Excerpt (Standard Workflow — Saga + Callback Token)
+{
+  "StartAt": "ReserveInventory",
+  "States": {
+    "ReserveInventory": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "ReserveInventoryFn", "Payload.$": "$" },
+      "ResultPath": "$.inventoryResult",
+      "Retry": [{
+        "ErrorEquals": ["States.Timeout", "Lambda.TooManyRequestsException"],
+        "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0, "JitterStrategy": "FULL"
+      }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.errorInfo", "Next": "OrderFailed" }],
+      "Next": "WaitFor3DSCallback"
+    },
+    "WaitFor3DSCallback": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+      "TimeoutSeconds": 900,
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/payment-3ds-requests",
+        "MessageBody": { "orderId.$": "$.orderId", "taskToken.$": "$$.Task.Token" }
+      },
+      "ResultPath": "$.paymentResult",
+      "Catch": [{
+        "ErrorEquals": ["States.Timeout", "PaymentDeclined", "States.ALL"],
+        "ResultPath": "$.errorInfo",
+        "Next": "ReleaseInventory"
+      }],
+      "Next": "CreateShipment"
+    },
+    "ReleaseInventory": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "ReleaseInventoryIdempotentFn", "Payload.$": "$" },
+      "ResultPath": "$.compensationResult",
+      "Next": "OrderFailed"
+    },
+    "OrderFailed": { "Type": "Fail", "Error": "CheckoutSagaRolledBack" }
+  }
+}
+
+// 2. Webhook Handler (Node.js / AWS SDK v3) completing the paused Task Token
+import { SFNClient, SendTaskSuccessCommand, SendTaskFailureCommand } from "@aws-sdk/client-sfn";
+const sfn = new SFNClient({});
+
+export async function handle3DSWebhook({ taskToken, approved, authId, declineReason }) {
+  try {
+    if (approved) {
+      await sfn.send(new SendTaskSuccessCommand({
+        taskToken,
+        output: JSON.stringify({ authId, verifiedAt: new Date().toISOString() })
+      }));
+    } else {
+      await sfn.send(new SendTaskFailureCommand({
+        taskToken,
+        error: "PaymentDeclined",
+        cause: declineReason || "3DS challenge rejected by issuer"
+      }));
+    }
+  } catch (err) {
+    // TaskTimedOut or TaskDoesNotExist means TimeoutSeconds already triggered Saga rollback
+    if (err.name === "TaskTimedOut" || err.name === "TaskDoesNotExist") return { ignored: true };
+    throw err;
+  }
+}</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build a Step Functions Saga state-machine executor in JavaScript. Your executor must handle transient retries, non-retryable fail-fast errors, strict reverse-order (LIFO) compensations of completed steps only, and resilient DLQ-style recording if a compensating action itself throws.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your production intuition on Standard vs. Express semantics, idempotent Saga rollbacks, and callback token timeouts.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/step-functions/latest/dg/concepts-standard-vs-express.html" target="_blank" rel="noopener">AWS Step Functions — Standard vs. Express Workflows</a> (Execution guarantees, duration limits, and pricing tradeoffs).
+          </li>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/step-functions/latest/dg/connect-to-resource.html#connect-wait-token" target="_blank" rel="noopener">Wait for a Callback with the Task Token</a> (<code>.waitForTaskToken</code>, <code>SendTaskSuccess</code>, and <code>TimeoutSeconds</code>).
+          </li>
+          <li>
+            <strong>Architecture Reference:</strong> <a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/implement-the-serverless-saga-pattern-by-using-aws-step-functions.html" target="_blank" rel="noopener">AWS Prescriptive Guidance — Implement the Serverless Saga Pattern with Step Functions</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0040 (CloudFormation Internals: Change Sets, Rollbacks, Drift &amp; StackSets)</strong>, ask me anything that feels fuzzy—for example: <em>"How do Distributed Map states process 10 million S3 objects without hitting the 25,000 history event cap?"</em> or <em>"When should an Android client poll a status endpoint vs. receive an FCM push when a Step Functions callback completes?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0038-eventbridge-buses-pipes-ses.html">&larr; Lesson 0038: EventBridge Event Buses, Schema Registry, Pipes & Transactional SES Integration</a>
+          <a href="./0040-cloudformation-drift-changesets-stacksets.html">Lesson 0040: CloudFormation Internals: Change Sets, Rollbacks, Drift & StackSets &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why <code>ResultPath</code> Matters in <code>Catch</code></strong>
+          By default, a failed Task replaces the entire state output with <code>{ Error, Cause }</code>—wiping out <code>$.orderId</code>! Always set <code>"ResultPath": "$.errorInfo"</code> on <code>Catch</code> rules so downstream compensation states still have the original order payload.
+        </div>
+        <div class="sidenote">
+          <strong>256 KB Payload Cap (Claim Check)</strong>
+          Step Functions enforces a 256 KB limit across each state's input and output. Store oversized JSON blobs or invoice PDFs in S3 and pass only lightweight <code>s3://</code> object pointers between states.
+        </div>
+        <div class="sidenote">
+          <strong>Built-In Full Jitter</strong>
+          In ASL <code>Retry</code> blocks, adding <code>"JitterStrategy": "FULL"</code> randomizes retry delays across concurrent executions—preventing thundering herds when a downstream payment provider recovers.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0039",
+      title: "Lab 0039: Step Functions Saga Executor & Compensation Rollback",
+      filename: "saga-executor.js",
+      description:
+        "Implement <code>executeSaga(steps, initialInput)</code>. Each step is <code>{ name, action, compensate?, maxRetries? }</code>. Rules: (1) Create <code>context = { input: initialInput, results: {} }</code>. (2) Run steps in forward order. Track <code>attemptsByStep[step.name]</code> on every call to <code>step.action(context)</code>. If <code>action</code> throws an error with <code>err.retryable === true</code>, retry up to <code>step.maxRetries || 0</code> additional times; non-retryable errors fail immediately without retrying. (3) On success, save <code>context.results[step.name] = result</code>, append <code>step.name</code> to <code>executedSteps</code>, and push <code>{ step, result }</code> onto a rollback stack. (4) If a step fails after exhausting retries, set <code>failedStep = step.name</code> and <code>error = { code: err.code || \"States.TaskFailed\", message: err.message }</code>, then unwind the rollback stack in reverse (LIFO) order: for each item with <code>typeof item.step.compensate === \"function\"</code>, call <code>item.step.compensate(context, item.result)</code>. If it succeeds, push <code>item.step.name</code> to <code>compensatedSteps</code>; if it throws, push <code>{ step: item.step.name, message: compErr.message }</code> to <code>compensationFailures</code> and continue compensating earlier steps. (5) Return <code>{ status, executedSteps, compensatedSteps, failedStep, error, compensationFailures, attemptsByStep, results: context.results }</code> where <code>status</code> is <code>\"SUCCEEDED\"</code>, <code>\"COMPENSATED\"</code>, or <code>\"COMPENSATION_FAILED\"</code>.",
+      exports: ["executeSaga"],
+      starterCode: `function executeSaga(steps, initialInput) {
+  const context = { input: initialInput, results: {} };
+  const executedSteps = [];
+  const compensatedSteps = [];
+  const compensationFailures = [];
+  const attemptsByStep = {};
+  const rollbackStack = [];
+
+  let failedStep = null;
+  let error = null;
+
+  // TODO 1: Loop over steps in forward order.
+  // For each step, attempt step.action(context) up to 1 + (step.maxRetries || 0) times,
+  // retrying ONLY when err.retryable === true.
+
+  // TODO 2: On step success, store context.results[step.name], record executedSteps,
+  // and push { step, result } onto rollbackStack.
+
+  // TODO 3: On terminal step failure, set failedStep and error, break out of the
+  // forward loop, and pop rollbackStack in reverse (LIFO) order to run compensations.
+  // If a compensate() throws, record { step, message } in compensationFailures and keep rolling back.
+
+  // TODO 4: Compute status ("SUCCEEDED", "COMPENSATED", or "COMPENSATION_FAILED").
+  const status = "SUCCEEDED";
+
+  return {
+    status,
+    executedSteps,
+    compensatedSteps,
+    failedStep,
+    error,
+    compensationFailures,
+    attemptsByStep,
+    results: context.results
+  };
+}
+
+// Quick smoke check
+const sampleLog = [];
+console.log(
+  "Saga rollback sample:",
+  executeSaga(
+    [
+      {
+        name: "ReserveInventory",
+        action: (ctx) => ({ reservationId: "res-" + ctx.input.orderId }),
+        compensate: (_ctx, res) => sampleLog.push("released:" + res.reservationId)
+      },
+      {
+        name: "ChargeCard",
+        action: () => {
+          const err = new Error("CardDeclined");
+          err.code = "CardDeclined";
+          throw err;
+        },
+        compensate: () => sampleLog.push("voided")
+      }
+    ],
+    { orderId: "ord-101" }
+  )
+);`,
+      hints: [
+        "Wrap the forward attempt in a <code>while (true)</code> or <code>for (let attempt = 0; attempt &lt;= maxRetries; attempt++)</code> loop: increment <code>attemptsByStep[step.name]</code> before calling <code>step.action(context)</code>, and in <code>catch (err)</code> only continue if <code>err.retryable === true &amp;&amp; attempt &lt; maxRetries</code>.",
+        "To unwind in strict LIFO order, iterate <code>while (rollbackStack.length &gt; 0) { const entry = rollbackStack.pop(); ... }</code>. Skip entries where <code>typeof entry.step.compensate !== \"function\"</code>.",
+        "Wrap each <code>entry.step.compensate(context, entry.result)</code> in its own <code>try / catch</code> so a failed compensation pushes to <code>compensationFailures</code> without stopping earlier compensations. Set <code>status = !failedStep ? \"SUCCEEDED\" : (compensationFailures.length &gt; 0 ? \"COMPENSATION_FAILED\" : \"COMPENSATED\")</code>."
+      ],
+      solutionExplanation:
+        "A Step Functions Saga pushes each completed compensatable step onto a stack and handles transient errors with bounded retries before triggering a Catch transition. Once a terminal failure occurs, the rollback stack unwinds in strict reverse (LIFO) order—skipping unexecuted steps and read-only steps without compensators—and isolates each compensation call in its own try/catch so one failed rollback never orphans earlier reservations.",
+      solutionCode: `function executeSaga(steps, initialInput) {
+  const context = { input: initialInput, results: {} };
+  const executedSteps = [];
+  const compensatedSteps = [];
+  const compensationFailures = [];
+  const attemptsByStep = {};
+  const rollbackStack = [];
+
+  let failedStep = null;
+  let error = null;
+
+  for (const step of steps) {
+    const maxRetries = step.maxRetries || 0;
+    let stepSucceeded = false;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      attemptsByStep[step.name] = (attemptsByStep[step.name] || 0) + 1;
+      try {
+        const result = step.action(context);
+        context.results[step.name] = result;
+        executedSteps.push(step.name);
+        rollbackStack.push({ step, result });
+        stepSucceeded = true;
+        break;
+      } catch (err) {
+        const canRetry = err && err.retryable === true && attempt < maxRetries;
+        if (!canRetry) {
+          failedStep = step.name;
+          error = {
+            code: (err && err.code) || "States.TaskFailed",
+            message: (err && err.message) || String(err)
+          };
+          break;
+        }
+      }
+    }
+
+    if (!stepSucceeded) {
+      break;
+    }
+  }
+
+  if (failedStep !== null) {
+    while (rollbackStack.length > 0) {
+      const entry = rollbackStack.pop();
+      if (typeof entry.step.compensate !== "function") {
+        continue;
+      }
+      try {
+        entry.step.compensate(context, entry.result);
+        compensatedSteps.push(entry.step.name);
+      } catch (compErr) {
+        compensationFailures.push({
+          step: entry.step.name,
+          message: (compErr && compErr.message) || String(compErr)
+        });
+      }
+    }
+  }
+
+  let status = "SUCCEEDED";
+  if (failedStep !== null) {
+    status = compensationFailures.length > 0 ? "COMPENSATION_FAILED" : "COMPENSATED";
+  }
+
+  return {
+    status,
+    executedSteps,
+    compensatedSteps,
+    failedStep,
+    error,
+    compensationFailures,
+    attemptsByStep,
+    results: context.results
+  };
+}`,
+      tests: [
+        {
+          name: "Happy path executes all steps in order with zero compensations",
+          run: (scope) => {
+            const log = [];
+            const out = scope.executeSaga(
+              [
+                {
+                  name: "ValidateCart",
+                  action: (ctx) => { log.push("validate:" + ctx.input.orderId); return { valid: true }; }
+                },
+                {
+                  name: "ReserveInventory",
+                  action: () => { log.push("reserve"); return { resId: "R-1" }; },
+                  compensate: () => log.push("comp-reserve")
+                },
+                {
+                  name: "ChargeCard",
+                  action: (ctx) => { log.push("charge:" + ctx.results.ReserveInventory.resId); return { txId: "TX-9" }; },
+                  compensate: () => log.push("comp-charge")
+                }
+              ],
+              { orderId: "O-42" }
+            );
+            const pass =
+              out.status === "SUCCEEDED" &&
+              out.failedStep === null &&
+              out.error === null &&
+              out.executedSteps.join(",") === "ValidateCart,ReserveInventory,ChargeCard" &&
+              out.compensatedSteps.length === 0 &&
+              out.results.ChargeCard.txId === "TX-9" &&
+              log.join("|") === "validate:O-42|reserve|charge:R-1";
+            return { pass, message: `status=${out.status}, executed=${out.executedSteps.join(",")}` };
+          }
+        },
+        {
+          name: "Failure on step 4 unwinds completed compensatable steps in strict reverse (LIFO) order",
+          run: (scope) => {
+            const compOrder = [];
+            const out = scope.executeSaga(
+              [
+                { name: "AuditRead", action: () => ({ ok: true }) },
+                {
+                  name: "ReserveInventory",
+                  action: () => ({ resId: "R-77" }),
+                  compensate: (_ctx, res) => compOrder.push("Release:" + res.resId)
+                },
+                {
+                  name: "AuthorizePayment",
+                  action: () => ({ authId: "A-88" }),
+                  compensate: (_ctx, res) => compOrder.push("Void:" + res.authId)
+                },
+                {
+                  name: "CreateShipment",
+                  action: () => { throw new Error("CarrierUnavailable"); },
+                  compensate: () => compOrder.push("CancelShipment")
+                },
+                {
+                  name: "SendReceipt",
+                  action: () => ({ sent: true }),
+                  compensate: () => compOrder.push("UndoReceipt")
+                }
+              ],
+              { orderId: "O-99" }
+            );
+            const pass =
+              out.status === "COMPENSATED" &&
+              out.failedStep === "CreateShipment" &&
+              out.error &&
+              out.error.code === "States.TaskFailed" &&
+              out.error.message === "CarrierUnavailable" &&
+              out.executedSteps.join(",") === "AuditRead,ReserveInventory,AuthorizePayment" &&
+              out.compensatedSteps.join(",") === "AuthorizePayment,ReserveInventory" &&
+              compOrder.join("|") === "Void:A-88|Release:R-77" &&
+              out.attemptsByStep.SendReceipt === undefined;
+            return { pass, message: `status=${out.status}, compensated=${out.compensatedSteps.join(",")}` };
+          }
+        },
+        {
+          name: "Retries transient retryable errors up to maxRetries and succeeds without compensation",
+          run: (scope) => {
+            let calls = 0;
+            const out = scope.executeSaga(
+              [
+                {
+                  name: "ReserveInventory",
+                  action: () => ({ resId: "R-10" }),
+                  compensate: () => { throw new Error("ShouldNotCompensate"); }
+                },
+                {
+                  name: "ChargeCard",
+                  maxRetries: 2,
+                  action: () => {
+                    calls++;
+                    if (calls < 3) {
+                      const e = new Error("Gateway timeout");
+                      e.retryable = true;
+                      e.code = "States.Timeout";
+                      throw e;
+                    }
+                    return { charged: true };
+                  },
+                  compensate: () => {}
+                }
+              ],
+              { orderId: "O-55" }
+            );
+            const pass =
+              out.status === "SUCCEEDED" &&
+              out.attemptsByStep.ChargeCard === 3 &&
+              out.compensatedSteps.length === 0 &&
+              out.results.ChargeCard.charged === true;
+            return { pass, message: `status=${out.status}, attempts=${out.attemptsByStep.ChargeCard}` };
+          }
+        },
+        {
+          name: "Non-retryable error fails fast without retrying even when maxRetries > 0",
+          run: (scope) => {
+            const out = scope.executeSaga(
+              [
+                {
+                  name: "ReserveInventory",
+                  action: () => ({ resId: "R-22" }),
+                  compensate: () => {}
+                },
+                {
+                  name: "ChargeCard",
+                  maxRetries: 3,
+                  action: () => {
+                    const e = new Error("Insufficient funds");
+                    e.retryable = false;
+                    e.code = "CardDeclined";
+                    throw e;
+                  }
+                }
+              ],
+              { orderId: "O-66" }
+            );
+            const pass =
+              out.status === "COMPENSATED" &&
+              out.attemptsByStep.ChargeCard === 1 &&
+              out.error.code === "CardDeclined" &&
+              out.compensatedSteps.join(",") === "ReserveInventory";
+            return { pass, message: `attempts=${out.attemptsByStep.ChargeCard}, code=${out.error && out.error.code}` };
+          }
+        },
+        {
+          name: "Continues compensating earlier steps and returns COMPENSATION_FAILED when a compensator throws",
+          run: (scope) => {
+            const out = scope.executeSaga(
+              [
+                {
+                  name: "ReserveInventory",
+                  action: () => ({ ok: true }),
+                  compensate: () => {}
+                },
+                {
+                  name: "HoldLoyaltyPoints",
+                  action: () => ({ points: 500 }),
+                  compensate: () => { throw new Error("LoyaltyServiceDown"); }
+                },
+                {
+                  name: "ChargeCard",
+                  action: () => { throw new Error("ProcessorError"); }
+                }
+              ],
+              { orderId: "O-77" }
+            );
+            const pass =
+              out.status === "COMPENSATION_FAILED" &&
+              out.compensatedSteps.join(",") === "ReserveInventory" &&
+              out.compensationFailures.length === 1 &&
+              out.compensationFailures[0].step === "HoldLoyaltyPoints" &&
+              out.compensationFailures[0].message === "LoyaltyServiceDown";
+            return {
+              pass,
+              message: `status=${out.status}, compensated=${out.compensatedSteps.join(",")}, failures=${out.compensationFailures.length}`
+            };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0039",
+      title: "Quiz 0039: Standard vs. Express, Sagas &amp; Callback Tokens",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Your Android checkout backend triggers a fulfillment workflow that pauses for a warehouse worker to scan a package and hit an approval webhook up to 48 hours later. A teammate suggests an Express Workflow to cut costs. Why will that fail?",
+          options: [
+            "Express workflows cap execution at five minutes and lack callback task tokens",
+            "Express workflows require synchronous API Gateway triggers and reject SQS event sources",
+            "Express workflows lock active state transitions and reject incoming webhook status payloads",
+            "Express workflows purge execution payloads after thirty seconds of idle task wait"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Express Workflows have a strict 5-minute maximum duration and do not support .waitForTaskToken callbacks, making them unusable for a 48-hour pause.",
+            "Asynchronous Express Workflows can be triggered by SQS, EventBridge Pipes, or Step Functions SDK calls; they are not restricted to API Gateway.",
+            "Step Functions does not lock active transitions against webhooks; Express simply lacks the .waitForTaskToken integration pattern altogether.",
+            "Express runs up to 5 minutes per execution and does not purge active payloads after 30 seconds of waiting."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "In a checkout Saga, ReserveInventory succeeds, AuthorizePayment succeeds, and CreateShipment fails after exhausting retries. During rollback, the ReleaseInventory Lambda gets invoked twice due to a network retry. What prevents inventory corruption?",
+          options: [
+            "Disabling Step Functions Retry blocks inside every Catch compensation fallback path",
+            "Guarding each compensation update with a conditional order-and-step idempotency key check",
+            "Wrapping forward and rollback Lambda handlers inside one DynamoDB client transaction",
+            "Increasing the Step Functions task heartbeat timeout above the Lambda duration"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Removing Retry from a compensation path means any transient network glitch leaves inventory permanently locked instead of retrying safely.",
+            "Compensating actions must be idempotent—using a deterministic orderId + step key with a conditional write guarantees duplicate invocations are safe no-ops.",
+            "Step Functions executes separate invocations over time across distinct services, which cannot share a single synchronous DynamoDB transaction.",
+            "Task heartbeat timeouts detect stalled workers; they do not deduplicate retried Lambda invocations inside a compensating action."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "A Standard Workflow uses sqs:sendMessage.waitForTaskToken to wait for a third-party fraud vendor webhook. Months later, you find 1,400 executions stuck in RUNNING because the vendor silently dropped webhooks. Which ASL configuration prevents these zombie executions?",
+          options: [
+            "Adding a Task state TimeoutSeconds paired with a States.Timeout Catch handler",
+            "Switching the state machine to Express mode for five-minute automatic purging",
+            "Passing the task token inside an EventBridge archive replay rule payload",
+            "Attaching a short VisibilityTimeout attribute inside the Step Functions Retry block"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Without TimeoutSeconds, a .waitForTaskToken state can remain RUNNING for up to 1 year; pairing TimeoutSeconds with a Catch for States.Timeout transitions cleanly into Saga rollback.",
+            "Express Workflows do not support .waitForTaskToken at all, so migrating the callback state there will fail validation.",
+            "EventBridge archive replays re-deliver historical events; they do not expire or cancel a paused Step Functions task token.",
+            "SQS VisibilityTimeout belongs to queue message redelivery semantics, not Step Functions ASL Retry blocks or task token expiration."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

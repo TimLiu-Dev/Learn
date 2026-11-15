@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0027 — EKS (Kubernetes on AWS): Control Plane, IRSA/Pod Identity &amp; When NOT to Use EKS</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0027</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0027-eks-kubernetes-irsa-tradeoffs.html" class="active">Lesson 0027</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.3</span>
+      <span class="pill">AWS Compute &amp; Containers</span>
+      <span class="pill">Est. Time: 30 mins</span>
+    </div>
+
+    <h1>EKS (Kubernetes on AWS): Control Plane, IRSA/Pod Identity &amp; When NOT to Use EKS</h1>
+    <p class="lead">
+      Amazon EKS gives you upstream Kubernetes on AWS, but it is never "free Kubernetes": you inherit VPC CNI IP-address planning, Pod-level IAM credential plumbing, ALB Ingress readiness mechanics, and a continuous version-upgrade treadmill. Senior cloud architects know both how EKS works under the hood and when ECS on Fargate ships the same product at a fraction of the operational cost.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            Think about Android teams that wire up multi-component Dagger graphs, custom KSP code generators, and five Gradle convention plugins for a 4-screen app—when simple constructor injection or a single Hilt <code>@Singleton</code> module would have shipped in an afternoon. Adopting <strong>Amazon EKS</strong> for a small set of standard HTTP APIs is the exact cloud equivalent: you pay a <strong>$73/month control-plane tax</strong> per cluster, maintain Kubernetes API upgrades, tune VPC ENI IP pools, and manage cluster add-ons before deploying a single line of business logic.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. EKS Control Plane vs. Data Plane (And the Hidden VPC CNI Trap)</h2>
+        <p>
+          In Amazon EKS, AWS splits responsibility cleanly at the Kubernetes API boundary:
+        </p>
+        <ul>
+          <li>
+            <strong>Managed Control Plane ($0.10/hour &approx; $73/month per cluster):</strong> AWS runs a dedicated, single-tenant Kubernetes control plane (<code>kube-apiserver</code>, <code>kube-scheduler</code>, <code>kube-controller-manager</code>, and a 3-AZ <code>etcd</code> cluster) behind a managed endpoint. Unlike ECS—where the cluster control plane costs <strong>$0</strong>—every EKS cluster starts with a fixed $73/month bill under Standard Support, jumping to <strong>$0.60/hour (&approx; $438/month)</strong> per cluster if you fall behind Kubernetes releases (~14 months per minor version) and enter EKS Extended Support.
+          </li>
+          <li>
+            <strong>Customer Data Plane (EC2 Managed Node Groups, Karpenter, or Fargate):</strong> Your Pods still execute on compute you pay for and size. With <strong>Managed Node Groups</strong> or <strong>Karpenter</strong>, EC2 instances join the cluster in your VPC subnets and run <code>kubelet</code>, <code>kube-proxy</code>, and the <strong>Amazon VPC CNI</strong> plugin (<code>aws-node</code>).
+          </li>
+        </ul>
+        <p>
+          Here is the #1 EKS networking failure mode that surprises engineers coming from overlay CNI clusters (like Calico/Flannel on-prem): <strong>by default, the Amazon VPC CNI assigns real VPC secondary IPv4 addresses directly to Pods</strong> from your subnet CIDR.
+        </p>
+        <p>
+          Consider an <code>m5.large</code> worker node. Per AWS EC2 ENI limits, an <code>m5.large</code> supports at most <strong>3 ENIs</strong> and <strong>10 IPv4 addresses per ENI</strong> (one primary IP + 9 secondary IPs). Excluding the node's own primary IP, that caps a single <code>m5.large</code> at <strong>29 Pods</strong> unless you enable Prefix Delegation (assigning <code>/28</code> blocks of 16 IPs per slot). Worse, by default <code>aws-node</code> pre-allocates a full ENI's worth of warm IPs (<code>WARM_ENI_TARGET=1</code>) on every node. Twenty nodes in a <code>/24</code> subnet (251 usable AWS IPs) can exhaust the subnet's free IPs before CPU hits 30%, causing new Pods to stick in <code>ContainerCreating</code> with <code>FailedCreatePodSandBox: no available IP addresses</code>.
+        </p>
+
+        <!-- SECTION 2 -->
+        <h2>2. Pod IAM: Node Profiles vs. IRSA vs. EKS Pod Identity</h2>
+        <p>
+          Containers inside Pods frequently call DynamoDB, S3, or SQS. How does a Pod obtain short-lived AWS STS credentials without hardcoding static access keys?
+        </p>
+        <ol>
+          <li>
+            <strong>Anti-Pattern — EC2 Node Instance Profile (IMDSv2):</strong> Every Pod on a worker node shares the node's IAM role via <code>169.254.169.254</code>. That violates least privilege: a compromised static-asset Pod on the same node as your Payments Pod inherits Payments' database permissions. (Setting IMDS hop limit to <code>1</code> blocks Pods from reaching IMDSv2 entirely; setting it to <code>2</code> exposes the node role to every container.)
+          </li>
+          <li>
+            <strong>IRSA (IAM Roles for Service Accounts):</strong> Introduced in 2019. You register an IAM OIDC Identity Provider tied to your cluster's unique issuer URL (<code>oidc.eks.&lt;region&gt;.amazonaws.com/id/&lt;cluster-id&gt;</code>), annotate a Kubernetes <code>ServiceAccount</code> with <code>eks.amazonaws.com/role-arn</code>, and a mutating webhook injects <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> + <code>AWS_ROLE_ARN</code> into new Pods. The AWS SDK calls <code>sts:AssumeRoleWithWebIdentity</code>. <em>Operational friction:</em> every IAM trust policy hardcodes the cluster's OIDC ID, so rebuilding a cluster or sharing one IAM role across 10 clusters requires editing IAM trust policies for every cluster.
+          </li>
+          <li>
+            <strong>EKS Pod Identity (Modern Standard):</strong> Launched in late 2023 to fix IRSA's OIDC coupling. You run the <code>eks-pod-identity-agent</code> DaemonSet on nodes, which exposes a node-local credential endpoint at <code>169.254.170.23</code> (link-local, reachable by Pods with an injected <code>AWS_CONTAINER_CREDENTIALS_FULL_URI</code> + <code>AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE</code>). You bind a <code>ServiceAccount</code> to an IAM Role using the EKS API (<code>aws eks create-pod-identity-association</code>), and the IAM trust policy simply trusts the universal service principal <code>pods.eks.amazonaws.com</code> with <code>sts:AssumeRole</code> and <code>sts:TagSession</code>.
+          </li>
+        </ol>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 250" width="100%" height="auto" role="img" aria-label="IRSA vs EKS Pod Identity Credential Flow">
+            <rect x="0" y="0" width="680" height="250" fill="#fdfcf8" rx="6" />
+
+            <!-- Left Column: IRSA -->
+            <text x="18" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#991b1b">Legacy IRSA (Cluster-Coupled OIDC)</text>
+            <rect x="18" y="42" width="305" height="190" rx="6" fill="#fff5f5" stroke="#fecaca" />
+
+            <rect x="34" y="58" width="273" height="36" rx="4" fill="#ffffff" stroke="#c2b9a7" />
+            <text x="170" y="80" text-anchor="middle" font-family="monospace" font-size="11" fill="#1b1d21">1. Webhook injects OIDC JWT + Role ARN</text>
+
+            <line x1="170" y1="94" x2="170" y2="114" stroke="#991b1b" stroke-width="1.5" />
+            <polygon points="166,110 174,110 170,117" fill="#991b1b" />
+
+            <rect x="34" y="118" width="273" height="42" rx="4" fill="#ffffff" stroke="#c2b9a7" />
+            <text x="170" y="136" text-anchor="middle" font-family="monospace" font-size="11" fill="#1b1d21">2. Pod calls sts:AssumeRoleWithWebIdentity</text>
+            <text x="170" y="152" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Trust policy hardcodes OIDC cluster ID</text>
+
+            <rect x="34" y="174" width="273" height="44" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="170" y="193" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#991b1b">Friction: Cluster rebuild = new OIDC ID</text>
+            <text x="170" y="209" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#991b1b">Must update IAM trust policies across roles</text>
+
+            <!-- Right Column: Pod Identity -->
+            <text x="356" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#166534">EKS Pod Identity (Decoupled Agent)</text>
+            <rect x="356" y="42" width="306" height="190" rx="6" fill="#f7fcf9" stroke="#a7f3d0" />
+
+            <rect x="372" y="58" width="274" height="36" rx="4" fill="#ffffff" stroke="#c2b9a7" />
+            <text x="509" y="80" text-anchor="middle" font-family="monospace" font-size="11" fill="#1b1d21">1. Pod reads http://169.254.170.23/v1/creds</text>
+
+            <line x1="509" y1="94" x2="509" y2="114" stroke="#166534" stroke-width="1.5" />
+            <polygon points="505,110 513,110 509,117" fill="#166534" />
+
+            <rect x="372" y="118" width="274" height="42" rx="4" fill="#ffffff" stroke="#c2b9a7" />
+            <text x="509" y="136" text-anchor="middle" font-family="monospace" font-size="11" fill="#1b1d21">2. EKS Pod Identity Agent fetches STS creds</text>
+            <text x="509" y="152" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Trusts pods.eks.amazonaws.com + TagSession</text>
+
+            <rect x="372" y="174" width="274" height="44" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="509" y="193" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#166534">Win: 1 IAM Role reusable across clusters</text>
+            <text x="509" y="209" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#166534">Auto-injects ABAC session tags + SourceAccount guard</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: EKS Pod Identity removes per-cluster OIDC providers from IAM trust policies and attaches session tags (cluster, namespace, service account) automatically.
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-title">Confused Deputy Guard for Pod Identity</div>
+          <p style="margin: 0;">
+            Because <code>pods.eks.amazonaws.com</code> is a shared AWS service principal rather than a cluster-specific OIDC URL, always include an <code>aws:SourceAccount</code> (and optionally <code>aws:SourceArn</code>) condition in your IAM role's trust policy so no external AWS account could ever reference your role via the EKS Pod Identity service.
+          </p>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. ALB Ingress: <code>target-type: ip</code> vs. <code>instance</code> &amp; Readiness Gates</h2>
+        <p>
+          Kubernetes <code>Ingress</code> objects do nothing on AWS until you install the <strong>AWS Load Balancer Controller</strong> inside <code>kube-system</code> (itself authenticated via Pod Identity or IRSA). When you create an <code>Ingress</code>, the controller provisions a real <a href="../reference/glossary.html#alb">Application Load Balancer</a> and reconciles Target Groups automatically.
+        </p>
+        <p>
+          Two annotations determine whether rolling deployments are zero-downtime or drop live traffic:
+        </p>
+        <ul>
+          <li>
+            <strong><code>alb.ingress.kubernetes.io/target-type: ip</code> (Recommended with VPC CNI):</strong> Registers each Pod's VPC IP directly into the ALB Target Group. Traffic flows <code>ALB &rarr; Pod ENI</code> directly, skipping an extra <code>NodePort</code> hop through <code>kube-proxy</code> iptables/IPVS, preserving true client source IP, and avoiding cross-AZ node bounces. (Required if you run Pods on EKS Fargate.)
+          </li>
+          <li>
+            <strong><code>alb.ingress.kubernetes.io/target-type: instance</code>:</strong> Routes <code>ALB &rarr; NodePort (30000–32767) &rarr; kube-proxy &rarr; Pod</code>. If the Pod sits on a different node than the NodePort target, traffic makes an extra cross-node/cross-AZ hop and gets SNATed.
+          </li>
+          <li>
+            <strong>Pod Readiness Gates:</strong> Without labeling your namespace with <code>elbv2.k8s.aws/pod-readiness-gate-inject: enabled</code>, Kubernetes considers a new Pod "Ready" the instant its local <code>readinessProbe</code> passes—<em>before</em> the ALB registers the Pod IP and completes its target-group health checks (often 10–30 seconds later). During a rolling update, Kubernetes may terminate old Pods while new Pods are still <code>initial</code> in the ALB Target Group, producing bursts of <code>HTTP 502/503</code>. Readiness gates block old Pod termination until the ALB itself reports the new Pod as <code>healthy</code>.
+          </li>
+        </ul>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production Config: Pod Identity Trust Policy &amp; ALB Ingress</h2>
+        <p>
+          Below is a production-safe EKS Pod Identity trust policy, CLI association, and zero-downtime ALB <code>Ingress</code> manifest:
+        </p>
+<pre><code>// 1. IAM Role Trust Policy for EKS Pod Identity (reusable across clusters in this account)
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "pods.eks.amazonaws.com" },
+      "Action": ["sts:AssumeRole", "sts:TagSession"],
+      "Condition": {
+        "StringEquals": { "aws:SourceAccount": "111122223333" }
+      }
+    }
+  ]
+}
+
+# 2. Associate Kubernetes ServiceAccount to the IAM Role (no OIDC provider needed)
+aws eks create-pod-identity-association \
+  --cluster-name prod-orders-eks \
+  --namespace orders \
+  --service-account orders-api-sa \
+  --role-arn arn:aws:iam::111122223333:role/OrdersApiPodRole
+
+# 3. Namespace label + Ingress with target-type: ip for Pod Readiness Gates
+# kubectl label namespace orders elbv2.k8s.aws/pod-readiness-gate-inject=enabled
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orders-api-ingress
+  namespace: orders
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+spec:
+  ingressClassName: alb
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: orders-api-svc
+                port:
+                  number: 8080</code></pre>
+
+        <!-- SECTION 5 -->
+        <h2>5. When NOT to Use EKS: ECS Fargate vs. EKS Decision Matrix</h2>
+        <p>
+          In Lesson 0026, you saw how ECS on Fargate abstracts hosts, assigns an ENI per Task, and attaches IAM roles natively via <code>taskRoleArn</code>. Before proposing EKS in an Architecture Decision Record (ADR), benchmark your team against this matrix:
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>ECS on Fargate</th>
+              <th>Amazon EKS</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Control Plane Cost</strong></td>
+              <td><strong>$0 / month</strong> (pay only per vCPU/GB-sec of running tasks)</td>
+              <td><strong>$73 / month</strong> per cluster ($438/mo in Extended Support) + add-on overhead</td>
+            </tr>
+            <tr>
+              <td><strong>IAM per Workload</strong></td>
+              <td>Native <code>taskRoleArn</code> on Task Definition; zero agents</td>
+              <td>Requires Pod Identity Agent DaemonSet (or cluster OIDC + IRSA webhook)</td>
+            </tr>
+            <tr>
+              <td><strong>Upgrade Treadmill</strong></td>
+              <td>AWS patches Fargate platform versions transparently</td>
+              <td>~3 Kubernetes minor versions/year; must test deprecated APIs, CNI &amp; CSI drivers</td>
+            </tr>
+            <tr>
+              <td><strong>Networking &amp; IPs</strong></td>
+              <td>1 ENI / 1 private IP per Fargate Task automatically</td>
+              <td>VPC CNI secondary IPs + warm pool tuning; prefix delegation needed for density</td>
+            </tr>
+            <tr>
+              <td><strong>When It Wins</strong></td>
+              <td>Teams &lt; 25 devs, &lt; 30 services, standard APIs/workers, zero platform SREs</td>
+              <td>Custom GPU/ML bin-packing (Karpenter), CNCF/Helm/CRD platforms, strict multi-cloud</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          <strong>Rule of thumb:</strong> If you do not have a dedicated platform team to own Kubernetes upgrades, CoreDNS, Metrics Server, Cluster Autoscaler/Karpenter, and Ingress controller lifecycles—and you do not strictly need Kubernetes CRDs or specialized EC2 GPU scheduling—<strong>choose ECS on Fargate</strong>.
+        </p>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement both functions in the lab below: <code>recommendPlatform(workload)</code> to decide between <code>"ECS_FARGATE"</code> and <code>"EKS"</code> with the exact engineering rationale, and <code>validatePodIdentity(config)</code> to audit Pod IAM configurations for least-privilege and confused-deputy safety.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Apply your EKS mental model to three production architecture scenarios. Every answer reveals why the winning option holds and why each distractor fails.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCE & NEXT STEPS -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html" target="_blank" rel="noopener">Amazon EKS User Guide — EKS Pod Identity</a> (Compare Pod Identity vs. IRSA and inspect the IAM trust policy with <code>sts:TagSession</code>).
+          </li>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/eks/latest/userguide/cni-increase-ip-addresses.html" target="_blank" rel="noopener">Amazon EKS User Guide — Prefix Mode &amp; VPC CNI IP Allocation</a> (Understand <code>WARM_IP_TARGET</code> and ENI limits per EC2 instance type).
+          </li>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/deploy/pod_readiness_gate/" target="_blank" rel="noopener">AWS Load Balancer Controller — Pod Readiness Gate</a> (How ALB target health integrates with Kubernetes rollout readiness).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0028 (AWS Lambda Internals: Firecracker MicroVMs, Cold Starts, Concurrency &amp; Power Tuning)</strong>, ask me anything that still feels fuzzy—for example: <em>"How does Karpenter consolidate underutilized EC2 nodes without dropping in-flight HTTP connections?"</em> or <em>"When does EKS Auto Mode make sense compared to ECS Fargate?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0026-ecr-ecs-fargate-blue-green.html">&larr; Lesson 0026: ECR &amp; ECS on Fargate: Task Definitions, IAM Roles, Service Connect &amp; Blue/Green</a>
+          <a href="./0028-lambda-firecracker-cold-starts-vpc.html">Lesson 0028: AWS Lambda Internals: Firecracker MicroVMs, Cold Starts, Concurrency &amp; Power Tuning &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>EKS Extended Support Cost</strong>
+          Each Kubernetes minor version stays in EKS Standard Support for ~14 months ($0.10/hr = $73/mo). Missing an upgrade automatically moves the cluster to Extended Support at $0.60/hr ($438/mo)—a 6x control-plane price jump.
+        </div>
+        <div class="sidenote">
+          <strong>Pod Identity ABAC Tags</strong>
+          Because Pod Identity requires <code>sts:TagSession</code>, AWS automatically tags temporary credentials with <code>eks-cluster-name</code>, <code>kubernetes-namespace</code>, and <code>kubernetes-service-account</code>, enabling fine-grained ABAC IAM conditions.
+        </div>
+        <div class="sidenote">
+          <strong>Graceful Termination Order</strong>
+          With <code>target-type: ip</code>, deregistering a Pod IP from the ALB Target Group happens asynchronously. Always pair readiness gates with a short <code>preStop</code> sleep (e.g., 5–15s) so kubelet waits while ALB stops routing new requests.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0027",
+      title: "Lab 0027: ECS vs. EKS Decision Engine & Pod Identity Auditor",
+      filename: "eks-decision-auditor.js",
+      description:
+        "Implement two functions:<br>1) <code>recommendPlatform(workload)</code> where <code>workload</code> has <code>{ serviceCount, hasPlatformTeam, requiresKubernetesOperators, needsGpuKarpenter, multiCloudMandatory }</code>. Always return <code>eksMonthlyControlPlaneUsd: 73</code> and <code>ecsMonthlyControlPlaneUsd: 0</code>. Return <code>recommendedPlatform: \"EKS\"</code> when any of these hold (checked in this exact priority for <code>reasonCode</code>): <code>requiresKubernetesOperators</code> (&rarr; <code>\"K8S_ECOSYSTEM_REQUIRED\"</code>), <code>needsGpuKarpenter</code> (&rarr; <code>\"CUSTOM_NODE_BINPACKING\"</code>), <code>multiCloudMandatory</code> (&rarr; <code>\"MULTI_CLOUD_PORTABILITY\"</code>), or <code>serviceCount &gt;= 30 &amp;&amp; hasPlatformTeam</code> (&rarr; <code>\"SCALE_AMORTIZES_CONTROL_PLANE\"</code>). Otherwise return <code>recommendedPlatform: \"ECS_FARGATE\"</code> with <code>reasonCode: \"NO_PLATFORM_TEAM_FOR_EKS\"</code> if <code>serviceCount &gt;= 30 &amp;&amp; !hasPlatformTeam</code>, else <code>\"ECS_FARGATE_LOWER_OPS_TAX\"</code>.<br>2) <code>validatePodIdentity(config)</code> where <code>config</code> has <code>{ mode, trustPrincipals, trustActions, hasSourceAccountGuard, agentInstalled, namespace, serviceAccount }</code>. Push issues in order: if <code>mode === \"NODE_INSTANCE_PROFILE\"</code> push <code>\"SHARED_NODE_ROLE_VIOLATES_LEAST_PRIVILEGE\"</code>. If <code>mode === \"POD_IDENTITY\"</code>: check <code>!agentInstalled</code> (<code>\"MISSING_POD_IDENTITY_AGENT_DAEMONSET\"</code>), missing <code>\"pods.eks.amazonaws.com\"</code> in <code>trustPrincipals</code> (<code>\"INVALID_POD_IDENTITY_PRINCIPAL\"</code>), missing either <code>\"sts:AssumeRole\"</code> or <code>\"sts:TagSession\"</code> in <code>trustActions</code> (<code>\"MISSING_ASSUME_OR_TAG_SESSION_ACTION\"</code>), and <code>!hasSourceAccountGuard</code> (<code>\"MISSING_CONFUSED_DEPUTY_SOURCE_ACCOUNT\"</code>). If <code>mode === \"IRSA\"</code>: check missing <code>\"sts:AssumeRoleWithWebIdentity\"</code> in <code>trustActions</code> (<code>\"MISSING_WEB_IDENTITY_ACTION\"</code>) and <code>!namespace || !serviceAccount</code> (<code>\"UNSCOPED_SERVICE_ACCOUNT\"</code>). Return <code>{ valid: issues.length === 0, mode: config.mode, issues }</code>.",
+      exports: ["recommendPlatform", "validatePodIdentity"],
+      starterCode: `function recommendPlatform(workload) {
+  const eksMonthlyControlPlaneUsd = 73;
+  const ecsMonthlyControlPlaneUsd = 0;
+
+  let recommendedPlatform = "ECS_FARGATE";
+  let reasonCode = "ECS_FARGATE_LOWER_OPS_TAX";
+
+  // TODO 1: Evaluate EKS triggers in priority order:
+  // requiresKubernetesOperators -> K8S_ECOSYSTEM_REQUIRED
+  // needsGpuKarpenter -> CUSTOM_NODE_BINPACKING
+  // multiCloudMandatory -> MULTI_CLOUD_PORTABILITY
+  // serviceCount >= 30 && hasPlatformTeam -> SCALE_AMORTIZES_CONTROL_PLANE
+  // Otherwise ECS_FARGATE (NO_PLATFORM_TEAM_FOR_EKS if serviceCount >= 30 && !hasPlatformTeam)
+
+  return {
+    recommendedPlatform,
+    reasonCode,
+    eksMonthlyControlPlaneUsd,
+    ecsMonthlyControlPlaneUsd
+  };
+}
+
+function validatePodIdentity(config) {
+  const issues = [];
+
+  // TODO 2: Validate NODE_INSTANCE_PROFILE, POD_IDENTITY, and IRSA rules
+
+  return {
+    valid: issues.length === 0,
+    mode: config.mode,
+    issues
+  };
+}
+
+console.log(
+  "Small team check:",
+  recommendPlatform({
+    serviceCount: 6,
+    hasPlatformTeam: false,
+    requiresKubernetesOperators: false,
+    needsGpuKarpenter: false,
+    multiCloudMandatory: false
+  })
+);`,
+      hints: [
+        "In <code>recommendPlatform</code>, use an <code>if / else if</code> chain matching the priority order in the prompt: <code>requiresKubernetesOperators</code>, then <code>needsGpuKarpenter</code>, then <code>multiCloudMandatory</code>, then <code>serviceCount >= 30 && hasPlatformTeam</code>, then <code>serviceCount >= 30 && !hasPlatformTeam</code>.",
+        "In <code>validatePodIdentity</code>, guard array checks cleanly (e.g., <code>const principals = config.trustPrincipals || [];</code> and <code>const actions = config.trustActions || [];</code>) and check <code>!actions.includes(\"sts:AssumeRole\") || !actions.includes(\"sts:TagSession\")</code> for <code>POD_IDENTITY</code>."
+      ],
+      solutionExplanation:
+        "Teams without a dedicated platform group or hard Kubernetes ecosystem/GPU-Karpenter/multi-cloud requirements avoid $73/mo cluster taxes and CNI/upgrade toil by choosing ECS Fargate. For EKS workloads, EKS Pod Identity replaces per-cluster OIDC trust policies with pods.eks.amazonaws.com, requires sts:TagSession for ABAC session tags, relies on the eks-pod-identity-agent DaemonSet, and must include aws:SourceAccount to prevent confused-deputy role assumption.",
+      solutionCode: `function recommendPlatform(workload) {
+  const eksMonthlyControlPlaneUsd = 73;
+  const ecsMonthlyControlPlaneUsd = 0;
+
+  let recommendedPlatform = "ECS_FARGATE";
+  let reasonCode = "ECS_FARGATE_LOWER_OPS_TAX";
+
+  if (workload.requiresKubernetesOperators) {
+    recommendedPlatform = "EKS";
+    reasonCode = "K8S_ECOSYSTEM_REQUIRED";
+  } else if (workload.needsGpuKarpenter) {
+    recommendedPlatform = "EKS";
+    reasonCode = "CUSTOM_NODE_BINPACKING";
+  } else if (workload.multiCloudMandatory) {
+    recommendedPlatform = "EKS";
+    reasonCode = "MULTI_CLOUD_PORTABILITY";
+  } else if (workload.serviceCount >= 30 && workload.hasPlatformTeam) {
+    recommendedPlatform = "EKS";
+    reasonCode = "SCALE_AMORTIZES_CONTROL_PLANE";
+  } else if (workload.serviceCount >= 30 && !workload.hasPlatformTeam) {
+    recommendedPlatform = "ECS_FARGATE";
+    reasonCode = "NO_PLATFORM_TEAM_FOR_EKS";
+  }
+
+  return {
+    recommendedPlatform,
+    reasonCode,
+    eksMonthlyControlPlaneUsd,
+    ecsMonthlyControlPlaneUsd
+  };
+}
+
+function validatePodIdentity(config) {
+  const issues = [];
+  const principals = config.trustPrincipals || [];
+  const actions = config.trustActions || [];
+
+  if (config.mode === "NODE_INSTANCE_PROFILE") {
+    issues.push("SHARED_NODE_ROLE_VIOLATES_LEAST_PRIVILEGE");
+  } else if (config.mode === "POD_IDENTITY") {
+    if (!config.agentInstalled) {
+      issues.push("MISSING_POD_IDENTITY_AGENT_DAEMONSET");
+    }
+    if (!principals.includes("pods.eks.amazonaws.com")) {
+      issues.push("INVALID_POD_IDENTITY_PRINCIPAL");
+    }
+    if (!actions.includes("sts:AssumeRole") || !actions.includes("sts:TagSession")) {
+      issues.push("MISSING_ASSUME_OR_TAG_SESSION_ACTION");
+    }
+    if (!config.hasSourceAccountGuard) {
+      issues.push("MISSING_CONFUSED_DEPUTY_SOURCE_ACCOUNT");
+    }
+  } else if (config.mode === "IRSA") {
+    if (!actions.includes("sts:AssumeRoleWithWebIdentity")) {
+      issues.push("MISSING_WEB_IDENTITY_ACTION");
+    }
+    if (!config.namespace || !config.serviceAccount) {
+      issues.push("UNSCOPED_SERVICE_ACCOUNT");
+    }
+  }
+
+  return {
+    valid: issues.length === 0,
+    mode: config.mode,
+    issues
+  };
+}`,
+      tests: [
+        {
+          name: "Selects ECS_FARGATE with $0 control plane for 6 services and no platform team",
+          run: (scope) => {
+            const out = scope.recommendPlatform({
+              serviceCount: 6,
+              hasPlatformTeam: false,
+              requiresKubernetesOperators: false,
+              needsGpuKarpenter: false,
+              multiCloudMandatory: false
+            });
+            const pass =
+              out.recommendedPlatform === "ECS_FARGATE" &&
+              out.reasonCode === "ECS_FARGATE_LOWER_OPS_TAX" &&
+              out.eksMonthlyControlPlaneUsd === 73 &&
+              out.ecsMonthlyControlPlaneUsd === 0;
+            return { pass, message: `got ${out.recommendedPlatform} (${out.reasonCode})` };
+          }
+        },
+        {
+          name: "Flags NO_PLATFORM_TEAM_FOR_EKS when serviceCount >= 30 without platform team",
+          run: (scope) => {
+            const out = scope.recommendPlatform({
+              serviceCount: 35,
+              hasPlatformTeam: false,
+              requiresKubernetesOperators: false,
+              needsGpuKarpenter: false,
+              multiCloudMandatory: false
+            });
+            const pass =
+              out.recommendedPlatform === "ECS_FARGATE" &&
+              out.reasonCode === "NO_PLATFORM_TEAM_FOR_EKS";
+            return { pass, message: `got ${out.recommendedPlatform} (${out.reasonCode})` };
+          }
+        },
+        {
+          name: "Selects EKS (CUSTOM_NODE_BINPACKING) when GPU Karpenter scheduling is required",
+          run: (scope) => {
+            const out = scope.recommendPlatform({
+              serviceCount: 8,
+              hasPlatformTeam: false,
+              requiresKubernetesOperators: false,
+              needsGpuKarpenter: true,
+              multiCloudMandatory: false
+            });
+            const pass =
+              out.recommendedPlatform === "EKS" &&
+              out.reasonCode === "CUSTOM_NODE_BINPACKING";
+            return { pass, message: `got ${out.recommendedPlatform} (${out.reasonCode})` };
+          }
+        },
+        {
+          name: "Rejects NODE_INSTANCE_PROFILE for violating Pod least privilege",
+          run: (scope) => {
+            const out = scope.validatePodIdentity({
+              mode: "NODE_INSTANCE_PROFILE",
+              trustPrincipals: ["ec2.amazonaws.com"],
+              trustActions: ["sts:AssumeRole"],
+              hasSourceAccountGuard: true,
+              agentInstalled: false,
+              namespace: "orders",
+              serviceAccount: "orders-sa"
+            });
+            const pass =
+              out.valid === false &&
+              out.issues.includes("SHARED_NODE_ROLE_VIOLATES_LEAST_PRIVILEGE");
+            return { pass, message: `valid=${out.valid}, issues=${JSON.stringify(out.issues)}` };
+          }
+        },
+        {
+          name: "Catches missing sts:TagSession, missing agent, and missing SourceAccount guard in POD_IDENTITY",
+          run: (scope) => {
+            const bad = scope.validatePodIdentity({
+              mode: "POD_IDENTITY",
+              trustPrincipals: ["pods.eks.amazonaws.com"],
+              trustActions: ["sts:AssumeRole"],
+              hasSourceAccountGuard: false,
+              agentInstalled: false,
+              namespace: "orders",
+              serviceAccount: "orders-sa"
+            });
+            const good = scope.validatePodIdentity({
+              mode: "POD_IDENTITY",
+              trustPrincipals: ["pods.eks.amazonaws.com"],
+              trustActions: ["sts:AssumeRole", "sts:TagSession"],
+              hasSourceAccountGuard: true,
+              agentInstalled: true,
+              namespace: "orders",
+              serviceAccount: "orders-sa"
+            });
+            const pass =
+              bad.valid === false &&
+              bad.issues.length === 3 &&
+              bad.issues.includes("MISSING_POD_IDENTITY_AGENT_DAEMONSET") &&
+              bad.issues.includes("MISSING_ASSUME_OR_TAG_SESSION_ACTION") &&
+              bad.issues.includes("MISSING_CONFUSED_DEPUTY_SOURCE_ACCOUNT") &&
+              good.valid === true &&
+              good.issues.length === 0;
+            return { pass, message: `bad.issues=${JSON.stringify(bad.issues)}, good.valid=${good.valid}` };
+          }
+        },
+        {
+          name: "Validates IRSA requires sts:AssumeRoleWithWebIdentity and scoped ServiceAccount",
+          run: (scope) => {
+            const bad = scope.validatePodIdentity({
+              mode: "IRSA",
+              trustPrincipals: ["arn:aws:iam::111122223333:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/ABC"],
+              trustActions: ["sts:AssumeRole"],
+              hasSourceAccountGuard: false,
+              agentInstalled: false,
+              namespace: "",
+              serviceAccount: "orders-sa"
+            });
+            const good = scope.validatePodIdentity({
+              mode: "IRSA",
+              trustPrincipals: ["arn:aws:iam::111122223333:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/ABC"],
+              trustActions: ["sts:AssumeRoleWithWebIdentity"],
+              hasSourceAccountGuard: false,
+              agentInstalled: false,
+              namespace: "orders",
+              serviceAccount: "orders-sa"
+            });
+            const pass =
+              bad.valid === false &&
+              bad.issues.includes("MISSING_WEB_IDENTITY_ACTION") &&
+              bad.issues.includes("UNSCOPED_SERVICE_ACCOUNT") &&
+              good.valid === true;
+            return { pass, message: `bad.issues=${JSON.stringify(bad.issues)}, good.valid=${good.valid}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0027",
+      title: "Quiz 0027: EKS Architecture, Pod Identity & Platform Selection",
+      questions: [
+        {
+          id: "q1",
+          prompt: "A 12-person Android and backend team runs 6 microservices in Docker containers. Someone proposes migrating to EKS for hypothetical future portability even though no multi-cloud mandate exists. What is the strongest technical reason to stay on ECS on Fargate?",
+          options: [
+            "EKS adds control plane fees, CNI IP tuning, and cluster upgrade overhead",
+            "ECS Fargate avoids IAM task roles by reusing underlying host instance profiles",
+            "EKS cannot attach Application Load Balancers directly to private subnet pod IPs",
+            "ECS Fargate natively runs Helm charts without charging any control plane fees"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "EKS imposes a $73/mo control-plane fee ($438/mo in Extended Support), VPC CNI ENI/IP pool planning, and continuous Kubernetes minor-version upgrades—operational tax a 6-service team does not need.",
+            "ECS on Fargate gives every task its own isolated taskRoleArn natively; it never shares underlying EC2 host instance profiles with your application containers.",
+            "EKS works seamlessly with private subnet Pod IPs via the AWS Load Balancer Controller using alb.ingress.kubernetes.io/target-type: ip.",
+            "ECS does not run Kubernetes Helm charts; Helm is specific to Kubernetes manifests and operators."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "Your platform team migrates 15 EKS clusters from IRSA to EKS Pod Identity so one shared Payments IAM role works across clusters without editing its IAM trust policy on every cluster rebuild. Why does Pod Identity enable this?",
+          options: [
+            "Trust policies name pods.eks.amazonaws.com instead of embedding a cluster-specific OIDC provider URL",
+            "DaemonSet agents query EC2 instance metadata endpoints and forward worker node credentials",
+            "Kubernetes secrets automatically replicate long-lived IAM access keys across every cluster namespace",
+            "AWS STS skips trust policy checks whenever the eks-pod-identity-agent signs requests locally"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Pod Identity decouples IAM trust policies from per-cluster OIDC issuer URLs by trusting the universal pods.eks.amazonaws.com service principal (with sts:AssumeRole, sts:TagSession, and aws:SourceAccount).",
+            "Querying EC2 IMDSv2 for the worker node's instance profile is the legacy anti-pattern that violates Pod least privilege; Pod Identity uses 169.254.170.23 and per-ServiceAccount associations.",
+            "Pod Identity issues short-lived STS session tokens on demand; it never stores or replicates static IAM access keys inside Kubernetes Secrets.",
+            "AWS STS always evaluates the IAM role's trust policy (including sts:AssumeRole, sts:TagSession, and SourceAccount conditions) before issuing temporary credentials."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "During an EKS rolling deployment behind an AWS Load Balancer Controller Ingress with target-type set to ip, users hit intermittent HTTP 502 errors for 15 seconds while old Pods terminate and new Pods start. Which mechanism prevents this gap?",
+          options: [
+            "ALB target-group pod readiness gates block rollout until ALB health checks pass",
+            "Switching target-type from ip to instance eliminates kube-proxy SNAT and draining delays",
+            "Lowering VPC CNI WARM_IP_TARGET prevents ALBs from caching stale pod IP addresses",
+            "Disabling pod preStop hooks forces SIGTERM to close active HTTP sockets immediately"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Pod readiness gates (elbv2.k8s.aws/pod-readiness-gate-inject: enabled) make Kubernetes wait until the ALB Target Group marks the new Pod IP healthy before terminating old Pods.",
+            "Switching to target-type: instance actually introduces kube-proxy NodePort routing, SNAT, and extra hops rather than removing them.",
+            "WARM_IP_TARGET controls how many spare VPC secondary IPs the VPC CNI pre-allocates on worker nodes; it does not synchronize ALB target-group health checks during rollouts.",
+            "Killing active HTTP sockets immediately on SIGTERM without draining worsens 502 errors; graceful termination pairs readiness gates with preStop draining."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

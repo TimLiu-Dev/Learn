@@ -115,44 +115,110 @@
   </div>
 
   <!-- Lesson Concepts -->
-  <article>
-    
-          <p>For over a decade, Android developers used <code>SharedPreferences</code> for key-value storage. <strong>In 2026/2027, SharedPreferences is considered legacy and dangerous!</strong> SharedPreferences parses XML synchronously on the main thread, causing Application Not Responding (ANR) frame freezes.</p>
+    <article>
+<h2>Jetpack DataStore (Proto / Typed Kotlinx Serialization vs Preferences) &amp; Why `SharedPreferences` is Extinct</h2>
+    <p>In 2027 Android engineering, legacy <code>SharedPreferences</code> is strictly banned in production codebases. Why? Even though developers thought `SharedPreferences.Editor.apply()` was "safe and asynchronous" compared to `.commit()`, `apply()` queues an in-memory runnable in Android's `QueuedWork`. Whenever any `Activity.onStop()`, `Service.onDestroy()`, or broadcast finishes on the <strong>Main UI Thread</strong>, `ActivityThread` calls `QueuedWork.waitToFinish()`, <strong>blocking the Main Thread until the pending `SharedPreferences` `fsync` disk write completes</strong>—causing systemic `Application Not Responding` (ANR) crashes in Play Console vitals! Furthermore, `SharedPreferences` parses the entire XML file synchronously on first read, provides zero type safety, and cannot signal I/O errors.</p>
+    <p><strong>Jetpack DataStore</strong> eliminates every one of these flaws by running all file reads and atomic write-rename operations asynchronously on `Dispatchers.IO`, exposing state as a cold <code>Flow&lt;T&gt;</code>, and updating values inside a transactional, coroutine-safe <code>dataStore.updateData { current -&gt; ... }</code> block. DataStore comes in two flavors:</p>
+    <ol>
+      <li><strong>Preferences DataStore (`DataStore&lt;Preferences&gt;`):</strong> Stores untyped key-value pairs (`booleanPreferencesKey("biometric_lock")`) similar to a map, without defining a schema upfront.</li>
+      <li><strong>Typed DataStore (`DataStore&lt;UserSettings&gt;` via Proto or Kotlinx Serialization `Serializer&lt;T&gt;`):</strong> The <strong>2027 Senior Production Standard</strong>! Instead of nullable dictionary lookups, you persist a strongly-typed, immutable `@Serializable data class UserSettings` (or Protocol Buffer message) validated by a custom `Serializer&lt;UserSettings&gt;` paired with a <strong><code>ReplaceFileCorruptionHandler</code></strong> that recovers gracefully if disk blocks corrupt.</li>
+    </ol>
 
-          <div class="junior-note">
-            <div class="junior-note-title">🌱 Junior Android Dev Mental Model: Preferences vs Proto DataStore</div>
-            <ul>
-              <li><strong>Preferences DataStore:</strong> Key-value storage (like SharedPreferences), but 100% asynchronous, transactional, and runs on Kotlin Flow and Coroutines.</li>
-              <li><strong>Proto DataStore (Recommended for Complex Settings):</strong> Stores structured typed schema objects backed by Protocol Buffers with compile-time type safety.</li>
-            </ul>
-          </div>
-        
+    <div class="junior-note">
+      <div class="junior-note-title">🌱 Junior Android Dev Mental Model: The Singleton File Rule for DataStore</div>
+      <p>Never instantiate two <code>DataStore</code> objects pointing to the same physical file (`"user_settings.pb"`) in the same process! Doing so throws an immediate <code>IllegalStateException: There are multiple DataStores active for the same file</code>. Always provide your `DataStore` instance as an <code>@Singleton</code> in Hilt's <code>SingletonComponent</code>!</p>
+    </div>
+
+    <h3>Senior Interview Trap: Reading DataStore Synchronously with `runBlocking` at Startup</h3>
+    <p>A common anti-pattern when migrating away from `SharedPreferences` is wrapping `runBlocking { dataStore.data.first() }` on the Main thread inside `Activity.onCreate()`. That re-introduces the exact disk-I/O main-thread stall DataStore was built to prevent! Instead, hold the Android 12+ `SplashScreen` open via `splashScreen.setKeepOnScreenCondition { viewModel.uiState.value is Loading }` while `viewModelScope` asynchronously collects the initial theme/auth state from `DataStore` on `Dispatchers.IO`.</p>
+
+    <div class="comparison-grid">
+      <div class="comparison-card bad">
+        <h4>❌ Legacy Anti-Pattern: SharedPreferences ANR &amp; runBlocking DataStore Read</h4>
+        <pre><code>// BUG 1: SharedPreferences.apply() blocks Activity.onStop() on QueuedWork fsync -> ANR!
+context.getSharedPreferences("prefs", MODE_PRIVATE)
+    .edit()
+    .putString("currency", "EUR")
+    .apply()
+
+// BUG 2: Calling runBlocking on Main Thread stalls frame rendering on disk I/O!
+val currency = runBlocking { dataStore.data.first()[CURRENCY_KEY] }</code></pre>
+      </div>
+      <div class="comparison-card good">
+        <h4>✅ 2027 Senior Production Standard: Typed DataStore&lt;UserSettings&gt; + CorruptionHandler</h4>
+        <pre><code>@Serializable
+data class UserSettings(
+    val displayCurrency: String = "USD",
+    val biometricEnabled: Boolean = false,
+    val chartCandlesCount: Int = 120
+)
+
+@Provides @Singleton
+fun provideUserSettingsDataStore(
+    @ApplicationContext context: Context,
+    @IoDispatcher ioDispatcher: CoroutineDispatcher
+): DataStore&lt;UserSettings&gt; = DataStoreFactory.create(
+    serializer = UserSettingsSerializer,
+    scope = CoroutineScope(ioDispatcher + SupervisorJob()),
+    corruptionHandler = ReplaceFileCorruptionHandler { UserSettings() },
+    produceFile = { context.dataStoreFile("user_settings.json") }
+)
+
+// Transactional atomic read-modify-write:
+suspend fun setCurrency(currency: String) {
+    dataStore.updateData { current -&gt; current.copy(displayCurrency = currency) }
+}</code></pre>
+      </div>
+    </div>
 
     <!-- Runnable Code Example -->
     <h2>2027 Production Standard (Runnable Example)</h2>
     <p>Click <strong>▶ Run Example</strong> to execute this snippet and inspect the simulated runtime output and state transformations:</p>
 
-    <div class="runnable-example-box" data-output="[DATASTORE] Initializing Jetpack Preferences DataStore...
-[IO] Reading user preferences stream via Kotlin Flow...
-[STATE] Preference emitted: isBiometricEnabled = true, darkTheme = SYSTEM
-[MUTATION] Updating preference: dataStore.edit { it[BIOMETRICS] = false }
-[TRANSACTION] Transactional write completed on Dispatchers.IO with atomic file flush!
-[SUCCESS] Zero UI thread blocking. ANR risk completely eliminated!">
+    <div class="runnable-example-box" data-output="1. Initial Flow Emission: UserSettings(displayCurrency=USD, biometricEnabled=false, slippageBps=50)
+[DATASTORE-IO] Atomic write-and-rename committed -&gt; UserSettings(displayCurrency=EUR, biometricEnabled=true, slippageBps=50)
+[DATASTORE-ERROR] CorruptionException detected on disk read! Invoking ReplaceFileCorruptionHandler...
+[DATASTORE-RECOVERED] Restored default settings -&gt; UserSettings(displayCurrency=USD, biometricEnabled=false, slippageBps=50)">
       <div class="runnable-header">
         <div class="runnable-tab">
           <span class="runnable-badge">KOTLIN 2.X</span>
-          <span>DataStoreSetup.kt</span>
+          <span>TypedDataStoreTransactionSim.kt</span>
         </div>
         <button class="btn-run-example">▶ Run Example</button>
       </div>
-      <pre class="runnable-code"><code>fun main() {
-    println(&quot;[DATASTORE] Initializing Jetpack Preferences DataStore...&quot;)
-    println(&quot;[IO] Reading user preferences stream via Kotlin Flow...&quot;)
-    println(&quot;[STATE] Preference emitted: isBiometricEnabled = true, darkTheme = SYSTEM&quot;)
+      <pre class="runnable-code"><code>data class UserSettings(
+    val displayCurrency: String = &quot;USD&quot;,
+    val biometricEnabled: Boolean = false,
+    val slippageBps: Int = 50
+)
 
-    println(&quot;[MUTATION] Updating preference: dataStore.edit { it[BIOMETRICS] = false }&quot;)
-    println(&quot;[TRANSACTION] Transactional write completed on Dispatchers.IO with atomic file flush!&quot;)
-    println(&quot;[SUCCESS] Zero UI thread blocking. ANR risk completely eliminated!&quot;)
+class SimulatedTypedDataStore(
+    initial: UserSettings = UserSettings(),
+    private val onCorruptFallback: () -&gt; UserSettings = { UserSettings() }
+) {
+    var currentData: UserSettings = initial
+        private set
+
+    fun updateData(transform: (UserSettings) -&gt; UserSettings): UserSettings {
+        val updated = transform(currentData)
+        currentData = updated
+        println(&quot;[DATASTORE-IO] Atomic write-and-rename committed -&gt; $currentData&quot;)
+        return currentData
+    }
+
+    fun simulateCorruptedDiskRead(): UserSettings {
+        println(&quot;[DATASTORE-ERROR] CorruptionException detected on disk read! Invoking ReplaceFileCorruptionHandler...&quot;)
+        currentData = onCorruptFallback()
+        println(&quot;[DATASTORE-RECOVERED] Restored default settings -&gt; $currentData&quot;)
+        return currentData
+    }
+}
+
+fun main() {
+    val store = SimulatedTypedDataStore()
+    println(&quot;1. Initial Flow Emission: ${store.currentData}&quot;)
+    store.updateData { it.copy(displayCurrency = &quot;EUR&quot;, biometricEnabled = true) }
+    store.simulateCorruptedDiskRead()
 }</code></pre>
       <div class="runnable-terminal">
         <span class="terminal-badge">Terminal Console Output</span>
@@ -162,26 +228,42 @@
 
     <!-- Interactive In-Browser Code Practice & Runner -->
     <h2>Interactive Code Practice</h2>
-    <p>Declare a boolean preferences key: &#x27;val BIOMETRICS_ENABLED = booleanPreferencesKey(&quot;biometrics_enabled&quot;)&#x27;.</p>
-    
-    <div class="interactive-ide" data-tests="[{&quot;name&quot;: &quot;Declares BIOMETRICS_ENABLED booleanPreferencesKey&quot;, &quot;pattern&quot;: &quot;val\\s+BIOMETRICS_ENABLED\\s*=\\s*booleanPreferencesKey\\s*\\(\\s*[\&quot;&#x27;]biometrics_enabled[\&quot;&#x27;]\\s*\\)&quot;, &quot;message&quot;: &quot;Declare &#x27;val BIOMETRICS_ENABLED = booleanPreferencesKey(\&quot;biometrics_enabled\&quot;)&#x27;.&quot;}]" data-hints="[&quot;Use booleanPreferencesKey(\&quot;biometrics_enabled\&quot;).&quot;, &quot;Assign to &#x27;val BIOMETRICS_ENABLED&#x27;.&quot;]">
+    <p>Implement <code>UserPreferencesRepository</code> backed by a typed <code>DataStore&lt;AppSettings&gt;</code>: expose <code>val settingsFlow: Flow&lt;AppSettings&gt; = dataStore.data.catch { ... }</code> that recovers from <code>IOException</code> by calling <code>emit(AppSettings())</code>, and implement <code>enableBiometrics(enabled: Boolean)</code> using <code>dataStore.updateData { it.copy(biometrics = enabled) }</code>.</p>
+
+    <div class="interactive-ide" data-tests="[{&quot;name&quot;: &quot;Catches IOException on dataStore.data and emits default AppSettings()&quot;, &quot;pattern&quot;: &quot;dataStore\\.data\\.catch\\s*\\{[\\s\\S]*?IOException[\\s\\S]*?emit\\s*\\(\\s*AppSettings\\s*\\(\\s*\\)\\s*\\)&quot;, &quot;message&quot;: &quot;Chain .catch { if (it is IOException) emit(AppSettings()) else throw it } onto dataStore.data.&quot;}, {&quot;name&quot;: &quot;Updates settings atomically with dataStore.updateData&quot;, &quot;pattern&quot;: &quot;dataStore\\.updateData\\s*\\{[\\s\\S]*?\\.copy\\s*\\(\\s*biometrics\\s*=\\s*enabled\\s*\\)&quot;, &quot;message&quot;: &quot;Call dataStore.updateData { it.copy(biometrics = enabled) } inside enableBiometrics.&quot;}]" data-hints="[&quot;Chain .catch { e -&gt; if (e is IOException) emit(AppSettings()) else throw e } onto dataStore.data.&quot;, &quot;Inside enableBiometrics, call dataStore.updateData { current -&gt; ... }.&quot;, &quot;Return current.copy(biometrics = enabled) inside the updateData block.&quot;]">
       <div class="ide-header">
-        <div class="ide-tab">UserSettingsDataStore.kt</div>
+        <div class="ide-tab">UserPreferencesRepository.kt</div>
         <div class="ide-actions">
           <button class="btn-secondary-dark btn-reset">Reset Code</button>
         </div>
       </div>
-      
-      <div class="code-editor-area">
-        <textarea class="code-textarea" spellcheck="false">import androidx.datastore.preferences.core.booleanPreferencesKey
 
-// TODO: Declare val BIOMETRICS_ENABLED = booleanPreferencesKey("biometrics_enabled")</textarea>
+      <div class="code-editor-area">
+        <textarea class="code-textarea" spellcheck="false">import androidx.datastore.core.DataStore
+import java.io.IOException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+
+data class AppSettings(val biometrics: Boolean = false, val currency: String = &quot;USD&quot;)
+
+class UserPreferencesRepository(
+    private val dataStore: DataStore&lt;AppSettings&gt;
+) {
+    // TODO 1: Expose val settingsFlow: Flow&lt;AppSettings&gt; = dataStore.data.catch { e -&gt;
+    //             if (e is IOException) emit(AppSettings()) else throw e
+    //         }
+    val settingsFlow: Flow&lt;AppSettings&gt; = dataStore.data
+
+    suspend fun enableBiometrics(enabled: Boolean) {
+        // TODO 2: Call dataStore.updateData { it.copy(biometrics = enabled) }
+    }
+}</textarea>
       </div>
 
       <div class="ide-controls">
         <div class="ide-controls-left">
           <button class="btn-run">▶ Run &amp; Check Code</button>
-          <button class="btn-hint">💡 Hint (0/2)</button>
+          <button class="btn-hint">💡 Hint (0/3)</button>
         </div>
         <button class="btn-solution">👁️ Reveal Answer</button>
       </div>
@@ -204,30 +286,56 @@
           <span>🎯 Reference Production Solution</span>
           <button class="btn-load-solution">Load Solution into Editor</button>
         </div>
-        <pre class="solution-code"><code>import androidx.datastore.preferences.core.booleanPreferencesKey
+        <pre class="solution-code"><code>import androidx.datastore.core.DataStore
+import java.io.IOException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 
-val BIOMETRICS_ENABLED = booleanPreferencesKey(&quot;biometrics_enabled&quot;)</code></pre>
+data class AppSettings(val biometrics: Boolean = false, val currency: String = &quot;USD&quot;)
+
+class UserPreferencesRepository(
+    private val dataStore: DataStore&lt;AppSettings&gt;
+) {
+    val settingsFlow: Flow&lt;AppSettings&gt; = dataStore.data.catch { exception -&gt;
+        if (exception is IOException) {
+            emit(AppSettings())
+        } else {
+            throw exception
+        }
+    }
+
+    suspend fun enableBiometrics(enabled: Boolean) {
+        dataStore.updateData { current -&gt;
+            current.copy(biometrics = enabled)
+        }
+    }
+}</code></pre>
         <p style="font-size:0.88rem; color:var(--text-muted); margin-top:0.5rem;">
-          <strong>Why this works:</strong> Preferences keys are strongly typed tokens that prevent type-cast errors when reading or writing values in DataStore.
+          <strong>Why this works:</strong> Chaining .catch on dataStore.data handles disk read IOExceptions gracefully by emitting default settings instead of crashing the collector, while dataStore.updateData performs an atomic, serialized read-modify-write transaction on Dispatchers.IO.
         </p>
       </div>
     </div>
 
     <!-- Enhanced Dual Quiz Section -->
     <h2>Concept Retrieval &amp; Code Quizzes</h2>
-    
-    <!-- Quiz 1: Code-Reading / Bug-Hunting Quiz -->
-    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;What is the primary danger of using legacy SharedPreferences apply() or commit() on the Android main thread?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;It can block the main UI thread during disk I/O, causing dropped frames and Application Not Responding (ANR) crashes&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! SharedPreferences reads and writes synchronously on the UI thread, causing UI freezes when parsing large XML files.&quot;}, {&quot;text&quot;: &quot;It invalidates the user&#x27;s Google Play Store purchase receipts&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Billing is handled via Google Play Billing Library, not SharedPreferences.&quot;}, {&quot;text&quot;: &quot;It causes the Android device battery to explode&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Software libraries do not cause battery explosions.&quot;}, {&quot;text&quot;: &quot;It deletes all photos stored in the camera gallery&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: SharedPreferences only operates within the app&#x27;s private sandbox.&quot;}]}">
+
+    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;Why does this repository crash at runtime with `IllegalStateException: There are multiple DataStores active for the same file` when two different screens call `ThemeRepository(context)`?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;`preferencesDataStoreFile` can only be called inside an `Activity`, not with `@ApplicationContext`.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: `@ApplicationContext` is the exact context that should be used for a singleton `DataStore`.&quot;}, {&quot;text&quot;: &quot;`PreferenceDataStoreFactory` does not support `.map` operators on `dataStore.data`.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: `dataStore.data` is a standard `Flow&lt;Preferences&gt;` that supports all Flow operators.&quot;}, {&quot;text&quot;: &quot;File names passed to `preferencesDataStoreFile` cannot contain underscores.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Underscores in file names are completely valid.&quot;}, {&quot;text&quot;: &quot;`ThemeRepository` is unscoped, so every injection creates a new `ThemeRepository` instance that calls `PreferenceDataStoreFactory.create` for the same `theme_prefs.preferences_pb` file. `DataStore` strictly enforces a single process-wide instance per file to guarantee transactional consistency, so `DataStore` must be provided as an `@Singleton` in Hilt.&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! `DataStore` maintains an in-memory cache and actor lock for its backing file. Creating two `DataStore` instances for the same file path throws an immediate `IllegalStateException`.&quot;}], &quot;code&quot;: &quot;class ThemeRepository @Inject constructor(\n    @ApplicationContext private val context: Context\n) {\n    private val dataStore = PreferenceDataStoreFactory.create {\n        context.preferencesDataStoreFile(\&quot;theme_prefs\&quot;)\n    }\n    val isDarkFlow = dataStore.data.map { it[DARK_KEY] ?: false }\n}&quot;}">
       <div class="quiz-card">
         <span class="quiz-tag">Quiz 1: Code Analysis &amp; Bug Hunt</span>
-        <p class="quiz-question">What is the primary danger of using legacy SharedPreferences apply() or commit() on the Android main thread?</p>
-        
+        <p class="quiz-question">Why does this repository crash at runtime with `IllegalStateException: There are multiple DataStores active for the same file` when two different screens call `ThemeRepository(context)`?</p>
+        <pre class="quiz-code-block"><code>class ThemeRepository @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val dataStore = PreferenceDataStoreFactory.create {
+        context.preferencesDataStoreFile(&quot;theme_prefs&quot;)
+    }
+    val isDarkFlow = dataStore.data.map { it[DARK_KEY] ?: false }
+}</code></pre>
         <div class="quiz-options">
-          <div class="quiz-option" data-idx="0">It can block the main UI thread during disk I/O, causing dropped frames and Application Not Responding (ANR) crashes</div>
-<div class="quiz-option" data-idx="1">It invalidates the user&#x27;s Google Play Store purchase receipts</div>
-<div class="quiz-option" data-idx="2">It causes the Android device battery to explode</div>
-<div class="quiz-option" data-idx="3">It deletes all photos stored in the camera gallery</div>
-
+          <div class="quiz-option" data-idx="0">`preferencesDataStoreFile` can only be called inside an `Activity`, not with `@ApplicationContext`.</div>
+          <div class="quiz-option" data-idx="1">`PreferenceDataStoreFactory` does not support `.map` operators on `dataStore.data`.</div>
+          <div class="quiz-option" data-idx="2">File names passed to `preferencesDataStoreFile` cannot contain underscores.</div>
+          <div class="quiz-option" data-idx="3">`ThemeRepository` is unscoped, so every injection creates a new `ThemeRepository` instance that calls `PreferenceDataStoreFactory.create` for the same `theme_prefs.preferences_pb` file. `DataStore` strictly enforces a single process-wide instance per file to guarantee transactional consistency, so `DataStore` must be provided as an `@Singleton` in Hilt.</div>
         </div>
         <div class="quiz-breakdown-card">
           <div class="breakdown-header">
@@ -239,17 +347,15 @@ val BIOMETRICS_ENABLED = booleanPreferencesKey(&quot;biometrics_enabled&quot;)</
       </div>
     </div>
 
-    <!-- Quiz 2: Conceptual & Architectural Quiz -->
-    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;Why is Proto DataStore superior to Preferences DataStore for managing complex user settings?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;It uses Protocol Buffers to provide a compile-time strongly typed schema without key string lookups&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! Proto DataStore generates types directly from a schema definition, eliminating manual key-string mappings.&quot;}, {&quot;text&quot;: &quot;It stores all data in cloud databases with zero local file storage&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: DataStore is local on-device persistence.&quot;}, {&quot;text&quot;: &quot;It only works on Android devices manufactured by Google&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Jetpack DataStore works across all Android manufacturers.&quot;}, {&quot;text&quot;: &quot;It requires writing custom assembly code in C++&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Protocol Buffers compile cleanly to Kotlin and Java bytecode.&quot;}]}">
+    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;Why does `SharedPreferences.edit().putBoolean(\&quot;key\&quot;, true).apply()` still cause Main-Thread ANRs (Application Not Responding) in production Android apps even though `.apply()` updates memory immediately and writes to disk on a background thread?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;Android&#x27;s `ActivityThread` calls `QueuedWork.waitToFinish()` on the Main UI Thread during `Activity.onStop()` and `Service` lifecycle transitions, which blocks the Main Thread until all pending `.apply()` disk `fsync` writes complete.&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! This is one of the most famous Android framework internals gotchas: `QueuedWork.waitToFinish()` blocks `onStop()` on the UI thread waiting for in-flight `SharedPreferences.apply()` disk writes, which causes ANRs on slow flash storage IO.&quot;}, {&quot;text&quot;: &quot;`apply()` secretly calls `commit()` on the main thread on Android 14+.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: `apply()` still schedules work on `QueuedWork`&#x27;s handler thread, and `QueuedWork.waitToFinish()` blocks lifecycle transitions.&quot;}, {&quot;text&quot;: &quot;`SharedPreferences` encrypts every boolean with RSA-4096 on the UI thread.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Standard `SharedPreferences` stores unencrypted plaintext XML.&quot;}, {&quot;text&quot;: &quot;`putBoolean` triggers a full SQLite `VACUUM` command.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: `SharedPreferences` is backed by an XML file, not SQLite.&quot;}]}">
       <div class="quiz-card">
         <span class="quiz-tag">Quiz 2: Production Architectural Reasoning</span>
-        <p class="quiz-question">Why is Proto DataStore superior to Preferences DataStore for managing complex user settings?</p>
+        <p class="quiz-question">Why does `SharedPreferences.edit().putBoolean(&quot;key&quot;, true).apply()` still cause Main-Thread ANRs (Application Not Responding) in production Android apps even though `.apply()` updates memory immediately and writes to disk on a background thread?</p>
         <div class="quiz-options">
-          <div class="quiz-option" data-idx="0">It uses Protocol Buffers to provide a compile-time strongly typed schema without key string lookups</div>
-<div class="quiz-option" data-idx="1">It stores all data in cloud databases with zero local file storage</div>
-<div class="quiz-option" data-idx="2">It only works on Android devices manufactured by Google</div>
-<div class="quiz-option" data-idx="3">It requires writing custom assembly code in C++</div>
-
+          <div class="quiz-option" data-idx="0">Android&#x27;s `ActivityThread` calls `QueuedWork.waitToFinish()` on the Main UI Thread during `Activity.onStop()` and `Service` lifecycle transitions, which blocks the Main Thread until all pending `.apply()` disk `fsync` writes complete.</div>
+          <div class="quiz-option" data-idx="1">`apply()` secretly calls `commit()` on the main thread on Android 14+.</div>
+          <div class="quiz-option" data-idx="2">`SharedPreferences` encrypts every boolean with RSA-4096 on the UI thread.</div>
+          <div class="quiz-option" data-idx="3">`putBoolean` triggers a full SQLite `VACUUM` command.</div>
         </div>
         <div class="quiz-breakdown-card">
           <div class="breakdown-header">
@@ -266,7 +372,7 @@ val BIOMETRICS_ENABLED = booleanPreferencesKey(&quot;biometrics_enabled&quot;)</
       <div class="agent-prompt-title">
         <span>💬 Learn with your Antigravity Pair Programmer</span>
       </div>
-      <p>Have questions about this lesson? Want me to review your custom code variation or explain a compiler diagnostic? Switch back to our conversation and ask — I'm here as your personal pair programmer!</p>
+      <p>Have questions about this lesson? Want me to review your custom code variation, walk through an architectural tradeoff, or run a mock interview drill? Switch back to our conversation and ask — I'm here as your personal pair programmer!</p>
     </div>
 
   </article>

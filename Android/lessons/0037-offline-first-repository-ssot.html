@@ -115,47 +115,136 @@
   </div>
 
   <!-- Lesson Concepts -->
-  <article>
-    
-          <p>In modern high-performance apps, <strong>network access is a background synchronization mechanism, not a precondition for rendering UI</strong>. If a user opens your app on a subway tunnel or airplane, cached data must render instantly!</p>
+    <article>
+<p>In a 2027 production Android architecture, <strong>network connectivity is an asynchronous background synchronization detail, never a prerequisite for rendering UI</strong>. Whether a user opens your application inside an elevator, on a subway tunnel, or over a high-jitter 5G handoff, cached domain models must render within a single 16ms frame budget from local storage.</p>
 
-          <div class="junior-note">
-            <div class="junior-note-title">🌱 Junior Android Dev Mental Model: Single Source of Truth (SSOT)</div>
-            <p><strong>The Golden Rule:</strong> The UI <em>never</em> observes the network directly. The UI observes the local Room database (which emits cached data instantly in 5ms). In the background, the Repository triggers a network sync. When fresh data arrives, it is saved into Room, which automatically pushes the update to the UI via Flow!</p>
-          </div>
-        
+      <h2>Under the Hood: Room InvalidationTracker &amp; Reactive SSOT</h2>
+      <p>The <strong>Single Source of Truth (SSOT)</strong> pattern mandates that the UI and Domain layers observe an immutable <code>Flow&lt;List&lt;DomainModel&gt;&gt;</code> backed exclusively by Room's SQLite database. Under the hood, when Room executes a <code>@Query</code> returning a <code>Flow</code>, it registers a table observer on its internal <code>InvalidationTracker</code> using SQLite triggers on a hidden shadow table (<code>room_table_modification_log</code>). When your repository's <code>sync()</code> coroutine fetches fresh DTOs from Ktor/Retrofit and writes them into SQLite inside an atomic <code>@Upsert</code> transaction, SQLite increments the table modification counter. Room's tracker detects the dirty table and automatically re-executes the read query on <code>Dispatchers.IO</code>, pushing the updated domain models downstream to any active <code>StateFlow</code> collector.</p>
+
+      <div class="junior-note">
+        <div class="junior-note-title">🌱 Junior Android Dev Mental Model: Unidirectional Data Sync</div>
+        <p><strong>The Golden Rule:</strong> Read streams flow strictly <em>Upward</em> (Room SQLite &rarr; Repository mapping &rarr; ViewModel <code>StateFlow</code> &rarr; Compose UI). Network responses never return data directly to the ViewModel; instead, network DTOs flow strictly into the local database, which then triggers the reactive read stream.</p>
+      </div>
+
+      <h2>Optimistic Mutations, Tombstones &amp; Conflict Resolution</h2>
+      <p>What happens when the user modifies data while offline (e.g., bookmarking an asset or rebalancing a portfolio)? A senior offline-first repository applies an <strong>optimistic local write</strong> immediately to Room with a <code>syncState = PENDING_UPLOAD</code> flag or records a tombstone row (<code>isDeleted = true</code>) for deletions rather than executing a hard <code>DELETE</code> before the server acknowledges it. A background synchronization engine (<code>WorkManager</code>) later drains dirty rows using exponential backoff and resolves server conflicts using vector clocks or <code>updatedAtEpochMillis</code> Last-Write-Wins (LWW) timestamps.</p>
+
+      <div class="comparison-grid">
+        <div class="comparison-card bad">
+          <h4>❌ Junior Anti-Pattern: Network-Direct with Fallback</h4>
+          <pre><code>// Coupled to network latency; flickers spinners on every launch
+// and loses local optimistic edits if the call fails!
+suspend fun getPortfolio(): List&lt;Asset&gt; {
+    return try {
+        val dtos = api.fetchPortfolio()
+        dao.insertAll(dtos.map { it.toEntity() })
+        dtos.map { it.toDomain() }
+    } catch (e: IOException) {
+        dao.getAllSnapshot().map { it.toDomain() }
+    }
+}</code></pre>
+        </div>
+        <div class="comparison-card good">
+          <h4>✅ 2027 Senior Production Standard: Reactive SSOT</h4>
+          <pre><code>class OfflineFirstPortfolioRepository(
+    private val dao: AssetDao,
+    private val api: PortfolioNetworkDataSource
+) {
+    // UI strictly observes local SQLite SSOT
+    val portfolio: Flow&lt;List&lt;Asset&gt;&gt; = dao.observeActiveAssets()
+        .map { entities -&gt; entities.map(AssetEntity::asExternalModel) }
+        .distinctUntilChanged()
+
+    // Sync writes only to Room; never returns data to UI
+    suspend fun syncWith(synchronizer: ChangeListSynchronizer): Boolean =
+        suspendRunCatching {
+            val changeList = api.getChangeList(afterVersion = synchronizer.ChangeVersion)
+            dao.deleteAssets(changeList.deletedIds)
+            val updated = api.getAssets(changeList.updatedIds)
+            dao.upsertAssets(updated.map(NetworkAsset::asEntity))
+        }.isSuccess
+}</code></pre>
+        </div>
+      </div>
+
+      <h2>⚠️ Senior Interview Trap: Structured Cancellation &amp; <code>CancellationException</code></h2>
+      <p>When wrapping network synchronization inside a generic helper like <code>runCatching { ... }</code>, catching <code>Throwable</code> swallows <code>kotlinx.coroutines.CancellationException</code>! If the coroutine scope is cancelled, swallowing <code>CancellationException</code> breaks structured concurrency and allows subsequent suspension points in the parent coroutine to execute zombie writes. Always define a dedicated <code>suspendRunCatching</code> helper that explicitly rethrows <code>CancellationException</code>.</p>
 
     <!-- Runnable Code Example -->
     <h2>2027 Production Standard (Runnable Example)</h2>
     <p>Click <strong>▶ Run Example</strong> to execute this snippet and inspect the simulated runtime output and state transformations:</p>
 
-    <div class="runnable-example-box" data-output="[OFFLINE-FIRST] App launched in Airplane Mode!
-[STEP 1] UI collects from Local Database (SSOT)...
-[EMIT 1] Room database immediately emits cached portfolio: 5 assets (Render time: 4ms)
-[UI] Screen is 100% interactive and populated with zero loading spinners!
-[NETWORK] Network connection restored! Repository initiates background sync...
-[SYNC] Fetched 5 updated asset quotes from remote API.
-[STEP 2] Repository saves fresh quotes into Room database via @Upsert.
-[EMIT 2] Room Flow automatically emits updated prices to UI!
-[SUCCESS] Offline-first SSOT pattern delivered instant startup and seamless sync!">
+    <div class="runnable-example-box" data-output="[LAUNCH] Instant SSOT emission from SQLite: [Asset(symbol=BTC, priceUsd=91200.0, isSynced=true), Asset(symbol=ETH, priceUsd=3150.0, isSynced=true)]
+[OPTIMISTIC] Local dirty write applied:     [Asset(symbol=BTC, priceUsd=91200.0, isSynced=true), Asset(symbol=ETH, priceUsd=3200.0, isSynced=false)]
+[SYNC] Remote delta reconciled (result=Success(3))
+[SSOT] Post-sync emission (ETH protected):  [Asset(symbol=BTC, priceUsd=94500.0, isSynced=true), Asset(symbol=ETH, priceUsd=3200.0, isSynced=false), Asset(symbol=SOL, priceUsd=210.0, isSynced=true)]">
       <div class="runnable-header">
         <div class="runnable-tab">
           <span class="runnable-badge">KOTLIN 2.X</span>
-          <span>OfflineFirstEngine.kt</span>
+          <span>OfflineFirstRepositoryEngine.kt</span>
         </div>
         <button class="btn-run-example">▶ Run Example</button>
       </div>
-      <pre class="runnable-code"><code>fun main() {
-    println(&quot;[OFFLINE-FIRST] App launched in Airplane Mode!&quot;)
-    println(&quot;[STEP 1] UI collects from Local Database (SSOT)...&quot;)
-    println(&quot;[EMIT 1] Room database immediately emits cached portfolio: 5 assets (Render time: 4ms)&quot;)
-    println(&quot;[UI] Screen is 100% interactive and populated with zero loading spinners!&quot;)
+      <pre class="runnable-code"><code>import kotlinx.coroutines.CancellationException
 
-    println(&quot;[NETWORK] Network connection restored! Repository initiates background sync...&quot;)
-    println(&quot;[SYNC] Fetched 5 updated asset quotes from remote API.&quot;)
-    println(&quot;[STEP 2] Repository saves fresh quotes into Room database via @Upsert.&quot;)
-    println(&quot;[EMIT 2] Room Flow automatically emits updated prices to UI!&quot;)
-    println(&quot;[SUCCESS] Offline-first SSOT pattern delivered instant startup and seamless sync!&quot;)
+data class AssetDto(val symbol: String, val priceUsd: Double, val serverVersion: Long)
+data class AssetEntity(val symbol: String, val priceUsd: Double, val version: Long, val pendingSync: Boolean)
+data class Asset(val symbol: String, val priceUsd: Double, val isSynced: Boolean)
+
+class InMemoryAssetDao {
+    private val table = linkedMapOf(
+        &quot;BTC&quot; to AssetEntity(&quot;BTC&quot;, 91200.0, version = 10L, pendingSync = false),
+        &quot;ETH&quot; to AssetEntity(&quot;ETH&quot;, 3150.0, version = 10L, pendingSync = false)
+    )
+
+    fun queryActiveAssets(): List&lt;AssetEntity&gt; = table.values.toList()
+
+    fun upsertWithLwwResolution(incoming: List&lt;AssetEntity&gt;) {
+        for (entity in incoming) {
+            val current = table[entity.symbol]
+            if (current == null || (!current.pendingSync &amp;&amp; entity.version &gt;= current.version)) {
+                table[entity.symbol] = entity
+            }
+        }
+    }
+
+    fun markOptimisticPriceAlert(symbol: String, targetPrice: Double) {
+        val cur = table[symbol] ?: return
+        table[symbol] = cur.copy(priceUsd = targetPrice, pendingSync = true)
+    }
+}
+
+class OfflineFirstAssetRepository(private val dao: InMemoryAssetDao) {
+    fun readSsotSnapshot(): List&lt;Asset&gt; =
+        dao.queryActiveAssets().map { Asset(it.symbol, it.priceUsd, !it.pendingSync) }
+
+    fun syncFromRemote(remoteDtos: List&lt;AssetDto&gt;): Result&lt;Int&gt; = try {
+        val entities = remoteDtos.map { AssetEntity(it.symbol, it.priceUsd, it.serverVersion, pendingSync = false) }
+        dao.upsertWithLwwResolution(entities)
+        Result.success(entities.size)
+    } catch (c: CancellationException) {
+        throw c
+    } catch (t: Throwable) {
+        Result.failure(t)
+    }
+}
+
+fun main() {
+    val dao = InMemoryAssetDao()
+    val repo = OfflineFirstAssetRepository(dao)
+
+    println(&quot;[LAUNCH] Instant SSOT emission from SQLite: ${repo.readSsotSnapshot()}&quot;)
+    dao.markOptimisticPriceAlert(&quot;ETH&quot;, 3200.0)
+    println(&quot;[OPTIMISTIC] Local dirty write applied:     ${repo.readSsotSnapshot()}&quot;)
+
+    val remotePayload = listOf(
+        AssetDto(&quot;BTC&quot;, 94500.0, serverVersion = 11L),
+        AssetDto(&quot;ETH&quot;, 3180.0, serverVersion = 11L), // Blocked by local pendingSync!
+        AssetDto(&quot;SOL&quot;, 210.0, serverVersion = 11L)
+    )
+    val synced = repo.syncFromRemote(remotePayload)
+    println(&quot;[SYNC] Remote delta reconciled (result=$synced)&quot;)
+    println(&quot;[SSOT] Post-sync emission (ETH protected):  ${repo.readSsotSnapshot()}&quot;)
 }</code></pre>
       <div class="runnable-terminal">
         <span class="terminal-badge">Terminal Console Output</span>
@@ -165,41 +254,50 @@
 
     <!-- Interactive In-Browser Code Practice & Runner -->
     <h2>Interactive Code Practice</h2>
-    <p>Write an offline-first repository class OfflineAssetRepository(private val dao: MockDao, private val api: MockApi). Implement val assetStream: Flow&lt;List&lt;String&gt;&gt; = dao.observeAssets(), and suspend fun refresh() { val remote = api.fetch(); dao.upsert(remote) }.</p>
-    
-    <div class="interactive-ide" data-tests="[{&quot;name&quot;: &quot;Exposes assetStream from dao&quot;, &quot;pattern&quot;: &quot;val\\s+assetStream\\s*:\\s*Flow&lt;List&lt;String&gt;&gt;\\s*=\\s*dao\\.observeAssets\\(\\)&quot;, &quot;message&quot;: &quot;Expose &#x27;val assetStream: Flow&lt;List&lt;String&gt;&gt; = dao.observeAssets()&#x27;.&quot;}, {&quot;name&quot;: &quot;Fetches from api and upserts into dao&quot;, &quot;pattern&quot;: &quot;dao\\.upsert\\s*\\(\\s*remote\\s*\\)&quot;, &quot;message&quot;: &quot;Call &#x27;dao.upsert(remote)&#x27; inside refresh().&quot;}]" data-hints="[&quot;Set val assetStream: Flow&lt;List&lt;String&gt;&gt; = dao.observeAssets().&quot;, &quot;Inside suspend fun refresh(), fetch remote items and upsert them into dao.&quot;]">
+    <p>Implement <code>OfflineFirstTickerRepository</code> following the 2027 Single Source of Truth standard: expose <code>val tickers: Flow&lt;List&lt;Ticker&gt;&gt;</code> mapped from <code>dao.observeTickers()</code> with <code>distinctUntilChanged()</code>, and implement <code>suspend fun synchronize(): Boolean</code> that fetches remote DTOs from <code>api.fetchTickers()</code>, maps and upserts them into <code>dao.upsertAll(...)</code>, and safely rethrows <code>CancellationException</code> while returning <code>false</code> on other exceptions.</p>
+
+    <div class="interactive-ide" data-tests="[{&quot;name&quot;: &quot;Exposes reactive tickers Flow from DAO with distinctUntilChanged()&quot;, &quot;pattern&quot;: &quot;val\\s+tickers\\s*:\\s*Flow&lt;\\s*List&lt;\\s*Ticker\\s*&gt;\\s*&gt;\\s*=\\s*dao\\.observeTickers\\s*\\(\\s*\\).*?\\.distinctUntilChanged\\s*\\(\\s*\\)&quot;, &quot;message&quot;: &quot;Map dao.observeTickers() to Flow&lt;List&lt;Ticker&gt;&gt; and chain .distinctUntilChanged().&quot;}, {&quot;name&quot;: &quot;Upserts network DTOs into DAO inside synchronize()&quot;, &quot;pattern&quot;: &quot;suspend\\s+fun\\s+synchronize\\s*\\(\\s*\\)\\s*:\\s*Boolean[\\s\\S]*?api\\.fetchTickers\\s*\\(\\s*\\)[\\s\\S]*?dao\\.upsertAll\\s*\\(&quot;, &quot;message&quot;: &quot;Fetch from api.fetchTickers() and persist into dao.upsertAll(...) inside suspend fun synchronize(): Boolean.&quot;}, {&quot;name&quot;: &quot;Explicitly rethrows CancellationException&quot;, &quot;pattern&quot;: &quot;catch\\s*\\(\\s*\\w+\\s*:\\s*CancellationException\\s*\\)\\s*\\{\\s*throw\\s+\\w+\\s*\\}&quot;, &quot;message&quot;: &quot;Catch CancellationException explicitly and rethrow it so structured concurrency is preserved.&quot;}]" data-hints="[&quot;Chain dao.observeTickers().map { entities -&gt; entities.map { Ticker(it.id, it.price) } }.distinctUntilChanged() for val tickers.&quot;, &quot;Inside suspend fun synchronize(): Boolean, call api.fetchTickers(), map each TickerDto to TickerEntity, and pass the list to dao.upsertAll(...).&quot;, &quot;Wrap the network/database sync in a try block with catch (e: CancellationException) { throw e } before catching general Exception.&quot;]">
       <div class="ide-header">
-        <div class="ide-tab">OfflineRepository.kt</div>
+        <div class="ide-tab">OfflineFirstRepository.kt</div>
         <div class="ide-actions">
           <button class="btn-secondary-dark btn-reset">Reset Code</button>
         </div>
       </div>
-      
+
       <div class="code-editor-area">
-        <textarea class="code-textarea" spellcheck="false">import kotlinx.coroutines.flow.Flow
+        <textarea class="code-textarea" spellcheck="false">import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
-interface MockDao {
-    fun observeAssets(): Flow<List<String>>
-    suspend fun upsert(items: List<String>)
+data class TickerDto(val id: String, val price: Double)
+data class TickerEntity(val id: String, val price: Double)
+data class Ticker(val id: String, val price: Double)
+
+interface TickerDao {
+    fun observeTickers(): Flow&lt;List&lt;TickerEntity&gt;&gt;
+    suspend fun upsertAll(entities: List&lt;TickerEntity&gt;)
 }
 
-interface MockApi {
-    suspend fun fetch(): List<String>
+interface TickerNetworkDataSource {
+    suspend fun fetchTickers(): List&lt;TickerDto&gt;
 }
 
-class OfflineAssetRepository(
-    private val dao: MockDao,
-    private val api: MockApi
+class OfflineFirstTickerRepository(
+    private val dao: TickerDao,
+    private val api: TickerNetworkDataSource
 ) {
-    // TODO: val assetStream: Flow<List<String>> = dao.observeAssets()
-    // TODO: suspend fun refresh() { val remote = api.fetch(); dao.upsert(remote) }
+    // TODO 1: Expose val tickers: Flow&lt;List&lt;Ticker&gt;&gt; mapped from dao.observeTickers() with distinctUntilChanged()
+
+    // TODO 2: Implement suspend fun synchronize(): Boolean that fetches DTOs, calls dao.upsertAll,
+    // rethrows CancellationException, and returns true on success / false on failure.
 }</textarea>
       </div>
 
       <div class="ide-controls">
         <div class="ide-controls-left">
           <button class="btn-run">▶ Run &amp; Check Code</button>
-          <button class="btn-hint">💡 Hint (0/2)</button>
+          <button class="btn-hint">💡 Hint (0/3)</button>
         </div>
         <button class="btn-solution">👁️ Reveal Answer</button>
       </div>
@@ -222,49 +320,66 @@ class OfflineAssetRepository(
           <span>🎯 Reference Production Solution</span>
           <button class="btn-load-solution">Load Solution into Editor</button>
         </div>
-        <pre class="solution-code"><code>import kotlinx.coroutines.flow.Flow
+        <pre class="solution-code"><code>import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
-interface MockDao {
-    fun observeAssets(): Flow&lt;List&lt;String&gt;&gt;
-    suspend fun upsert(items: List&lt;String&gt;)
+data class TickerDto(val id: String, val price: Double)
+data class TickerEntity(val id: String, val price: Double)
+data class Ticker(val id: String, val price: Double)
+
+interface TickerDao {
+    fun observeTickers(): Flow&lt;List&lt;TickerEntity&gt;&gt;
+    suspend fun upsertAll(entities: List&lt;TickerEntity&gt;)
 }
 
-interface MockApi {
-    suspend fun fetch(): List&lt;String&gt;
+interface TickerNetworkDataSource {
+    suspend fun fetchTickers(): List&lt;TickerDto&gt;
 }
 
-class OfflineAssetRepository(
-    private val dao: MockDao,
-    private val api: MockApi
+class OfflineFirstTickerRepository(
+    private val dao: TickerDao,
+    private val api: TickerNetworkDataSource
 ) {
-    val assetStream: Flow&lt;List&lt;String&gt;&gt; = dao.observeAssets()
+    val tickers: Flow&lt;List&lt;Ticker&gt;&gt; = dao.observeTickers()
+        .map { entities -&gt; entities.map { Ticker(it.id, it.price) } }
+        .distinctUntilChanged()
 
-    suspend fun refresh() {
-        val remote = api.fetch()
-        dao.upsert(remote)
+    suspend fun synchronize(): Boolean = try {
+        val networkItems = api.fetchTickers()
+        dao.upsertAll(networkItems.map { TickerEntity(it.id, it.price) })
+        true
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        false
     }
 }</code></pre>
         <p style="font-size:0.88rem; color:var(--text-muted); margin-top:0.5rem;">
-          <strong>Why this works:</strong> Making the local database the Single Source of Truth ensures the application functions flawlessly offline and renders cached data without waiting for network latency.
+          <strong>Why this works:</strong> Exposing a mapped Flow from Room with distinctUntilChanged() ensures UI collectors only recompose when domain-visible columns change, while synchronize() updates the database without breaking coroutine cancellation.
         </p>
       </div>
     </div>
 
     <!-- Enhanced Dual Quiz Section -->
     <h2>Concept Retrieval &amp; Code Quizzes</h2>
-    
-    <!-- Quiz 1: Code-Reading / Bug-Hunting Quiz -->
-    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;In an offline-first Single Source of Truth (SSOT) architecture, what component does the UI layer observe?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;The local database stream; network responses are saved directly into the database rather than fed to the UI&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! The UI continuously listens to the database. The network is treated as a sync mechanism that updates the database.&quot;}, {&quot;text&quot;: &quot;The remote HTTP REST API endpoint directly&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Direct network observation causes blank screens when offline.&quot;}, {&quot;text&quot;: &quot;The device&#x27;s Wi-Fi router IP address&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: IP addresses are low-level network identifiers, not domain state.&quot;}, {&quot;text&quot;: &quot;The Android manifest configuration XML file&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: The manifest contains component metadata, not runtime application data.&quot;}]}">
+
+    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;Examine this offline-first repository synchronization method. What critical bug will occur in production when the user navigates away mid-sync?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;Room @Upsert methods cannot be called inside a runCatching lambda because Kotlin inline functions strip the CoroutineContext needed by Room&#x27;s transaction dispatcher.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. Because runCatching is an inline function, suspend calls inside its block inherit the exact outer CoroutineContext without stripping dispatchers.&quot;}, {&quot;text&quot;: &quot;kotlin.runCatching catches Throwable, which intercepts CancellationException when the calling scope cancels at Suspension Point 1, logging normal coroutine cancellation as a production error and failing to propagate cancellation to callers.&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! Standard runCatching catches all Throwables including CancellationException. Swallowing CancellationException violates structured concurrency and pollutes crash analytics with normal lifecycle cancellations.&quot;}, {&quot;text&quot;: &quot;Calling map { it.asEntity() } on the calling dispatcher causes a Room IllegalStateException unless wrapped in withContext(Dispatchers.Default).&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. Room&#x27;s suspend DAO functions are already main-safe and switch to Room&#x27;s internal transaction executor automatically.&quot;}, {&quot;text&quot;: &quot;Result&lt;Unit&gt; cannot be returned from a suspend function in Kotlin 2.x due to inline value class boxing restrictions across continuation state machines.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. Kotlin value classes like Result&lt;T&gt; are fully supported as return types of suspend functions.&quot;}], &quot;code&quot;: &quot;suspend fun syncFeed(): Result&lt;Unit&gt; = runCatching {\n    val articles = networkApi.fetchLatestArticles() // Suspension point 1\n    articleDao.upsertArticles(articles.map { it.asEntity() }) // Suspension point 2\n}.onFailure { throwable -&gt;\n    analyticsLogger.logNonFatal(throwable)\n}&quot;}">
       <div class="quiz-card">
         <span class="quiz-tag">Quiz 1: Code Analysis &amp; Bug Hunt</span>
-        <p class="quiz-question">In an offline-first Single Source of Truth (SSOT) architecture, what component does the UI layer observe?</p>
-        
+        <p class="quiz-question">Examine this offline-first repository synchronization method. What critical bug will occur in production when the user navigates away mid-sync?</p>
+        <pre class="quiz-code-block"><code>suspend fun syncFeed(): Result&lt;Unit&gt; = runCatching {
+    val articles = networkApi.fetchLatestArticles() // Suspension point 1
+    articleDao.upsertArticles(articles.map { it.asEntity() }) // Suspension point 2
+}.onFailure { throwable -&gt;
+    analyticsLogger.logNonFatal(throwable)
+}</code></pre>
         <div class="quiz-options">
-          <div class="quiz-option" data-idx="0">The local database stream; network responses are saved directly into the database rather than fed to the UI</div>
-<div class="quiz-option" data-idx="1">The remote HTTP REST API endpoint directly</div>
-<div class="quiz-option" data-idx="2">The device&#x27;s Wi-Fi router IP address</div>
-<div class="quiz-option" data-idx="3">The Android manifest configuration XML file</div>
-
+          <div class="quiz-option" data-idx="0">Room @Upsert methods cannot be called inside a runCatching lambda because Kotlin inline functions strip the CoroutineContext needed by Room&#x27;s transaction dispatcher.</div>
+          <div class="quiz-option" data-idx="1">kotlin.runCatching catches Throwable, which intercepts CancellationException when the calling scope cancels at Suspension Point 1, logging normal coroutine cancellation as a production error and failing to propagate cancellation to callers.</div>
+          <div class="quiz-option" data-idx="2">Calling map { it.asEntity() } on the calling dispatcher causes a Room IllegalStateException unless wrapped in withContext(Dispatchers.Default).</div>
+          <div class="quiz-option" data-idx="3">Result&lt;Unit&gt; cannot be returned from a suspend function in Kotlin 2.x due to inline value class boxing restrictions across continuation state machines.</div>
         </div>
         <div class="quiz-breakdown-card">
           <div class="breakdown-header">
@@ -276,17 +391,15 @@ class OfflineAssetRepository(
       </div>
     </div>
 
-    <!-- Quiz 2: Conceptual & Architectural Quiz -->
-    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;What is the primary user experience advantage of the offline-first repository pattern?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;Instant app startup time because cached data is displayed in milliseconds without waiting for network latency&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! Users immediately see their data without blank screens or blocking spinners, and changes work seamlessly offline.&quot;}, {&quot;text&quot;: &quot;It bypasses Android&#x27;s Google Play Store review process&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Architecture patterns do not bypass app store review.&quot;}, {&quot;text&quot;: &quot;It increases the smartphone screen refresh rate from 60Hz to 240Hz&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Display refresh rates are determined by device display hardware.&quot;}, {&quot;text&quot;: &quot;It converts local databases into encrypted bitcoin cryptocurrency&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Offline-first architecture is purely for local data caching and reliability.&quot;}]}">
+    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;In an enterprise offline-first app where users can delete items while offline, why must the Repository record a local &#x27;tombstone&#x27; row (isDeleted = true) rather than immediately executing a SQL DELETE on the Room table?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;SQLite does not support executing DELETE statements while the device radio is in Airplane Mode due to WAL file lock constraints.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. SQLite is a local embedded database engine and has zero awareness of device network state.&quot;}, {&quot;text&quot;: &quot;Room&#x27;s InvalidationTracker only triggers Flow emissions on INSERT and UPDATE statements, ignoring physical DELETE statements.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. Room&#x27;s SQLite triggers monitor INSERT, UPDATE, and DELETE equally to invalidate active Flows.&quot;}, {&quot;text&quot;: &quot;If the row is physically deleted locally while offline, a subsequent pull-sync or no-network retry has no record that the deletion needs to be pushed to the server, causing the server&#x27;s undeleted item to resurrect on the next sync.&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! Without a soft-delete tombstone (filtered out of UI queries via WHERE isDeleted = 0), the sync worker cannot know which IDs were deleted offline, and the next server fetch will re-insert the deleted record.&quot;}, {&quot;text&quot;: &quot;Physical DELETE statements immediately trigger a blocking SQLite VACUUM operation on the UI thread, causing ANRs.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. DELETE does not automatically run a blocking VACUUM on the UI thread.&quot;}]}">
       <div class="quiz-card">
         <span class="quiz-tag">Quiz 2: Production Architectural Reasoning</span>
-        <p class="quiz-question">What is the primary user experience advantage of the offline-first repository pattern?</p>
+        <p class="quiz-question">In an enterprise offline-first app where users can delete items while offline, why must the Repository record a local &#x27;tombstone&#x27; row (isDeleted = true) rather than immediately executing a SQL DELETE on the Room table?</p>
         <div class="quiz-options">
-          <div class="quiz-option" data-idx="0">Instant app startup time because cached data is displayed in milliseconds without waiting for network latency</div>
-<div class="quiz-option" data-idx="1">It bypasses Android&#x27;s Google Play Store review process</div>
-<div class="quiz-option" data-idx="2">It increases the smartphone screen refresh rate from 60Hz to 240Hz</div>
-<div class="quiz-option" data-idx="3">It converts local databases into encrypted bitcoin cryptocurrency</div>
-
+          <div class="quiz-option" data-idx="0">SQLite does not support executing DELETE statements while the device radio is in Airplane Mode due to WAL file lock constraints.</div>
+          <div class="quiz-option" data-idx="1">Room&#x27;s InvalidationTracker only triggers Flow emissions on INSERT and UPDATE statements, ignoring physical DELETE statements.</div>
+          <div class="quiz-option" data-idx="2">If the row is physically deleted locally while offline, a subsequent pull-sync or no-network retry has no record that the deletion needs to be pushed to the server, causing the server&#x27;s undeleted item to resurrect on the next sync.</div>
+          <div class="quiz-option" data-idx="3">Physical DELETE statements immediately trigger a blocking SQLite VACUUM operation on the UI thread, causing ANRs.</div>
         </div>
         <div class="quiz-breakdown-card">
           <div class="breakdown-header">
@@ -303,7 +416,7 @@ class OfflineAssetRepository(
       <div class="agent-prompt-title">
         <span>💬 Learn with your Antigravity Pair Programmer</span>
       </div>
-      <p>Have questions about this lesson? Want me to review your custom code variation or explain a compiler diagnostic? Switch back to our conversation and ask — I'm here as your personal pair programmer!</p>
+      <p>Have questions about this lesson? Want me to review your custom code variation, walk through an architectural tradeoff, or run a mock interview drill? Switch back to our conversation and ask — I'm here as your personal pair programmer!</p>
     </div>
 
   </article>

@@ -1,0 +1,160 @@
+name: CloudPulse CI/CD (OIDC + cdk-nag + Canary Rollback Guard)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write # Required for GitHub OIDC JWT minting
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CDK_DIR: infra/cdk
+  STACK_NAME: CloudPulse-production
+
+jobs:
+  validate-and-synth:
+    name: Typecheck, cdk-nag & CDK Synth
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: infra/cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        working-directory: ${{ env.CDK_DIR }}
+        run: npm ci
+
+      - name: TypeScript strict typecheck
+        working-directory: ${{ env.CDK_DIR }}
+        run: npm run typecheck
+
+      - name: Authenticate to AWS via OIDC (Zero static keys)
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cloudpulse-ci-synth-${{ github.run_id }}
+
+      - name: Synthesize CloudFormation & run cdk-nag AwsSolutionsChecks
+        working-directory: ${{ env.CDK_DIR }}
+        run: |
+          npx cdk synth --context env=production --strict
+          if grep -rn "AwsSolutions-" cdk.out/ | grep -i "Error"; then
+            echo "::error::cdk-nag detected unsuppressed AwsSolutions errors"
+            exit 1
+          fi
+
+      - name: Preview infrastructure diff on Pull Request
+        if: github.event_name == 'pull_request' && vars.AWS_DEPLOY_ROLE_ARN != ''
+        working-directory: ${{ env.CDK_DIR }}
+        run: npx cdk diff ${{ env.STACK_NAME }} --context env=production
+
+      - name: Upload synthesized CloudFormation template
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdk-out
+          path: ${{ env.CDK_DIR }}/cdk.out
+          retention-days: 7
+
+  deploy-canary:
+    name: Canary Deploy & SLO Rollback Guard
+    needs: validate-and-synth
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install CDK dependencies
+        working-directory: ${{ env.CDK_DIR }}
+        run: npm ci
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cloudpulse-prod-deploy-${{ github.run_id }}
+
+      - name: Capture last-known-good ECS task definition for rollback guard
+        id: preflight
+        run: |
+          CLUSTER=$(aws cloudformation describe-stacks \
+            --stack-name "${{ env.STACK_NAME }}" \
+            --query "Stacks[0].Outputs[?OutputKey=='EcsClusterName'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+          SERVICE=$(aws cloudformation describe-stacks \
+            --stack-name "${{ env.STACK_NAME }}" \
+            --query "Stacks[0].Outputs[?OutputKey=='EcsServiceName'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$CLUSTER" ] && [ -n "$SERVICE" ]; then
+            PREV_TD=$(aws ecs describe-services \
+              --cluster "$CLUSTER" \
+              --services "$SERVICE" \
+              --query "services[0].taskDefinition" \
+              --output text)
+            echo "cluster=$CLUSTER" >> "$GITHUB_OUTPUT"
+            echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+            echo "prev_task_def=$PREV_TD" >> "$GITHUB_OUTPUT"
+          else
+            echo "first_deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy CDK Stack (Canary rolling update with ECS Circuit Breaker)
+        working-directory: ${{ env.CDK_DIR }}
+        run: |
+          npx cdk deploy ${{ env.STACK_NAME }} \
+            --context env=production \
+            --context imageTag=${{ github.sha }} \
+            --require-approval never
+
+      - name: SLO Rollback Guard (5-minute CloudWatch Canary Observation)
+        if: steps.preflight.outputs.first_deploy != 'true'
+        run: |
+          ALARMS="cloudpulse-production-slo-5xx-rate cloudpulse-production-slo-p99-latency cloudpulse-production-dlq-nonempty"
+          echo "Monitoring CloudWatch SLO alarms for 5 minutes (10 checks x 30s)..."
+
+          for i in $(seq 1 10); do
+            BREACHED=$(aws cloudwatch describe-alarms \
+              --alarm-names $ALARMS \
+              --state-value ALARM \
+              --query "MetricAlarms[].AlarmName" \
+              --output text)
+
+            if [ -n "$BREACHED" ]; then
+              echo "::error::SLO breach detected during canary window: $BREACHED"
+              echo "Initiating automatic rollback to ${{ steps.preflight.outputs.prev_task_def }}..."
+              aws ecs update-service \
+                --cluster "${{ steps.preflight.outputs.cluster }}" \
+                --service "${{ steps.preflight.outputs.service }}" \
+                --task-definition "${{ steps.preflight.outputs.prev_task_def }}" \
+                --force-new-deployment
+              aws ecs wait services-stable \
+                --cluster "${{ steps.preflight.outputs.cluster }}" \
+                --services "${{ steps.preflight.outputs.service }}"
+              exit 1
+            fi
+
+            echo "Check $i/10 passed — all SLO alarms OK."
+            sleep 30
+          done
+
+          echo "Canary observation window succeeded with zero SLO breaches."

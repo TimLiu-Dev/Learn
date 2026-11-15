@@ -108,19 +108,8 @@ Items marked ➕ were added to expand the language scope.
 - **13.1** ➕ Modern Kotlin 2.2–2.4 syntax, DSLs & deep recursion (`when` guards, non-local `break`/`continue`, context parameters, `@DslMarker`, `fun interface` SAM, `tailrec`, `DeepRecursiveFunction`)
 - **13.2** ➕ Production Android Flow & Concurrency (`callbackFlow` + `awaitClose`, `stateIn(WhileSubscribed(5_000))`, `flatMapLatest`, `Mutex.withLock`)
 - **13.3** ➕ Gradle Kotlin DSL (`build.gradle.kts` & `libs.versions.toml`), resilient `kotlinx.serialization`, and JVM interop (`@JvmOverloads`, `@JvmName`, `@JvmStatic`, `@Throws`)
+- **13.4** ➕ Staff Internals: Kotlin Contracts (`callsInPlace`, `returns(true) implies`), `@PublishedApi internal`, binary compatibility, and Android R8 shrinking
 - **R13** ➕ 2027 Android Mastery Review: Capstone offline-sync engine & 4-bug production PR audit
-
----
-
-## Senior Deep-Dive Expansion Queue (Section-by-Section)
-1. **Section 3 (Functions)**: Expand to 3–4 quizzes/lesson, progressive hints, `check()` harnesses, and JVM interop annotations (`@JvmOverloads`, `@JvmName`, `@JvmStatic`).
-2. **Section 4 (Classes & Modeling)**: Expand quizzes/hints + `data class` binary compatibility, array equality traps, and `copy()` encapsulation caveats.
-3. **Section 5 (Lambdas & DSLs)**: Add `fun interface` (SAM), `@DslMarker`, `crossinline` / `noinline` / `@PublishedApi`, and Kotlin Contracts (`callsInPlace`).
-4. **Section 6 (Scope Functions)**: Expand to 3–4 quizzes/lesson, hints, `check()` harnesses, and Production Bug Hunt exercises.
-5. **Section 7 (Collections & DSA)**: Add `tailrec` & `DeepRecursiveFunction`, `List<T>` vs `ImmutableList<T>`, and `Sequence` small-list overhead crossover.
-6. **Section 8 & 9 (Delegation & Generics)**: Expand thin reference sheets (`delegation.html`, `generics.html`), add 3–4 quizzes/lesson, hints, and JVM signature clash resolution.
-7. **Section 10 (Coroutines & Flow)**: Add `Mutex.withLock` / `Semaphore`, `callbackFlow` + `awaitClose`, `stateIn` / `shareIn` (`WhileSubscribed(5_000)`), `collectLatest` / `flatMapLatest`, and `CoroutineExceptionHandler` traps.
-8. **Section 12 (Testing)**: Build Lessons `0062`–`0065` + `reference/testing.html`.
 
 ---
 

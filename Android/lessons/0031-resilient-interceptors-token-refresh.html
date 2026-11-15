@@ -115,49 +115,120 @@
   </div>
 
   <!-- Lesson Concepts -->
-  <article>
-    
-          <p>When an OAuth2 access token expires, the server returns <code>HTTP 401 Unauthorized</code>. If 5 network requests fail with 401 at the same millisecond, an uncoordinated app will fire <strong>5 simultaneous refresh requests</strong>, invalidating refresh tokens and logging the user out! Solving this requires an <strong>asynchronous <code>Mutex</code> lock</strong>.</p>
+    <article>
+<h2>Resilient Networking: OkHttp `Interceptor` vs `Authenticator` &amp; Single-Flight Token Refresh</h2>
+    <p>In production fintech and enterprise apps, short-lived OAuth2 / JWT access tokens (e.g., 15-minute TTL) expire while the user is actively using the app. Handling authentication cleanly requires understanding the architectural separation between two OkHttp components:</p>
+    <ul>
+      <li><strong>Application <code>Interceptor</code> (`addInterceptor`):</strong> Runs proactively on <em>every outgoing request</em> before it hits the network cache or wire. Its job is to attach the current `Authorization: Bearer &lt;accessToken&gt;` header, correlation `X-Request-ID`, and telemetry headers.</li>
+      <li><strong><code>Authenticator</code> (`authenticator(...)`):</strong> Runs <em>reactively only when the server responds with `HTTP 401 Unauthorized`</em>. Its job is to exchange the long-lived `refreshToken` for a new `accessToken` and return a retried `Request` with the updated `Authorization` header (or return `null` to stop retrying and force logout).</li>
+    </ul>
+    <p>However, a naive `Authenticator` creates a catastrophic production outage known as a <strong>Token Refresh Stampede (Thundering Herd)</strong>: when a screen launches 4 parallel API calls (`getBalance`, `getPositions`, `getWatchlist`, `getAlerts`) with an expired token, all 4 fail with `HTTP 401` simultaneously on different OkHttp dispatcher threads. Without synchronization, all 4 threads call `/oauth/refresh` concurrently—invalidating the single-use refresh token on the server and logging the user out! The 2027 Senior Android standard is a <strong>double-checked lock (`Mutex` or `synchronized`)</strong> inside the `Authenticator`: the first thread acquires the lock and refreshes the token; when the remaining 3 threads enter the lock, they compare the request's failed bearer token against the newly stored token—seeing it has already changed, they immediately retry with the new token without hitting `/oauth/refresh` a second time!</p>
 
-          <div class="junior-note">
-            <div class="junior-note-title">🌱 Junior Android Dev Mental Model: Mutex Double-Check Pattern</div>
-            <p>When a request gets a 401:
-            <ol>
-              <li>Acquire <code>mutex.withLock { ... }</code>.</li>
-              <li>Check if the active token was <em>already</em> refreshed by a previous coroutine while waiting for the lock. If so, simply retry with the new token!</li>
-              <li>If not yet refreshed, call the refresh API once, save the new token, and release the lock.</li>
-            </ol></p>
-          </div>
-        
+    <div class="junior-note">
+      <div class="junior-note-title">🌱 Junior Android Dev Mental Model: Bound Retry Loops with `responseCount`!</div>
+      <p>What if the server has a bug and returns <code>401 Unauthorized</code> even with a brand-new token? An unguarded <code>Authenticator</code> will loop until OkHttp throws a protocol exception after 20 attempts! Always check <code>response.priorResponse</code> depth (e.g., if <code>responseCount(response) &gt;= 2</code>, return <code>null</code> immediately to abort).</p>
+    </div>
+
+    <h3>Senior Interview Trap: Exponential Backoff with Full Jitter</h3>
+    <p>When retrying transient `HTTP 503` / `429` or network timeouts, fixed-interval retries (`delay(2000)`) synchronize thousands of reconnecting mobile clients into destructive traffic spikes on your backend. Always apply <strong>Exponential Backoff with Jitter</strong>: <code>val sleepMs = min(maxDelay, baseDelay * (1L shl attempt)) + Random.nextLong(0, 500)</code>, and never retry non-idempotent POST requests unless an `Idempotency-Key: &lt;UUID&gt;` header is attached!</p>
+
+    <div class="comparison-grid">
+      <div class="comparison-card bad">
+        <h4>❌ Junior Anti-Pattern: Unsynchronized 401 Refresh Storm &amp; Infinite Retry Risk</h4>
+        <pre><code>class BadTokenAuthenticator(
+    private val tokenStore: TokenStore,
+    private val authApi: AuthApi
+) : Authenticator {
+    override fun authenticate(route: Route?, response: Response): Request? {
+        // BUG 1: 4 concurrent 401s will all hit refreshTokenSync() simultaneously!
+        // BUG 2: No retry depth check — loops 20x if server keeps returning 401!
+        val newToken = authApi.refreshTokenSync(tokenStore.getRefreshToken())
+        tokenStore.saveAccessToken(newToken)
+        return response.request.newBuilder()
+            .header("Authorization", "Bearer $newToken")
+            .build()
+    }
+}</code></pre>
+      </div>
+      <div class="comparison-card good">
+        <h4>✅ 2027 Senior Production Standard: Double-Checked Synchronized Single-Flight Authenticator</h4>
+        <pre><code>class SingleFlightAuthenticator @Inject constructor(
+    private val tokenStore: TokenStore,
+    private val authApi: AuthApi
+) : Authenticator {
+    private val lock = Any()
+
+    override fun authenticate(route: Route?, response: Response): Request? {
+        if (responseCount(response) &gt;= 2) return null // Prevent infinite 401 loop!
+        val failedHeader = response.request.header("Authorization")
+
+        synchronized(lock) {
+            val currentToken = tokenStore.getAccessToken()
+            // Double-check: Did another thread ALREADY refresh the token while we waited?
+            val tokenToUse = if (currentToken != null &amp;&amp; "Bearer $currentToken" != failedHeader) {
+                currentToken // Reuse fresh token without a duplicate network refresh call!
+            } else {
+                val refreshed = authApi.refreshTokenSync(tokenStore.getRefreshToken()) ?: return null
+                tokenStore.saveAccessToken(refreshed)
+                refreshed
+            }
+            return response.request.newBuilder()
+                .header("Authorization", "Bearer $tokenToUse")
+                .build()
+        }
+    }
+}</code></pre>
+      </div>
+    </div>
 
     <!-- Runnable Code Example -->
     <h2>2027 Production Standard (Runnable Example)</h2>
     <p>Click <strong>▶ Run Example</strong> to execute this snippet and inspect the simulated runtime output and state transformations:</p>
 
-    <div class="runnable-example-box" data-output="[HTTP] 3 concurrent requests encounter HTTP 401 Unauthorized...
-[MUTEX] Coroutine 1 acquires mutex lock. Initiating POST /auth/refresh...
-[MUTEX] Coroutine 2 &amp; 3 queue up waiting for mutex lock...
-[AUTH-SERVER] Token rotation successful! New AccessToken: &#x27;eyJhGci...&#x27;
-[MUTEX] Coroutine 1 updates token cache and releases lock.
-[RETRY] Coroutines 2 &amp; 3 acquire lock, detect token was already refreshed, and retry with new token!
-[SUCCESS] Solved the token refresh race condition with zero duplicate network requests!">
+    <div class="runnable-example-box" data-output="[401-HANDLER /v1/balance] Executed single-flight /oauth/refresh (#1) -&gt; Issued JWT_V2_FRESH
+  -&gt; Retrying /v1/balance with Authorization: Bearer JWT_V2_FRESH
+[401-HANDLER /v1/positions] Token already updated (JWT_V1_EXPIRED -&gt; JWT_V2_FRESH). Reusing without network call!
+  -&gt; Retrying /v1/positions with Authorization: Bearer JWT_V2_FRESH
+[401-HANDLER /v1/watchlist] Token already updated (JWT_V1_EXPIRED -&gt; JWT_V2_FRESH). Reusing without network call!
+  -&gt; Retrying /v1/watchlist with Authorization: Bearer JWT_V2_FRESH
+[401-HANDLER /v1/orders] Token already updated (JWT_V1_EXPIRED -&gt; JWT_V2_FRESH). Reusing without network call!
+  -&gt; Retrying /v1/orders with Authorization: Bearer JWT_V2_FRESH
+[SUMMARY] 4 concurrent 401 responses handled with only 1 /oauth/refresh network call!">
       <div class="runnable-header">
         <div class="runnable-tab">
           <span class="runnable-badge">KOTLIN 2.X</span>
-          <span>TokenRefreshMutex.kt</span>
+          <span>SingleFlightAuthenticatorSim.kt</span>
         </div>
         <button class="btn-run-example">▶ Run Example</button>
       </div>
-      <pre class="runnable-code"><code>fun main() {
-    println(&quot;[HTTP] 3 concurrent requests encounter HTTP 401 Unauthorized...&quot;)
-    println(&quot;[MUTEX] Coroutine 1 acquires mutex lock. Initiating POST /auth/refresh...&quot;)
-    println(&quot;[MUTEX] Coroutine 2 &amp; 3 queue up waiting for mutex lock...&quot;)
-    
-    println(&quot;[AUTH-SERVER] Token rotation successful! New AccessToken: &#x27;eyJhGci...&#x27;&quot;)
-    println(&quot;[MUTEX] Coroutine 1 updates token cache and releases lock.&quot;)
-    
-    println(&quot;[RETRY] Coroutines 2 &amp; 3 acquire lock, detect token was already refreshed, and retry with new token!&quot;)
-    println(&quot;[SUCCESS] Solved the token refresh race condition with zero duplicate network requests!&quot;)
+      <pre class="runnable-code"><code>class SingleFlightTokenCoordinator(initialToken: String) {
+    var currentAccessToken: String = initialToken
+        private set
+    var networkRefreshCalls: Int = 0
+        private set
+
+    fun handle401(endpoint: String, requestTokenUsed: String, priorAttempts: Int): String? {
+        if (priorAttempts &gt;= 2) return null
+        if (currentAccessToken != requestTokenUsed) {
+            println(&quot;[401-HANDLER $endpoint] Token already updated ($requestTokenUsed -&gt; $currentAccessToken). Reusing without network call!&quot;)
+            return currentAccessToken
+        }
+        networkRefreshCalls++
+        currentAccessToken = &quot;JWT_V${networkRefreshCalls + 1}_FRESH&quot;
+        println(&quot;[401-HANDLER $endpoint] Executed single-flight /oauth/refresh (#$networkRefreshCalls) -&gt; Issued $currentAccessToken&quot;)
+        return currentAccessToken
+    }
+}
+
+fun main() {
+    val coordinator = SingleFlightTokenCoordinator(initialToken = &quot;JWT_V1_EXPIRED&quot;)
+    val concurrent401Endpoints = listOf(&quot;/v1/balance&quot;, &quot;/v1/positions&quot;, &quot;/v1/watchlist&quot;, &quot;/v1/orders&quot;)
+
+    for (endpoint in concurrent401Endpoints) {
+        val retryToken = coordinator.handle401(endpoint, requestTokenUsed = &quot;JWT_V1_EXPIRED&quot;, priorAttempts = 1)
+        println(&quot;  -&gt; Retrying $endpoint with Authorization: Bearer $retryToken&quot;)
+    }
+    println(&quot;[SUMMARY] 4 concurrent 401 responses handled with only ${coordinator.networkRefreshCalls} /oauth/refresh network call!&quot;)
 }</code></pre>
       <div class="runnable-terminal">
         <span class="terminal-badge">Terminal Console Output</span>
@@ -167,31 +238,41 @@
 
     <!-- Interactive In-Browser Code Practice & Runner -->
     <h2>Interactive Code Practice</h2>
-    <p>Write a thread-safe token manager class TokenManager with &#x27;private val mutex = Mutex()&#x27; and &#x27;private var token: String = &quot;&quot;&#x27;. Implement suspend fun updateToken(newToken: String) using mutex.withLock { token = newToken }.</p>
-    
-    <div class="interactive-ide" data-tests="[{&quot;name&quot;: &quot;Declares Mutex instance&quot;, &quot;pattern&quot;: &quot;val\\s+mutex\\s*=\\s*Mutex\\(\\)&quot;, &quot;message&quot;: &quot;Instantiate &#x27;val mutex = Mutex()&#x27;.&quot;}, {&quot;name&quot;: &quot;Uses mutex.withLock in updateToken&quot;, &quot;pattern&quot;: &quot;mutex\\.withLock\\s*\\{&quot;, &quot;message&quot;: &quot;Wrap token update in &#x27;mutex.withLock { ... }&#x27;.&quot;}]" data-hints="[&quot;Declare &#x27;private val mutex = Mutex()&#x27;.&quot;, &quot;Inside updateToken, write &#x27;mutex.withLock { token = newToken }&#x27;.&quot;]">
+    <p>Implement a coroutine-safe <code>SingleFlightTokenRefresher</code> using <code>Mutex</code> and <code>mutex.withLock</code>. Inside the lock, check if <code>currentToken != failedToken</code> (returning <code>currentToken</code> immediately if another coroutine already refreshed it); otherwise call <code>fetchNewToken()</code>, update <code>currentToken</code>, and return it.</p>
+
+    <div class="interactive-ide" data-tests="[{&quot;name&quot;: &quot;Guards critical section with mutex.withLock&quot;, &quot;pattern&quot;: &quot;mutex\\.withLock\\s*\\{&quot;, &quot;message&quot;: &quot;Use mutex.withLock { ... } to synchronize concurrent token refresh calls.&quot;}, {&quot;name&quot;: &quot;Double-checks currentToken != failedToken inside lock&quot;, &quot;pattern&quot;: &quot;currentToken\\s*!=\\s*failedToken|failedToken\\s*!=\\s*currentToken&quot;, &quot;message&quot;: &quot;Check if currentToken != failedToken inside the mutex lock to avoid duplicate refresh calls.&quot;}, {&quot;name&quot;: &quot;Invokes fetchNewToken() and updates currentToken&quot;, &quot;pattern&quot;: &quot;fetchNewToken\\s*\\(\\s*\\)&quot;, &quot;message&quot;: &quot;Call fetchNewToken() and update currentToken when the token has not yet been refreshed.&quot;}]" data-hints="[&quot;Wrap the body of refreshTokenIfNeeded in mutex.withLock { ... }.&quot;, &quot;Inside the lock, check if (currentToken != failedToken) return@withLock currentToken.&quot;, &quot;Otherwise, call currentToken = fetchNewToken() and return currentToken.&quot;]">
       <div class="ide-header">
-        <div class="ide-tab">AuthInterceptor.kt</div>
+        <div class="ide-tab">SingleFlightTokenRefresher.kt</div>
         <div class="ide-actions">
           <button class="btn-secondary-dark btn-reset">Reset Code</button>
         </div>
       </div>
-      
+
       <div class="code-editor-area">
         <textarea class="code-textarea" spellcheck="false">import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-class TokenManager {
-    // TODO: private val mutex = Mutex()
-    // TODO: private var token: String = ""
-    // TODO: suspend fun updateToken(newToken: String) = mutex.withLock { token = newToken }
+class SingleFlightTokenRefresher(
+    initialToken: String,
+    private val fetchNewToken: suspend () -&gt; String
+) {
+    private val mutex = Mutex()
+    var currentToken: String = initialToken
+        private set
+
+    suspend fun refreshTokenIfNeeded(failedToken: String): String {
+        // TODO 1: Wrap the logic in mutex.withLock { ... }
+        // TODO 2: If currentToken != failedToken, return currentToken immediately
+        // TODO 3: Otherwise, call fetchNewToken(), assign it to currentToken, and return currentToken
+        return currentToken
+    }
 }</textarea>
       </div>
 
       <div class="ide-controls">
         <div class="ide-controls-left">
           <button class="btn-run">▶ Run &amp; Check Code</button>
-          <button class="btn-hint">💡 Hint (0/2)</button>
+          <button class="btn-hint">💡 Hint (0/3)</button>
         </div>
         <button class="btn-solution">👁️ Reveal Answer</button>
       </div>
@@ -217,35 +298,49 @@ class TokenManager {
         <pre class="solution-code"><code>import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-class TokenManager {
+class SingleFlightTokenRefresher(
+    initialToken: String,
+    private val fetchNewToken: suspend () -&gt; String
+) {
     private val mutex = Mutex()
-    private var token: String = &quot;&quot;
+    var currentToken: String = initialToken
+        private set
 
-    suspend fun updateToken(newToken: String) = mutex.withLock {
-        token = newToken
+    suspend fun refreshTokenIfNeeded(failedToken: String): String = mutex.withLock {
+        if (currentToken != failedToken) {
+            return@withLock currentToken
+        }
+        val newToken = fetchNewToken()
+        currentToken = newToken
+        newToken
     }
 }</code></pre>
         <p style="font-size:0.88rem; color:var(--text-muted); margin-top:0.5rem;">
-          <strong>Why this works:</strong> Mutex.withLock is non-blocking to the underlying thread, providing cooperative mutual exclusion across concurrent coroutines.
+          <strong>Why this works:</strong> mutex.withLock serializes concurrent 401 handlers without blocking OS threads, and comparing currentToken != failedToken inside the critical section ensures only the first coroutine triggers a network refresh while queued coroutines immediately reuse the freshly fetched token.
         </p>
       </div>
     </div>
 
     <!-- Enhanced Dual Quiz Section -->
     <h2>Concept Retrieval &amp; Code Quizzes</h2>
-    
-    <!-- Quiz 1: Code-Reading / Bug-Hunting Quiz -->
-    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;Why is a Mutex lock necessary when handling OAuth2 token refresh across multiple coroutines?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;To prevent concurrent requests from firing multiple duplicate refresh calls and invalidating the token rotation sequence&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! With strict token rotation, if request A and B both send the same refresh token concurrently, the backend will treat it as a replay attack and log the user out.&quot;}, {&quot;text&quot;: &quot;To convert the phone&#x27;s Wi-Fi connection into Bluetooth&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Mutex is a concurrency synchronization primitive, not a radio hardware controller.&quot;}, {&quot;text&quot;: &quot;Because the Android operating system bans apps with more than one network thread&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Modern Android apps run dozens of concurrent network coroutines.&quot;}, {&quot;text&quot;: &quot;To prevent users from opening the app on rooted devices&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Root detection is handled via security attestation APIs, not Mutex.&quot;}]}">
+
+    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;Why does this OkHttp configuration cause a `StackOverflowError` or deadlock when the access token expires and `Authenticator` attempts to call `authApi.refreshToken()`?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;OkHttp does not allow `addInterceptor` and `authenticator` on the same `OkHttpClient.Builder`.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Pairing an `Interceptor` (to attach tokens) with an `Authenticator` (to handle 401s) on the authenticated client is standard practice.&quot;}, {&quot;text&quot;: &quot;`TokenAuthenticator` depends on `AuthApi`, which is built using the exact same `OkHttpClient`\u2014creating a circular dependency in Dagger and causing a 401 on `/oauth/refresh` to trigger `TokenAuthenticator` recursively. Refresh calls should use a separate `@PublicClient OkHttpClient` without the `TokenAuthenticator`.&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! Injecting a Retrofit service into an `Authenticator` that uses the same `OkHttpClient` causes a Dagger dependency cycle (unless `Lazy&lt;AuthApi&gt;` is used) and risks recursive `Authenticator` invocations if the refresh endpoint itself returns 401. Always use a dedicated lightweight `@AuthRefreshClient OkHttpClient` (sharing the same connection pool) for the refresh endpoint.&quot;}, {&quot;text&quot;: &quot;`OkHttpClient` cannot be scoped as `@Singleton` because sockets expire after 60 seconds.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: `OkHttpClient` MUST be a singleton so all requests share a single `ConnectionPool` and `Dispatcher`.&quot;}, {&quot;text&quot;: &quot;Authenticators only execute for HTTP GET requests and throw an error on HTTP POST.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: OkHttp&#x27;s `Authenticator` triggers on 401 responses for any HTTP method.&quot;}], &quot;code&quot;: &quot;@Provides @Singleton\nfun provideOkHttpClient(\n    authInterceptor: AuthInterceptor,\n    tokenAuthenticator: TokenAuthenticator // Injects AuthApi built on THIS SAME OkHttpClient!\n): OkHttpClient = OkHttpClient.Builder()\n    .addInterceptor(authInterceptor)\n    .authenticator(tokenAuthenticator)\n    .build()&quot;}">
       <div class="quiz-card">
         <span class="quiz-tag">Quiz 1: Code Analysis &amp; Bug Hunt</span>
-        <p class="quiz-question">Why is a Mutex lock necessary when handling OAuth2 token refresh across multiple coroutines?</p>
-        
+        <p class="quiz-question">Why does this OkHttp configuration cause a `StackOverflowError` or deadlock when the access token expires and `Authenticator` attempts to call `authApi.refreshToken()`?</p>
+        <pre class="quiz-code-block"><code>@Provides @Singleton
+fun provideOkHttpClient(
+    authInterceptor: AuthInterceptor,
+    tokenAuthenticator: TokenAuthenticator // Injects AuthApi built on THIS SAME OkHttpClient!
+): OkHttpClient = OkHttpClient.Builder()
+    .addInterceptor(authInterceptor)
+    .authenticator(tokenAuthenticator)
+    .build()</code></pre>
         <div class="quiz-options">
-          <div class="quiz-option" data-idx="0">To prevent concurrent requests from firing multiple duplicate refresh calls and invalidating the token rotation sequence</div>
-<div class="quiz-option" data-idx="1">To convert the phone&#x27;s Wi-Fi connection into Bluetooth</div>
-<div class="quiz-option" data-idx="2">Because the Android operating system bans apps with more than one network thread</div>
-<div class="quiz-option" data-idx="3">To prevent users from opening the app on rooted devices</div>
-
+          <div class="quiz-option" data-idx="0">OkHttp does not allow `addInterceptor` and `authenticator` on the same `OkHttpClient.Builder`.</div>
+          <div class="quiz-option" data-idx="1">`TokenAuthenticator` depends on `AuthApi`, which is built using the exact same `OkHttpClient`—creating a circular dependency in Dagger and causing a 401 on `/oauth/refresh` to trigger `TokenAuthenticator` recursively. Refresh calls should use a separate `@PublicClient OkHttpClient` without the `TokenAuthenticator`.</div>
+          <div class="quiz-option" data-idx="2">`OkHttpClient` cannot be scoped as `@Singleton` because sockets expire after 60 seconds.</div>
+          <div class="quiz-option" data-idx="3">Authenticators only execute for HTTP GET requests and throw an error on HTTP POST.</div>
         </div>
         <div class="quiz-breakdown-card">
           <div class="breakdown-header">
@@ -257,17 +352,15 @@ class TokenManager {
       </div>
     </div>
 
-    <!-- Quiz 2: Conceptual & Architectural Quiz -->
-    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;What is the difference between a Coroutines Mutex and a traditional Java synchronized block?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;Mutex suspends coroutines cooperatively without blocking the underlying OS thread; synchronized blocks freeze the thread&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! When a coroutine waits for a Mutex, the underlying thread is released to do other work. Synchronized blocks hold the thread hostage.&quot;}, {&quot;text&quot;: &quot;Synchronized blocks can only be used on Android TV&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: synchronized is a core Java keyword present on all JVMs.&quot;}, {&quot;text&quot;: &quot;Mutex requires 4 gigabytes of temporary memory&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Mutex is a tiny lightweight object with negligible memory footprint.&quot;}, {&quot;text&quot;: &quot;There is no difference between them&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Suspending vs thread-blocking is a critical performance distinction.&quot;}]}">
+    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;When implementing automatic network retries for a `POST /v1/orders` financial trade submission that failed due to a socket read timeout, what is mandatory to prevent accidentally buying the asset twice?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;Wait at least 10 seconds before retrying the POST request without extra headers.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Delaying the retry without an idempotency key will still execute a second duplicate order on the server.&quot;}, {&quot;text&quot;: &quot;Use HTTP GET instead of HTTP POST for creating financial orders.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: State-mutating order creation must use POST/PUT with an idempotency token, never GET.&quot;}, {&quot;text&quot;: &quot;Generate a deterministic client-side UUID `Idempotency-Key` header for the user&#x27;s order intent and attach it to the initial request and any retry attempts, so the server deduplicates already-processed orders.&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! A socket read timeout means the request may have already reached the server and executed before the response dropped. Retrying a non-idempotent POST without an `Idempotency-Key` header risks double execution!&quot;}, {&quot;text&quot;: &quot;Clear the OkHttp DNS cache before every retry.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: DNS cache clearing has no relation to server-side transaction deduplication.&quot;}]}">
       <div class="quiz-card">
         <span class="quiz-tag">Quiz 2: Production Architectural Reasoning</span>
-        <p class="quiz-question">What is the difference between a Coroutines Mutex and a traditional Java synchronized block?</p>
+        <p class="quiz-question">When implementing automatic network retries for a `POST /v1/orders` financial trade submission that failed due to a socket read timeout, what is mandatory to prevent accidentally buying the asset twice?</p>
         <div class="quiz-options">
-          <div class="quiz-option" data-idx="0">Mutex suspends coroutines cooperatively without blocking the underlying OS thread; synchronized blocks freeze the thread</div>
-<div class="quiz-option" data-idx="1">Synchronized blocks can only be used on Android TV</div>
-<div class="quiz-option" data-idx="2">Mutex requires 4 gigabytes of temporary memory</div>
-<div class="quiz-option" data-idx="3">There is no difference between them</div>
-
+          <div class="quiz-option" data-idx="0">Wait at least 10 seconds before retrying the POST request without extra headers.</div>
+          <div class="quiz-option" data-idx="1">Use HTTP GET instead of HTTP POST for creating financial orders.</div>
+          <div class="quiz-option" data-idx="2">Generate a deterministic client-side UUID `Idempotency-Key` header for the user&#x27;s order intent and attach it to the initial request and any retry attempts, so the server deduplicates already-processed orders.</div>
+          <div class="quiz-option" data-idx="3">Clear the OkHttp DNS cache before every retry.</div>
         </div>
         <div class="quiz-breakdown-card">
           <div class="breakdown-header">
@@ -284,7 +377,7 @@ class TokenManager {
       <div class="agent-prompt-title">
         <span>💬 Learn with your Antigravity Pair Programmer</span>
       </div>
-      <p>Have questions about this lesson? Want me to review your custom code variation or explain a compiler diagnostic? Switch back to our conversation and ask — I'm here as your personal pair programmer!</p>
+      <p>Have questions about this lesson? Want me to review your custom code variation, walk through an architectural tradeoff, or run a mock interview drill? Switch back to our conversation and ask — I'm here as your personal pair programmer!</p>
     </div>
 
   </article>

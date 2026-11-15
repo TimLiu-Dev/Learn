@@ -1,0 +1,3 @@
+CREATE TABLE t (x INTEGER);
+INSERT INTO t VALUES (1), (2), (NULL);
+SELECT count(*) FROM t WHERE x = 1 OR NOT (x = 1);

@@ -26,9 +26,10 @@
 - **2027 Platform Mandates & Trust**: 16 KB Memory Page alignment, Android 17 mandatory large-screen resizability, Predictive Back (`PredictiveBackHandler`), Credential Manager (Passkeys), Play Integrity API, Foreground Service Types & Photo Picker
 - **Visual Regression & Observability**: Roborazzi / Compose Preview Screenshot Testing, `ApplicationExitInfo` ANR/OOM forensics, Staged Rollouts
 - **Cross-Platform Native & On-Device AI**: Kotlin Multiplatform (KMP `commonMain` shared domain/data with Ktor, Room KMP, Koin), Compose Multiplatform (CMP), Gemini Nano / AICore
+- **Enterprise Brownfield, Media & System Surfaces**: `ComposeView`/`AndroidView` interop (`DisposeOnViewTreeLifecycleDestroyed`), Jetpack Media3 (`ExoPlayer` pooling & `CacheDataSource`) + `CameraX`, Jetpack Glance Widgets + Android 16/17 Promoted Live Updates, Multi-Module Feature Flags & Analytics
 
 ## Current Progress & Curriculum State
-- **Master Plan**: 68 Lessons across 9 Phases fully structured in `MASTER_PLAN.md` and `MASTER_PLAN.html`.
+- **Master Plan**: 72 Lessons across 9 Phases fully structured in `MASTER_PLAN.md` and `MASTER_PLAN.html`.
 - **Reference Cheat Sheets**:
   1. `reference/01-kotlin-coroutines-flow.html`
   2. `reference/02-jetpack-compose-m3.html`

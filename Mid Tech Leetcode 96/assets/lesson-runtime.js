@@ -292,9 +292,9 @@
           var btn = document.getElementById('practice-lang-' + l);
           if (btn) {
             if (l === lang) {
-              btn.className = "px-3 py-1 rounded bg-indigo-600 text-white font-bold transition-colors";
+              btn.className = "px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold transition-all";
             } else {
-              btn.className = "px-3 py-1 rounded text-slate-400 hover:text-white transition-colors";
+              btn.className = "px-3 py-1.5 rounded-lg text-slate-400 hover:text-white transition-all";
             }
           }
         });
@@ -304,6 +304,10 @@
         if (fnEl) fnEl.innerText = filenameMap[lang];
 
         textarea.value = loadCodeForLang(lang);
+        var modelPre = document.getElementById('practice-model-code');
+        if (modelPre && config.modelSolutions) {
+          modelPre.innerText = config.modelSolutions[currentLang] || '';
+        }
       }
 
       // Tab indentation support (4 spaces)
@@ -452,14 +456,63 @@
         var allPassed = true;
         var resultsHtml = '';
 
+        function normalizeInputArgs(rawInput) {
+          if (Array.isArray(rawInput)) {
+            return JSON.parse(JSON.stringify(rawInput));
+          }
+          if (rawInput && typeof rawInput === 'object') {
+            var vals = Object.keys(rawInput).map(function(k) { return rawInput[k]; });
+            return JSON.parse(JSON.stringify(vals));
+          }
+          if (typeof rawInput === 'string') {
+            var trimmed = rawInput.trim();
+            try {
+              var parsed = JSON.parse('[' + trimmed + ']');
+              return parsed;
+            } catch (e) {
+              // Extract key = val assignments like 'nums = [1,2,3], k = 2'
+              var parts = [];
+              var eqRe = /[a-zA-Z0-9_]+\s*=\s*(\[[^\]]*\]|\{[^}]*\}|"[^"]*"|'[^']*'|[^\s,]+)/g;
+              var m;
+              while ((m = eqRe.exec(trimmed)) !== null) {
+                var token = m[1].replace(/'/g, '"');
+                try { parts.push(JSON.parse(token)); } catch (_) { parts.push(m[1]); }
+              }
+              if (parts.length > 0) return parts;
+              return [trimmed];
+            }
+          }
+          return [rawInput];
+        }
+
+        function valuesEqual(a, b) {
+          if (typeof a === 'number' && typeof b === 'number') {
+            return Math.abs(a - b) < 1e-5;
+          }
+          if (typeof b === 'string' && typeof a !== 'string') {
+            var bTrim = b.trim();
+            if (bTrim === 'true' && a === true) return true;
+            if (bTrim === 'false' && a === false) return true;
+            if (!isNaN(Number(bTrim)) && typeof a === 'number') return Math.abs(a - Number(bTrim)) < 1e-5;
+            try {
+              var bParsed = JSON.parse(bTrim.replace(/'/g, '"'));
+              return JSON.stringify(a) === JSON.stringify(bParsed);
+            } catch (_) {}
+          }
+          return JSON.stringify(a) === JSON.stringify(b);
+        }
+
         for (var i = 0; i < testCases.length; i++) {
           var tc = testCases[i];
           var actual;
           var error = null;
+          var argsClone = [];
           try {
-            // Clone input so mutations in-place don't pollute subsequent assertions
-            var inputClone = JSON.parse(JSON.stringify(tc.input));
-            actual = fn.apply(null, inputClone);
+            argsClone = normalizeInputArgs(tc.input);
+            actual = fn.apply(null, argsClone);
+            if (actual === undefined && argsClone.length > 0 && tc.expected !== undefined && tc.expected !== null) {
+              actual = argsClone[0];
+            }
           } catch (err) {
             error = err.message;
             allPassed = false;
@@ -472,7 +525,7 @@
             } else if (config.comparator) {
               passed = config.comparator(actual, tc.expected);
             } else {
-              passed = (JSON.stringify(actual) === JSON.stringify(tc.expected));
+              passed = valuesEqual(actual, tc.expected);
             }
             if (!passed) allPassed = false;
           }
@@ -488,9 +541,8 @@
             statusBadge = "<span class='px-2 py-0.5 rounded bg-red-950/80 border border-red-800 text-red-300 font-bold'>FAIL ✗</span>";
           }
 
-          var inputStr = JSON.stringify(tc.input[0]);
-          if (tc.input.length > 1) inputStr = tc.input.map(function(a) { return JSON.stringify(a); }).join(', ');
-          var expectedStr = tc.isCustom ? 'User Input' : JSON.stringify(tc.expected);
+          var inputStr = argsClone.map(function(a) { return JSON.stringify(a); }).join(', ');
+          var expectedStr = tc.isCustom ? 'User Input' : (typeof tc.expected === 'string' ? tc.expected : JSON.stringify(tc.expected));
           var actualStr = error ? ('Exception: ' + error) : JSON.stringify(actual);
 
           resultsHtml += "<div class='p-3 rounded-xl bg-slate-900 border " + (passed ? 'border-slate-800' : 'border-red-900/60') + " space-y-1.5 text-xs font-mono'>" +
@@ -510,7 +562,7 @@
           if (dot) dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse";
           if (statusText) {
             statusText.className = "text-emerald-400 font-bold text-xs";
-            statusText.innerText = "All " + config.testCases.length + " Test Cases Passed (" + elapsedMs + "ms)";
+            statusText.innerText = "All " + testCases.length + " Test Cases Passed (" + elapsedMs + "ms)";
           }
         } else {
           if (dot) dot.className = "w-2.5 h-2.5 rounded-full bg-red-400";
@@ -522,6 +574,15 @@
 
         output.innerHTML = "<div class='space-y-2'>" + resultsHtml + "</div>";
       };
+
+      // Expose methods on LessonRuntime.PracticeArena for v2 template onclick handlers
+      LessonRuntime.PracticeArena.setLang = setLang;
+      LessonRuntime.PracticeArena.resetStub = window.resetPracticeStub;
+      LessonRuntime.PracticeArena.revealHint = window.revealNextHint;
+      LessonRuntime.PracticeArena.revealSolution = window.toggleModelSolution;
+      LessonRuntime.PracticeArena.loadSolution = window.loadModelIntoEditor;
+      LessonRuntime.PracticeArena.runTests = window.runPracticeCode;
+      LessonRuntime.PracticeArena.runCustomInput = window.runPracticeCode;
 
       setLang('kotlin');
     }

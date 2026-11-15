@@ -39,7 +39,7 @@ This curriculum follows the **2026/2027 Google Modern Android Architecture (Now 
 
 ---
 
-## 2. Master Curriculum Index (68 Lessons)
+## 2. Master Curriculum Index (72 Lessons)
 
 ```mermaid
 flowchart TD
@@ -50,7 +50,7 @@ flowchart TD
     P5 --> P6["Phase VI: Profiling, Security & Optimization<br/>(Lessons 0044–0049)"]
     P6 --> P7["Phase VII: Capstone Project: Aether<br/>(Lessons 0050–0055)"]
     P7 --> P8["Phase VIII: Career & System Design<br/>(Lessons 0056–0060)"]
-    P8 --> P9["Phase IX: 2027 Senior Frontier & KMP<br/>(Lessons 0061–0068)"]
+    P8 --> P9["Phase IX: 2027 Senior Frontier & KMP<br/>(Lessons 0061–0072)"]
 ```
 
 ---
@@ -223,7 +223,7 @@ flowchart TD
 
 ---
 
-### Phase IX: 2027 Senior Frontier — Platform Mandates, Trust, Observability & KMP (Lessons 0061–0068)
+### Phase IX: 2027 Senior Frontier — Platform Mandates, Trust, Observability, KMP & Production Surfaces (Lessons 0061–0072)
 *Closing every gap between `roadmap.sh/android` and 2027 Senior Android + Kotlin Multiplatform engineering.*
 
 - **[Lesson 0061: Android 16/17 Mandates: 16 KB Pages & Adaptive Resizability](lessons/0061-android-16-17-mandates-16kb-adaptive.html)**  
@@ -242,6 +242,14 @@ flowchart TD
   *Concepts:* Ktor engines (`OkHttp`/`Darwin`), Room KMP (`BundledSQLiteDriver`), DataStore KMP, Koin vs Hilt boundaries.
 - **[Lesson 0068: Compose Multiplatform (CMP) & On-Device AI (Gemini Nano)](lessons/0068-compose-multiplatform-and-on-device-ai.html)**  
   *Concepts:* Shared Compose UI tradeoffs (`composeApp`), Android AICore / Gemini Nano capability probing and cloud fallback strategies.
+- **[Lesson 0069: Brownfield Compose & View Interop (AndroidView, ComposeView & Migration)](lessons/0069-compose-view-interop-brownfield-migration.html)**  
+  *Concepts:* `ComposeView` with `DisposeOnViewTreeLifecycleDestroyed`, `AndroidView` pooling (`onReset`/`onRelease`), incremental Fragment-to-Compose migration.
+- **[Lesson 0070: Rich Media Engineering: Jetpack Media3 (ExoPlayer) & CameraX Pipelines](lessons/0070-media3-exoplayer-camerax-architecture.html)**  
+  *Concepts:* Single `ExoPlayer` instance pooling, `CacheDataSource` pre-warming for vertical feeds, `MediaSessionService`, and `CameraX` concurrent UseCases.
+- **[Lesson 0071: System Surfaces: Jetpack Glance App Widgets & Android 16/17 Live Updates](lessons/0071-jetpack-glance-widgets-live-updates.html)**  
+  *Concepts:* `GlanceAppWidget` (`RemoteViews` composition tree), `GlanceStateDefinition` with DataStore, `ActionCallback`, and `Notification.ProgressStyle` Live Updates.
+- **[Lesson 0072: Production Rollouts: Feature Flags, Remote Config & Analytics Architecture](lessons/0072-feature-flags-analytics-experimentation-scale.html)**  
+  *Concepts:* Multi-module `:core:featureflag` evaluation, local QA override panels, atomic cold-start flag snapshots, and decoupled `:core:analytics` pipelines.
 
 ---
 

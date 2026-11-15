@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0032 — RDS PostgreSQL &amp; Aurora: Multi-AZ Failover, Read Replicas &amp; RDS Proxy</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0032</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0032-rds-aurora-multiaz-rds-proxy.html" class="active">Lesson 0032</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.5</span>
+      <span class="pill">Est. Time: 30 mins</span>
+    </div>
+
+    <h1>RDS PostgreSQL &amp; Aurora: Multi-AZ Failover, Read Replicas &amp; RDS Proxy</h1>
+    <p class="lead">
+      In Android, Room talks to a local SQLite file with zero network hops and one process. On AWS, relational databases sit across a VPC boundary where PostgreSQL forks an expensive OS process per socket, Multi-AZ failover flips DNS underneath idle pools, Read Replicas introduce replication lag, and bursty Lambda traffic exhausts <code>max_connections</code> in milliseconds unless RDS Proxy sits in front.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, <code>RoomDatabase</code> wraps a single local SQLite file through <code>SupportSQLiteOpenHelper</code>. Enabling Write-Ahead Logging (WAL) lets coroutines run concurrent reads alongside one writer inside your app process—with <strong>0 ms network RTT</strong>, no TLS handshakes, and no connection limits beyond local file locks. Cloud PostgreSQL on <strong>Amazon RDS</strong> or <strong>Amazon Aurora</strong> breaks every piece of that intuition: every new client connection costs TCP + TLS + authentication RTTs plus ~5–10 MB of database RAM, writes must survive whole Availability Zone outages, and read scaling shifts from local threads to distributed replicas.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. RDS PostgreSQL: Multi-AZ (High Availability) vs. Read Replicas (Scale)</h2>
+        <p>
+          Junior engineers frequently confuse <strong>Multi-AZ deployments</strong> with <strong>Read Replicas</strong> because both maintain a second database instance. In <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html" target="_blank" rel="noopener">Amazon RDS</a>, they solve completely different problems using opposite replication models:
+        </p>
+        <ul>
+          <li>
+            <strong>Multi-AZ DB Instance (1 Standby — High Availability &amp; Durability):</strong> AWS provisions a primary instance in AZ-a and a <strong>passive standby</strong> in AZ-b. Every storage write is replicated <strong>synchronously</strong> at the physical block level to the standby before the commit returns. Result: <strong>zero data loss (RPO = 0)</strong> if an AZ fails, and automatic failover by updating the instance's DNS CNAME record (typically a 5-second DNS TTL, completing failover in <strong>60–120 seconds</strong>). Crucially, the standby <em>cannot</em> serve read queries—its endpoint is closed until promoted.
+          </li>
+          <li>
+            <strong>Multi-AZ DB Cluster (2 Readable Standbys — HA + Read Scaling):</strong> A newer RDS option spanning <strong>3 AZs</strong> (1 writer + 2 readable standbys) using semi-synchronous transaction log replication (at least 1 standby acknowledges before commit). It supports read traffic on the standbys and typically fails over in <strong>~35 seconds</strong>.
+          </li>
+          <li>
+            <strong>RDS Read Replicas (Asynchronous — Read Scale &amp; Cross-Region DR):</strong> <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html" target="_blank" rel="noopener">Read Replicas</a> use PostgreSQL's <strong>asynchronous</strong> WAL streaming replication from the primary to up to <strong>15</strong> read replicas (same region or cross-region). Because replication is asynchronous, the primary does <em>not</em> wait for replicas to apply WAL records before returning <code>COMMIT</code> to your backend.
+          </li>
+        </ul>
+
+        <div class="callout warning">
+          <div class="callout-title">Production Trap: Read-After-Write Consistency &amp; Stale JVM DNS</div>
+          <p style="margin: 0;">
+            Two failures bite mobile backends immediately in production: (1) <strong>Replication Lag:</strong> An Android client posts <code>POST /orders</code> to the primary and immediately calls <code>GET /orders/{id}</code> routed to a Read Replica—getting <code>HTTP 404</code> because the WAL record hasn't arrived yet (<code>ReplicaLag &gt; 0</code>). Route read-your-own-writes queries strictly to the primary writer. (2) <strong>Client DNS Caching:</strong> During an RDS Multi-AZ failover, AWS updates the DNS record to the promoted standby IP, but runtimes with aggressive DNS caching (older JVMs or unconfigured connection pools) keep sending packets to the dead IP until restarted.
+          </p>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. Amazon Aurora: Decoupled Storage &amp; the 6-Copy Quorum</h2>
+        <p>
+          Classic RDS PostgreSQL couples compute and storage: the database engine writes 8 KB dirty pages, full-page images, and WAL over EBS, and EBS replicates blocks synchronously across AZs. <a href="https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.StorageReliability.html" target="_blank" rel="noopener">Amazon Aurora</a> eliminates EBS page writes from the critical path by separating compute head nodes from a shared, multi-tenant <strong>cluster storage volume</strong> spanning <strong>3 Availability Zones</strong>:
+        </p>
+        <ol>
+          <li><strong>6 Storage Copies Across 3 AZs:</strong> Every 10 GB protection group in the cluster volume is replicated <strong>6 times</strong>—2 copies in AZ-1, 2 copies in AZ-2, and 2 copies in AZ-3. The primary compute node sends only compact redo log records (not full 8 KB data pages) to the storage fleet.</li>
+          <li><strong>4-of-6 Write Quorum &amp; 3-of-6 Read Quorum:</strong> A write is durable once <strong>4 of 6</strong> storage nodes acknowledge the redo log record. Reads and peer-to-peer storage repair query at least <strong>3 of 6</strong> nodes. Because $4 + 3 = 7 &gt; 6$, every read quorum is mathematically guaranteed to intersect with at least one copy holding the latest write.</li>
+          <li><strong>AZ + 1 Fault Tolerance:</strong> Losing an entire Availability Zone destroys 2 copies, leaving 4 copies healthy—so <strong>both reads and writes continue uninterrupted</strong>. Losing an entire AZ <em>plus</em> 1 additional storage node (3 copies lost) leaves 3 surviving copies: writes pause because the 4/6 write quorum is lost, while reads and automated storage repair continue from the 3/6 read quorum.</li>
+          <li><strong>Fast Failover &amp; Shared-Storage Replicas:</strong> Up to <strong>15 Aurora Replicas</strong> mount the <em>exact same</em> 6-copy storage volume. The writer only ships lightweight log metadata to invalidate replica buffer caches—keeping replica lag typically in the <strong>10–20 ms</strong> range and enabling automatic failover in <strong>under 30 seconds</strong> without replaying gigabytes of WAL.</li>
+        </ol>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 315" width="100%" height="auto" role="img" aria-label="Lambda burst through RDS Proxy to Aurora 6-copy storage quorum">
+            <rect x="0" y="0" width="680" height="315" fill="#fdfcf8" rx="6" />
+
+            <!-- Top Title -->
+            <text x="16" y="26" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Serverless Burst + RDS Proxy Multiplexing + Aurora 6-Copy Storage Quorum</text>
+
+            <!-- Lambda Burst Box -->
+            <rect x="16" y="42" width="160" height="92" rx="6" fill="#fef3c7" stroke="#b45309" />
+            <text x="96" y="64" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#b45309">AWS Lambda Burst</text>
+            <text x="96" y="84" text-anchor="middle" font-family="monospace" font-size="11" fill="#1b1d21">500 concurrent</text>
+            <text x="96" y="100" text-anchor="middle" font-family="monospace" font-size="11" fill="#1b1d21">ClientConnections</text>
+            <text x="96" y="120" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#991b1b">Direct to DB = OOM / FATAL</text>
+
+            <!-- Arrow Lambda -> Proxy -->
+            <line x1="176" y1="88" x2="226" y2="88" stroke="#575c66" stroke-width="2" />
+            <polygon points="226,83 236,88 226,93" fill="#575c66" />
+
+            <!-- RDS Proxy Box -->
+            <rect x="236" y="42" width="188" height="92" rx="6" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="330" y="64" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f4c81">Amazon RDS Proxy</text>
+            <text x="330" y="83" text-anchor="middle" font-family="monospace" font-size="11" fill="#1b1d21">Warm Pool + Multiplex</text>
+            <text x="330" y="100" text-anchor="middle" font-family="monospace" font-size="11" fill="#166534">500 client &rarr; 50 DB conns</text>
+            <text x="330" y="120" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">No pinning = 10:1 reuse</text>
+
+            <!-- Arrow Proxy -> Compute -->
+            <line x1="424" y1="88" x2="466" y2="88" stroke="#0f4c81" stroke-width="2" />
+            <polygon points="466,83 476,88 466,93" fill="#0f4c81" />
+
+            <!-- Aurora Compute Nodes -->
+            <rect x="476" y="42" width="188" height="42" rx="5" fill="#dcfce7" stroke="#166534" />
+            <text x="570" y="60" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#166534">Aurora Writer (AZ-1)</text>
+            <text x="570" y="75" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Cluster Endpoint (R/W)</text>
+
+            <rect x="476" y="92" width="188" height="42" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="570" y="110" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f4c81">Aurora Replica (AZ-2)</text>
+            <text x="570" y="125" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Reader Endpoint (RO)</text>
+
+            <!-- Divider -->
+            <line x1="16" y1="154" x2="664" y2="154" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Quorum Section -->
+            <text x="16" y="178" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">Shared Aurora Cluster Storage Volume (6 Copies Across 3 AZs &middot; 4/6 Write Quorum &middot; 3/6 Read Quorum)</text>
+
+            <!-- AZ-1 -->
+            <rect x="16" y="192" width="204" height="106" rx="6" fill="#f6f3ec" stroke="#b5afa3" />
+            <text x="118" y="212" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#1b1d21">AZ-1 Storage Nodes</text>
+            <rect x="30" y="224" width="82" height="32" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="71" y="244" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Copy 1 (ACK)</text>
+            <rect x="124" y="224" width="82" height="32" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="165" y="244" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Copy 2 (ACK)</text>
+            <text x="118" y="282" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">AZ outage loses 2 copies</text>
+
+            <!-- AZ-2 -->
+            <rect x="238" y="192" width="204" height="106" rx="6" fill="#f6f3ec" stroke="#b5afa3" />
+            <text x="340" y="212" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#1b1d21">AZ-2 Storage Nodes</text>
+            <rect x="252" y="224" width="82" height="32" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="293" y="244" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Copy 3 (ACK)</text>
+            <rect x="346" y="224" width="82" height="32" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="387" y="244" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Copy 4 (ACK)</text>
+            <text x="340" y="282" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#166534">4/6 Write Quorum met!</text>
+
+            <!-- AZ-3 -->
+            <rect x="460" y="192" width="204" height="106" rx="6" fill="#f6f3ec" stroke="#b5afa3" />
+            <text x="562" y="212" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#1b1d21">AZ-3 Storage Nodes</text>
+            <rect x="474" y="224" width="82" height="32" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="515" y="244" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">Copy 5 (Down)</text>
+            <rect x="568" y="224" width="82" height="32" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="609" y="244" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">Copy 6 (Down)</text>
+            <text x="562" y="282" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#991b1b">AZ-3 offline: writes still succeed</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: RDS Proxy absorbs thousands of short-lived Lambda connections and multiplexes transactions onto a bounded backend pool, while Aurora's 4-of-6 write quorum survives a full AZ failure with zero write downtime.
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. RDS Proxy: Multiplexing Lambda Bursts &amp; Avoiding Connection Pinning</h2>
+        <p>
+          PostgreSQL uses a <strong>process-per-connection</strong> model: each client socket spawns a separate OS backend process consuming roughly 5–10 MB of RAM even while idle. A traditional ECS service with 4 containers holding a pool of 20 connections each opens 80 DB connections. By contrast, if an Android push notification triggers 600 concurrent AWS Lambda invocations, each warm container opens its own pool—instantly exceeding <code>max_connections</code> on a <code>db.t3.medium</code> (~450 max) and burning CPU on TLS + SCRAM-SHA-256 handshakes.
+        </p>
+        <p>
+          <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html" target="_blank" rel="noopener">Amazon RDS Proxy</a> solves this by placing a managed, highly available proxy fleet inside your VPC:
+        </p>
+        <ul>
+          <li><strong>Transaction-Level Multiplexing:</strong> RDS Proxy holds a warm pool of persistent DB connections (capped via <code>MaxConnectionsPercent</code> of <code>max_connections</code>). After a Lambda finishes a SQL transaction (<code>COMMIT</code> or <code>ROLLBACK</code>), the proxy immediately reuses that underlying database connection for another Lambda's transaction.</li>
+          <li><strong>Failover Acceleration (Up to 66% Faster):</strong> Because RDS Proxy directly monitors the underlying cluster topology, it preserves client TCP connections during a failover, pauses incoming queries briefly, and routes them straight to the promoted writer without waiting for client DNS caches to expire.</li>
+          <li><strong>IAM &amp; Secrets Manager Integration:</strong> Lambda functions authenticate to RDS Proxy using short-lived IAM tokens while the proxy retrieves the actual DB credentials from AWS Secrets Manager.</li>
+        </ul>
+
+        <div class="callout warning">
+          <div class="callout-title">The RDS Proxy Anti-Pattern: Connection Pinning</div>
+          <p style="margin: 0;">
+            Multiplexing only works when the backend connection carries <strong>zero leftover session state</strong> between transactions. If your Lambda executes session-wide <code>SET</code> statements (e.g., <code>SET TIME ZONE 'UTC'</code> or Prisma/TypeORM startup session config), creates <code>TEMP</code> tables, uses advisory locks, or triggers unsupported prepared statement state, RDS Proxy <strong>pins</strong> the client socket 1:1 to a physical database connection for the rest of the session. Watch the CloudWatch metric <code>DatabaseConnectionsCurrentlySessionPinned</code>: if pinning climbs during a burst, multiplexing collapses and your database still hits <code>max_connections</code>! Fix it by keeping transactions short, replacing session <code>SET</code> with transaction-scoped <code>SET LOCAL</code>, or enabling <code>EXCLUDE_VARIABLE_SETS</code> in your proxy target group's <code>SessionPinningFilters</code> when safe.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production Code Example: Aurora + RDS Proxy (CDK) &amp; Safe Lambda Pooling</h2>
+        <p>
+          Notice how the CDK configuration caps backend pool usage at 80% (leaving 20% headroom for migrations and DBA consoles) and enables <code>EXCLUDE_VARIABLE_SETS</code>, while the Lambda initializes its PostgreSQL client <em>outside</em> the handler and uses <code>SET LOCAL</code> inside transactions to prevent connection pinning:
+        </p>
+<pre><code>// 1. Infrastructure (AWS CDK TypeScript) — Aurora PostgreSQL + RDS Proxy
+const cluster = new rds.DatabaseCluster(this, "OrdersAurora", {
+  engine: rds.DatabaseClusterEngine.auroraPostgres({
+    version: rds.AuroraPostgresEngineVersion.VER_16_2,
+  }),
+  writer: rds.ClusterInstance.provisioned("Writer", {
+    instanceType: ec2.InstanceType.of(ec2.InstanceClass.R6G, ec2.InstanceSize.LARGE),
+  }),
+  readers: [
+    rds.ClusterInstance.provisioned("Reader", {
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.R6G, ec2.InstanceSize.LARGE),
+    }),
+  ],
+  vpc,
+});
+
+const proxy = cluster.addProxy("OrdersProxy", {
+  secrets: [cluster.secret!],
+  vpc,
+  iamAuth: true,
+  requireTLS: true,
+  maxConnectionsPercent: 80,           // Leave 20% of max_connections for admin/migrations
+  idleClientTimeout: Duration.minutes(30),
+  sessionPinningFilters: [rds.SessionPinningFilter.EXCLUDE_VARIABLE_SETS],
+});
+
+// 2. Lambda Handler (Node.js / pg) — Global pool + transaction-scoped SET LOCAL
+const { Pool } = require("pg");
+// Global scope: reused across warm Lambda invocations (max: 1 or 2 per container)
+const pool = new Pool({ host: process.env.PROXY_ENDPOINT, max: 2, ssl: { rejectUnauthorized: true } });
+
+exports.handler = async (event) =&gt; {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL statement_timeout = '3000ms'"); // Transaction-scoped: NO pinning!
+    const res = await client.query("SELECT id, status FROM orders WHERE user_id = $1", [event.userId]);
+    await client.query("COMMIT");
+    return { statusCode: 200, body: JSON.stringify(res.rows) };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release(); // Returns socket to container pool; Proxy detaches backend DB conn
+  }
+};</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build a topology &amp; connection-exhaustion simulator in <code>evaluateDatabaseTopology(config)</code> to quantify how Lambda bursts, RDS Proxy multiplexing, session pinning, and Aurora's 6-copy storage quorum determine whether your production database stays online.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Verify your architectural instincts on real production failure modes. Each question explains why the right choice works and why every other option is wrong.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>RDS Multi-AZ:</strong> <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html" target="_blank" rel="noopener">High Availability (Multi-AZ) for Amazon RDS</a> (Synchronous standby replication, DNS CNAME failover, and Multi-AZ DB Clusters).
+          </li>
+          <li>
+            <strong>RDS Read Replicas:</strong> <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html" target="_blank" rel="noopener">Working with Amazon RDS Read Replicas</a> (Asynchronous WAL streaming, replication lag, and promotion).
+          </li>
+          <li>
+            <strong>Aurora Storage Engine:</strong> <a href="https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.StorageReliability.html" target="_blank" rel="noopener">Amazon Aurora Storage and Reliability</a> (6 copies across 3 AZs, 4/6 write quorum, 3/6 read quorum).
+          </li>
+          <li>
+            <strong>RDS Proxy:</strong> <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html" target="_blank" rel="noopener">Managing Connections with Amazon RDS Proxy</a> (Multiplexing, IAM auth, and avoiding session pinning).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0033 (DynamoDB Fundamentals: Partition &amp; Sort Keys, Hot Partitions, Capacity &amp; GSIs)</strong>, ask me anything that feels fuzzy—for example: <em>"When should I pick Aurora Serverless v2 instead of provisioned Aurora + RDS Proxy?"</em> or <em>"How do Prisma or Hibernate ORMs accidentally trigger RDS Proxy pinning?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0031-route53-dns-routing-failover.html">&larr; Lesson 0031: Route 53: Hosted Zones, Alias vs CNAME, Health Checks &amp; Routing Policies</a>
+          <a href="./0033-dynamodb-keys-hot-partitions-capacity.html">Lesson 0033: DynamoDB Fundamentals: Partition &amp; Sort Keys, Hot Partitions, Capacity &amp; GSIs &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why PostgreSQL Exhausts RAM Quickly</strong>
+          PostgreSQL forks a dedicated OS process per active connection (~5–10 MB RAM each plus <code>work_mem</code>). A <code>db.t3.medium</code> (4 GB RAM, ~450 <code>max_connections</code>) runs out of slots or OOM-crashes fast during unpooled Lambda bursts.
+        </div>
+        <div class="sidenote">
+          <strong>Aurora Cluster vs. Reader Endpoints</strong>
+          Aurora provisions two DNS names automatically: the <strong>Cluster (Writer) Endpoint</strong> always resolves to the current primary instance, while the <strong>Reader Endpoint</strong> load-balances connections across all Aurora Replicas.
+        </div>
+        <div class="sidenote">
+          <strong>Check the Glossary</strong>
+          Review crisp networking and keep-alive definitions anytime in <a href="../reference/glossary.html">reference/glossary.html</a>.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0032",
+      title: "Lab 0032: RDS/Aurora Topology & Connection-Exhaustion Simulator",
+      filename: "rds-topology-simulator.js",
+      description:
+        "Implement <code>evaluateDatabaseTopology(config)</code>. Rules: (1) <code>rawClientConnections = config.lambdaConcurrency * config.connectionsPerLambda</code>. (2) If <code>!config.useRdsProxy</code>, <code>backendConnections = rawClientConnections</code>. If <code>config.useRdsProxy</code>, <code>pinned = Math.ceil(rawClientConnections * config.pinnedFraction)</code>, <code>unpinned = rawClientConnections - pinned</code>, and <code>backendConnections = pinned + Math.ceil(unpinned / config.multiplexFactor)</code>. (3) <code>connectionExhausted = backendConnections > config.maxConnections</code>. (4) <code>proxyCap = Math.floor((config.maxConnections * config.proxyMaxConnectionsPercent) / 100)</code>; <code>proxySaturated = config.useRdsProxy ? backendConnections > proxyCap : false</code>. (5) For <code>engine === \"aurora\"</code>, <code>surviving = Math.max(0, 6 - config.failedStorageCopies)</code>: <code>&gt;= 4</code> &rarr; <code>\"READ_WRITE_OK\"</code>, <code>3</code> &rarr; <code>\"READ_ONLY\"</code>, <code>&lt; 3</code> &rarr; <code>\"UNAVAILABLE\"</code>; for <code>\"rds-multiaz\"</code> return <code>\"NOT_APPLICABLE\"</code>. (6) <code>baseFailoverSec = config.engine === \"aurora\" ? 25 : 90</code>; <code>estimatedFailoverSec = Math.round(baseFailoverSec * (config.useRdsProxy ? 0.4 : 1))</code>. (7) <code>healthy = !connectionExhausted && !proxySaturated && (config.engine === \"rds-multiaz\" || quorumStatus === \"READ_WRITE_OK\")</code>.",
+      exports: ["evaluateDatabaseTopology"],
+      starterCode: `function evaluateDatabaseTopology(config) {
+  // config: {
+  //   engine: "rds-multiaz" | "aurora",
+  //   maxConnections: number,
+  //   lambdaConcurrency: number,
+  //   connectionsPerLambda: number,
+  //   useRdsProxy: boolean,
+  //   proxyMaxConnectionsPercent: number,
+  //   pinnedFraction: number,
+  //   multiplexFactor: number,
+  //   failedStorageCopies: number
+  // }
+
+  const rawClientConnections = config.lambdaConcurrency * config.connectionsPerLambda;
+
+  let backendConnections = rawClientConnections;
+  // TODO 1: when useRdsProxy is true, compute pinned + Math.ceil(unpinned / multiplexFactor)
+
+  const connectionExhausted = false; // TODO 2: backendConnections > config.maxConnections
+  const proxySaturated = false;      // TODO 3: compare against proxyCap when useRdsProxy is true
+
+  let quorumStatus = "NOT_APPLICABLE";
+  // TODO 4: for "aurora", evaluate 6 - failedStorageCopies against 4/6 write & 3/6 read quorum
+
+  const estimatedFailoverSec = 0; // TODO 5: base (25 aurora, 90 rds-multiaz) * (useRdsProxy ? 0.4 : 1)
+  const healthy = false;          // TODO 6: !connectionExhausted && !proxySaturated && writable
+
+  return {
+    rawClientConnections,
+    backendConnections,
+    connectionExhausted,
+    proxySaturated,
+    quorumStatus,
+    estimatedFailoverSec,
+    healthy
+  };
+}
+
+console.log(
+  "Aurora + RDS Proxy sample:",
+  evaluateDatabaseTopology({
+    engine: "aurora",
+    maxConnections: 200,
+    lambdaConcurrency: 500,
+    connectionsPerLambda: 1,
+    useRdsProxy: true,
+    proxyMaxConnectionsPercent: 80,
+    pinnedFraction: 0.05,
+    multiplexFactor: 10,
+    failedStorageCopies: 2
+  })
+);`,
+      hints: [
+        "When <code>config.useRdsProxy</code> is <code>true</code>, compute <code>const pinned = Math.ceil(rawClientConnections * config.pinnedFraction)</code>, then <code>const unpinned = rawClientConnections - pinned</code>, and add <code>Math.ceil(unpinned / config.multiplexFactor)</code>.",
+        "For Aurora quorum, <code>surviving = Math.max(0, 6 - config.failedStorageCopies)</code>: <code>&gt;= 4</code> is <code>\"READ_WRITE_OK\"</code>, <code>=== 3</code> is <code>\"READ_ONLY\"</code>, and <code>&lt; 3</code> is <code>\"UNAVAILABLE\"</code>. Remember <code>healthy</code> requires both pools to be within limits AND writes to be available."
+      ],
+      solutionExplanation:
+        "Without RDS Proxy, 300+ concurrent Lambdas immediately exhaust a 200-connection PostgreSQL instance. Enabling RDS Proxy multiplexes unpinned sessions by 10:1 and slashes failover time by 60%. However, if session pinning rises (for example via session-level SET commands), pinned 1:1 sockets quickly blow past both the proxy's MaxConnectionsPercent cap and the database max_connections. On Aurora, losing 2 copies (one full AZ) still preserves the 4/6 write quorum, whereas losing 3 copies (AZ + 1) drops the cluster into READ_ONLY mode.",
+      solutionCode: `function evaluateDatabaseTopology(config) {
+  const rawClientConnections = config.lambdaConcurrency * config.connectionsPerLambda;
+
+  let backendConnections = rawClientConnections;
+  if (config.useRdsProxy) {
+    const pinned = Math.ceil(rawClientConnections * config.pinnedFraction);
+    const unpinned = rawClientConnections - pinned;
+    backendConnections = pinned + Math.ceil(unpinned / config.multiplexFactor);
+  }
+
+  const connectionExhausted = backendConnections > config.maxConnections;
+  const proxyCap = Math.floor((config.maxConnections * config.proxyMaxConnectionsPercent) / 100);
+  const proxySaturated = config.useRdsProxy ? backendConnections > proxyCap : false;
+
+  let quorumStatus = "NOT_APPLICABLE";
+  if (config.engine === "aurora") {
+    const surviving = Math.max(0, 6 - config.failedStorageCopies);
+    if (surviving >= 4) {
+      quorumStatus = "READ_WRITE_OK";
+    } else if (surviving === 3) {
+      quorumStatus = "READ_ONLY";
+    } else {
+      quorumStatus = "UNAVAILABLE";
+    }
+  }
+
+  const baseFailoverSec = config.engine === "aurora" ? 25 : 90;
+  const estimatedFailoverSec = Math.round(baseFailoverSec * (config.useRdsProxy ? 0.4 : 1));
+  const healthy =
+    !connectionExhausted &&
+    !proxySaturated &&
+    (config.engine === "rds-multiaz" || quorumStatus === "READ_WRITE_OK");
+
+  return {
+    rawClientConnections,
+    backendConnections,
+    connectionExhausted,
+    proxySaturated,
+    quorumStatus,
+    estimatedFailoverSec,
+    healthy
+  };
+}`,
+      tests: [
+        {
+          name: "Direct Lambda burst without RDS Proxy exhausts max_connections on RDS Multi-AZ",
+          run: (scope) => {
+            const out = scope.evaluateDatabaseTopology({
+              engine: "rds-multiaz",
+              maxConnections: 200,
+              lambdaConcurrency: 300,
+              connectionsPerLambda: 1,
+              useRdsProxy: false,
+              proxyMaxConnectionsPercent: 80,
+              pinnedFraction: 0,
+              multiplexFactor: 10,
+              failedStorageCopies: 0
+            });
+            const pass =
+              out.rawClientConnections === 300 &&
+              out.backendConnections === 300 &&
+              out.connectionExhausted === true &&
+              out.proxySaturated === false &&
+              out.quorumStatus === "NOT_APPLICABLE" &&
+              out.estimatedFailoverSec === 90 &&
+              out.healthy === false;
+            return { pass, message: `got backend=${out.backendConnections}, exhausted=${out.connectionExhausted}, failover=${out.estimatedFailoverSec}` };
+          }
+        },
+        {
+          name: "RDS Proxy multiplexes unpinned Lambda burst and accelerates failover",
+          run: (scope) => {
+            const out = scope.evaluateDatabaseTopology({
+              engine: "rds-multiaz",
+              maxConnections: 200,
+              lambdaConcurrency: 300,
+              connectionsPerLambda: 1,
+              useRdsProxy: true,
+              proxyMaxConnectionsPercent: 80,
+              pinnedFraction: 0,
+              multiplexFactor: 10,
+              failedStorageCopies: 0
+            });
+            const pass =
+              out.backendConnections === 30 &&
+              out.connectionExhausted === false &&
+              out.proxySaturated === false &&
+              out.estimatedFailoverSec === 36 &&
+              out.healthy === true;
+            return { pass, message: `got backend=${out.backendConnections}, failover=${out.estimatedFailoverSec}, healthy=${out.healthy}` };
+          }
+        },
+        {
+          name: "High connection pinning defeats RDS Proxy multiplexing and exhausts DB",
+          run: (scope) => {
+            const out = scope.evaluateDatabaseTopology({
+              engine: "aurora",
+              maxConnections: 200,
+              lambdaConcurrency: 500,
+              connectionsPerLambda: 1,
+              useRdsProxy: true,
+              proxyMaxConnectionsPercent: 80,
+              pinnedFraction: 0.4,
+              multiplexFactor: 10,
+              failedStorageCopies: 0
+            });
+            const pass =
+              out.backendConnections === 230 &&
+              out.connectionExhausted === true &&
+              out.proxySaturated === true &&
+              out.healthy === false;
+            return { pass, message: `got backend=${out.backendConnections}, exhausted=${out.connectionExhausted}, saturated=${out.proxySaturated}` };
+          }
+        },
+        {
+          name: "Proxy MaxConnectionsPercent cap flags proxySaturated before DB max_connections",
+          run: (scope) => {
+            const out = scope.evaluateDatabaseTopology({
+              engine: "aurora",
+              maxConnections: 200,
+              lambdaConcurrency: 500,
+              connectionsPerLambda: 1,
+              useRdsProxy: true,
+              proxyMaxConnectionsPercent: 50,
+              pinnedFraction: 0.2,
+              multiplexFactor: 10,
+              failedStorageCopies: 0
+            });
+            const pass =
+              out.backendConnections === 140 &&
+              out.connectionExhausted === false &&
+              out.proxySaturated === true &&
+              out.healthy === false;
+            return { pass, message: `got backend=${out.backendConnections}, saturated=${out.proxySaturated}, healthy=${out.healthy}` };
+          }
+        },
+        {
+          name: "Aurora single-AZ loss (2 copies down) maintains 4/6 write quorum and stays healthy",
+          run: (scope) => {
+            const out = scope.evaluateDatabaseTopology({
+              engine: "aurora",
+              maxConnections: 200,
+              lambdaConcurrency: 400,
+              connectionsPerLambda: 1,
+              useRdsProxy: true,
+              proxyMaxConnectionsPercent: 80,
+              pinnedFraction: 0.05,
+              multiplexFactor: 10,
+              failedStorageCopies: 2
+            });
+            const pass =
+              out.backendConnections === 58 &&
+              out.quorumStatus === "READ_WRITE_OK" &&
+              out.estimatedFailoverSec === 10 &&
+              out.healthy === true;
+            return { pass, message: `got backend=${out.backendConnections}, quorum=${out.quorumStatus}, failover=${out.estimatedFailoverSec}` };
+          }
+        },
+        {
+          name: "Aurora AZ + 1 failure (3 copies down) drops to READ_ONLY and marks healthy=false",
+          run: (scope) => {
+            const out = scope.evaluateDatabaseTopology({
+              engine: "aurora",
+              maxConnections: 200,
+              lambdaConcurrency: 100,
+              connectionsPerLambda: 1,
+              useRdsProxy: true,
+              proxyMaxConnectionsPercent: 80,
+              pinnedFraction: 0,
+              multiplexFactor: 10,
+              failedStorageCopies: 3
+            });
+            const pass =
+              out.quorumStatus === "READ_ONLY" &&
+              out.connectionExhausted === false &&
+              out.healthy === false;
+            return { pass, message: `got quorum=${out.quorumStatus}, healthy=${out.healthy}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0032",
+      title: "Quiz 0032: Multi-AZ, Aurora Quorum & RDS Proxy",
+      questions: [
+        {
+          id: "q1",
+          prompt: "An Android app posts a new checkout order to an ECS service backed by RDS PostgreSQL (Multi-AZ DB Instance plus two Read Replicas) and immediately fetches GET /orders/{id} from a Read Replica, receiving HTTP 404 intermittently. What explains this?",
+          options: [
+            "Standby instances reject read queries until automatic database failover finishes promoting",
+            "Read replicas receive asynchronous replication streams and lag behind recent writes",
+            "Primary database instances delay committing transactions until all replicas acknowledge durability",
+            "Route 53 caches replica endpoints longer than standard primary writer records"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Multi-AZ standby instances do reject reads, but the backend here queried a Read Replica—not the passive Multi-AZ standby.",
+            "RDS Read Replicas use asynchronous WAL streaming, so a read immediately following a write can hit a replica before the new row arrives (replication lag).",
+            "Read Replicas are asynchronous; the primary commits without waiting for replicas, which is precisely why read-after-write sees lag.",
+            "DNS caching controls which IP an instance resolves to, not whether a newly written row has finished streaming across WAL."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "An Amazon Aurora PostgreSQL cluster spans three Availability Zones in us-east-1. One entire Availability Zone goes offline and simultaneously a single storage disk fails in a second Availability Zone. What happens to cluster operations?",
+          options: [
+            "Both reads and writes continue normally because four storage copies remain online",
+            "Reads continue using three surviving copies while new writes pause without quorum",
+            "The cluster shuts down completely until at least five copies recover synchronously",
+            "Aurora immediately promotes a read replica to restore the four copy quorum"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "An AZ outage removes 2 copies and an extra disk failure removes a 3rd copy, leaving only 3 of 6 copies—one short of the 4/6 write quorum.",
+            "With 3 of 6 storage copies surviving (AZ + 1 failure), Aurora satisfies its 3/6 read quorum so reads and storage repair continue, while writes pause until 4/6 is restored.",
+            "Aurora requires 4/6 copies for writes and 3/6 copies for reads—never 5—and keeps serving reads from the 3 surviving copies.",
+            "Promoting a compute head node does not create missing storage copies; all Aurora instances share the same 6-copy distributed storage volume."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "After adding RDS Proxy in front of Aurora PostgreSQL, a Lambda spike still triggers connection exhaustion on the database, and CloudWatch shows DatabaseConnectionsCurrentlySessionPinned climbing alongside ClientConnections. Which code pattern in the Lambda handler explains this?",
+          options: [
+            "Executing session level SET commands forces one to one connection pinning",
+            "Initializing the PostgreSQL driver globally prevents Lambda from opening new sockets",
+            "Wrapping short read queries in explicit transactions disables proxy connection pooling",
+            "Authenticating Lambda workers through Secrets Manager bypasses the RDS Proxy pool"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Session-level SET statements alter connection state across transactions, forcing RDS Proxy to pin each client 1:1 to a backend connection and defeating multiplexing.",
+            "Initializing the DB pool globally outside the handler is a best practice that reuses warm container connections rather than causing pinning.",
+            "Short explicit transactions (BEGIN/COMMIT) are ideal for RDS Proxy because multiplexing detaches backend connections cleanly at transaction boundaries.",
+            "Secrets Manager is the standard credential store used by RDS Proxy itself and does not bypass proxy pooling."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

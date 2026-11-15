@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0040 — CloudFormation Internals: Change Sets, Rollbacks, Drift &amp; StackSets</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0040</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0040-cloudformation-drift-changesets-stacksets.html" class="active">Lesson 0040</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.7</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>CloudFormation Internals: Change Sets, Rollbacks, Drift &amp; StackSets</h1>
+    <p class="lead">
+      Before adopting AWS CDK or Terraform, you must understand the declarative control-plane engine underneath AWS itself: how CloudFormation compiles templates into a resource DAG, why a single property edit triggers destructive replacement, how <code>DeletionPolicy</code> and <code>UpdateReplacePolicy</code> protect stateful databases, why out-of-band console edits poison rollbacks, and how StackSets roll out organization-wide guardrails safely.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, your <code>build.gradle.kts</code> and Hilt modules declare <em>what</em> dependencies and components exist—not imperative shell commands telling <code>kotlinc</code> which file to compile first. Gradle builds a Directed Acyclic Graph (DAG), resolves edges, and only rebuilds dirty nodes. <strong>AWS CloudFormation</strong> does the exact same thing for cloud infrastructure: you declare VPCs, IAM roles, and RDS databases with <code>!Ref</code>, <code>!GetAtt</code>, and <code>DependsOn</code> edges, and CloudFormation computes a plan (a <strong>Change Set</strong>) against live stack state. The critical difference: when Gradle decides a build cache key changed, wiping <code>build/</code> is harmless; when CloudFormation decides a property change requires <code>Replacement: True</code> on a database, wiping the old node destroys production user data unless you explicitly guard it.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. The Declarative Engine: DAG Resolution, Stacks &amp; Quotas</h2>
+        <p>
+          Imperative provisioning scripts (<code>aws rds create-db-instance ...</code>) break the moment step 4 of 12 fails: you are left with half-created subnets, orphaned security groups, and no automatic rollback or diffing. A <strong>CloudFormation Stack</strong> solves this by storing a declarative template, parameter values, and the mapping from <em>Logical IDs</em> (names inside your template) to <em>Physical IDs</em> (real ARNs/names in AWS).
+        </p>
+        <p>
+          At deploy time, CloudFormation constructs a <strong>Directed Acyclic Graph (DAG)</strong>:
+        </p>
+        <ul>
+          <li><strong>Implicit edges:</strong> Using <code>!Ref Vpc</code> or <code>!GetAtt OrdersDB.Endpoint.Address</code> forces CloudFormation to finish provisioning the referenced resource (or wait until the attribute is available) before creating the dependent resource.</li>
+          <li><strong>Explicit edges:</strong> <code>DependsOn: [GatewayAttachment]</code> enforces ordering when no direct property reference exists (such as waiting for an Internet Gateway attachment before creating a default route).</li>
+          <li><strong>Parallel execution:</strong> Independent branches of the DAG execute concurrently up to service throttling limits, while deletions run in exact reverse topological order.</li>
+        </ul>
+        <p>
+          Per the <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cloudformation-limits.html" target="_blank" rel="noopener">AWS CloudFormation Quotas specification</a>, every stack faces hard structural boundaries you must design around early:
+        </p>
+        <ul>
+          <li><strong>500 resources</strong> maximum per template (pushing teams toward modular multi-stack architectures rather than one giant monolith).</li>
+          <li><strong>51,200 bytes</strong> max template size via direct API body upload, or <strong>1,048,576 bytes (1 MB)</strong> when staged in S3.</li>
+          <li><strong>200 parameters</strong>, <strong>200 mappings</strong>, and <strong>200 outputs</strong> per template; <strong>2,000 stacks</strong> default limit per account per region.</li>
+        </ul>
+
+        <!-- SECTION 2 -->
+        <h2>2. Change Sets &amp; Replacement Blast Radius</h2>
+        <p>
+          Running <code>aws cloudformation deploy</code> blindly applies changes immediately. In production, senior teams separate planning from execution using a <strong>Change Set</strong> (<code>create-change-set</code> &rarr; inspect &rarr; <code>execute-change-set</code>). Note that a stack can hold up to <strong>100</strong> unexecuted Change Sets, and creating a Change Set executes zero infrastructure mutations.
+        </p>
+        <p>
+          Every entry in <code>describe-change-set</code> reports an <code>Action</code> (<code>Add</code>, <code>Modify</code>, <code>Remove</code>, <code>Import</code>, or <code>Dynamic</code>) and—for modifications—a <code>Replacement</code> field with three possible values:
+        </p>
+        <ul>
+          <li><strong><code>Replacement: False</code>:</strong> In-place update (e.g., changing a Lambda memory size, adding a DynamoDB GSI, or editing tags). Minimal blast radius.</li>
+          <li><strong><code>Replacement: True</code>:</strong> CloudFormation <strong>cannot mutate the property in place</strong> (e.g., changing a DynamoDB partition key, an RDS <code>DBName</code>/<code>AvailabilityZone</code>, or an S3 bucket name). It creates a brand-new physical resource, updates downstream references, and then deletes the old resource.</li>
+          <li><strong><code>Replacement: Conditional</code>:</strong> Replacement depends on runtime parameter values or conditions (treat this as <code>True</code> during code review unless proven otherwise).</li>
+        </ul>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 250" width="100%" height="auto" role="img" aria-label="CloudFormation Change Set Blast Radius and Update Flow">
+            <rect x="0" y="0" width="680" height="250" fill="#fdfcf8" rx="6" />
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Change Set Evaluation &amp; Replacement Blast Radius</text>
+
+            <!-- Box 1: Template v2 -->
+            <rect x="16" y="48" width="130" height="54" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="81" y="71" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f4c81">Template v2</text>
+            <text x="81" y="88" text-anchor="middle" font-family="monospace" font-size="10" fill="#0f4c81">create-change-set</text>
+
+            <!-- Arrow 1 -->
+            <line x1="146" y1="75" x2="180" y2="75" stroke="#575c66" stroke-width="1.5" />
+            <polygon points="180,71 188,75 180,79" fill="#575c66" />
+
+            <!-- Box 2: Diff Engine -->
+            <rect x="188" y="48" width="140" height="54" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="258" y="71" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#b45309">Change Set Diff</text>
+            <text x="258" y="88" text-anchor="middle" font-family="monospace" font-size="10" fill="#b45309">Inspect Replacement</text>
+
+            <!-- Branches -->
+            <line x1="328" y1="62" x2="375" y2="45" stroke="#166534" stroke-width="1.5" />
+            <line x1="328" y1="75" x2="375" y2="112" stroke="#991b1b" stroke-width="1.5" />
+            <line x1="328" y1="88" x2="375" y2="182" stroke="#b45309" stroke-width="1.5" />
+
+            <!-- Branch A: False -->
+            <rect x="375" y="24" width="289" height="44" rx="5" fill="#dcfce7" stroke="#166534" />
+            <text x="387" y="43" font-family="monospace" font-size="11" font-weight="700" fill="#166534">Replacement: False (In-Place)</text>
+            <text x="387" y="58" font-family="sans-serif" font-size="11" fill="#166534">Mutates existing physical resource; zero downtime.</text>
+
+            <!-- Branch B: True -->
+            <rect x="375" y="82" width="289" height="62" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="387" y="101" font-family="monospace" font-size="11" font-weight="700" fill="#991b1b">Replacement: True (Create &rarr; Swap &rarr; Delete)</text>
+            <text x="387" y="117" font-family="sans-serif" font-size="11" fill="#991b1b">1. Fails if custom physical name collides!</text>
+            <text x="387" y="133" font-family="sans-serif" font-size="11" fill="#991b1b">2. Deletes old resource unless UpdateReplacePolicy guards it.</text>
+
+            <!-- Branch C: Rollback failure -->
+            <rect x="375" y="158" width="289" height="68" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="387" y="177" font-family="monospace" font-size="11" font-weight="700" fill="#b45309">Update Fails &rarr; UPDATE_ROLLBACK_IN_PROGRESS</text>
+            <text x="387" y="193" font-family="sans-serif" font-size="11" fill="#b45309">Reverts to last known template. If console drift</text>
+            <text x="387" y="209" font-family="sans-serif" font-size="11" fill="#b45309">deleted a dependency &rarr; UPDATE_ROLLBACK_FAILED.</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: CloudFormation builds a replacement before deleting the original resource. Hardcoded physical names block creation of the replacement, causing immediate rollback.
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-title">The Hardcoded Physical Name Anti-Pattern</div>
+          <p style="margin: 0;">
+            Never hardcode physical names like <code>TableName: orders-prod</code>, <code>BucketName: myapp-assets</code>, or <code>DBInstanceIdentifier: primary-db</code> on resources that might ever be replaced. Because CloudFormation performs <strong>create-before-delete</strong> during <code>Replacement: True</code>, two resources with the exact same physical name cannot coexist in AWS—so the replacement immediately fails with <code>AlreadyExistsException</code>! Let CloudFormation auto-generate unique physical names (or include a version suffix) and pass them around via <code>!Ref</code> and <code>!GetAtt</code>.
+          </p>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Stateful Protection (<code>DeletionPolicy</code>, <code>UpdateReplacePolicy</code>) &amp; Rollback Traps</h2>
+        <p>
+          Two separate attributes govern what happens to physical data when CloudFormation lets go of a resource, and confusing them is a classic senior production incident:
+        </p>
+        <ul>
+          <li><strong><code>DeletionPolicy</code></strong> (<code>Delete</code> [default], <code>Retain</code>, <code>Snapshot</code>): Fires when you <strong>remove the resource</strong> from the template or <strong>delete the entire stack</strong>.</li>
+          <li><strong><code>UpdateReplacePolicy</code></strong> (<code>Delete</code> [default], <code>Retain</code>, <code>Snapshot</code>): Fires when a stack <strong>update triggers <code>Replacement: True</code></strong> and CloudFormation disposes of the <em>old</em> physical resource after creating the new one.</li>
+        </ul>
+        <p>
+          If you put <code>DeletionPolicy: Retain</code> on an <code>AWS::RDS::DBInstance</code> but forget <code>UpdateReplacePolicy</code>, a Change Set that replaces the DB instance will spin up an empty database and <strong>delete your original production database</strong> once the swap finishes! Furthermore, per the <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-deletionpolicy.html" target="_blank" rel="noopener">CloudFormation DeletionPolicy documentation</a>, <code>Snapshot</code> is supported only on select resource types (such as <code>AWS::RDS::DBInstance</code>, <code>AWS::RDS::DBCluster</code>, <code>AWS::EC2::Volume</code>, and <code>AWS::ElastiCache::ReplicationGroup</code>). Setting <code>Snapshot</code> on <code>AWS::DynamoDB::Table</code> or <code>AWS::S3::Bucket</code> is invalid and fails stack validation/deletion.
+        </p>
+        <p>
+          As a second line of defense, attach a <strong>Stack Policy</strong> (a resource-based JSON policy on the stack itself) that explicitly denies <code>Update:Replace</code> and <code>Update:Delete</code> on critical logical IDs like <code>OrdersDB</code> and <code>OrdersTable</code>. Even if an engineer accidentally approves a destructive Change Set, CloudFormation rejects the update at execution time unless a separate overriding stack policy is explicitly supplied.
+        </p>
+        <p>
+          <strong>Rollback Mechanics &amp; <code>UPDATE_ROLLBACK_FAILED</code>:</strong> By default, any failed resource step during an update puts the stack into <code>UPDATE_ROLLBACK_IN_PROGRESS</code>, reverting modified resources to the prior template. If that rollback itself hits an unrecoverable error—for instance, an out-of-band edit deleted a referenced security group, IAM permissions were revoked, or an S3 bucket is non-empty—the stack freezes in <code>UPDATE_ROLLBACK_FAILED</code>. No further updates or deletes can run until you manually reconcile the broken resource and call <code>aws cloudformation continue-update-rollback --resources-to-skip &lt;LogicalId&gt;</code>.
+        </p>
+
+        <!-- SECTION 4 -->
+        <h2>4. Drift Detection &amp; Out-of-Band Console Edits</h2>
+        <p>
+          ClickOps—editing a Lambda timeout, opening a Security Group port, or deleting an IAM policy directly in the AWS Console during an incident—creates <strong>configuration drift</strong>. CloudFormation stores the <em>template</em> it last deployed, not live AWS state, so routine updates do <em>not</em> automatically detect console changes.
+        </p>
+        <p>
+          Running <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-stack-drift.html" target="_blank" rel="noopener">Stack Drift Detection</a> (<code>detect-stack-drift</code>) inspects live resource properties against the stack's expected template state and classifies each supported resource as:
+        </p>
+        <ul>
+          <li><strong><code>IN_SYNC</code>:</strong> Live properties match the template definition.</li>
+          <li><strong><code>MODIFIED</code>:</strong> Property-level diff shows <code>ADD</code>, <code>REMOVE</code>, or <code>NOT_EQUAL</code> between expected and actual JSON.</li>
+          <li><strong><code>DELETED</code>:</strong> The physical resource no longer exists in AWS (a ticking time bomb for <code>UPDATE_ROLLBACK_FAILED</code>).</li>
+          <li><strong><code>NOT_CHECKED</code>:</strong> Resource type does not support drift detection yet.</li>
+        </ul>
+        <p>
+          Critically, CloudFormation drift detection is <strong>read-only</strong>—it alerts you, but never auto-remediates. To bring a drifted resource back under IaC control cleanly, either update the template to match the desired live configuration (or revert the console edit), or use <strong>Resource Import</strong> when adopting unmanaged resources into a stack.
+        </p>
+
+        <!-- SECTION 5 -->
+        <h2>5. Multi-Account &amp; Multi-Region Rollouts with StackSets</h2>
+        <p>
+          A single CloudFormation stack deploys into <strong>one account and one region</strong>. When your organization runs 50+ accounts across dev, staging, production, and security OUs, deploying baseline IAM roles, AWS Config rules, or CloudTrail trails stack-by-stack breaks down. <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/what-is-cfnstacksets.html" target="_blank" rel="noopener">AWS CloudFormation StackSets</a> manage a single template from an administrator (or delegated admin) account and stamp out <strong>Stack Instances</strong> across any matrix of target accounts and regions.
+        </p>
+        <ul>
+          <li><strong><code>SELF_MANAGED</code> permissions:</strong> You manually create <code>AWSCloudFormationStackSetAdministrationRole</code> in the hub account and <code>AWSCloudFormationStackSetExecutionRole</code> trust roles in every spoke account.</li>
+          <li><strong><code>SERVICE_MANAGED</code> permissions:</strong> Integrates directly with AWS Organizations and Organizational Units (OUs). Enabling <code>AutoDeployment</code> automatically provisions baseline stacks whenever a new AWS account joins an OU—and automatically retains or deletes them if an account leaves.</li>
+        </ul>
+        <p>
+          To prevent a broken template change from taking down every production account simultaneously, always configure <strong><code>OperationPreferences</code></strong> as a deployment circuit breaker:
+        </p>
+        <ul>
+          <li><strong><code>MaxConcurrentCount</code> / <code>MaxConcurrentPercentage</code>:</strong> Limits simultaneous account-region deployments (e.g., roll out to 1 canary account or <code>10%</code> first).</li>
+          <li><strong><code>FailureToleranceCount</code> / <code>FailureTolerancePercentage</code>:</strong> Stops the entire StackSet rollout once failures exceed your threshold (set <code>FailureToleranceCount: 0</code> for zero-tolerance security/network baselines).</li>
+          <li><strong><code>RegionConcurrencyType</code>:</strong> Choose <code>SEQUENTIAL</code> (region-by-region blast containment) or <code>PARALLEL</code> (faster rollouts for low-risk updates), alongside <code>STRICT_FAILURE_TOLERANCE</code> so later regions never start after an earlier failure threshold trips.</li>
+        </ul>
+
+        <!-- SECTION 6 -->
+        <h2>6. Production Code Example: Stateful Guardrails &amp; CLI Workflow</h2>
+        <p>
+          Below is a production-safe CloudFormation snippet protecting stateful databases during both deletion and replacement, paired with the exact CLI Change Set and StackSet rollout commands:
+        </p>
+<pre><code># 1. template.yaml — Stateful Resources with Full Protection &amp; Auto-Generated Physical Names
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain         # Survives stack delete / resource removal
+    UpdateReplacePolicy: Retain    # Survives key-schema replacement (Snapshot unsupported on DynamoDB!)
+    Properties:
+      # Omit TableName so CloudFormation generates a unique name (avoids create-before-delete collision)
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+
+  OrdersDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot       # RDS supports Snapshot on delete AND on UpdateReplacePolicy
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: "16.3"
+      DBInstanceClass: db.t4g.medium
+      AllocatedStorage: 100
+
+# 2. stack-policy.json — Block accidental Replacement or Delete on stateful databases
+# {
+#   "Statement": [
+#     { "Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*" },
+#     { "Effect": "Deny", "Action": ["Update:Replace", "Update:Delete"],
+#       "Principal": "*", "Resource": ["LogicalResourceId/OrdersTable", "LogicalResourceId/OrdersDatabase"] }
+#   ]
+# }
+
+# 3. Safe Production CLI Workflow (Change Set + Drift Check + StackSet Canary)
+aws cloudformation detect-stack-drift --stack-name orders-prod
+aws cloudformation create-change-set --stack-name orders-prod --template-body file://template.yaml --change-set-name v42-rollout
+aws cloudformation describe-change-set --stack-name orders-prod --change-set-name v42-rollout --query 'Changes[*].[ResourceChange.LogicalResourceId,ResourceChange.Action,ResourceChange.Replacement]'
+aws cloudformation execute-change-set --stack-name orders-prod --change-set-name v42-rollout
+
+aws cloudformation update-stack-instances \
+  --stack-set-name org-security-baselines \
+  --deployment-targets OrganizationalUnitIds=ou-prod-12345 \
+  --regions us-east-1 us-west-2 \
+  --operation-preferences RegionConcurrencyType=SEQUENTIAL,MaxConcurrentPercentage=10,FailureToleranceCount=0,ConcurrencyMode=STRICT_FAILURE_TOLERANCE</code></pre>
+
+        <!-- SECTION 7: INTERACTIVE CODE PRACTICE -->
+        <h2>7. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement <code>auditChangeSet(templateResources, changes, stackPolicy)</code> to catch destructive replacement blast-radius traps before calling <code>execute-change-set</code>: hardcoded physical name collisions, missing <code>UpdateReplacePolicy</code> or <code>DeletionPolicy</code> on stateful resources, invalid <code>Snapshot</code> policies on DynamoDB/S3, and changes blocked by a Stack Policy.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 8: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>8. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your CloudFormation internals mental model before moving to AWS CDK. Every question explains both why the right answer holds and why each distractor fails.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 9: PRIMARY SOURCE & NEXT STEPS -->
+        <h2>9. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Change Sets:</strong> <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-updating-stacks-changesets.html" target="_blank" rel="noopener">AWS CloudFormation User Guide — Updating stacks using change sets</a>
+          </li>
+          <li>
+            <strong>Deletion &amp; Replace Policies:</strong> <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-deletionpolicy.html" target="_blank" rel="noopener">AWS CloudFormation User Guide — DeletionPolicy &amp; UpdateReplacePolicy attributes</a>
+          </li>
+          <li>
+            <strong>Drift Detection:</strong> <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-stack-drift.html" target="_blank" rel="noopener">AWS CloudFormation User Guide — Detecting unmanaged configuration changes</a>
+          </li>
+          <li>
+            <strong>StackSets &amp; Quotas:</strong> <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/what-is-cfnstacksets.html" target="_blank" rel="noopener">Working with AWS CloudFormation StackSets</a> &amp; <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cloudformation-limits.html" target="_blank" rel="noopener">AWS CloudFormation Quotas</a>
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0041 (AWS CDK in TypeScript: L1/L2/L3 Constructs, Aspects, cdk-nag &amp; Assertions)</strong>, ask anything that feels fuzzy—for example: <em>"How do nested stacks and cross-stack <code>Export</code> / <code>Fn::ImportValue</code> create hidden coupling locks?"</em> or <em>"When would you choose Terraform state over CloudFormation Change Sets?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0039-step-functions-saga-compensations.html">&larr; Lesson 0039: AWS Step Functions: Standard vs Express, Saga Pattern & Callback Tokens</a>
+          <a href="./0041-aws-cdk-constructs-aspects-nag.html">Lesson 0041: AWS CDK (TypeScript): L1/L2/L3 Constructs, Aspects, cdk-nag & Assertions &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>CDK &amp; SAM Under the Hood</strong>
+          Both AWS CDK (<code>cdk deploy</code>) and AWS SAM synthesize directly into CloudFormation templates and Change Sets. Every CDK deployment failure ultimately surfaces as a CloudFormation stack event.
+        </div>
+        <div class="sidenote">
+          <strong>The <code>UpdateReplacePolicy</code> Trap</strong>
+          <code>DeletionPolicy</code> only triggers when you delete a stack or drop a resource from the template. During <code>Replacement: True</code> updates, CloudFormation enforces <code>UpdateReplacePolicy</code> on the replaced physical resource instead.
+        </div>
+        <div class="sidenote">
+          <strong>Check the Glossary</strong>
+          Review core cloud terms anytime in <a href="../reference/glossary.html">reference/glossary.html</a>.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0040",
+      title: "Lab 0040: CloudFormation Change Set Blast-Radius & Policy Auditor",
+      filename: "cfn-changeset-auditor.js",
+      description:
+        "Implement <code>auditChangeSet(templateResources, changes, stackPolicy)</code>. Stateful types are <code>AWS::RDS::DBInstance</code>, <code>AWS::RDS::DBCluster</code>, <code>AWS::DynamoDB::Table</code>, and <code>AWS::S3::Bucket</code>. For each change <code>{ logicalId, action, replacement }</code>: (1) If <code>action === \"Modify\"</code> and <code>replacement</code> is <code>\"True\"</code> or <code>\"Conditional\"</code> and <code>res.hasCustomPhysicalName</code> is true, push <code>{ logicalId, severity: \"CRITICAL\", code: \"PHYSICAL_NAME_COLLISION\" }</code>. (2) On <code>Modify</code> with <code>Replacement</code> <code>\"True\"</code>/<code>\"Conditional\"</code> on a stateful resource, check <code>res.updateReplacePolicy || \"Delete\"</code>: if <code>\"Delete\"</code> push <code>CRITICAL</code> / <code>\"UNPROTECTED_STATEFUL_REPLACE\"</code>; if <code>\"Snapshot\"</code> on DynamoDB or S3 push <code>CRITICAL</code> / <code>\"UNSUPPORTED_SNAPSHOT_POLICY\"</code>. (3) On <code>Remove</code> of a stateful resource, check <code>res.deletionPolicy || \"Delete\"</code>: if <code>\"Delete\"</code> push <code>CRITICAL</code> / <code>\"UNPROTECTED_STATEFUL_DELETE\"</code>; if <code>\"Snapshot\"</code> on DynamoDB or S3 push <code>CRITICAL</code> / <code>\"UNSUPPORTED_SNAPSHOT_POLICY\"</code>. (4) If <code>stackPolicy.protectedLogicalIds</code> includes <code>logicalId</code> and the change is <code>Remove</code> or a replacing <code>Modify</code>, push <code>{ logicalId, severity: \"HIGH\", code: \"BLOCKED_BY_STACK_POLICY\" }</code>. Return <code>{ approved: findings.length === 0, criticalCount, highCount, findings }</code>.",
+      exports: ["auditChangeSet"],
+      starterCode: `function auditChangeSet(templateResources, changes, stackPolicy) {
+  // templateResources: { [logicalId]: { type, hasCustomPhysicalName, deletionPolicy?, updateReplacePolicy? } }
+  // changes: Array<{ logicalId: string, action: "Add" | "Modify" | "Remove", replacement?: "True" | "False" | "Conditional" }>
+  // stackPolicy: { protectedLogicalIds: string[] }
+
+  const STATEFUL_TYPES = new Set([
+    "AWS::RDS::DBInstance",
+    "AWS::RDS::DBCluster",
+    "AWS::DynamoDB::Table",
+    "AWS::S3::Bucket"
+  ]);
+  const NO_SNAPSHOT_TYPES = new Set([
+    "AWS::DynamoDB::Table",
+    "AWS::S3::Bucket"
+  ]);
+
+  const protectedSet = new Set((stackPolicy && stackPolicy.protectedLogicalIds) || []);
+  const findings = [];
+
+  for (const change of changes) {
+    const res = templateResources[change.logicalId];
+    const isReplacing =
+      change.action === "Modify" &&
+      (change.replacement === "True" || change.replacement === "Conditional");
+    const isStateful = Boolean(res && STATEFUL_TYPES.has(res.type));
+
+    // TODO 1: Flag PHYSICAL_NAME_COLLISION when isReplacing && res.hasCustomPhysicalName
+
+    // TODO 2: Flag UNPROTECTED_STATEFUL_REPLACE or UNSUPPORTED_SNAPSHOT_POLICY on replacing stateful resources
+
+    // TODO 3: Flag UNPROTECTED_STATEFUL_DELETE or UNSUPPORTED_SNAPSHOT_POLICY on Remove of stateful resources
+
+    // TODO 4: Flag BLOCKED_BY_STACK_POLICY (HIGH) when protectedSet.has(change.logicalId) && (change.action === "Remove" || isReplacing)
+  }
+
+  const criticalCount = findings.filter((f) => f.severity === "CRITICAL").length;
+  const highCount = findings.filter((f) => f.severity === "HIGH").length;
+
+  return {
+    approved: findings.length === 0,
+    criticalCount,
+    highCount,
+    findings
+  };
+}
+
+console.log(
+  "Sample audit:",
+  auditChangeSet(
+    {
+      OrdersTable: {
+        type: "AWS::DynamoDB::Table",
+        hasCustomPhysicalName: true,
+        deletionPolicy: "Retain"
+      }
+    },
+    [{ logicalId: "OrdersTable", action: "Modify", replacement: "True" }],
+    { protectedLogicalIds: ["OrdersTable"] }
+  )
+);`,
+      hints: [
+        "Notice that <code>OrdersTable</code> in the sample has <code>deletionPolicy: \"Retain\"</code>, NOT <code>updateReplacePolicy</code>! On a replacing <code>Modify</code>, CloudFormation reads <code>res.updateReplacePolicy || \"Delete\"</code>.",
+        "Multiple findings can apply to the same resource change (for example, both <code>PHYSICAL_NAME_COLLISION</code>, <code>UNPROTECTED_STATEFUL_REPLACE</code>, and <code>BLOCKED_BY_STACK_POLICY</code>), so use independent <code>if</code> blocks rather than <code>else if</code> across the four checks."
+      ],
+      solutionExplanation:
+        "Safe Change Set gating checks every hazard independently: custom physical names cause create-before-delete collisions on replacement; stateful replacements require UpdateReplacePolicy (and Snapshot is illegal on DynamoDB/S3); stateful removals require DeletionPolicy; and Stack Policies block destructive updates on protected Logical IDs.",
+      solutionCode: `function auditChangeSet(templateResources, changes, stackPolicy) {
+  const STATEFUL_TYPES = new Set([
+    "AWS::RDS::DBInstance",
+    "AWS::RDS::DBCluster",
+    "AWS::DynamoDB::Table",
+    "AWS::S3::Bucket"
+  ]);
+  const NO_SNAPSHOT_TYPES = new Set([
+    "AWS::DynamoDB::Table",
+    "AWS::S3::Bucket"
+  ]);
+
+  const protectedSet = new Set((stackPolicy && stackPolicy.protectedLogicalIds) || []);
+  const findings = [];
+
+  for (const change of changes) {
+    const res = templateResources[change.logicalId];
+    const isReplacing =
+      change.action === "Modify" &&
+      (change.replacement === "True" || change.replacement === "Conditional");
+    const isStateful = Boolean(res && STATEFUL_TYPES.has(res.type));
+
+    if (isReplacing && res && res.hasCustomPhysicalName) {
+      findings.push({
+        logicalId: change.logicalId,
+        severity: "CRITICAL",
+        code: "PHYSICAL_NAME_COLLISION"
+      });
+    }
+
+    if (isReplacing && isStateful) {
+      const replacePolicy = res.updateReplacePolicy || "Delete";
+      if (replacePolicy === "Delete") {
+        findings.push({
+          logicalId: change.logicalId,
+          severity: "CRITICAL",
+          code: "UNPROTECTED_STATEFUL_REPLACE"
+        });
+      } else if (replacePolicy === "Snapshot" && NO_SNAPSHOT_TYPES.has(res.type)) {
+        findings.push({
+          logicalId: change.logicalId,
+          severity: "CRITICAL",
+          code: "UNSUPPORTED_SNAPSHOT_POLICY"
+        });
+      }
+    }
+
+    if (change.action === "Remove" && isStateful) {
+      const deletePolicy = res.deletionPolicy || "Delete";
+      if (deletePolicy === "Delete") {
+        findings.push({
+          logicalId: change.logicalId,
+          severity: "CRITICAL",
+          code: "UNPROTECTED_STATEFUL_DELETE"
+        });
+      } else if (deletePolicy === "Snapshot" && NO_SNAPSHOT_TYPES.has(res.type)) {
+        findings.push({
+          logicalId: change.logicalId,
+          severity: "CRITICAL",
+          code: "UNSUPPORTED_SNAPSHOT_POLICY"
+        });
+      }
+    }
+
+    if (protectedSet.has(change.logicalId) && (change.action === "Remove" || isReplacing)) {
+      findings.push({
+        logicalId: change.logicalId,
+        severity: "HIGH",
+        code: "BLOCKED_BY_STACK_POLICY"
+      });
+    }
+  }
+
+  const criticalCount = findings.filter((f) => f.severity === "CRITICAL").length;
+  const highCount = findings.filter((f) => f.severity === "HIGH").length;
+
+  return {
+    approved: findings.length === 0,
+    criticalCount,
+    highCount,
+    findings
+  };
+}`,
+      tests: [
+        {
+          name: "Approves in-place Modify and Retain-protected RDS replacement without custom physical name",
+          run: (scope) => {
+            const out = scope.auditChangeSet(
+              {
+                ApiLambda: { type: "AWS::Lambda::Function", hasCustomPhysicalName: false },
+                OrdersDB: {
+                  type: "AWS::RDS::DBInstance",
+                  hasCustomPhysicalName: false,
+                  deletionPolicy: "Snapshot",
+                  updateReplacePolicy: "Snapshot"
+                }
+              },
+              [
+                { logicalId: "ApiLambda", action: "Modify", replacement: "False" },
+                { logicalId: "OrdersDB", action: "Modify", replacement: "True" }
+              ],
+              { protectedLogicalIds: ["ApiLambda"] }
+            );
+            const pass = out.approved === true && out.criticalCount === 0 && out.highCount === 0 && out.findings.length === 0;
+            return { pass, message: `got approved=${out.approved}, findings=${JSON.stringify(out.findings)}` };
+          }
+        },
+        {
+          name: "Catches DeletionPolicy Retain false-sense-of-security when UpdateReplacePolicy is omitted on Conditional replace",
+          run: (scope) => {
+            const out = scope.auditChangeSet(
+              {
+                OrdersTable: {
+                  type: "AWS::DynamoDB::Table",
+                  hasCustomPhysicalName: true,
+                  deletionPolicy: "Retain"
+                }
+              },
+              [{ logicalId: "OrdersTable", action: "Modify", replacement: "Conditional" }],
+              { protectedLogicalIds: ["OrdersTable"] }
+            );
+            const codes = out.findings.map((f) => f.code);
+            const pass =
+              out.approved === false &&
+              out.criticalCount === 2 &&
+              out.highCount === 1 &&
+              codes.includes("PHYSICAL_NAME_COLLISION") &&
+              codes.includes("UNPROTECTED_STATEFUL_REPLACE") &&
+              codes.includes("BLOCKED_BY_STACK_POLICY");
+            return { pass, message: `got critical=${out.criticalCount}, high=${out.highCount}, codes=${codes.join(",")}` };
+          }
+        },
+        {
+          name: "Flags UNSUPPORTED_SNAPSHOT_POLICY when Snapshot is used on S3 or DynamoDB",
+          run: (scope) => {
+            const out = scope.auditChangeSet(
+              {
+                UserUploads: {
+                  type: "AWS::S3::Bucket",
+                  hasCustomPhysicalName: false,
+                  deletionPolicy: "Snapshot"
+                },
+                SessionsTable: {
+                  type: "AWS::DynamoDB::Table",
+                  hasCustomPhysicalName: false,
+                  updateReplacePolicy: "Snapshot"
+                }
+              },
+              [
+                { logicalId: "UserUploads", action: "Remove" },
+                { logicalId: "SessionsTable", action: "Modify", replacement: "True" }
+              ],
+              { protectedLogicalIds: [] }
+            );
+            const codes = out.findings.map((f) => f.code);
+            const pass =
+              out.approved === false &&
+              out.criticalCount === 2 &&
+              codes.filter((c) => c === "UNSUPPORTED_SNAPSHOT_POLICY").length === 2;
+            return { pass, message: `got codes=${codes.join(",")}` };
+          }
+        },
+        {
+          name: "Flags UNPROTECTED_STATEFUL_DELETE and BLOCKED_BY_STACK_POLICY on Remove",
+          run: (scope) => {
+            const out = scope.auditChangeSet(
+              {
+                LedgerCluster: {
+                  type: "AWS::RDS::DBCluster",
+                  hasCustomPhysicalName: false,
+                  updateReplacePolicy: "Retain"
+                }
+              },
+              [{ logicalId: "LedgerCluster", action: "Remove" }],
+              { protectedLogicalIds: ["LedgerCluster"] }
+            );
+            const codes = out.findings.map((f) => f.code);
+            const pass =
+              out.approved === false &&
+              out.criticalCount === 1 &&
+              out.highCount === 1 &&
+              codes.includes("UNPROTECTED_STATEFUL_DELETE") &&
+              codes.includes("BLOCKED_BY_STACK_POLICY");
+            return { pass, message: `got codes=${codes.join(",")}` };
+          }
+        },
+        {
+          name: "Allows Add and non-replacing Modify even on protected resources with custom names",
+          run: (scope) => {
+            const out = scope.auditChangeSet(
+              {
+                OrdersTable: {
+                  type: "AWS::DynamoDB::Table",
+                  hasCustomPhysicalName: true,
+                  deletionPolicy: "Retain",
+                  updateReplacePolicy: "Retain"
+                }
+              },
+              [
+                { logicalId: "NewQueue", action: "Add" },
+                { logicalId: "OrdersTable", action: "Modify", replacement: "False" }
+              ],
+              { protectedLogicalIds: ["OrdersTable"] }
+            );
+            const pass = out.approved === true && out.findings.length === 0;
+            return { pass, message: `got approved=${out.approved}, findings=${JSON.stringify(out.findings)}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0040",
+      title: "Quiz 0040: Change Sets, Rollbacks, Drift & StackSets",
+      questions: [
+        {
+          id: "q1",
+          prompt: "A team sets DeletionPolicy: Retain on a production AWS::RDS::DBInstance, omits UpdateReplacePolicy, and then executes a Change Set showing Replacement: True after changing an immutable property. What happens?",
+          options: [
+            "CloudFormation replaces the database and deletes the original physical RDS instance after swap",
+            "CloudFormation retains the original database and launches a second parallel RDS instance safely",
+            "CloudFormation rejects the Change Set because DeletionPolicy Retain blocks all RDS engine replacements",
+            "CloudFormation takes an automated RDS snapshot before dropping the original physical database instance"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "DeletionPolicy only applies when removing a resource or deleting the stack. During Replacement: True, CloudFormation uses UpdateReplacePolicy, which defaults to Delete and destroys the old DB after swapping.",
+            "Omitting UpdateReplacePolicy leaves it at its default value of Delete, so CloudFormation does not retain the replaced database.",
+            "DeletionPolicy does not prevent Change Sets from replacing resources; Stack Policies are required to block Update:Replace.",
+            "CloudFormation only creates an automated snapshot on replacement if UpdateReplacePolicy is explicitly set to Snapshot."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "During an incident last week, an engineer manually deleted a Lambda IAM execution role in the AWS Console. Today, an unrelated stack update fails mid-deploy, triggers rollback, and stalls in UPDATE_ROLLBACK_FAILED. Why, and how do you recover?",
+          options: [
+            "CloudFormation cannot revert the missing role, so run ContinueUpdateRollback skipping that logical resource",
+            "Drift detection locked the stack state, so force delete the stack and redeploy",
+            "Rollback requires Change Set approval, so generate and execute a new rollback plan",
+            "CloudFormation auto-imports console drift later, so re-running the update template restores the role"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "When rollback attempts to restore or inspect an out-of-band deleted resource, it halts in UPDATE_ROLLBACK_FAILED. After reconciling the resource, you call ContinueUpdateRollback with --resources-to-skip for that logical ID.",
+            "Drift detection never locks a stack, and force-deleting a production stack would destroy stateful resources inside it.",
+            "Rollbacks are automatic state-reversion operations and never use Change Sets for approval.",
+            "CloudFormation never auto-imports deleted console resources; re-running an update is blocked until ContinueUpdateRollback completes."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "Your organization manages 80 AWS accounts across three OUs and must deploy CloudTrail and IAM guardrails automatically whenever a new account joins an OU, while halting rollouts immediately if any target region fails. Which StackSets design fits?",
+          options: [
+            "SERVICE_MANAGED StackSet with AutoDeployment enabled and FailureToleranceCount set strictly to zero across accounts",
+            "SELF_MANAGED StackSet with parallel concurrency and FailureTolerancePercentage set to fifty across target accounts",
+            "Nested CloudFormation stacks triggered by EventBridge whenever an AWS account joins the organization",
+            "SERVICE_MANAGED StackSet with SEQUENTIAL regions and MaxConcurrentPercentage set to one hundred across accounts"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "SERVICE_MANAGED integrates with AWS Organizations OUs so AutoDeployment provisions new accounts automatically, and FailureToleranceCount: 0 trips the circuit breaker immediately on the first failure.",
+            "SELF_MANAGED does not support OU AutoDeployment, and 50% failure tolerance lets half your accounts fail before halting.",
+            "Nested stacks live inside a single account/region and cannot deploy cross-account without orchestrating StackSets or custom cross-account assume-role runners.",
+            "Setting MaxConcurrentPercentage to 100% blasts every account in the first region simultaneously without canary pacing, and omitting FailureToleranceCount defaults tolerance to 0 only if unset—failing to address safe canary blast-radius limits."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

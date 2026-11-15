@@ -8,8 +8,8 @@ data class BookSearch(
     val offset: Int = 0,
 ) {
     init {                           // the same validation build() did
-        check(yearFrom <= yearTo) { "yearFrom $yearFrom > yearTo $yearTo" }
-        check(limit in 1..100) { "limit must be 1..100, was $limit" }
+        require(yearFrom <= yearTo) { "yearFrom $yearFrom > yearTo $yearTo" }
+        require(limit in 1..100) { "limit must be 1..100, was $limit" }
     }
 }
 

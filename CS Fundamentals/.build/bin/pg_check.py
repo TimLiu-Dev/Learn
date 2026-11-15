@@ -44,7 +44,7 @@ def checks_block(src):
 
 def run_sql(setup, statements, check=""):
     """Like playground.js runSql: the result of the last statement that returned rows (or of the check query)."""
-    db = sqlite3.connect(":memory:")
+    db = sqlite3.connect(":memory:", isolation_level=None)  # autocommit, like sql.js
     try:
         db.executescript(setup)
         last = ([], [])
@@ -175,7 +175,7 @@ def code_quiz(f):
             return bad(f, f"throws or writes stderr ({r['exc'] or r['err'][:200]}); catch it and print instead")
         got = r["out"]
     elif f.suffix == ".sql":   # rows of every row-returning statement, printed like the sqlite3 CLI: a|b, NULL empty
-        db, got, buf = sqlite3.connect(":memory:"), "", ""
+        db, got, buf = sqlite3.connect(":memory:", isolation_level=None), "", ""   # autocommit, like sql.js
         try:
             for line in f.read_text().splitlines(keepends=True):
                 buf += line

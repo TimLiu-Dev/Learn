@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>73 · Mobile, Android &amp; Edge Client Networking</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<article class="page">
+
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 1 &amp;rsaquo; Module 3C: Applied Dev &amp;rsaquo; Session 0073 · Session 73</p>
+  <h1>Mobile, Android &amp;amp; Edge Client Networking</h1>
+  <p class="subtitle">Happy Eyeballs (RFC 8305), OkHttp connection pooling, cellular-to-Wi-Fi handoff with QUIC connection migration, captive portals, and certificate pinning pitfalls.</p>
+  <div class="meta"><span>~30 minutes</span><span>Tools: Browser, Java 25, Android / OkHttp concepts, tcpdump / dig</span><span class="badge interview">★ Senior Dev Core</span><span class="badge prod">⚡ Android Bridge</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>Understand why naive sequential DNS/TCP connect ruins mobile tail latency, how Happy Eyeballs v2 races IPv6 and IPv4 safely, how QUIC survives Wi-Fi-to-5G handoffs without breaking streams, and why hardcoded leaf-certificate pinning causes outages.</p>
+  </div>
+
+  <div class="warmup">
+    <span class="box-label">Warm-up · from earlier sessions</span>
+    <p>Two minutes, from memory, before you read on:</p>
+    <div class="recall" data-key="0073-warmup">
+      <p class="r-prompt">Suppose an Android user walks out of their apartment while uploading a photo: their phone drops Wi-Fi (<span class="layer l3">192.168.1.42</span>) and activates cellular 5G (<span class="layer l3">100.64.8.19</span>). Why does an open HTTPS/2 over TCP socket freeze or reset, while HTTP/3 over QUIC can keep the upload alive?</p>
+      <div class="keypoints">
+        A TCP connection is permanently bound to the 4-tuple <code>(src_ip, src_port, dst_ip, dst_port)</code>. Changing the client source IP breaks the server's socket lookup, forcing a fresh TCP + TLS 1.3 handshake (plus retransmitting unacknowledged bytes). QUIC binds state to a 64-bit <strong>Connection ID</strong> inside the UDP/QUIC header rather than the source IP/port, so after validating the new path with <code>PATH_CHALLENGE</code>/<code>PATH_RESPONSE</code>, the same cryptographic session and streams continue seamlessly.
+      </div>
+    </div>
+  </div>
+
+
+<section>
+  <h2>1 &middot; Dual-Stack Pain &amp; Happy Eyeballs v2 (RFC 8305)</h2>
+  <p>Modern mobile networks frequently hand a device both an IPv6 address and an IPv4 address (dual-stack). If the client queries <code>AAAA</code> and <code>A</code> DNS records and tries every IPv6 address sequentially with a 30-second TCP connect timeout when IPv6 routing on a misconfigured café Wi-Fi is black-holed, the user stares at a spinning loader for half a minute before falling back to IPv4.</p>
+  <p><strong>RFC 8305 (Happy Eyeballs v2)</strong> fixes this without flooding the network or starving IPv6:</p>
+  <ul>
+    <li><strong>DNS Racing:</strong> Issue <code>AAAA</code> and <code>A</code> queries asynchronously. If <code>AAAA</code> arrives first, start trying IPv6 right away; if <code>A</code> arrives first, wait briefly (~50 ms Resolution Delay) for <code>AAAA</code> so IPv6 still gets preference when healthy.</li>
+    <li><strong>Staggered Connection Attempts:</strong> Sort candidate addresses interleaving address families (starting with IPv6). Start attempt #1, then wait a <strong>Connection Attempt Delay</strong> (recommended <strong>250 ms</strong>, minimum 10 ms, maximum 2 s) before launching attempt #2 from the opposite family.</li>
+    <li><strong>First Connected Wins:</strong> Whichever socket completes the TCP 3-way handshake first is handed to TLS/HTTP; all other pending sockets are immediately closed to avoid leaked file descriptors and battery drain.</li>
+  </ul>
+  <div class="callout info">
+    <strong>Why 250 ms instead of launching all sockets at 0 ms?</strong> Racing every IP simultaneously doubles SYN packet bursts, stateful NAT table entries, and server accept-queue pressure at global scale. A 250 ms head start gives healthy IPv6 enough time to finish a local RTT (~20–80 ms) while bounding broken-IPv6 stalls to a fraction of a second.
+  </div>
+</section>
+
+<section>
+  <h2>2 &middot; OkHttp Internals, Radio Wakeups &amp; Background Limits</h2>
+  <p>On Android, the cellular modem is one of the highest-power components on the board. Every unbundled network request forces the LTE/5G radio from <code>RRC_IDLE</code> to <code>RRC_CONNECTED</code>, keeping a power tail active for 5–15 seconds afterward.</p>
+  <ul>
+    <li><strong>Single Shared <code>OkHttpClient</code>:</strong> Instantiating a new <code>OkHttpClient</code> per request creates a new <code>ConnectionPool</code> and <code>Dispatcher</code> every time—bypassing HTTP/1.1 keep-alive, HTTP/2 stream multiplexing, and TLS session resumption. Always share one singleton client and derive variants via <code>newBuilder()</code> (which shares the underlying pool and thread pool).</li>
+    <li><strong>DNS &amp; Captive Portals:</strong> Hotel or airport Wi-Fi often intercepts HTTP (port 80) or spoofs DNS to redirect to a login page. Android's <code>ConnectivityManager</code> probes <code>connectivitycheck.gstatic.com/generate_204</code> (expecting HTTP 204 with zero body) and marks the network <code>NET_CAPABILITY_CAPTIVE_PORTAL</code> until resolved.</li>
+    <li><strong>IPv6 NAT64 / DNS64 (RFC 6146 / 6147):</strong> Many cellular carriers (like T-Mobile) operate IPv6-only RANs. When an app queries an IPv4-only domain, the carrier's DNS64 synthesizer embeds the IPv4 literal inside the well-known <code>64:ff9b::/96</code> prefix, and NAT64 translates packets at the carrier gateway. <em>Gotcha:</em> Hardcoded IPv4 literals (<code>"192.0.2.10"</code>) in mobile code skip DNS64 entirely unless Android's CLAT (<code>464XLAT</code>) intervenes—always connect by hostname.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>3 &middot; QUIC Connection Migration vs Multipath</h2>
+  <p>HTTP/3 runs over QUIC (<span class="layer l4">UDP/443</span>). Unlike TCP, a QUIC connection is identified by variable-length <strong>Connection IDs (CIDs)</strong> negotiated during the handshake. When the client switches interfaces:</p>
+  <ol>
+    <li>The client sends packets from its new source IP/port using an unused server-issued CID (to prevent linkability across networks by passive eavesdroppers!).</li>
+    <li>The server detects the non-probing packet on a new 4-tuple and initiates <strong>Path Validation</strong>: it sends an encrypted <code>PATH_CHALLENGE</code> frame with 8 random bytes to the new address and waits for <code>PATH_RESPONSE</code> before committing high-rate congestion window growth (preventing off-path amplification attacks).</li>
+    <li>Active HTTP/3 streams and in-flight RPCs continue without re-authenticating TLS. (Carrier middleboxes that block UDP/443 trigger a fast fallback to HTTP/2 over TCP/443.)</li>
+  </ol>
+</section>
+
+<section>
+  <h2>4 &middot; Certificate Pinning: Why Leaf Pins Break Apps</h2>
+  <p>Android apps sometimes use <code>CertificatePinner</code> (or <code>network_security_config.xml</code>) to defend against rogue device CAs or corporate MITM proxies. Pinning the <strong>exact leaf certificate SPKI hash</strong> is an infamous outage generator: the instant your CDN/TLS edge rotates its leaf cert (often every 60–90 days, or automatically via ACME/Let's Encrypt), every un-updated mobile binary bricks itself.</p>
+  <div class="callout warn">
+    <strong>Safe Pinning Rules (if you must pin at all):</strong>
+    <ul>
+      <li>Pin <strong>intermediate/root CA SPKI hashes</strong>, never only the leaf certificate.</li>
+      <li>Always ship at least <strong>one offline backup pin</strong> generated from a different CA / keypair already pre-staged with your incident plan.</li>
+      <li>Include a configurable kill-switch or expiration date (Android <code>&lt;pin-set expiration="2027-06-01"&gt;</code>), and prefer Certificate Transparency (CT) enforcement over rigid client pinning where feasible.</li>
+    </ul>
+  </div>
+</section>
+
+
+  <h3>Practice: Quick Recall Drill</h3>
+  <div class="widget fill-in">
+    <ol style="margin:.4rem 0; padding-left:1.3rem;">
+      <li style="margin-bottom:.8rem;">
+        RFC 8305 recommended delay between staggering IPv6 and IPv4 TCP connect attempts (in ms):<br>
+        Connection Attempt Delay (ms) = <input class="blank" data-answer="250" size="8" aria-label="Connection Attempt Delay (ms)">
+      </li>
+      <li style="margin-bottom:.8rem;">
+        QUIC header field that keeps a session alive when the client IP address changes:<br>
+        QUIC Identifier = <input class="blank" data-answer="Connection ID" size="16" aria-label="QUIC Identifier">
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>Hands-On Inspection (macOS Terminal)</h2>
+  <ol class="steps" data-key="0073-steps">
+    <li>Inspect dual-stack DNS records for a major mobile edge endpoint: <code>dig +short AAAA google.com &amp;&amp; dig +short A google.com</code>.</li>
+    <li>Measure IPv4 vs IPv6 TLS handshake timing side by side with curl: <code>curl -4 -o /dev/null -s -w 'v4 connect=%{time_connect} tls=%{time_appconnect}\n' https://cloudflare.com</code> and repeat with <code>-6</code>.</li>
+    <li>Verify HTTP/3 (QUIC) support on a modern edge endpoint (if your local curl supports <code>--http3</code>): <code>curl -I --http3-only https://cloudflare.com</code> (compare fallback with <code>--http2</code>).</li>
+    <li>Check an endpoint's SPKI SHA-256 pin (the exact base64 hash OkHttp pins against): <code>openssl s_client -connect cloudflare.com:443 -servername cloudflare.com &lt;/dev/null 2&gt;/dev/null | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64</code>.</li>
+  </ol>
+</section>
+
+<section>
+  <h2>OkHttp Resilient Client + RFC 8305 Happy Eyeballs Race</h2>
+  <div class="code-tabs">
+    <div class="tab-buttons">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <div class="code-block-header">
+        <span class="code-lang-label">Java 25</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// Safe singleton OkHttpClient pattern for Android / JVM services
+OkHttpClient baseClient = new OkHttpClient.Builder()
+    .connectTimeout(Duration.ofSeconds(10))
+    .readTimeout(Duration.ofSeconds(15))
+    .callTimeout(Duration.ofSeconds(30))
+    .connectionPool(new ConnectionPool(10, 5, TimeUnit.MINUTES))
+    .protocols(List.of(Protocol.HTTP_2, Protocol.HTTP_1_1))
+    .build();
+
+// Share pool &amp;amp; dispatcher when needing custom per-call timeouts:
+OkHttpClient uploadClient = baseClient.newBuilder()
+    .writeTimeout(Duration.ofSeconds(60))
+    .build();</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <div class="code-block-header">
+        <span class="code-lang-label">Kotlin</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// Android Kotlin: NetworkCallback observing captive portal &amp;amp; link change
+val request = NetworkRequest.Builder()
+    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    .addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    .build()
+
+connectivityManager.registerNetworkCallback(request, object : ConnectivityManager.NetworkCallback() {
+    override fun onAvailable(network: Network) {
+        // Trigger fast connection pool eviction if switching from Wi-Fi to 5G
+        okHttpClient.connectionPool.evictAll()
+    }
+    override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+        val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val captive = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
+        logState(validated, captive)
+    }
+})</code></pre>
+    </div>
+  </div>
+
+  <h2>Lab: RFC 8305 Address Interleaving &amp; Staggered Winner</h2>
+  <div class="code-practice" data-key="0073-practice">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Implement Happy Eyeballs v2 candidate sorting and racing simulation in Java 25: interleave IPv6 (<code>v6:...</code>) and IPv4 (<code>v4:...</code>) addresses starting with IPv6, and pick the first address to finish considering a 250 ms stagger between attempts (if two finish at the exact same wall time, lower start index wins).</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">import java.util.*;
+
+public class Solution {
+    public record Candidate(String addr, int connectLatencyMs, boolean reachable) {}
+
+    /**
+     * Interleave candidates (IPv6 first, then alternating IPv4/IPv6 while both remain).
+     */
+    public static List&lt;Candidate&gt; interleave(List&lt;Candidate&gt; v6, List&lt;Candidate&gt; v4) {
+        // TODO: implement RFC 8305 family interleaving starting with v6
+        return List.of();
+    }
+
+    /**
+     * Launch attempt i at time i * 250ms. Return winning address, or &quot;FAILED&quot; if none reachable.
+     */
+    public static String raceHappyEyeballs(List&lt;Candidate&gt; ordered) {
+        // TODO: compute earliest (startMs + connectLatencyMs) among reachable candidates
+        return &quot;FAILED&quot;;
+    }
+}
+</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">import java.util.*;
+
+public class Solution {
+    public record Candidate(String addr, int connectLatencyMs, boolean reachable) {}
+
+    /**
+     * Interleave candidates (IPv6 first, then alternating IPv4/IPv6 while both remain).
+     */
+    public static List<Candidate> interleave(List<Candidate> v6, List<Candidate> v4) {
+        // TODO: implement RFC 8305 family interleaving starting with v6
+        return List.of();
+    }
+
+    /**
+     * Launch attempt i at time i * 250ms. Return winning address, or "FAILED" if none reachable.
+     */
+    public static String raceHappyEyeballs(List<Candidate> ordered) {
+        // TODO: compute earliest (startMs + connectLatencyMs) among reachable candidates
+        return "FAILED";
+    }
+}
+</script>
+    <script type="text/plain" class="test-harness">import java.util.*;
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0, total = 4;
+
+        var v6 = List.of(
+            new Solution.Candidate("2001:db8::1", 5000, false),
+            new Solution.Candidate("2001:db8::2", 40, true)
+        );
+        var v4 = List.of(
+            new Solution.Candidate("198.51.100.1", 60, true)
+        );
+
+        var interleaved = Solution.interleave(v6, v4);
+        if (interleaved.size() == 3
+                && interleaved.get(0).addr().equals("2001:db8::1")
+                && interleaved.get(1).addr().equals("198.51.100.1")
+                && interleaved.get(2).addr().equals("2001:db8::2")) {
+            passed++;
+        } else {
+            System.out.println("FAIL 1: interleaved order=" + interleaved);
+        }
+
+        // Attempt 0 (v6::1) fails. Attempt 1 (v4) starts at 250ms + 60ms = 310ms.
+        // Attempt 2 (v6::2) starts at 500ms + 40ms = 540ms. Winner: 198.51.100.1
+        String w1 = Solution.raceHappyEyeballs(interleaved);
+        if ("198.51.100.1".equals(w1)) passed++; else System.out.println("FAIL 2: got " + w1);
+
+        // Healthy IPv6 wins immediately at 35ms (before IPv4 even launches at 250ms)
+        var fastV6 = List.of(
+            new Solution.Candidate("2001:db8::1", 35, true),
+            new Solution.Candidate("198.51.100.1", 10, true)
+        );
+        if ("2001:db8::1".equals(Solution.raceHappyEyeballs(fastV6))) passed++;
+        else System.out.println("FAIL 3: fast v6 failed");
+
+        // All unreachable
+        var dead = List.of(
+            new Solution.Candidate("2001:db8::dead", 100, false),
+            new Solution.Candidate("198.51.100.99", 100, false)
+        );
+        if ("FAILED".equals(Solution.raceHappyEyeballs(dead))) passed++;
+        else System.out.println("FAIL 4: expected FAILED");
+
+        System.out.println("SUMMARY:" + passed + "/" + total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">import java.util.*;
+
+public class Solution {
+    public record Candidate(String addr, int connectLatencyMs, boolean reachable) {}
+
+    public static List<Candidate> interleave(List<Candidate> v6, List<Candidate> v4) {
+        List<Candidate> out = new ArrayList<>();
+        int max = Math.max(v6.size(), v4.size());
+        for (int i = 0; i < max; i++) {
+            if (i < v6.size()) out.add(v6.get(i));
+            if (i < v4.size()) out.add(v4.get(i));
+        }
+        return out;
+    }
+
+    public static String raceHappyEyeballs(List<Candidate> ordered) {
+        String bestAddr = "FAILED";
+        int bestFinish = Integer.MAX_VALUE;
+        for (int i = 0; i < ordered.size(); i++) {
+            Candidate c = ordered.get(i);
+            if (!c.reachable()) continue;
+            int finishMs = (i * 250) + c.connectLatencyMs();
+            if (finishMs < bestFinish) {
+                bestFinish = finishMs;
+                bestAddr = c.addr();
+            }
+        }
+        return bestAddr;
+    }
+}
+</script>
+    <script type="application/json" class="hints-data">["Interleaving iterates <code>i</code> from <code>0</code> to <code>max(v6.size(), v4.size()) - 1</code>, appending <code>v6.get(i)</code> when in bounds followed by <code>v4.get(i)</code> when in bounds.", "For candidate index <code>i</code>, its launch timestamp is <code>i * 250</code> ms, so a reachable candidate completes at <code>(i * 250) + connectLatencyMs</code>."]</script>
+  </div>
+</section>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0073-recall">
+    <p class="r-prompt">Without scrolling up, summarize: (1) Why RFC 8305 waits ~250 ms before launching IPv4 instead of firing both at t=0, (2) Why creating an <code>OkHttpClient</code> per API call destroys performance, and (3) Two rules for safe TLS certificate pinning.</p>
+    <div class="keypoints">
+      <ul>
+        <li>250 ms stagger gives healthy IPv6 time to connect without doubling SYN bursts or NAT entries.</li>
+        <li>One shared <code>OkHttpClient</code> preserves HTTP/2 connection multiplexing, HTTP/1.1 keep-alive, and TLS resumption.</li>
+        <li>Pin intermediate/root SPKI hashes (never only the leaf), include an offline backup CA pin, and set a pin expiration/kill-switch.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="q" data-answer="1">
+      <p class="q-prompt">Why does RFC 8305 recommend a ~250 ms Connection Attempt Delay before trying the second IP family instead of opening all sockets simultaneously?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Processes can open both AF_INET and AF_INET6 sockets simultaneously without restriction.">Because the Linux kernel forbids opening IPv6 and IPv4 sockets inside the same user process.</li>
+        <li data-why="Correct! A 250 ms head start preserves IPv6 preference and caps connection-stall latency without doubling network traffic.">To give healthy IPv6 paths time to win while avoiding doubled SYN bursts and NAT state exhaustion.</li>
+        <li data-why="Incorrect: RFC 8305 encourages issuing AAAA and A DNS queries in parallel right away.">Because DNS servers refuse to answer AAAA and A queries sent within the same 250 ms window.</li>
+        <li data-why="Incorrect: TCP handshake connects before slow start sends application data; 250 ms is an inter-attempt stagger.">To ensure TCP slow start finishes its initial 10-MSS window before TLS ClientHello begins.</li>
+      </ol>
+      <div class="q-explain">Staggering by ~250 ms balances fast fallback against broken IPv6 with low network overhead.</div>
+    </div>
+    <div class="q" data-answer="2">
+      <p class="q-prompt">Why does hardcoding an IPv4 literal (e.g., http://203.0.113.5/api) inside an Android app cause subtle failures on modern IPv6-only cellular networks?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Cleartext traffic policy applies to hostnames and IPs alike unless permitted in network_security_config.">Android blocks cleartext port 80 connections only when an IPv4 address string is used directly.</li>
+        <li data-why="Incorrect: HPACK indexes header strings normally regardless of whether Authority is an IP or hostname.">OkHttp cannot compute SHA-256 hashes over numeric addresses during HTTP/2 HPACK compression.</li>
+        <li data-why="Correct! DNS64 synthesizes 64:ff9b::/96 AAAA records only during DNS name resolution; hardcoded IPv4 literals rely on local CLAT hacks.">It bypasses DNS64 synthesis, preventing carrier NAT64 gateways from translating cleanly via DNS.</li>
+        <li data-why="Incorrect: Packet forwarding never queries reverse PTR records on the radio access network.">LTE base stations drop any packet whose destination IPv4 address lacks a reverse PTR record.</li>
+      </ol>
+      <div class="q-explain">Using hostnames lets DNS64 + Happy Eyeballs work natively across IPv6-only mobile networks.</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">During a mobile device handoff from Wi-Fi to 5G, what validates the client's new source IP/port in QUIC before the server blasts full-rate data to it?</p>
+      <ol class="options">
+        <li data-why="Correct! Path validation proves the client actually owns the new IP/port and blocks off-path traffic amplification.">An encrypted PATH_CHALLENGE and PATH_RESPONSE frame exchange confirming return reachability.</li>
+        <li data-why="Incorrect: QUIC runs entirely over UDP and uses no TCP handshake or sequence numbers.">A fresh TCP three-way handshake conducted out-of-band over port 80 to synchronize ISNs.</li>
+        <li data-why="Incorrect: ARP is strictly Layer-2 local broadcast and never traverses routed internet links.">An ARP broadcast emitted by the carrier's PGW router directly onto the internet backbone.</li>
+        <li data-why="Incorrect: The existing TLS/QUIC cryptographic keys remain valid across connection migration.">Re-running full Diffie-Hellman key exchange and re-verifying the entire X.509 certificate chain.</li>
+      </ol>
+      <div class="q-explain">QUIC PATH_CHALLENGE / PATH_RESPONSE defends against source-spoofed amplification while keeping streams uninterrupted.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://datatracker.ietf.org/doc/html/rfc8305" target="_blank" rel="noopener">RFC 8305 — Happy Eyeballs Version 2: Better Connectivity Using Concurrency</a></p>
+    <p><a href="https://datatracker.ietf.org/doc/html/rfc9000#section-9" target="_blank" rel="noopener">RFC 9000 Section 9 — QUIC Connection Migration</a></p>
+    <p><a href="https://developer.android.com/training/articles/security-config#CertificatePinning" target="_blank" rel="noopener">Android Developers — Network Security Config &amp; Certificate Pinning</a></p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>How does Android's 464XLAT (CLAT) work on IPv6-only cellular networks when a legacy library insists on IPv4 socket APIs?</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0035-review-developer-track.html"><small>&larr; Previous</small>0035 · Review: Web Protocols and Developer Networking</a>
+  <a class="next" href="0074-reverse-proxies-and-graceful-draining.html"><small>Next &rarr;</small>0074 · Reverse Proxies, L7 Routing &amp; Graceful Draining</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

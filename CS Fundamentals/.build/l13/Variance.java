@@ -44,7 +44,7 @@ public class Variance {
         addSquares(objects, 2);
         System.out.println(numbers + " " + objects);
 
-        copyInto(doubles, numbers);                       // T = Number
+        copyInto(doubles, numbers);                       // T = Double, dst accepts it
         System.out.println(numbers);
         System.out.println(countNonNull(List.of("a", "b")) + " " + countNonNull(ints));
         System.out.println(describeAll(new String[] {"x", "y"}));

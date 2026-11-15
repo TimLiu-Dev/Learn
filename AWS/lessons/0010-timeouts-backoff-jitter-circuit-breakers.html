@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0010 — Timeouts, Exponential Backoff with Jitter &amp; Circuit Breakers</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0010</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0010-timeouts-backoff-jitter-circuit-breakers.html" class="active">Lesson 0010</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part1">Part 1 &middot; Module 1.4</span>
+      <span class="pill verified">Resilience Engineering</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>Timeouts, Exponential Backoff with Jitter &amp; Circuit Breakers</h1>
+    <p class="lead">
+      In distributed cloud systems, partial failures and transient brownouts are normal—not rare exceptions. Left unchecked, generous timeouts and naive retries turn a 5-second database hiccup into a self-inflicted <strong>retry storm</strong> that keeps your AWS stack down for an hour. Here is how to bound wait times, spread retries with Marc Brooker's <strong>Full Jitter</strong>, enforce <strong>retry budgets</strong>, and fail fast with a <strong>3-state circuit breaker</strong>.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            On Android, <code>WorkManager</code> gives you <code>BackoffPolicy.EXPONENTIAL</code> (defaulting to a <code>30s</code> initial delay, floored at <code>10s</code>), and <code>OkHttp</code> gives you <code>connectTimeout</code>, <code>readTimeout</code>, <code>writeTimeout</code>, and <code>callTimeout</code>. On a single device, a deterministic <code>2s &rarr; 4s &rarr; 8s</code> retry loop feels harmless. When <strong>200,000 phones</strong> and dozens of backend ECS containers hit the same AWS ALB and RDS primary during a brief brownout, unjittered retries synchronize into periodic hammer waves that crush recovery.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Bounded Timeouts &amp; Metastable Retry Amplification</h2>
+        <p>
+          Every network call consumes a finite resource while waiting: a thread or coroutine, memory buffers, a file descriptor, or a precious PostgreSQL connection slot. If you omit a strict timeout—or set it to <code>60 seconds</code> on a service whose normal p99 latency is <code>40 ms</code>—slow failures become far worse than fast errors.
+        </p>
+        <p>
+          Consider an ECS service with <strong>100 worker slots</strong> handling <code>2,500 req/s</code> at <code>40 ms</code> average latency. If a downstream dependency hangs and your timeout is <code>30,000 ms</code>, all 100 workers saturate at just <strong><code>3.3 req/s</code></strong> (<code>100 / 30s</code>). Even after the dependency recovers, queued retries keep workers pinned at 100% saturation—a classic <strong>metastable failure</strong>.
+        </p>
+        <ul>
+          <li><strong>Per-attempt timeout vs. total call deadline:</strong> Separate the time allowed for one attempt (e.g., <code>800 ms</code>) from the total wall-clock budget including retries (OkHttp's <code>callTimeout = 2,500 ms</code>).</li>
+          <li><strong>Only retry transient failures:</strong> Retry <code>429 Too Many Requests</code>, <code>500</code>, <code>502</code>, <code>503</code>, <code>504</code>, and socket/connect timeouts. Never retry deterministic client errors (<code>400</code>, <code>401</code>, <code>403</code>, <code>404</code>)—they will fail identically every time.</li>
+          <li><strong>Respect idempotency:</strong> Retrying a timed-out <code>GET</code> is safe; retrying a timed-out <code>POST /charges</code> without an idempotency key risks double-charging the user (covered in Lesson 0011).</li>
+        </ul>
+
+        <!-- SECTION 2 -->
+        <h2>2. Exponential Backoff &amp; Marc Brooker's Full Jitter</h2>
+        <p>
+          Suppose an Availability Zone network blip drops 10,000 requests at <code>t = 0.00s</code>. With plain deterministic exponential backoff (<code>sleep = min(cap, base * 2^attempt)</code>), all 10,000 callers sleep <code>1s</code>, wake up together at <code>t = 1.00s</code>, overload the server, sleep <code>2s</code>, and collide again at <code>t = 3.00s</code>.
+        </p>
+        <p>
+          In the AWS Architecture Blog classic <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff And Jitter</a>, Marc Brooker simulated competing clients under contention and compared four formulas:
+        </p>
+        <ul>
+          <li><strong>No Jitter:</strong> <code>sleep = min(cap, base * 2^attempt)</code> — terrible under concurrency; creates sharp thundering-herd spikes.</li>
+          <li><strong>Full Jitter (Recommended Default):</strong> <code>sleep = random(0, min(cap, base * 2^attempt))</code> — uniformly spreads retries across the entire window from <code>0</code> up to the exponential cap, minimizing both total server work and client completion time.</li>
+          <li><strong>Equal Jitter:</strong> <code>temp = min(cap, base * 2^attempt); sleep = temp / 2 + random(0, temp / 2)</code> — guarantees at least half the backoff wait, avoiding immediate <code>0 ms</code> retries at the cost of slightly higher contention than Full Jitter.</li>
+          <li><strong>Decorrelated Jitter:</strong> <code>sleep = min(cap, random(base, prevSleep * 3))</code> — stateful across attempts; performs nearly as well as Full Jitter.</li>
+        </ul>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 230" width="100%" height="auto" role="img" aria-label="No Jitter Retry Spikes vs Full Jitter Uniform Spread">
+            <rect x="0" y="0" width="680" height="230" fill="#fdfcf8" rx="6" />
+
+            <!-- Panel 1: No Jitter -->
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#991b1b">Without Jitter: Synchronized Retry Waves (Thundering Herd)</text>
+            <line x1="24" y1="88" x2="656" y2="88" stroke="#cbd5e1" stroke-width="1.5" />
+            <rect x="44" y="42" width="18" height="46" rx="2" fill="#dc2626" />
+            <rect x="164" y="46" width="18" height="42" rx="2" fill="#dc2626" />
+            <rect x="344" y="50" width="18" height="38" rx="2" fill="#dc2626" />
+            <rect x="584" y="54" width="18" height="34" rx="2" fill="#dc2626" />
+            <text x="53" y="104" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">t=0s (fail)</text>
+            <text x="173" y="104" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">+1s spike</text>
+            <text x="353" y="104" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">+2s spike</text>
+            <text x="593" y="104" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">+4s spike</text>
+
+            <line x1="16" y1="120" x2="664" y2="120" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Panel 2: Full Jitter -->
+            <text x="16" y="146" font-family="sans-serif" font-size="13" font-weight="700" fill="#166534">With Full Jitter: Uniform Spread Across [0, min(cap, base * 2^attempt)]</text>
+            <line x1="24" y1="202" x2="656" y2="202" stroke="#cbd5e1" stroke-width="1.5" />
+            <rect x="44" y="156" width="18" height="46" rx="2" fill="#dc2626" />
+            <!-- Spread small bars -->
+            <rect x="82" y="190" width="10" height="12" rx="2" fill="#16a34a" />
+            <rect x="104" y="188" width="10" height="14" rx="2" fill="#16a34a" />
+            <rect x="128" y="191" width="10" height="11" rx="2" fill="#16a34a" />
+            <rect x="156" y="189" width="10" height="13" rx="2" fill="#16a34a" />
+            <rect x="188" y="192" width="10" height="10" rx="2" fill="#16a34a" />
+            <rect x="224" y="190" width="10" height="12" rx="2" fill="#16a34a" />
+            <rect x="262" y="192" width="10" height="10" rx="2" fill="#16a34a" />
+            <rect x="304" y="191" width="10" height="11" rx="2" fill="#16a34a" />
+            <rect x="350" y="193" width="10" height="9" rx="2" fill="#16a34a" />
+            <rect x="398" y="192" width="10" height="10" rx="2" fill="#16a34a" />
+            <rect x="452" y="193" width="10" height="9" rx="2" fill="#16a34a" />
+            <rect x="510" y="194" width="10" height="8" rx="2" fill="#16a34a" />
+            <rect x="572" y="194" width="10" height="8" rx="2" fill="#16a34a" />
+            <rect x="626" y="195" width="10" height="7" rx="2" fill="#16a34a" />
+            <text x="53" y="218" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">t=0s (fail)</text>
+            <text x="340" y="218" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Retries smeared smoothly — server recovers between sparse probes</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Deterministic backoff synchronizes clients into periodic load spikes. Full Jitter flattens contention by sampling uniformly over <code>[0, min(cap, base * 2^attempt)]</code>.
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Retry Budgets &amp; Avoiding Multi-Layer Amplification</h2>
+        <p>
+          Jitter fixes <em>timing</em> collisions, but it does not cap <em>total volume</em>. If a database goes completely dark for 60 seconds and every caller performs 3 retries, total traffic quadruples (<code>4x</code>) right when capacity is zero.
+        </p>
+        <p>
+          As detailed in the <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">Amazon Builders' Library</a> and the <a href="https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html" target="_blank" rel="noopener">AWS SDK Retry Behavior Specification</a>, production SDKs protect downstream services using a <strong>token bucket retry budget</strong>:
+        </p>
+        <ul>
+          <li>A client starts with a bucket of e.g. <code>500</code> retry tokens.</li>
+          <li>Each retry attempt spends <code>5</code> tokens (a <code>1:5</code> ratio, capping retries at roughly <strong>20% overhead</strong> during sustained outages).</li>
+          <li>Each successful first-try response refunds <code>1</code> token up to the bucket capacity.</li>
+          <li>When the bucket hits <code>0</code> tokens, retries are suppressed immediately—turning cascading amplification into fast failure until healthy responses return.</li>
+        </ul>
+
+        <div class="callout warning">
+          <div class="callout-title">Never Stack Retries Across Every Tier</div>
+          <p style="margin: 0;">
+            If your Android app retries <strong>3x</strong>, your API Gateway/BFF retries <strong>3x</strong>, and your Order Service retries <strong>3x</strong> against RDS, one user tap can generate <code>(1 + 3) &times; (1 + 3) &times; (1 + 3) = 64</code> database attempts! Retry at <strong>one</strong> well-chosen layer (typically the immediate caller of a flaky network boundary, or the client edge for transient mobile connectivity) and propagate remaining request deadlines downstream.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. The 3-State Circuit Breaker (Closed, Open, Half-Open)</h2>
+        <p>
+          Retries assume the failure is brief. When a downstream dependency is hard-down or timing out for minutes, retrying—even with Full Jitter—still forces callers to wait for timeouts and ties up worker pools. A <strong>circuit breaker</strong> wraps downstream calls in a 3-state finite state machine that stops calling a broken dependency altogether:
+        </p>
+        <ol>
+          <li><strong><code>CLOSED</code> (Healthy):</strong> Traffic flows normally. Every failure increments a failure counter (or sliding-window error rate); a success resets consecutive failures to <code>0</code>. When failures reach <code>failureThreshold</code>, the breaker trips to <code>OPEN</code> and records <code>openedAt</code>.</li>
+          <li><strong><code>OPEN</code> (Fail Fast):</strong> Calls are rejected immediately in <code>&lt;1 ms</code> without opening a socket—returning a cached fallback, degraded UI state, or fast <code>503</code>. This protects both caller threads and the struggling downstream service for <code>openDurationMs</code> (cooldown).</li>
+          <li><strong><code>HALF_OPEN</code> (Recovery Probe):</strong> Once <code>now - openedAt &ge; openDurationMs</code>, the breaker lets limited probe traffic through. If <code>halfOpenSuccessThreshold</code> probes succeed, it resets to <code>CLOSED</code>. If <strong>any</strong> probe fails, it trips immediately back to <code>OPEN</code> and restarts the cooldown timer.</li>
+        </ol>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 185" width="100%" height="auto" role="img" aria-label="3-State Circuit Breaker State Machine">
+            <rect x="0" y="0" width="680" height="185" fill="#fdfcf8" rx="6" />
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569" />
+              </marker>
+            </defs>
+
+            <!-- CLOSED -->
+            <rect x="34" y="64" width="150" height="58" rx="8" fill="#dcfce7" stroke="#166534" stroke-width="2" />
+            <text x="109" y="88" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="#166534">CLOSED</text>
+            <text x="109" y="106" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#166534">Allow normal traffic</text>
+
+            <!-- OPEN -->
+            <rect x="265" y="64" width="150" height="58" rx="8" fill="#fee2e2" stroke="#991b1b" stroke-width="2" />
+            <text x="340" y="88" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="#991b1b">OPEN</text>
+            <text x="340" y="106" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#991b1b">Fail fast (&lt;1 ms)</text>
+
+            <!-- HALF_OPEN -->
+            <rect x="496" y="64" width="150" height="58" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2" />
+            <text x="571" y="88" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="#b45309">HALF_OPEN</text>
+            <text x="571" y="106" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#b45309">Allow probe requests</text>
+
+            <!-- CLOSED -> OPEN -->
+            <path d="M 184 93 L 260 93" fill="none" stroke="#475569" stroke-width="1.8" marker-end="url(#arrow)" />
+            <text x="222" y="82" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">failures &ge; N</text>
+
+            <!-- OPEN -> HALF_OPEN -->
+            <path d="M 415 80 L 491 80" fill="none" stroke="#475569" stroke-width="1.8" marker-end="url(#arrow)" />
+            <text x="453" y="68" text-anchor="middle" font-family="monospace" font-size="10" fill="#b45309">cooldown elapsed</text>
+
+            <!-- HALF_OPEN -> OPEN -->
+            <path d="M 496 108 L 420 108" fill="none" stroke="#991b1b" stroke-width="1.8" marker-end="url(#arrow)" />
+            <text x="458" y="128" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">any probe fails</text>
+
+            <!-- HALF_OPEN -> CLOSED -->
+            <path d="M 571 64 C 571 20, 109 20, 109 59" fill="none" stroke="#166534" stroke-width="1.8" marker-end="url(#arrow)" />
+            <text x="340" y="24" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">K consecutive probe successes &rarr; reset to CLOSED</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 2: A 3-state circuit breaker isolates unhealthy dependencies in <code>OPEN</code>, then cautiously tests recovery in <code>HALF_OPEN</code> before restoring full traffic.
+          </div>
+        </div>
+
+        <p>
+          <strong>Serverless &amp; Fleet Caveat:</strong> In-memory circuit breakers live per container or AWS Lambda execution environment. If you run 100 ECS tasks, each task opens and probes independently (sending 100 probes instead of 1). Never share breaker state in a database that sits on the same failing path—keep per-instance breakers lightweight, or read coarse feature flags from an out-of-band control plane like AWS AppConfig.
+        </p>
+
+        <!-- SECTION 5 -->
+        <h2>5. Production Code: Android + AWS SDK v3 Resilience</h2>
+        <p>
+          Notice how both sides of the stack enforce bounded deadlines and backoff—while letting the AWS SDK handle jittered token-bucket retries rather than writing raw <code>for</code> loops:
+        </p>
+<pre><code>// 1. Android Client (Kotlin — WorkManager + OkHttp bounded callTimeout)
+val syncWork = OneTimeWorkRequestBuilder&lt;SyncOrdersWorker&gt;()
+    .setBackoffCriteria(
+        BackoffPolicy.EXPONENTIAL,
+        WorkRequest.MIN_BACKOFF_MILLIS, // 10,000 ms floor enforced by WorkManager
+        TimeUnit.MILLISECONDS
+    )
+    .build()
+
+val okHttp = OkHttpClient.Builder()
+    .connectTimeout(2, TimeUnit.SECONDS)
+    .readTimeout(3, TimeUnit.SECONDS)
+    .callTimeout(6, TimeUnit.SECONDS) // Hard ceiling across redirects + retries
+    .build()
+
+// 2. Cloud Service (TypeScript — AWS SDK v3 Adaptive Retry + Attempt Timeout)
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
+
+const ddb = new DynamoDBClient({
+  maxAttempts: 3,               // Total attempts (1 initial + up to 2 retries)
+  retryMode: "adaptive",        // Full jitter + client-side token bucket rate limiter
+  requestHandler: new NodeHttpHandler({
+    connectionTimeout: 500,     // Fail fast on TCP/TLS stall
+    requestTimeout: 1500,       // Bound each individual DynamoDB attempt
+  }),
+});</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement both core resilience primitives: (1) <code>computeFullJitterBackoff(params)</code> using Marc Brooker's Full Jitter formula, and (2) <code>createCircuitBreaker(config)</code> implementing the <code>CLOSED &rarr; OPEN &rarr; HALF_OPEN</code> finite state machine.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Diagnose real production incidents involving retry storms, stacked retry amplification, and circuit breaker state transitions.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Original Jitter Analysis:</strong> <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff And Jitter</a> — Marc Brooker (AWS Architecture Blog).
+          </li>
+          <li>
+            <strong>Production Resilience Guide:</strong> <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">Timeouts, retries, and backoff with jitter</a> — Marc Brooker (Amazon Builders' Library).
+          </li>
+          <li>
+            <strong>AWS SDK Specification:</strong> <a href="https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html" target="_blank" rel="noopener">AWS SDKs and Tools — Retry Behavior (Standard &amp; Adaptive Modes)</a>.
+          </li>
+          <li>
+            <strong>Android Reference:</strong> <a href="https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work#retry_backoff" target="_blank" rel="noopener">WorkManager — Retry and Backoff Policy</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0011 (Queues, At-Least-Once Delivery, Idempotency Keys, Outbox Pattern &amp; DLQs)</strong>, ask me anything that feels fuzzy—for example: <em>"When is Equal Jitter better than Full Jitter?"</em> or <em>"How do I size a circuit breaker's failure threshold for a low-QPS microservice?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0009-sql-vs-nosql-access-patterns.html">&larr; Lesson 0009: SQL vs NoSQL Access-Pattern Modeling</a>
+          <a href="./0011-queues-idempotency-outbox-dlq.html">Lesson 0011: Queues, At-Least-Once Delivery, Idempotency Keys, Outbox Pattern & DLQs &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>WorkManager's 10-Second Floor</strong>
+          Android's <code>WorkRequest.MIN_BACKOFF_MILLIS</code> is <code>10,000 ms</code> (10s) and caps at 5 hours. Background job schedulers enforce coarse floors to protect device battery and radio wakeups—never use WorkManager backoff patterns for interactive foreground API calls.
+        </div>
+        <div class="sidenote">
+          <strong>The Multiplication Trap</strong>
+          With 3 retries per layer across 3 service hops, total downstream attempts become <code>(1+3) &times; (1+3) &times; (1+3) = 64</code> for one user tap. Always keep retries at a single boundary.
+        </div>
+        <div class="sidenote">
+          <strong>Idempotency Comes Next</strong>
+          A timeout does not mean the server never executed your write. Retrying a non-idempotent <code>POST</code> creates duplicate orders—which Lesson 0011 solves with idempotency keys and the Outbox pattern.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0010",
+      title: "Lab 0010: Full Jitter Backoff & 3-State Circuit Breaker",
+      filename: "resilience-primitives.js",
+      description:
+        "Implement two functions: (1) <code>computeFullJitterBackoff({ attempt, baseDelayMs, maxDelayMs, randomFn })</code> computes <code>cap = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt))</code> and returns <code>Math.floor((randomFn || Math.random)() * cap)</code>. (2) <code>createCircuitBreaker({ failureThreshold, openDurationMs, halfOpenSuccessThreshold, nowFn })</code> returns <code>{ getState, allowRequest, recordSuccess, recordFailure }</code>. Start <code>CLOSED</code>; trip to <code>OPEN</code> (storing <code>openedAt = nowFn()</code>) when consecutive failures reach <code>failureThreshold</code>. While <code>OPEN</code>, transition to <code>HALF_OPEN</code> once <code>nowFn() - openedAt &gt;= openDurationMs</code>. In <code>HALF_OPEN</code>, <code>halfOpenSuccessThreshold</code> consecutive successes return to <code>CLOSED</code>; any failure trips immediately back to <code>OPEN</code> with a fresh <code>openedAt</code>.",
+      exports: ["computeFullJitterBackoff", "createCircuitBreaker"],
+      starterCode: `function computeFullJitterBackoff({ attempt, baseDelayMs, maxDelayMs, randomFn }) {
+  // TODO 1: compute capped exponential ceiling and multiply by (randomFn || Math.random)()
+  // Return Math.floor(rng() * cap)
+  return 0;
+}
+
+function createCircuitBreaker({ failureThreshold, openDurationMs, halfOpenSuccessThreshold, nowFn }) {
+  let state = "CLOSED";
+  let failureCount = 0;
+  let halfOpenSuccesses = 0;
+  let openedAt = null;
+
+  function getState() {
+    // TODO 2: if state === "OPEN" and (nowFn() - openedAt >= openDurationMs),
+    // transition to "HALF_OPEN" and reset halfOpenSuccesses = 0
+    return state;
+  }
+
+  function allowRequest() {
+    // TODO 3: return false when getState() === "OPEN", otherwise true
+    return true;
+  }
+
+  function recordSuccess() {
+    // TODO 4: handle CLOSED (reset failureCount) and HALF_OPEN (increment halfOpenSuccesses, close if threshold reached)
+  }
+
+  function recordFailure() {
+    // TODO 5: handle HALF_OPEN (immediately trip back to OPEN) and CLOSED (increment failureCount, trip to OPEN at threshold)
+  }
+
+  return { getState, allowRequest, recordSuccess, recordFailure };
+}
+
+console.log(
+  "Sample Full Jitter delay (attempt=3, base=100, max=500, rng=0.5):",
+  computeFullJitterBackoff({ attempt: 3, baseDelayMs: 100, maxDelayMs: 500, randomFn: () => 0.5 })
+);`,
+      hints: [
+        "In <code>computeFullJitterBackoff</code>: <code>const cap = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt)); const rng = randomFn || Math.random; return Math.floor(rng() * cap);</code>",
+        "In <code>createCircuitBreaker</code>, make sure <code>recordSuccess()</code> and <code>recordFailure()</code> call <code>getState()</code> first so an expired <code>OPEN</code> breaker transitions to <code>HALF_OPEN</code> before recording a probe outcome."
+      ],
+      solutionExplanation:
+        "Full Jitter samples uniformly between 0 and the capped exponential delay, eliminating synchronized retry waves. The circuit breaker tracks consecutive failures in CLOSED, fails fast in OPEN until openDurationMs elapses, then uses HALF_OPEN probes to either heal back to CLOSED or immediately re-open on failure.",
+      solutionCode: `function computeFullJitterBackoff({ attempt, baseDelayMs, maxDelayMs, randomFn }) {
+  const cap = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt));
+  const rng = randomFn || Math.random;
+  return Math.floor(rng() * cap);
+}
+
+function createCircuitBreaker({ failureThreshold, openDurationMs, halfOpenSuccessThreshold, nowFn }) {
+  let state = "CLOSED";
+  let failureCount = 0;
+  let halfOpenSuccesses = 0;
+  let openedAt = null;
+
+  function getState() {
+    if (state === "OPEN" && nowFn() - openedAt >= openDurationMs) {
+      state = "HALF_OPEN";
+      halfOpenSuccesses = 0;
+    }
+    return state;
+  }
+
+  function allowRequest() {
+    return getState() !== "OPEN";
+  }
+
+  function recordSuccess() {
+    const current = getState();
+    if (current === "HALF_OPEN") {
+      halfOpenSuccesses += 1;
+      if (halfOpenSuccesses >= halfOpenSuccessThreshold) {
+        state = "CLOSED";
+        failureCount = 0;
+        halfOpenSuccesses = 0;
+        openedAt = null;
+      }
+    } else if (current === "CLOSED") {
+      failureCount = 0;
+    }
+  }
+
+  function recordFailure() {
+    const current = getState();
+    if (current === "HALF_OPEN") {
+      state = "OPEN";
+      openedAt = nowFn();
+      halfOpenSuccesses = 0;
+      return;
+    }
+    if (current === "CLOSED") {
+      failureCount += 1;
+      if (failureCount >= failureThreshold) {
+        state = "OPEN";
+        openedAt = nowFn();
+      }
+    }
+  }
+
+  return { getState, allowRequest, recordSuccess, recordFailure };
+}`,
+      tests: [
+        {
+          name: "Full Jitter scales exponentially, respects maxDelayMs cap, and spreads via randomFn",
+          run: (scope) => {
+            const d0 = scope.computeFullJitterBackoff({ attempt: 0, baseDelayMs: 100, maxDelayMs: 1000, randomFn: () => 0.5 });
+            const d2 = scope.computeFullJitterBackoff({ attempt: 2, baseDelayMs: 100, maxDelayMs: 1000, randomFn: () => 0.25 });
+            const d5 = scope.computeFullJitterBackoff({ attempt: 5, baseDelayMs: 100, maxDelayMs: 1000, randomFn: () => 0.5 });
+            const dZero = scope.computeFullJitterBackoff({ attempt: 3, baseDelayMs: 100, maxDelayMs: 1000, randomFn: () => 0.0 });
+            const pass = d0 === 50 && d2 === 100 && d5 === 500 && dZero === 0;
+            return { pass, message: `got d0=${d0}, d2=${d2}, d5=${d5}, dZero=${dZero}` };
+          }
+        },
+        {
+          name: "Circuit breaker resets consecutive failures on CLOSED success and opens at threshold",
+          run: (scope) => {
+            let now = 1000;
+            const cb = scope.createCircuitBreaker({
+              failureThreshold: 3,
+              openDurationMs: 5000,
+              halfOpenSuccessThreshold: 2,
+              nowFn: () => now
+            });
+            cb.recordFailure();
+            cb.recordFailure();
+            cb.recordSuccess(); // resets consecutive failure count to 0
+            cb.recordFailure();
+            cb.recordFailure();
+            const stillClosed = cb.getState() === "CLOSED" && cb.allowRequest() === true;
+            cb.recordFailure(); // 3rd consecutive failure -> OPEN
+            const nowOpen = cb.getState() === "OPEN" && cb.allowRequest() === false;
+            const pass = stillClosed && nowOpen;
+            return { pass, message: `stillClosed=${stillClosed}, nowOpen=${nowOpen}` };
+          }
+        },
+        {
+          name: "OPEN breaker blocks requests before cooldown and transitions to HALF_OPEN after openDurationMs",
+          run: (scope) => {
+            let now = 10000;
+            const cb = scope.createCircuitBreaker({
+              failureThreshold: 2,
+              openDurationMs: 3000,
+              halfOpenSuccessThreshold: 2,
+              nowFn: () => now
+            });
+            cb.recordFailure();
+            cb.recordFailure();
+            now = 12999;
+            const blockedBefore = cb.getState() === "OPEN" && cb.allowRequest() === false;
+            now = 13000;
+            const halfOpenAtEdge = cb.getState() === "HALF_OPEN" && cb.allowRequest() === true;
+            const pass = blockedBefore && halfOpenAtEdge;
+            return { pass, message: `blockedBefore=${blockedBefore}, halfOpenAtEdge=${halfOpenAtEdge}` };
+          }
+        },
+        {
+          name: "A single probe failure in HALF_OPEN immediately trips back to OPEN and restarts cooldown",
+          run: (scope) => {
+            let now = 0;
+            const cb = scope.createCircuitBreaker({
+              failureThreshold: 2,
+              openDurationMs: 5000,
+              halfOpenSuccessThreshold: 2,
+              nowFn: () => now
+            });
+            cb.recordFailure();
+            cb.recordFailure();
+            now = 5000;
+            const isHalfOpen = cb.getState() === "HALF_OPEN";
+            cb.recordSuccess(); // 1 of 2 probes succeeds
+            now = 5100;
+            cb.recordFailure(); // 2nd probe fails -> back to OPEN at t=5100
+            const reOpened = cb.getState() === "OPEN" && cb.allowRequest() === false;
+            now = 10000; // only 4900ms since t=5100
+            const stillCooling = cb.getState() === "OPEN";
+            now = 10100; // 5000ms since t=5100
+            const probesAgain = cb.getState() === "HALF_OPEN";
+            const pass = isHalfOpen && reOpened && stillCooling && probesAgain;
+            return { pass, message: `isHalfOpen=${isHalfOpen}, reOpened=${reOpened}, stillCooling=${stillCooling}, probesAgain=${probesAgain}` };
+          }
+        },
+        {
+          name: "Reaching halfOpenSuccessThreshold closes the breaker and resets failure counters",
+          run: (scope) => {
+            let now = 0;
+            const cb = scope.createCircuitBreaker({
+              failureThreshold: 2,
+              openDurationMs: 1000,
+              halfOpenSuccessThreshold: 2,
+              nowFn: () => now
+            });
+            cb.recordFailure();
+            cb.recordFailure();
+            now = 1000;
+            cb.recordSuccess();
+            const stillHalfOpen = cb.getState() === "HALF_OPEN";
+            cb.recordSuccess();
+            const closedNow = cb.getState() === "CLOSED" && cb.allowRequest() === true;
+            cb.recordFailure(); // needs 2 failures again, not 1
+            const remainsClosedOnOne = cb.getState() === "CLOSED";
+            const pass = stillHalfOpen && closedNow && remainsClosedOnOne;
+            return { pass, message: `stillHalfOpen=${stillHalfOpen}, closedNow=${closedNow}, remainsClosedOnOne=${remainsClosedOnOne}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0010",
+      title: "Quiz 0010: Backoff Jitter, Retry Budgets & Circuit Breakers",
+      questions: [
+        {
+          id: "q1",
+          prompt: "An ECS cluster recovers from a 15-second NAT gateway hiccup, yet CPU spikes to 100% every 2, 4, and 8 seconds because 20,000 mobile clients use deterministic exponential backoff. What change eliminates those synchronized waves?",
+          options: [
+            "Increase the Android WorkManager minimum backoff floor to sixty whole seconds",
+            "Switch client retries to full jitter within the exponential delay cap",
+            "Disable all HTTP client timeouts so slow requests finish without retrying",
+            "Move the synchronized retry schedule from mobile clients into ECS tasks"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Increasing the deterministic floor still keeps every failing client aligned on the exact same retry timestamps, only spaced further apart.",
+            "Full Jitter samples each retry uniformly from [0, min(cap, base * 2^attempt)], smearing retries smoothly over time so the cluster can recover.",
+            "Removing client timeouts causes leaked sockets and hung threads on both mobile devices and backend load balancers.",
+            "Moving an unjittered schedule to ECS tasks preserves the exact same synchronized thundering-herd wave on downstream databases."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "In a three-tier microservice chain (Mobile -> API -> Order Service -> RDS), every layer independently performs up to 3 retries on timeouts. When RDS briefly stalls, load explodes. Why does this happen and how do you fix it?",
+          options: [
+            "TCP sockets buffer duplicate calls; increase the RDS connection pool limit",
+            "ALB health checks trigger scaling; deploy larger EC2 instances behind NAT",
+            "Stacked retries multiply total load; enforce bounded retries with token budgets",
+            "DNS TTL expires during brownouts; pin static backend IPs inside OkHttp"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "Raising RDS max_connections during a retry storm increases lock contention and memory pressure instead of stopping the extra load.",
+            "Spinning up larger EC2 instances behind NAT does not fix multiplicative retry amplification hitting the shared RDS database.",
+            "Retrying 3 times at 3 layers produces 4 x 4 x 4 = 64 attempts per tap; retrying at one layer with a token-bucket budget caps amplification.",
+            "Pinning static IPs breaks Route 53 failover and load balancing while having nothing to do with stacked retry multiplication."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "A payment service circuit breaker is OPEN with a 30s cooldown and halfOpenSuccessThreshold = 3. At t = 31s, probes 1 and 2 succeed, and probe 3 times out. What happens next?",
+          options: [
+            "The breaker stays half open because two earlier probe calls succeeded",
+            "The breaker closes immediately because two probes already passed health checks",
+            "The breaker discards probe history and permanently blocks every future request",
+            "The breaker returns to open state and restarts its cooldown timer"
+          ],
+          correctIndex: 3,
+          explanations: [
+            "Leaving the breaker in HALF_OPEN after a probe failure would keep sending probes into an unhealthy dependency instead of backing off.",
+            "A breaker only closes after reaching halfOpenSuccessThreshold consecutive successes; two successes followed by a failure is not healthy.",
+            "Circuit breakers never lock permanently; they always retry probing after another cooldown period.",
+            "Any failure during HALF_OPEN means the dependency has not fully recovered, so the breaker immediately re-opens and resets its 30s cooldown."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

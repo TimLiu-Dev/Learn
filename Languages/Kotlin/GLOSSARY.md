@@ -91,3 +91,29 @@ _Avoid_: `java.util.Stack` (synchronized overhead), `LinkedList` (pointer cache 
 **Infix bitwise operator**:
 A Kotlin keyword function (`shl`, `shr`, `and`, `or`, `xor`, `inv`) used in place of traditional symbolic operators for low-level binary manipulation.
 _Avoid_: Symbolic operators like `<<` or `&` (invalid in Kotlin)
+
+## Modern Kotlin (2.2–2.4), DSLs & Tooling
+
+**`@DslMarker`**:
+A meta-annotation applied to builder DSL receiver classes that prevents inner lambda scopes from implicitly calling methods on outer receivers of the same DSL family.
+_Avoid_: Unscoped nested `apply` chains where outer `this` leaks into inner blocks
+
+**`callbackFlow` & `awaitClose`**:
+A cold `Flow` builder that bridges callback/listener APIs into coroutines using thread-safe `trySend(...)` and suspends on a mandatory `awaitClose { ... }` block to unregister listeners upon cancellation.
+_Avoid_: Calling `emit()` inside external listener threads or omitting `awaitClose`
+
+**Kotlin Contract (`contract { ... }`)**:
+A compile-time declaration inside an `inline` or validator function (`callsInPlace(block, EXACTLY_ONCE)` or `returns(true) implies (x != null)`) that informs the compiler's control-flow and smart-cast analyzer about runtime guarantees.
+_Avoid_: Forcing callers to use `lateinit var` or `!!` after custom validation helpers
+
+**`@PublishedApi internal`**:
+A visibility modifier bridge that allows a `public inline` function (whose body is copied into external caller modules) to reference `internal` class members without exposing them in normal source autocomplete.
+_Avoid_: Making internal backing maps `public` just to support `inline fun <reified T>`
+
+**Gradle Version Catalog (`gradle/libs.versions.toml`)**:
+A centralized TOML file declaring `[versions]`, `[libraries]`, `[bundles]`, and `[plugins]` that Gradle compiles into type-safe Kotlin DSL accessors (`libs.kotlinx.coroutines.android`).
+_Avoid_: Hardcoding duplicate dependency version strings across multiple `build.gradle.kts` files
+
+**R8 Shrinking & Obfuscation**:
+Android's release build optimizer (`isMinifyEnabled = true`) that strips unreachable code (tree shaking), renames classes/fields to short identifiers (`a.b`), and optimizes bytecode; requires compile-time codegen (`@Serializable`, KSP) or explicit `@Keep` rules when using reflection.
+_Avoid_: Unannotated reflection DTOs that work in `debug` but deserialize `null` in `release`

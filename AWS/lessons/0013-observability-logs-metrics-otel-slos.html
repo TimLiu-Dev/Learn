@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0013 — Observability: Structured Logs, RED/USE Metrics, OpenTelemetry &amp; SLOs</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0013</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0013-observability-logs-metrics-otel-slos.html" class="active">Lesson 0013</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part1">Part 1 &middot; Module 1.5</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>Observability: Structured Logs, RED/USE Metrics, OpenTelemetry &amp; SLOs</h1>
+    <p class="lead">
+      Logging plain-text lines to <code>stdout</code> and watching average CPU graphs leaves you blind during real cloud incidents. Senior engineers connect distributed requests across Android clients, load balancers, and containers using <strong>structured JSON logs</strong>, <strong>RED/USE histogram metrics</strong>, <strong>W3C Trace Context</strong>, and <strong>SLO burn-rate alerts</strong>.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, you use <code>Timber.d("Checkout failed for %s", orderId)</code> in Logcat and attach <code>FirebaseCrashlytics.setCustomKey("userTier", tier)</code> so every crash report carries breadcrumbs from that single phone. In AWS, one user tap fans out across an ALB, multiple ECS containers, SQS queues, and PostgreSQL—interleaving logs from thousands of concurrent callers. <strong>Structured JSON logs</strong> are Timber with a strict machine-readable schema, and an OpenTelemetry <code>traceId</code> is the distributed Crashlytics custom key that stitches every hop back into one timeline.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Structured JSON Logs &amp; CloudWatch Logs Insights</h2>
+        <p>
+          Plain-text log lines like <code>2026-11-15 ERROR Checkout failed for user=8821 timeout=2000ms</code> fail in production for two reasons: multi-line stack traces split into separate log events, and every team invents slightly different spacing that breaks regex parsers.
+        </p>
+        <p>
+          Instead, emit <strong>one single-line JSON object per log event</strong> to <code>stdout</code>/<code>stderr</code> (which the AWS ECS <code>awslogs</code> driver or Fluent Bit ships to CloudWatch Logs). Every line carries fixed correlation fields:
+        </p>
+        <ul>
+          <li><code>timestamp</code> (ISO-8601 UTC), <code>level</code> (<code>INFO</code>/<code>WARN</code>/<code>ERROR</code>), and <code>service</code> (<code>orders-api</code>).</li>
+          <li><code>traceId</code> and <code>spanId</code> so you can jump from a single failing request to all logs emitted across every microservice.</li>
+          <li><code>route</code> (parameterized template like <code>/v1/orders/:id</code>), <code>statusCode</code>, and <code>durationMs</code>.</li>
+          <li><strong>Redacted context only:</strong> never log <code>Authorization</code> headers, JWTs, passwords, or raw credit card numbers—scrub them in the logger middleware before serialization.</li>
+        </ul>
+        <p>
+          At <strong>$0.50 per GB ingested</strong> in CloudWatch Logs Standard (<code>us-east-1</code>), verbose <code>DEBUG</code> dumps on every <code>200 OK</code> silently blow up your AWS bill. Emit one <em>canonical log line</em> per request at <code>INFO</code> (or <code>ERROR</code> on failure) instead of 15 scattered debug prints. Then query billions of events in seconds using <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html" target="_blank" rel="noopener">CloudWatch Logs Insights</a>:
+        </p>
+<pre><code>fields @timestamp, traceId, route, statusCode, durationMs, err.code
+| filter service = "orders-api" and statusCode >= 500
+| sort @timestamp desc
+| limit 50</code></pre>
+
+        <!-- SECTION 2 -->
+        <h2>2. RED vs. USE Metrics &amp; Why Averages Lie (<code>p50</code>, <code>p95</code>, <code>p99</code>)</h2>
+        <p>
+          Logs tell you <em>what</em> happened on a specific request; <strong>metrics</strong> tell you <em>how much</em> and <em>how fast</em> across the whole fleet at low cost. Use two complementary frameworks:
+        </p>
+        <ul>
+          <li><strong>RED Method (Request-Driven Services):</strong> Track <strong>R</strong>ate (requests/sec), <strong>E</strong>rrors (5xx/sec), and <strong>D</strong>uration (latency distribution) for every HTTP endpoint or RPC handler.</li>
+          <li><strong>USE Method (Infrastructure Resources):</strong> For CPUs, memory, DB connection pools, and EBS volumes, track <strong>U</strong>tilization (% busy), <strong>S</strong>aturation (queue depth or thread waits), and <strong>E</strong>rrors (dropped packets, OOM kills).</li>
+        </ul>
+        <p>
+          <strong>Why mean latency hides outages:</strong> Suppose 99 requests complete in <code>15 ms</code>, while 1 request hits a PostgreSQL lock wait and stalls for <code>2,015 ms</code>. The arithmetic mean is <code>35 ms</code>—your dashboard looks green—yet <strong><code>p99</code> is &gt;2,000 ms</strong>. At 1,000 req/s, 10 users every second experience a multi-second freeze (and if a mobile screen triggers 5 API calls on launch, roughly <code>1 - 0.99^5 &approx; 4.9%</code> of app opens hit that p99 tail!).
+        </p>
+
+        <div class="callout warning">
+          <div class="callout-title">The Percentile Aggregation Trap</div>
+          <p style="margin: 0;">
+            You <strong>cannot average percentiles</strong> across containers (<code>avg(p99)</code> across 10 ECS tasks is mathematically invalid—1 busy task having a 3-second spike gets diluted by 9 idle tasks). Always export <strong>histograms</strong> (bucket counts such as <code>&le;25ms</code>, <code>&le;100ms</code>, <code>&le;500ms</code>, <code>+Inf</code>) so your metrics backend merges bucket counts first and computes true fleet-wide <code>p95</code> and <code>p99</code>.
+          </p>
+        </div>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 248" width="100%" height="auto" role="img" aria-label="Distributed Trace Context and Three Pillars Correlation Diagram">
+            <rect x="0" y="0" width="680" height="248" fill="#fdfcf8" rx="6" />
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">W3C traceparent Propagation &amp; Three-Pillar Correlation</text>
+
+            <!-- Hop boxes -->
+            <rect x="16" y="46" width="136" height="58" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="84" y="67" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f4c81">Android OkHttp</text>
+            <text x="84" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">span: 00f067aa</text>
+            <text x="84" y="97" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#575c66">trace: 4bf92f35...</text>
+
+            <line x1="152" y1="75" x2="188" y2="75" stroke="#0f4c81" stroke-width="1.8" />
+            <polygon points="188,75 181,71 181,79" fill="#0f4c81" />
+
+            <rect x="190" y="46" width="132" height="58" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="256" y="67" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#b45309">AWS ALB</text>
+            <text x="256" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">forwards header</text>
+            <text x="256" y="97" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#575c66">RED edge metrics</text>
+
+            <line x1="322" y1="75" x2="358" y2="75" stroke="#b45309" stroke-width="1.8" />
+            <polygon points="358,75 351,71 351,79" fill="#b45309" />
+
+            <rect x="360" y="46" width="144" height="58" rx="5" fill="#dcfce7" stroke="#166534" />
+            <text x="432" y="67" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#166534">Orders ECS Task</text>
+            <text x="432" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">span: 9a12cc01</text>
+            <text x="432" y="97" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#575c66">parent: 00f067aa</text>
+
+            <line x1="504" y1="75" x2="538" y2="75" stroke="#166534" stroke-width="1.8" />
+            <polygon points="538,75 531,71 531,79" fill="#166534" />
+
+            <rect x="540" y="46" width="124" height="58" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="602" y="67" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#991b1b">PostgreSQL</text>
+            <text x="602" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">span: 77bc04e2</text>
+            <text x="602" y="97" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#575c66">lock wait 1.9s</text>
+
+            <!-- Divider -->
+            <line x1="16" y1="124" x2="664" y2="124" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Three Pillars Output -->
+            <text x="16" y="145" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">Emitted Telemetry Signals</text>
+
+            <rect x="16" y="158" width="204" height="72" rx="5" fill="#ffffff" stroke="#cbd5e1" />
+            <text x="26" y="176" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f4c81">1. Structured JSON Logs</text>
+            <text x="26" y="193" font-family="monospace" font-size="10" fill="#1b1d21">{"traceId":"4bf92f35...",</text>
+            <text x="26" y="207" font-family="monospace" font-size="10" fill="#1b1d21"> "statusCode":500,</text>
+            <text x="26" y="221" font-family="monospace" font-size="10" fill="#991b1b"> "durationMs":2015}</text>
+
+            <rect x="238" y="158" width="204" height="72" rx="5" fill="#ffffff" stroke="#cbd5e1" />
+            <text x="248" y="176" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#b45309">2. RED + USE Metrics</text>
+            <text x="248" y="193" font-family="monospace" font-size="10" fill="#1b1d21">http_duration_ms{route}</text>
+            <text x="248" y="207" font-family="monospace" font-size="10" fill="#1b1d21">p99: 2015ms (histogram)</text>
+            <text x="248" y="221" font-family="monospace" font-size="10" fill="#991b1b">slo_burn_rate: 14.4x</text>
+
+            <rect x="460" y="158" width="204" height="72" rx="5" fill="#ffffff" stroke="#cbd5e1" />
+            <text x="470" y="176" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#166534">3. OpenTelemetry Spans</text>
+            <text x="470" y="193" font-family="monospace" font-size="10" fill="#1b1d21">POST /orders [2015ms]</text>
+            <text x="470" y="207" font-family="monospace" font-size="10" fill="#1b1d21"> └─ SQL UPDATE [1980ms]</text>
+            <text x="470" y="221" font-family="monospace" font-size="10" fill="#575c66">retained by tail sampler</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: W3C <code>traceparent</code> links every hop under one <code>traceId</code>, uniting logs (why), metrics (how much/SLO burn), and traces (where time went).
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. OpenTelemetry &amp; W3C <code>traceparent</code> Propagation</h2>
+        <p>
+          <a href="https://opentelemetry.io/docs/concepts/signals/" target="_blank" rel="noopener">OpenTelemetry (OTel)</a> gives you vendor-neutral SDKs and a Collector so you can export to AWS X-Ray, CloudWatch, Honeycomb, or Grafana Tempo without rewriting application code.
+        </p>
+        <p>
+          Cross-service correlation relies on the <a href="https://www.w3.org/TR/trace-context/" target="_blank" rel="noopener">W3C Trace Context</a> HTTP header <code>traceparent</code>:
+        </p>
+<pre><code>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  └────────── 32-hex traceId ─────────┘ └─ 16-hex spanId ─┘ │
+             version (00)                                           flags (01 = sampled)</code></pre>
+        <p>
+          <strong>Sampling tradeoffs (Head vs. Tail):</strong> Tracing 100% of requests at 10,000 req/s costs more than your database. Two strategies exist:
+        </p>
+        <ul>
+          <li><strong>Head-based sampling:</strong> Decided at the first hop (e.g., keep 5% via bit <code>01</code> in <code>traceFlags</code>). Cheap and stateless, <em>but</em> discards 95% of rare <code>500</code> errors before you even know they failed.</li>
+          <li><strong>Tail-based sampling:</strong> Your ECS apps export all spans to an OTel Collector, which buffers each trace for a few seconds and keeps <strong>100% of error or slow (&gt;p95) traces</strong> while keeping only 1–5% of healthy fast traces.</li>
+        </ul>
+
+        <!-- SECTION 4 -->
+        <h2>4. SLIs, SLOs, Error Budgets &amp; Multi-Window Burn-Rate Alerts</h2>
+        <p>
+          Paging an on-call engineer at 3:00 AM because "CPU hit 82%" or "two requests returned 500" causes alert fatigue. <a href="https://sre.google/workbook/alerting-on-slos/" target="_blank" rel="noopener">Google SRE SLO alerting</a> replaces arbitrary thresholds with user-impact math:
+        </p>
+        <ul>
+          <li><strong>SLI (Indicator):</strong> Measured ratio of good events to total valid events (e.g., non-5xx responses under 300 ms / all requests).</li>
+          <li><strong>SLO (Objective):</strong> Target over a rolling window, such as <code>99.9%</code> over 30 days (<code>43,200</code> minutes).</li>
+          <li><strong>Error Budget:</strong> <code>1 - SLO = 0.1%</code> (<code>0.001</code>). At 100 req/s (259.2M requests/month), your budget is <strong>259,200 failed requests</strong> (equivalent to 43.2 minutes of total outage).</li>
+        </ul>
+        <p>
+          <strong>Burn Rate</strong> measures how fast you consume that budget relative to a steady 30-day pace:
+          <code>burnRate = observedErrorRate / (1 - sloTarget)</code>.
+        </p>
+        <ul>
+          <li><strong><code>1x</code> burn rate:</strong> <code>0.1%</code> errors consumes 100% of the budget in exactly 30 days.</li>
+          <li><strong><code>14.4x</code> burn rate (<code>1.44%</code> errors on a <code>99.9%</code> SLO):</strong> Consumes <strong>2% of your 30-day budget in 1 hour</strong> (exhausts the entire month's budget in 50 hours) &rarr; <strong>PAGE immediately</strong>.</li>
+          <li><strong><code>6x</code> burn rate (<code>0.6%</code> errors):</strong> Consumes <strong>5% of your 30-day budget in 6 hours</strong> &rarr; create an urgent <strong>TICKET</strong>.</li>
+        </ul>
+        <p>
+          Always pair a long window with a short confirmation window (e.g., <strong>1 hour AND 5 minutes</strong> both &ge; <code>14.4x</code>). Without the short window, an alert stays firing for 55 minutes after you already rolled back a bad deploy; without the long window, a 30-second deploy blip wakes up the team.
+        </p>
+
+        <!-- SECTION 5 -->
+        <h2>5. Production Code Example: Trace-Correlated Logger + CloudWatch EMF</h2>
+        <p>
+          Here is how a Node.js/TypeScript backend binds the incoming W3C <code>traceparent</code> into <code>AsyncLocalStorage</code> so every log line automatically carries <code>traceId</code>, while emitting zero-overhead <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html" target="_blank" rel="noopener">CloudWatch Embedded Metric Format (EMF)</a> metrics to <code>stdout</code>:
+        </p>
+<pre><code>import { AsyncLocalStorage } from "node:async_hooks";
+
+interface TraceCtx { traceId: string; spanId: string; }
+const traceStore = new AsyncLocalStorage&lt;TraceCtx&gt;();
+
+export function logJson(level: "INFO" | "WARN" | "ERROR", msg: string, fields: Record&lt;string, unknown&gt; = {}) {
+  const ctx = traceStore.getStore();
+  // Redact sensitive keys before writing to stdout
+  const safeFields = { ...fields };
+  delete safeFields.authorization;
+  delete safeFields.password;
+
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level,
+    service: "orders-api",
+    traceId: ctx?.traceId ?? "untraced",
+    spanId: ctx?.spanId ?? "none",
+    msg,
+    ...safeFields,
+  }));
+}
+
+// CloudWatch EMF line: parsed asynchronously by CloudWatch into RED metrics (no network call on hot path)
+export function emitRedEmf(route: string, statusCode: number, durationMs: number) {
+  console.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: "OrdersService/Prod",
+        Dimensions: [["Route"]], // Keep Route bounded (e.g. "/v1/orders/:id"), NEVER raw orderId!
+        Metrics: [
+          { Name: "LatencyMs", Unit: "Milliseconds" },
+          { Name: "ServerErrors", Unit: "Count" },
+        ],
+      }],
+    },
+    Route: route,
+    LatencyMs: durationMs,
+    ServerErrors: statusCode >= 500 ? 1 : 0,
+  }));
+}</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build two production observability utilities: <code>evaluateSloBurn(windowStats, sloTarget)</code> to compute error-budget burn rate and alerting severity, and <code>correlateTraceLogs(traceparentHeader, logLines)</code> to validate W3C <code>traceparent</code> headers and extract correlated logs.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Apply tail-latency math, sampling tradeoffs, and SLO burn-rate alerting to real production scenarios.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCE & NEXT STEPS -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Google SRE Workbook:</strong> <a href="https://sre.google/workbook/alerting-on-slos/" target="_blank" rel="noopener">Alerting on SLOs (Multi-Window, Multi-Burn-Rate Alerts)</a>.
+          </li>
+          <li>
+            <strong>W3C &amp; OpenTelemetry:</strong> <a href="https://www.w3.org/TR/trace-context/" target="_blank" rel="noopener">W3C Trace Context Specification (<code>traceparent</code>)</a> and <a href="https://opentelemetry.io/docs/concepts/signals/" target="_blank" rel="noopener">OpenTelemetry Signals (Traces, Metrics, Logs)</a>.
+          </li>
+          <li>
+            <strong>AWS CloudWatch:</strong> <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html" target="_blank" rel="noopener">CloudWatch Embedded Metric Format (EMF) Specification</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0014 (Testing Pyramid, GitHub Actions CI &amp; ADRs)</strong>, ask anything that feels fuzzy—for instance: <em>"How do we keep CloudWatch EMF dimensions from exploding when clients send arbitrary 404 URLs?"</em> or <em>"Should an Android app generate the initial <code>traceparent</code> header or let the edge ALB mint it?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0012-docker-multistage-nonroot-healthchecks.html">&larr; Lesson 0012: Docker Multi-Stage Builds, Non-Root Security &amp; Health Checks</a>
+          <a href="./0014-testing-pyramid-ci-adrs.html">Lesson 0014: Testing Pyramid (Testcontainers), GitHub Actions CI &amp; Architecture Decision Records &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>High-Cardinality Trap</strong>
+          Never put unbounded IDs (<code>userId</code>, <code>orderId</code>, <code>traceId</code>) into <em>metric dimensions</em>. Each unique combination creates a new paid time series. Put bounded routes (<code>/orders/:id</code>) in metrics, and put high-cardinality IDs in structured logs and trace attributes.
+        </div>
+        <div class="sidenote">
+          <strong>Why CloudWatch EMF?</strong>
+          Pushing metrics synchronously via <code>PutMetricData</code> API calls adds latency and rate-limit risk to every request. Writing EMF JSON to <code>stdout</code> lets the CloudWatch agent aggregate and ship metrics out-of-band.
+        </div>
+        <div class="sidenote">
+          <strong>The <code>01</code> Sampled Flag</strong>
+          In W3C <code>traceparent</code>, the trailing byte (<code>01</code> vs <code>00</code>) tells downstream services whether the edge decided to record spans for this trace, preventing half-broken traces where Service A records spans but Service B drops them.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0013",
+      title: "Lab 0013: SLO Burn-Rate Calculator & Trace-Log Correlator",
+      filename: "observability-tools.js",
+      description:
+        "Implement two functions: (1) <code>evaluateSloBurn(windowStats, sloTarget)</code> where <code>windowStats</code> is <code>{ totalRequests, errorRequests, windowMinutes, budgetWindowDays = 30 }</code>. Compute <code>errorBudgetFraction = 1 - sloTarget</code>, <code>observedErrorRate = totalRequests > 0 ? errorRequests / totalRequests : 0</code>, <code>burnRate = errorBudgetFraction > 0 ? observedErrorRate / errorBudgetFraction : 0</code>, and <code>budgetConsumedPct = burnRate * (windowMinutes / (budgetWindowDays * 1440)) * 100</code>. Round <code>observedErrorRate</code> to 6 decimals and <code>burnRate</code>/<code>budgetConsumedPct</code> to 2 decimals. Set <code>severity</code>: <code>\"PAGE\"</code> if <code>burnRate >= 14.4</code>, <code>\"TICKET\"</code> if <code>burnRate >= 6</code>, <code>\"WARN\"</code> if <code>burnRate > 1</code>, else <code>\"OK\"</code>. (2) <code>correlateTraceLogs(traceparentHeader, logLines)</code>: validate W3C <code>traceparent</code> (<code>00-&lt;32 hex traceId&gt;-&lt;16 hex spanId&gt;-&lt;2 hex flags&gt;</code>, version not <code>ff</code>, IDs not all zeros). If invalid, return <code>{ valid: false, traceId: null, parentSpanId: null, sampled: false, matchedLogs: [], errorCount: 0, maxDurationMs: 0 }</code>. If valid, parse <code>logLines</code> (ignoring invalid JSON), filter by <code>traceId</code>, sort chronologically by <code>timestamp</code>, and compute <code>sampled</code> (lowest bit of flags === 1), <code>errorCount</code> (<code>level === \"ERROR\"</code> or <code>statusCode >= 500</code>), and <code>maxDurationMs</code>.",
+      exports: ["evaluateSloBurn", "correlateTraceLogs"],
+      starterCode: `function evaluateSloBurn(windowStats, sloTarget) {
+  const total = windowStats.totalRequests || 0;
+  const errors = windowStats.errorRequests || 0;
+  const windowMinutes = windowStats.windowMinutes || 0;
+  const budgetWindowDays = windowStats.budgetWindowDays || 30;
+
+  // TODO 1: compute errorBudgetFraction, observedErrorRate, burnRate, budgetConsumedPct
+  // Round observedErrorRate to 6 decimals, burnRate and budgetConsumedPct to 2 decimals.
+  const observedErrorRate = 0;
+  const burnRate = 0;
+  const budgetConsumedPct = 0;
+
+  // TODO 2: classify severity ("PAGE" >= 14.4, "TICKET" >= 6, "WARN" > 1, else "OK")
+  const severity = "OK";
+
+  return { observedErrorRate, burnRate, budgetConsumedPct, severity };
+}
+
+function correlateTraceLogs(traceparentHeader, logLines) {
+  // TODO 3: validate W3C traceparent: ^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$
+  // Reject version === "ff" or all-zero traceId / parentSpanId.
+  // Parse valid JSON lines matching traceId, sort by timestamp, count errors, find maxDurationMs.
+  return {
+    valid: false,
+    traceId: null,
+    parentSpanId: null,
+    sampled: false,
+    matchedLogs: [],
+    errorCount: 0,
+    maxDurationMs: 0
+  };
+}
+
+console.log("Burn sample:", evaluateSloBurn({ totalRequests: 100000, errorRequests: 1440, windowMinutes: 60 }, 0.999));
+console.log(
+  "Trace sample:",
+  correlateTraceLogs("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", [
+    '{"timestamp":"2026-11-15T00:00:02Z","traceId":"4bf92f3577b34da6a3ce929d0e0e4736","level":"ERROR","statusCode":503,"durationMs":2015}',
+    '{"timestamp":"2026-11-15T00:00:01Z","traceId":"4bf92f3577b34da6a3ce929d0e0e4736","level":"INFO","statusCode":200,"durationMs":18}'
+  ])
+);`,
+      hints: [
+        "Use helper <code>const round = (n, d) => Math.round(n * 10 ** d) / 10 ** d;</code>. In a 30-day window (<code>43,200</code> minutes), a <code>14.4x</code> burn rate over 60 minutes yields <code>budgetConsumedPct = 14.4 * (60 / 43200) * 100 = 2</code>.",
+        "For <code>traceparent</code>, match against <code>/^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/</code>, check <code>version !== \"ff\"</code>, <code>!/^0+$/.test(traceId)</code>, and <code>!/^0+$/.test(parentSpanId)</code>. Determine <code>sampled</code> via <code>(parseInt(flags, 16) & 1) === 1</code>."
+      ],
+      solutionExplanation:
+        "A 14.4x burn rate on a 99.9% 30-day SLO consumes 2% of the entire monthly error budget in a single hour—requiring an immediate page. Correlating structured JSON logs by a validated W3C traceId lets engineers isolate the slow or failing span out of millions of interleaved container log lines.",
+      solutionCode: `function evaluateSloBurn(windowStats, sloTarget) {
+  const total = windowStats.totalRequests || 0;
+  const errors = windowStats.errorRequests || 0;
+  const windowMinutes = windowStats.windowMinutes || 0;
+  const budgetWindowDays = windowStats.budgetWindowDays || 30;
+
+  const round = (n, decimals) => {
+    const factor = Math.pow(10, decimals);
+    return Math.round(n * factor) / factor;
+  };
+
+  const errorBudgetFraction = 1 - sloTarget;
+  const rawErrorRate = total > 0 ? errors / total : 0;
+  const rawBurnRate = errorBudgetFraction > 0 ? rawErrorRate / errorBudgetFraction : 0;
+  const budgetWindowMinutes = budgetWindowDays * 1440;
+  const rawConsumedPct = budgetWindowMinutes > 0
+    ? rawBurnRate * (windowMinutes / budgetWindowMinutes) * 100
+    : 0;
+
+  const observedErrorRate = round(rawErrorRate, 6);
+  const burnRate = round(rawBurnRate, 2);
+  const budgetConsumedPct = round(rawConsumedPct, 2);
+
+  let severity = "OK";
+  if (burnRate >= 14.4) {
+    severity = "PAGE";
+  } else if (burnRate >= 6) {
+    severity = "TICKET";
+  } else if (burnRate > 1) {
+    severity = "WARN";
+  }
+
+  return { observedErrorRate, burnRate, budgetConsumedPct, severity };
+}
+
+function correlateTraceLogs(traceparentHeader, logLines) {
+  const empty = {
+    valid: false,
+    traceId: null,
+    parentSpanId: null,
+    sampled: false,
+    matchedLogs: [],
+    errorCount: 0,
+    maxDurationMs: 0
+  };
+
+  if (typeof traceparentHeader !== "string") return empty;
+  const match = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/.exec(traceparentHeader.trim());
+  if (!match) return empty;
+
+  const [, version, traceId, parentSpanId, flags] = match;
+  if (version === "ff" || /^0+$/.test(traceId) || /^0+$/.test(parentSpanId)) {
+    return empty;
+  }
+
+  const sampled = (parseInt(flags, 16) & 1) === 1;
+  const matchedLogs = [];
+
+  for (const line of logLines || []) {
+    let entry = line;
+    if (typeof line === "string") {
+      try {
+        entry = JSON.parse(line);
+      } catch (_) {
+        continue;
+      }
+    }
+    if (entry && typeof entry === "object" && entry.traceId === traceId) {
+      matchedLogs.push(entry);
+    }
+  }
+
+  matchedLogs.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+
+  let errorCount = 0;
+  let maxDurationMs = 0;
+  for (const entry of matchedLogs) {
+    if (entry.level === "ERROR" || (typeof entry.statusCode === "number" && entry.statusCode >= 500)) {
+      errorCount++;
+    }
+    if (typeof entry.durationMs === "number" && entry.durationMs > maxDurationMs) {
+      maxDurationMs = entry.durationMs;
+    }
+  }
+
+  return {
+    valid: true,
+    traceId,
+    parentSpanId,
+    sampled,
+    matchedLogs,
+    errorCount,
+    maxDurationMs
+  };
+}`,
+      tests: [
+        {
+          name: "14.4x burn rate over 1h on 99.9% SLO consumes 2% budget and triggers PAGE",
+          run: (scope) => {
+            const out = scope.evaluateSloBurn(
+              { totalRequests: 100000, errorRequests: 1440, windowMinutes: 60, budgetWindowDays: 30 },
+              0.999
+            );
+            const pass =
+              out.observedErrorRate === 0.0144 &&
+              out.burnRate === 14.4 &&
+              out.budgetConsumedPct === 2 &&
+              out.severity === "PAGE";
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "6x burn rate over 6h consumes 5% budget and triggers TICKET",
+          run: (scope) => {
+            const out = scope.evaluateSloBurn(
+              { totalRequests: 100000, errorRequests: 600, windowMinutes: 360 },
+              0.999
+            );
+            const pass =
+              out.burnRate === 6 &&
+              out.budgetConsumedPct === 5 &&
+              out.severity === "TICKET";
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Healthy traffic (burnRate <= 1) returns OK and handles zero requests safely",
+          run: (scope) => {
+            const okOut = scope.evaluateSloBurn({ totalRequests: 10000, errorRequests: 5, windowMinutes: 60 }, 0.999);
+            const zeroOut = scope.evaluateSloBurn({ totalRequests: 0, errorRequests: 0, windowMinutes: 60 }, 0.999);
+            const pass =
+              okOut.burnRate === 0.5 &&
+              okOut.severity === "OK" &&
+              zeroOut.burnRate === 0 &&
+              zeroOut.severity === "OK";
+            return { pass, message: `ok=${JSON.stringify(okOut)}, zero=${JSON.stringify(zeroOut)}` };
+          }
+        },
+        {
+          name: "correlateTraceLogs parses valid traceparent, ignores malformed JSON, and sorts chronologically",
+          run: (scope) => {
+            const out = scope.correlateTraceLogs(
+              "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+              [
+                "not-json-stacktrace-line",
+                '{"timestamp":"2026-11-15T00:00:05Z","traceId":"4bf92f3577b34da6a3ce929d0e0e4736","level":"ERROR","statusCode":500,"durationMs":2015}',
+                '{"timestamp":"2026-11-15T00:00:01Z","traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","level":"ERROR","statusCode":500,"durationMs":9999}',
+                '{"timestamp":"2026-11-15T00:00:02Z","traceId":"4bf92f3577b34da6a3ce929d0e0e4736","level":"INFO","statusCode":200,"durationMs":22}'
+              ]
+            );
+            const pass =
+              out.valid === true &&
+              out.traceId === "4bf92f3577b34da6a3ce929d0e0e4736" &&
+              out.parentSpanId === "00f067aa0ba902b7" &&
+              out.sampled === true &&
+              out.matchedLogs.length === 2 &&
+              out.matchedLogs[0].durationMs === 22 &&
+              out.errorCount === 1 &&
+              out.maxDurationMs === 2015;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "correlateTraceLogs rejects all-zero traceId, version ff, and detects unsampled flag 00",
+          run: (scope) => {
+            const badZero = scope.correlateTraceLogs(
+              "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+              []
+            );
+            const badVer = scope.correlateTraceLogs(
+              "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+              []
+            );
+            const unsampled = scope.correlateTraceLogs(
+              "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+              []
+            );
+            const pass =
+              badZero.valid === false &&
+              badVer.valid === false &&
+              unsampled.valid === true &&
+              unsampled.sampled === false;
+            return { pass, message: `badZero=${badZero.valid}, badVer=${badVer.valid}, unsampled=${unsampled.sampled}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0013",
+      title: "Quiz 0013: Structured Telemetry, Tail Latency & SLO Burn Rates",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Your team runs 12 ECS tasks behind an ALB. Each task reports its local p99 latency every minute, and a CloudWatch dashboard averages those 12 p99 numbers. During a database shard lock, the dashboard reads 180 ms while Android users hit 4-second timeouts. Why did the dashboard hide the outage?",
+          options: [
+            "Averaging per-task p99 values hides severe tail outliers unless raw histogram buckets are merged.",
+            "CloudWatch agents drop slow request samples whenever container CPU exceeds fifty percent utilization limits.",
+            "Android OkHttp clients buffer incoming response headers locally before starting their internal read timers.",
+            "AWS Application Load Balancers cap reported target latency metrics at two hundred milliseconds total."
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Percentiles are non-additive: averaging p99 across 12 tasks masks one overloaded task or shard; merging raw histogram bucket counts first yields the true fleet-wide p99.",
+            "CloudWatch agents do not selectively discard slow latency samples at 50% CPU utilization; the distortion came from mathematically invalid averaging of per-task quantiles.",
+            "OkHttp starts its call/read timers when executing the network request; client-side buffering does not explain why a server-side p99 average read 180 ms.",
+            "AWS ALB TargetResponseTime metrics record actual backend durations up to the idle timeout without capping them at 200 ms."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "You instrument your Android app and ECS services with OpenTelemetry using 5% head-based sampling at the edge ALB. A user reports an intermittent HTTP 500 checkout failure, and you find their traceId in CloudWatch structured logs—but zero spans exist in your trace backend. What is the cleanest architectural fix?",
+          options: [
+            "Deploy an OpenTelemetry Collector using tail sampling to retain every error trace.",
+            "Configure OkHttp clients to retry failed HTTP 500 requests with new headers.",
+            "Increase ECS task CPU limits so the logger flushes spans before crashes.",
+            "Disable structured JSON logging so CloudWatch captures full raw stack traces faster."
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Head-based sampling decides at request start before knowing if the request will fail; tail-based sampling in an OTel Collector inspects completed traces and keeps 100% of error traces.",
+            "Retrying HTTP 500s with new headers creates duplicate load (and risks double charges if non-idempotent) while still leaving 95% of failures unsampled.",
+            "The trace was absent because the 5% head sampler assigned trace-flags 00 at ingress, not because CPU limits prevented span flushing.",
+            "Disabling structured JSON logs actually hurts correlation by removing traceId fields, and has no effect on OpenTelemetry trace sampling."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "Your payments API has a 99.9% monthly availability SLO (0.1% error budget). After a bad deploy, your error rate jumps to 1.44% (14.4x burn rate). Why does the Google SRE Workbook recommend pairing a 1-hour 14.4x burn alert with a 5-minute confirmation window instead of firing an immediate page whenever 5-minute errors exceed 0.1%?",
+          options: [
+            "Dual windows catch fast budget exhaustion while filtering out brief transient error spikes.",
+            "Dual windows automatically roll back broken ECS task definitions without manual engineer approval.",
+            "Single short alerts violate AWS CloudWatch Logs Insights daily query concurrency quota limits.",
+            "Monthly error budgets reset to zero whenever two consecutive brief health checks fail."
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Requiring both a 1-hour window and a 5-minute confirmation window to burn at 14.4x prevents paging on tiny harmless blips while resolving promptly once a fix stops the bleed.",
+            "Burn-rate alerts notify on-call engineers or trigger automated pipelines; the alerting window logic itself does not perform ECS task rollbacks.",
+            "Metric-based SLO alarms evaluate time-series counts and do not run CloudWatch Logs Insights queries against raw log storage.",
+            "An error budget is tracked over a rolling window (such as 30 days) and is never wiped to zero by two failed health checks."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

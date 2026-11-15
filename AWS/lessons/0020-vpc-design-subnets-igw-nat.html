@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0020 — Designing Production Multi-AZ VPCs: Subnets, Route Tables, IGW &amp; NAT Gateways</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0020</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0020-vpc-design-subnets-igw-nat.html" class="active">Lesson 0020</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.2</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>Designing Production Multi-AZ VPCs: Subnets, Route Tables, IGW &amp; NAT Gateways</h1>
+    <p class="lead">
+      In Lesson 0002 you mastered CIDR bitmasks and longest-prefix matching. Now you will assemble those primitives into a resilient, multi-Availability-Zone Amazon VPC—separating ingress, compute, and databases across public, private, and isolated tiers while avoiding single-AZ NAT outages and silent cross-AZ data transfer taxes.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            Compare your home Wi-Fi router and your mobile carrier's NAT (CGNAT) to an AWS VPC. If you configure port forwarding and a public IP on your router, external traffic can reach a home server directly (a <strong>Public Subnet</strong> backed by an <strong>Internet Gateway</strong>). On 5G behind carrier NAT, your Android phone can open outbound HTTPS sockets via <code>OkHttp</code>, yet random internet hosts cannot initiate inbound TCP connections to your phone's <code>10.x</code> IP (a <strong>Private Subnet</strong> behind a <strong>NAT Gateway</strong>). Finally, a smart-home VLAN with no default gateway at all can only talk locally on your LAN (an <strong>Isolated Data Subnet</strong>).
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. The Three Production Subnet Tiers &amp; CIDR Sizing</h2>
+        <p>
+          An Amazon VPC spans an entire AWS Region (e.g., <code>us-east-1</code>) and typically claims a non-overlapping RFC 1918 <code>/16</code> block such as <code>10.20.0.0/16</code> (65,536 addresses). Because AWS subnets are bound to a <strong>single Availability Zone</strong>, high availability requires mirroring your subnet tiers across at least <strong>two (ideally three) AZs</strong>.
+        </p>
+        <p>
+          According to the <a href="https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html" target="_blank" rel="noopener">AWS VPC Subnet Architecture guide</a>, a subnet's tier is determined entirely by its associated <strong>Route Table</strong>—never by its name tag:
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 18%;">Tier</th>
+              <th style="width: 18%;">Typical Mask</th>
+              <th style="width: 28%;">Default Route (<code>0.0.0.0/0</code>)</th>
+              <th style="width: 36%;">Production Workloads</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Public</strong></td>
+              <td><code>/24</code> (251 IPs)</td>
+              <td><code>0.0.0.0/0 &rarr; igw-xxxx</code></td>
+              <td><a href="../reference/glossary.html#alb">Application Load Balancers</a>, Network Load Balancers, NAT Gateways. Never run application containers or databases here.</td>
+            </tr>
+            <tr>
+              <td><strong>Private</strong></td>
+              <td><code>/22</code> (1,019 IPs)</td>
+              <td><code>0.0.0.0/0 &rarr; nat-az</code> (same AZ)</td>
+              <td>ECS Fargate tasks, EKS pods, EC2 Auto Scaling groups, VPC-attached Lambda ENIs that call external APIs (Stripe, FCM, APNs).</td>
+            </tr>
+            <tr>
+              <td><strong>Isolated</strong></td>
+              <td><code>/24</code> (251 IPs)</td>
+              <td><strong>None</strong> (<code>local</code> + VPC endpoints only)</td>
+              <td>RDS PostgreSQL, Aurora, ElastiCache Redis, MSK Kafka—zero internet egress path even if compromised.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p>
+          Notice the asymmetric sizing: private compute tiers exhaust IPs fastest (especially EKS pods with VPC CNI or rolling blue/green ECS deployments), so allocating <code>/22</code> or <code>/21</code> blocks to private subnets while keeping public and isolated subnets at <code>/24</code> prevents premature IP exhaustion. Leave half your <code>/16</code> unallocated for future tiers or secondary CIDR expansions.
+        </p>
+
+        <!-- SECTION 2 -->
+        <h2>2. IGW vs. NAT Gateway: Wire Mechanics &amp; Multi-AZ HA</h2>
+        <p>
+          The <a href="https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html" target="_blank" rel="noopener">Internet Gateway (IGW)</a> is a <strong>horizontally scaled, redundant, regional AWS construct</strong>—it is never a single-AZ bottleneck and incurs zero hourly cost. On the wire, an IGW performs stateless 1:1 NAT between an instance's private IP and its assigned public IPv4 (or Elastic IP). Two crucial rules trip up engineers:
+        </p>
+        <ul>
+          <li><strong>No public IP, no IGW egress:</strong> Placing an EC2 instance without a public IPv4 address in a public subnet with <code>0.0.0.0/0 &rarr; igw-xxxx</code> causes every outbound internet packet to be silently dropped at the IGW, because the IGW has no public source address to map.</li>
+          <li><strong>IGW works bi-directionally:</strong> Once a public IPv4 is mapped and security groups allow it, both inbound and outbound flows traverse the IGW.</li>
+        </ul>
+
+        <p>
+          By contrast, an AWS <a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html" target="_blank" rel="noopener">NAT Gateway</a> is a <strong>zonal, stateful SNAT appliance</strong> that lives inside a <em>specific public subnet</em> in one AZ, binds to an Elastic IP, and auto-scales from 5 Gbps up to <strong>100 Gbps</strong> (supporting ~55,000 simultaneous connections per destination IP/port tuple per Elastic IP, expandable up to 8 EIPs).
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 355" width="100%" height="auto" role="img" aria-label="Production 2-AZ VPC Architecture with IGW, Per-AZ NAT Gateways, and S3 Gateway Endpoint">
+            <rect x="0" y="0" width="680" height="355" fill="#fdfcf8" rx="6" />
+
+            <!-- VPC Outer Boundary -->
+            <rect x="14" y="54" width="652" height="288" rx="6" fill="#ffffff" stroke="#c2b9a7" stroke-dasharray="5 4" />
+            <text x="26" y="72" font-family="monospace" font-size="11" font-weight="700" fill="#575c66">VPC 10.20.0.0/16 (us-east-1)</text>
+
+            <!-- IGW & S3 at Top -->
+            <rect x="155" y="10" width="190" height="34" rx="5" fill="#e9f1f8" stroke="#0f4c81" stroke-width="1.5" />
+            <text x="250" y="31" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#0f4c81">IGW (Regional HA)</text>
+
+            <rect x="430" y="10" width="215" height="34" rx="5" fill="#ede9fe" stroke="#5b21b6" stroke-width="1.5" />
+            <text x="537" y="31" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#5b21b6">S3 / DynamoDB (Free VPCE)</text>
+
+            <!-- AZ-a Column -->
+            <rect x="26" y="84" width="302" height="246" rx="5" fill="#f8fafc" stroke="#cbd5e1" />
+            <text x="38" y="102" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">Availability Zone A (us-east-1a)</text>
+
+            <!-- Public A -->
+            <rect x="38" y="112" width="278" height="62" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="48" y="130" font-family="monospace" font-size="11" font-weight="700" fill="#0f4c81">Public 10.20.0.0/24</text>
+            <text x="48" y="146" font-family="monospace" font-size="10" fill="#374151">RT: 0.0.0.0/0 &rarr; igw-01</text>
+            <rect x="206" y="122" width="100" height="42" rx="3" fill="#ffffff" stroke="#0f4c81" />
+            <text x="256" y="140" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="#0f4c81">ALB + nat-a</text>
+            <text x="256" y="155" text-anchor="middle" font-family="monospace" font-size="9" fill="#575c66">EIP-A</text>
+
+            <!-- Private A -->
+            <rect x="38" y="186" width="278" height="72" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="48" y="204" font-family="monospace" font-size="11" font-weight="700" fill="#b45309">Private 10.20.16.0/22</text>
+            <text x="48" y="220" font-family="monospace" font-size="10" fill="#374151">RT: 0.0.0.0/0 &rarr; nat-a</text>
+            <text x="48" y="234" font-family="monospace" font-size="10" fill="#5b21b6">RT: pl-s3 &rarr; vpce-s3</text>
+            <rect x="206" y="200" width="100" height="44" rx="3" fill="#ffffff" stroke="#b45309" />
+            <text x="256" y="219" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="#b45309">ECS / EKS</text>
+            <text x="256" y="234" text-anchor="middle" font-family="monospace" font-size="9" fill="#575c66">No Public IP</text>
+
+            <!-- Isolated A -->
+            <rect x="38" y="270" width="278" height="48" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="48" y="288" font-family="monospace" font-size="11" font-weight="700" fill="#166534">Isolated 10.20.32.0/24</text>
+            <text x="48" y="304" font-family="monospace" font-size="10" fill="#374151">RT: 10.20.0.0/16 &rarr; local ONLY</text>
+            <rect x="226" y="278" width="80" height="32" rx="3" fill="#ffffff" stroke="#166534" />
+            <text x="266" y="298" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="#166534">RDS Prim</text>
+
+            <!-- AZ-b Column -->
+            <rect x="352" y="84" width="302" height="246" rx="5" fill="#f8fafc" stroke="#cbd5e1" />
+            <text x="364" y="102" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">Availability Zone B (us-east-1b)</text>
+
+            <!-- Public B -->
+            <rect x="364" y="112" width="278" height="62" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="374" y="130" font-family="monospace" font-size="11" font-weight="700" fill="#0f4c81">Public 10.20.1.0/24</text>
+            <text x="374" y="146" font-family="monospace" font-size="10" fill="#374151">RT: 0.0.0.0/0 &rarr; igw-01</text>
+            <rect x="532" y="122" width="100" height="42" rx="3" fill="#ffffff" stroke="#0f4c81" />
+            <text x="582" y="140" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="#0f4c81">ALB + nat-b</text>
+            <text x="582" y="155" text-anchor="middle" font-family="monospace" font-size="9" fill="#575c66">EIP-B</text>
+
+            <!-- Private B -->
+            <rect x="364" y="186" width="278" height="72" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="374" y="204" font-family="monospace" font-size="11" font-weight="700" fill="#b45309">Private 10.20.20.0/22</text>
+            <text x="374" y="220" font-family="monospace" font-size="10" fill="#374151">RT: 0.0.0.0/0 &rarr; nat-b</text>
+            <text x="374" y="234" font-family="monospace" font-size="10" fill="#5b21b6">RT: pl-s3 &rarr; vpce-s3</text>
+            <rect x="532" y="200" width="100" height="44" rx="3" fill="#ffffff" stroke="#b45309" />
+            <text x="582" y="219" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="#b45309">ECS / EKS</text>
+            <text x="582" y="234" text-anchor="middle" font-family="monospace" font-size="9" fill="#575c66">No Public IP</text>
+
+            <!-- Isolated B -->
+            <rect x="364" y="270" width="278" height="48" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="374" y="288" font-family="monospace" font-size="11" font-weight="700" fill="#166534">Isolated 10.20.33.0/24</text>
+            <text x="374" y="304" font-family="monospace" font-size="10" fill="#374151">RT: 10.20.0.0/16 &rarr; local ONLY</text>
+            <rect x="552" y="278" width="80" height="32" rx="3" fill="#ffffff" stroke="#166534" />
+            <text x="592" y="298" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="#166534">RDS Stby</text>
+
+            <!-- Routing Arrows -->
+            <line x1="256" y1="122" x2="256" y2="44" stroke="#0f4c81" stroke-width="1.5" />
+            <line x1="582" y1="122" x2="290" y2="44" stroke="#0f4c81" stroke-width="1.5" />
+            <line x1="256" y1="200" x2="256" y2="164" stroke="#b45309" stroke-width="1.5" />
+            <line x1="582" y1="200" x2="582" y2="164" stroke="#b45309" stroke-width="1.5" />
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Each AZ pairs its own private route table with a local NAT Gateway inside that AZ's public subnet, isolating AZ failures and avoiding cross-AZ egress charges.
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-title">Three Cost &amp; Reliability Traps in NAT Gateway Design</div>
+          <p style="margin: 0;">
+            <strong>1. Single-AZ NAT SPOF:</strong> Deploying one NAT Gateway in <code>us-east-1a</code> ($32.40/mo) and pointing <code>us-east-1b</code> private subnets to it saves $32/month—but destroys AZ fault isolation and adds <strong>$0.02/GB cross-AZ transfer</strong> ($0.01 out + $0.01 in) on top of the $0.045/GB NAT processing fee.<br />
+            <strong>2. NAT in a Private Subnet:</strong> A NAT Gateway <em>must</em> sit in a public subnet with <code>0.0.0.0/0 &rarr; igw</code>. Putting a NAT Gateway inside a private subnet creates a routing blackhole.<br />
+            <strong>3. Missing Gateway Endpoints:</strong> S3 and DynamoDB have public endpoints. Without free <a href="https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html" target="_blank" rel="noopener">Gateway VPC Endpoints</a> in your private route tables, S3 uploads/downloads traverse your NAT Gateway at <strong>$0.045/GB</strong>.
+          </p>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Production Code Example: Multi-AZ VPC in AWS CDK (TypeScript)</h2>
+        <p>
+          In production Infrastructure as Code, explicitly declare subnet masks, per-AZ NAT Gateways (<code>natGateways: 2</code> or <code>3</code>), and free Gateway VPC Endpoints so S3 and DynamoDB never touch NAT billing:
+        </p>
+<pre><code>import * as ec2 from "aws-cdk-lib/aws-ec2";
+
+// Production 3-Tier, 2-AZ VPC with Per-AZ NAT Gateways &amp; Free Gateway Endpoints
+const vpc = new ec2.Vpc(this, "ProdVpc", {
+  ipAddresses: ec2.IpAddresses.cidr("10.20.0.0/16"),
+  maxAzs: 2,
+  natGateways: 2, // CRITICAL: 1 NAT Gateway per AZ eliminates cross-AZ SPOF &amp; $0.02/GB tax
+  subnetConfiguration: [
+    {
+      name: "PublicIngress",
+      subnetType: ec2.SubnetType.PUBLIC,
+      cidrMask: 24, // 251 usable IPs per AZ for ALBs &amp; NAT Gateways
+    },
+    {
+      name: "PrivateCompute",
+      subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+      cidrMask: 22, // 1,019 usable IPs per AZ for ECS/EKS &amp; Lambda ENIs
+    },
+    {
+      name: "IsolatedData",
+      subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+      cidrMask: 24, // 251 usable IPs per AZ; local routes only (RDS/Redis)
+    },
+  ],
+  gatewayEndpoints: {
+    S3: { service: ec2.GatewayVpcEndpointAwsService.S3 },
+    DynamoDB: { service: ec2.GatewayVpcEndpointAwsService.DYNAMODB },
+  },
+});</code></pre>
+
+        <!-- SECTION 4: INTERACTIVE CODE PRACTICE -->
+        <h2>4. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build <code>auditVpcTopology(vpc)</code> to statically audit a VPC's subnets, route tables, IGW, and NAT Gateways before deployment—catching single-AZ deployments, missing IGW routes, misplaced NAT Gateways, misrouted private subnets, cross-AZ NAT SPOFs, and leaked routes on isolated subnets.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 5: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>5. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Verify your architectural instincts against real production failure scenarios before advancing.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 6: PRIMARY SOURCES & TEACHER CHECK-IN -->
+        <h2>6. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Subnets &amp; Route Tables:</strong> <a href="https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html" target="_blank" rel="noopener">AWS VPC User Guide — Configure Subnets</a> (Public, Private, and Isolated tier routing patterns).
+          </li>
+          <li>
+            <strong>Internet Gateways:</strong> <a href="https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html" target="_blank" rel="noopener">AWS VPC User Guide — Connect to the Internet Using an Internet Gateway</a>.
+          </li>
+          <li>
+            <strong>NAT Gateways:</strong> <a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html" target="_blank" rel="noopener">AWS VPC User Guide — NAT Gateways</a> (Per-AZ deployment, port allocation, and bandwidth scaling).
+          </li>
+          <li>
+            <strong>Gateway VPC Endpoints:</strong> <a href="https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html" target="_blank" rel="noopener">AWS PrivateLink — Gateway Endpoints for Amazon S3 &amp; DynamoDB</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0021 (Stateful Security Groups vs. Stateless NACLs &amp; VPC Flow Logs Debugging)</strong>, ask about anything that still feels subtle—for example: <em>"When is an Interface VPC Endpoint (PrivateLink) worth $7.20/month per AZ compared to a NAT Gateway?"</em> or <em>"How do IPv6 Egress-Only Internet Gateways (EIGW) change NAT costs?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0019-aws-organizations-scps-identity-center.html">&larr; Lesson 0019: Multi-Account Landing Zones: Organizations, Control Tower, SCPs & Identity Center</a>
+          <a href="./0021-security-groups-vs-nacls-flow-logs.html">Lesson 0021: Stateful Security Groups vs Stateless NACLs & VPC Flow Logs Debugging &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Route Table Sharing Trap</strong>
+          Public subnets across AZ-a and AZ-b can safely share a single route table (<code>0.0.0.0/0 &rarr; igw-01</code>) because the IGW is regional. Private subnets MUST use <em>separate per-AZ route tables</em> so each AZ points to its own local NAT Gateway.
+        </div>
+        <div class="sidenote">
+          <strong>Ephemeral Port Exhaustion</strong>
+          Each Elastic IP on a NAT Gateway supports ~55,000 concurrent connections to any single destination IP:port. High-fanout crawlers or webhook senders can attach up to 8 EIPs per NAT Gateway (440k connections).
+        </div>
+        <div class="sidenote">
+          <strong>Why Not NAT Instances?</strong>
+          Self-managed EC2 NAT instances save a few dollars in tiny sandboxes, but require manual OS patching, lack automatic 100 Gbps scaling, and fail silently if their source/destination check flag isn't disabled.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0020",
+      title: "Lab 0020: Multi-AZ VPC Route-Table & Subnet Tier Auditor",
+      filename: "vpc-auditor.js",
+      description:
+        "Implement <code>auditVpcTopology(vpc)</code> returning <code>{ valid, azCount, findings }</code>. Audit rules: (1) Compute <code>azCount</code> (distinct <code>az</code> values across <code>vpc.subnets</code>); if <code>azCount &lt; 2</code>, push finding code <code>\"MULTI_AZ_REQUIRED\"</code>. (2) Every <code>\"public\"</code> subnet's route table must have a <code>\"0.0.0.0/0\"</code> route targeting <code>vpc.igwId</code>; else push <code>\"PUBLIC_MISSING_IGW\"</code> with <code>subnetId</code>. (3) Every NAT Gateway in <code>vpc.natGateways</code> must reside in a <code>\"public\"</code> subnet in the same <code>az</code>; else push <code>\"NAT_IN_NON_PUBLIC_SUBNET\"</code> with <code>natId</code> and <code>subnetId</code>. (4) For every <code>\"private\"</code> subnet, examine its <code>\"0.0.0.0/0\"</code> route: if target is <code>vpc.igwId</code> or starts with <code>\"igw-\"</code>, push <code>\"PRIVATE_MISROUTED_TO_IGW\"</code>; else if route is missing or target is not a NAT Gateway in <code>vpc.natGateways</code>, push <code>\"PRIVATE_MISSING_NAT\"</code>; else if that NAT Gateway's <code>az !== subnet.az</code>, push <code>\"NAT_CROSS_AZ_SPOF\"</code> (all with <code>subnetId</code>). (5) Any <code>\"isolated\"</code> subnet whose route table has a <code>\"0.0.0.0/0\"</code> route gets <code>\"ISOLATED_HAS_DEFAULT_ROUTE\"</code> with <code>subnetId</code>. Set <code>valid: findings.length === 0</code>.",
+      exports: ["auditVpcTopology"],
+      starterCode: `function auditVpcTopology(vpc) {
+  // vpc: {
+  //   vpcCidr: string,
+  //   igwId: string,
+  //   natGateways: [{ id, az, subnetId }],
+  //   subnets: [{ id, az, tier: "public"|"private"|"isolated", routeTableId }],
+  //   routeTables: [{ id, routes: [{ destination, target }] }]
+  // }
+  const findings = [];
+  const azSet = new Set(vpc.subnets.map((s) => s.az));
+  const azCount = azSet.size;
+
+  const rtById = Object.fromEntries(vpc.routeTables.map((rt) => [rt.id, rt]));
+  const subnetById = Object.fromEntries(vpc.subnets.map((s) => [s.id, s]));
+  const natById = Object.fromEntries(vpc.natGateways.map((n) => [n.id, n]));
+
+  // TODO 1: Flag MULTI_AZ_REQUIRED if azCount < 2
+
+  // TODO 2: Verify every NAT Gateway resides in a "public" subnet in the same AZ (NAT_IN_NON_PUBLIC_SUBNET)
+
+  // TODO 3: Audit each subnet by tier ("public", "private", "isolated")
+  //   - public:   0.0.0.0/0 must target vpc.igwId (PUBLIC_MISSING_IGW)
+  //   - private:  flag PRIVATE_MISROUTED_TO_IGW, PRIVATE_MISSING_NAT, or NAT_CROSS_AZ_SPOF
+  //   - isolated: must NOT have any 0.0.0.0/0 route (ISOLATED_HAS_DEFAULT_ROUTE)
+
+  return { valid: findings.length === 0, azCount, findings };
+}
+
+console.log(
+  "Sample audit:",
+  auditVpcTopology({
+    vpcCidr: "10.20.0.0/16",
+    igwId: "igw-01",
+    natGateways: [{ id: "nat-a", az: "us-east-1a", subnetId: "pub-a" }],
+    subnets: [
+      { id: "pub-a", az: "us-east-1a", tier: "public", routeTableId: "rt-pub" },
+      { id: "priv-a", az: "us-east-1a", tier: "private", routeTableId: "rt-priv" },
+      { id: "priv-b", az: "us-east-1b", tier: "private", routeTableId: "rt-priv" }
+    ],
+    routeTables: [
+      { id: "rt-pub", routes: [{ destination: "10.20.0.0/16", target: "local" }, { destination: "0.0.0.0/0", target: "igw-01" }] },
+      { id: "rt-priv", routes: [{ destination: "10.20.0.0/16", target: "local" }, { destination: "0.0.0.0/0", target: "nat-a" }] }
+    ]
+  })
+);`,
+      hints: [
+        "Write a small helper <code>getDefaultRoute(rtId)</code> that looks up <code>rtById[rtId]</code> and returns <code>rt.routes.find(r =&gt; r.destination === \"0.0.0.0/0\")</code> (or <code>null</code> if missing).",
+        "Check <code>natById[route.target]</code> for private subnets: if the route targets <code>vpc.igwId</code> or starts with <code>\"igw-\"</code>, report <code>PRIVATE_MISROUTED_TO_IGW</code>; otherwise verify the NAT Gateway exists and its <code>az === subnet.az</code>."
+      ],
+      solutionExplanation:
+        "Auditing route tables programmatically before deployment enforces three invariants: every public subnet reaches the IGW, every private subnet uses a NAT Gateway in its own AZ (avoiding cross-AZ SPOFs and transfer fees), and isolated data subnets never receive a 0.0.0.0/0 default route.",
+      solutionCode: `function auditVpcTopology(vpc) {
+  const findings = [];
+  const azCount = new Set(vpc.subnets.map((s) => s.az)).size;
+
+  const rtById = Object.fromEntries(vpc.routeTables.map((rt) => [rt.id, rt]));
+  const subnetById = Object.fromEntries(vpc.subnets.map((s) => [s.id, s]));
+  const natById = Object.fromEntries(vpc.natGateways.map((n) => [n.id, n]));
+
+  function getDefaultRoute(rtId) {
+    const rt = rtById[rtId];
+    if (!rt || !Array.isArray(rt.routes)) return null;
+    return rt.routes.find((r) => r.destination === "0.0.0.0/0") || null;
+  }
+
+  if (azCount < 2) {
+    findings.push({
+      code: "MULTI_AZ_REQUIRED",
+      message: "Production VPC must span at least 2 Availability Zones."
+    });
+  }
+
+  for (const nat of vpc.natGateways) {
+    const host = subnetById[nat.subnetId];
+    if (!host || host.tier !== "public" || host.az !== nat.az) {
+      findings.push({
+        code: "NAT_IN_NON_PUBLIC_SUBNET",
+        natId: nat.id,
+        subnetId: nat.subnetId,
+        message: "NAT Gateway " + nat.id + " must reside in a public subnet in " + nat.az + "."
+      });
+    }
+  }
+
+  for (const subnet of vpc.subnets) {
+    const defRoute = getDefaultRoute(subnet.routeTableId);
+
+    if (subnet.tier === "public") {
+      if (!defRoute || defRoute.target !== vpc.igwId) {
+        findings.push({
+          code: "PUBLIC_MISSING_IGW",
+          subnetId: subnet.id,
+          message: "Public subnet " + subnet.id + " lacks 0.0.0.0/0 -> " + vpc.igwId + "."
+        });
+      }
+    } else if (subnet.tier === "private") {
+      if (defRoute && (defRoute.target === vpc.igwId || String(defRoute.target).startsWith("igw-"))) {
+        findings.push({
+          code: "PRIVATE_MISROUTED_TO_IGW",
+          subnetId: subnet.id,
+          message: "Private subnet " + subnet.id + " routes 0.0.0.0/0 directly to an IGW."
+        });
+      } else if (!defRoute || !natById[defRoute.target]) {
+        findings.push({
+          code: "PRIVATE_MISSING_NAT",
+          subnetId: subnet.id,
+          message: "Private subnet " + subnet.id + " has no valid NAT Gateway default route."
+        });
+      } else if (natById[defRoute.target].az !== subnet.az) {
+        findings.push({
+          code: "NAT_CROSS_AZ_SPOF",
+          subnetId: subnet.id,
+          message: "Private subnet " + subnet.id + " (" + subnet.az + ") routes egress through cross-AZ NAT " + defRoute.target + "."
+        });
+      }
+    } else if (subnet.tier === "isolated") {
+      if (defRoute) {
+        findings.push({
+          code: "ISOLATED_HAS_DEFAULT_ROUTE",
+          subnetId: subnet.id,
+          message: "Isolated subnet " + subnet.id + " must not have a 0.0.0.0/0 route."
+        });
+      }
+    }
+  }
+
+  return { valid: findings.length === 0, azCount, findings };
+}`,
+      tests: [
+        {
+          name: "Accepts a clean 2-AZ, 3-tier VPC with per-AZ NAT Gateways",
+          run: (scope) => {
+            const out = scope.auditVpcTopology({
+              vpcCidr: "10.20.0.0/16",
+              igwId: "igw-01",
+              natGateways: [
+                { id: "nat-a", az: "us-east-1a", subnetId: "pub-a" },
+                { id: "nat-b", az: "us-east-1b", subnetId: "pub-b" }
+              ],
+              subnets: [
+                { id: "pub-a", az: "us-east-1a", tier: "public", routeTableId: "rt-pub" },
+                { id: "pub-b", az: "us-east-1b", tier: "public", routeTableId: "rt-pub" },
+                { id: "priv-a", az: "us-east-1a", tier: "private", routeTableId: "rt-priv-a" },
+                { id: "priv-b", az: "us-east-1b", tier: "private", routeTableId: "rt-priv-b" },
+                { id: "iso-a", az: "us-east-1a", tier: "isolated", routeTableId: "rt-iso" },
+                { id: "iso-b", az: "us-east-1b", tier: "isolated", routeTableId: "rt-iso" }
+              ],
+              routeTables: [
+                { id: "rt-pub", routes: [{ destination: "10.20.0.0/16", target: "local" }, { destination: "0.0.0.0/0", target: "igw-01" }] },
+                { id: "rt-priv-a", routes: [{ destination: "10.20.0.0/16", target: "local" }, { destination: "0.0.0.0/0", target: "nat-a" }] },
+                { id: "rt-priv-b", routes: [{ destination: "10.20.0.0/16", target: "local" }, { destination: "0.0.0.0/0", target: "nat-b" }] },
+                { id: "rt-iso", routes: [{ destination: "10.20.0.0/16", target: "local" }] }
+              ]
+            });
+            const pass = out.valid === true && out.azCount === 2 && out.findings.length === 0;
+            return { pass, message: `got valid=${out.valid}, findings=${out.findings.map((f) => f.code).join(",") || "none"}` };
+          }
+        },
+        {
+          name: "Catches single-AZ NAT Gateway SPOF when private-b routes through nat-a",
+          run: (scope) => {
+            const out = scope.auditVpcTopology({
+              vpcCidr: "10.20.0.0/16",
+              igwId: "igw-01",
+              natGateways: [{ id: "nat-a", az: "us-east-1a", subnetId: "pub-a" }],
+              subnets: [
+                { id: "pub-a", az: "us-east-1a", tier: "public", routeTableId: "rt-pub" },
+                { id: "priv-a", az: "us-east-1a", tier: "private", routeTableId: "rt-priv-shared" },
+                { id: "priv-b", az: "us-east-1b", tier: "private", routeTableId: "rt-priv-shared" }
+              ],
+              routeTables: [
+                { id: "rt-pub", routes: [{ destination: "10.20.0.0/16", target: "local" }, { destination: "0.0.0.0/0", target: "igw-01" }] },
+                { id: "rt-priv-shared", routes: [{ destination: "10.20.0.0/16", target: "local" }, { destination: "0.0.0.0/0", target: "nat-a" }] }
+              ]
+            });
+            const hit = out.findings.find((f) => f.code === "NAT_CROSS_AZ_SPOF" && f.subnetId === "priv-b");
+            const pass = out.valid === false && Boolean(hit);
+            return { pass, message: `got codes=[${out.findings.map((f) => f.code).join(",")}]` };
+          }
+        },
+        {
+          name: "Catches misrouted private subnet pointing 0.0.0.0/0 to IGW and isolated subnet with default route",
+          run: (scope) => {
+            const out = scope.auditVpcTopology({
+              vpcCidr: "10.20.0.0/16",
+              igwId: "igw-01",
+              natGateways: [{ id: "nat-a", az: "us-east-1a", subnetId: "pub-a" }],
+              subnets: [
+                { id: "pub-a", az: "us-east-1a", tier: "public", routeTableId: "rt-pub" },
+                { id: "priv-b", az: "us-east-1b", tier: "private", routeTableId: "rt-bad-priv" },
+                { id: "iso-a", az: "us-east-1a", tier: "isolated", routeTableId: "rt-bad-iso" }
+              ],
+              routeTables: [
+                { id: "rt-pub", routes: [{ destination: "0.0.0.0/0", target: "igw-01" }] },
+                { id: "rt-bad-priv", routes: [{ destination: "0.0.0.0/0", target: "igw-01" }] },
+                { id: "rt-bad-iso", routes: [{ destination: "0.0.0.0/0", target: "nat-a" }] }
+              ]
+            });
+            const codes = out.findings.map((f) => f.code);
+            const pass =
+              out.valid === false &&
+              codes.includes("PRIVATE_MISROUTED_TO_IGW") &&
+              codes.includes("ISOLATED_HAS_DEFAULT_ROUTE");
+            return { pass, message: `got codes=[${codes.join(",")}]` };
+          }
+        },
+        {
+          name: "Flags NAT Gateway placed in a private subnet and public subnet missing IGW",
+          run: (scope) => {
+            const out = scope.auditVpcTopology({
+              vpcCidr: "10.20.0.0/16",
+              igwId: "igw-01",
+              natGateways: [{ id: "nat-bad", az: "us-east-1a", subnetId: "priv-a" }],
+              subnets: [
+                { id: "pub-a", az: "us-east-1a", tier: "public", routeTableId: "rt-no-igw" },
+                { id: "priv-a", az: "us-east-1a", tier: "private", routeTableId: "rt-priv-a" },
+                { id: "iso-b", az: "us-east-1b", tier: "isolated", routeTableId: "rt-iso" }
+              ],
+              routeTables: [
+                { id: "rt-no-igw", routes: [{ destination: "10.20.0.0/16", target: "local" }] },
+                { id: "rt-priv-a", routes: [{ destination: "0.0.0.0/0", target: "nat-bad" }] },
+                { id: "rt-iso", routes: [{ destination: "10.20.0.0/16", target: "local" }] }
+              ]
+            });
+            const codes = out.findings.map((f) => f.code);
+            const pass =
+              out.valid === false &&
+              codes.includes("NAT_IN_NON_PUBLIC_SUBNET") &&
+              codes.includes("PUBLIC_MISSING_IGW");
+            return { pass, message: `got codes=[${codes.join(",")}]` };
+          }
+        },
+        {
+          name: "Flags single-AZ VPC and private subnet missing a NAT route",
+          run: (scope) => {
+            const out = scope.auditVpcTopology({
+              vpcCidr: "10.20.0.0/16",
+              igwId: "igw-01",
+              natGateways: [],
+              subnets: [
+                { id: "pub-a", az: "us-east-1a", tier: "public", routeTableId: "rt-pub" },
+                { id: "priv-a", az: "us-east-1a", tier: "private", routeTableId: "rt-priv-empty" }
+              ],
+              routeTables: [
+                { id: "rt-pub", routes: [{ destination: "0.0.0.0/0", target: "igw-01" }] },
+                { id: "rt-priv-empty", routes: [{ destination: "10.20.0.0/16", target: "local" }] }
+              ]
+            });
+            const codes = out.findings.map((f) => f.code);
+            const pass =
+              out.valid === false &&
+              out.azCount === 1 &&
+              codes.includes("MULTI_AZ_REQUIRED") &&
+              codes.includes("PRIVATE_MISSING_NAT");
+            return { pass, message: `got azCount=${out.azCount}, codes=[${codes.join(",")}]` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0020",
+      title: "Quiz 0020: Multi-AZ VPC Routing & NAT Architecture",
+      questions: [
+        {
+          id: "q1",
+          prompt: "You deploy ECS tasks into private subnets across us-east-1a and us-east-1b. To save $32/month, a teammate deploys a single NAT Gateway in us-east-1a and points both private route tables' 0.0.0.0/0 route to it. What happens during a us-east-1a AZ outage?",
+          options: [
+            "AWS automatically promotes a standby NAT Gateway inside the healthy us-east-1b subnet",
+            "Both Availability Zones lose only inbound ALB traffic while outbound APIs continue",
+            "Healthy us-east-1b tasks immediately lose all outbound internet access through that NAT",
+            "The Internet Gateway intercepts private egress packets and performs failover SNAT routing"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "NAT Gateways are strictly zonal resources; AWS never creates or promotes a standby NAT Gateway in another AZ automatically.",
+            "ALBs span multiple AZs so healthy us-east-1b targets keep receiving inbound requests, whereas outbound traffic dies when the shared AZ-a NAT fails.",
+            "Because the us-east-1b private route table depends on the NAT Gateway living in us-east-1a, an AZ-a impairment blackholes outbound traffic for healthy us-east-1b tasks too.",
+            "An Internet Gateway only translates traffic for resources with public IPv4 addresses and never intercepts or failover-routes private subnet egress."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "An engineer creates a subnet named private-app-1a, associates a route table containing 0.0.0.0/0 -> igw-abc123, and launches an EC2 instance without a public IPv4 address. Why do outbound HTTPS calls from this instance time out?",
+          options: [
+            "Subnet names starting with private prevent VPC routers from reaching Internet Gateways",
+            "An Internet Gateway cannot translate packets for instances without a public IPv4",
+            "Internet Gateways block outbound HTTPS flows unless an ALB terminates TLS first",
+            "The VPC local CIDR route overrides 0.0.0.0/0 for every external internet destination"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Subnet Name tags are purely metadata; AWS determines routing behavior solely from the associated route table entries.",
+            "IGWs perform 1:1 stateless NAT between an instance's private IP and its mapped public IPv4 or Elastic IP—without one, outbound packets are dropped.",
+            "Internet Gateways operate transparently at Layer 3/4 IP translation and never inspect TLS or require an ALB for outbound connections.",
+            "By longest-prefix matching, the VPC local CIDR only matches intra-VPC destinations and never matches external internet IPs."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "Your ECS service in private subnets downloads 40 TB/month of artifacts from Amazon S3 in the same AWS region. Your bill shows ~$1,800/month in NAT Gateway data processing charges. Which architectural change eliminates this charge?",
+          options: [
+            "Consolidate traffic onto one shared NAT Gateway inside the primary Availability Zone",
+            "Attach three extra Elastic IPs onto each NAT Gateway for parallel bandwidth",
+            "Replace managed NAT Gateways with EC2 NAT instances inside isolated data subnets",
+            "Attach an S3 Gateway VPC Endpoint directly onto every private route table"
+          ],
+          correctIndex: 3,
+          explanations: [
+            "Consolidating NAT Gateways only trims hourly instance fees while keeping the $0.045/GB processing charge—and adds $0.02/GB cross-AZ transfer fees.",
+            "Extra Elastic IPs increase concurrent SNAT port capacity beyond 55,000 connections per tuple, but do not reduce per-GB NAT processing charges.",
+            "NAT instances cannot function inside isolated data subnets lacking an IGW path, and self-managed NAT introduces single-instance scaling and patching risks.",
+            "S3 Gateway VPC Endpoints are free and inject a more-specific S3 prefix-list route into private route tables, keeping S3 traffic inside AWS without touching NAT."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

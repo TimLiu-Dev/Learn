@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0082: Off-Heap Memory (FFM API JEP 454) &amp; Project Leyden AOT Cache</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0036-jit-compilation-jfr-and-profiling.html">&larr; Prev: Lesson 0036</a></div>
+      <div class="lesson-nav-center"><a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan &amp; Index</a></div>
+      <div><a href="0037-classloading-reflection-annotations.html">Next: Lesson 0037 &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Phase 1 &bull; JVM Internals &amp; Native/AOT Runtime &bull; Lesson 0082</div>
+      <h1>Off-Heap Memory (<code>java.lang.foreign</code> FFM API) &amp; Project Leyden AOT Cache vs. GraalVM Native</h1>
+      <p class="lesson-subtitle">
+        Replace legacy <code>sun.misc.Unsafe</code> and brittle <code>DirectByteBuffer</code> cleaners with Java's deterministic Foreign Function &amp; Memory API (JEP 454), and slash Java 25 startup latency with Project Leyden's AOT Cache (JEP 483/514/515).
+      </p>
+    </header>
+
+    <section>
+      <h2>1. Why Legacy Off-Heap Memory (<code>Unsafe</code> &amp; <code>DirectByteBuffer</code>) Failed</h2>
+      <p>
+        High-throughput databases (RocksDB, DuckDB), vector search indexes, and zero-copy network engines allocate gigabytes of memory <strong>off-heap</strong> to avoid GC pause overhead and 24-byte object headers. Historically, Java offered only two flawed paths:
+      </p>
+      <ul>
+        <li><strong><code>ByteBuffer.allocateDirect(size)</code>:</strong> Limited to <code>Integer.MAX_VALUE</code> (2 GiB max buffer size!) and relies on non-deterministic GC <code>Cleaner</code> phantom references to free native RAM—causing sudden container <code>OOMKilled</code> crashes when off-heap memory fills up while the Java heap looks nearly empty.</li>
+        <li><strong><code>sun.misc.Unsafe</code>:</strong> Allowed raw C-style pointer arithmetic with zero bounds or temporal checks; a single use-after-free or out-of-bounds offset corrupts JVM memory and triggers an unrecoverable <code>SIGSEGV</code> crash. (And in JDK 24/25 via <strong>JEP 498</strong>, memory-access methods on <code>Unsafe</code> emit runtime warnings ahead of permanent removal!)</li>
+      </ul>
+      <pre><code>// ANTI-PATTERN: Non-deterministic DirectByteBuffer Cleaner + 2 GiB index limit
+public void processOffHeapBad() {
+    // 1. Cannot exceed 2 GiB (int capacity parameter)
+    // 2. Native memory is NOT freed at method exit; waits for GC Cleaner!
+    ByteBuffer direct = ByteBuffer.allocateDirect(64 * 1024 * 1024);
+    direct.putLong(0, 999_001L);
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>2. Deterministic Off-Heap Engineering: <code>Arena</code> &amp; <code>MemorySegment</code> (JEP 454)</h2>
+      <p>
+        Finalized in JDK 22+ and standard in Java 25 LTS, the <strong>Foreign Function &amp; Memory (FFM) API</strong> (<code>java.lang.foreign</code>, Project Panama) provides safe, <code>long</code>-indexed (64-bit) off-heap memory with deterministic lexical deallocation and C native downcalls without JNI C glue code:
+      </p>
+      <table>
+        <thead>
+          <tr><th>FFM Component</th><th>Engineering Role</th><th>Safety Guarantee</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>Arena.ofConfined()</code></td><td>Single-thread lexical off-heap lifecycle</td><td>Frees native memory <strong>immediately</strong> on <code>try-with-resources</code> <code>close()</code>; rejects cross-thread access.</td></tr>
+          <tr><td><code>Arena.ofShared()</code></td><td>Multi-thread concurrent off-heap lifecycle</td><td>Thread-safe access across Virtual/Platform threads; atomic deallocation on <code>close()</code> via HotSpot thread-local handshakes.</td></tr>
+          <tr><td><code>MemorySegment</code></td><td>Contiguous slice of off-heap (or heap) memory</td><td>Enforces spatial bounds (`IndexOutOfBoundsException`) and temporal liveness (`IllegalStateException` on use-after-free!).</td></tr>
+          <tr><td><code>ValueLayout</code></td><td>Typed alignment &amp; endianness descriptor</td><td><code>ValueLayout.JAVA_INT</code>, <code>ValueLayout.JAVA_LONG</code>, <code>MemoryLayout.structLayout(...)</code>.</td></tr>
+          <tr><td><code>Linker.nativeLinker()</code></td><td>Zero-JNI C library function invocation</td><td>Binds native C symbols (`strlen`, `radix_sort`, `io_uring`) into typed `MethodHandle` downcalls.</td></tr>
+        </tbody>
+      </table>
+      <pre><code>// IDIOMATIC JAVA 25: Deterministic off-heap Arena + 64-bit MemorySegment
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+
+public final class OffHeapRingBuffer {
+    public static long writeAndSum(long[] records) {
+        // Confined Arena guarantees immediate native free() the instant try block exits!
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment segment = arena.allocate(ValueLayout.JAVA_LONG, records.length);
+            for (int i = 0; i &lt; records.length; i++) {
+                segment.setAtIndex(ValueLayout.JAVA_LONG, i, records[i]);
+            }
+            long total = 0;
+            for (int i = 0; i &lt; records.length; i++) {
+                total += segment.getAtIndex(ValueLayout.JAVA_LONG, i);
+            }
+            return total;
+        } // Native memory freed deterministically right here — zero GC Cleaner delay!
+    }
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>3. Java 25 Startup Revolution: Project Leyden AOT Cache vs. GraalVM Native Image</h2>
+      <p>
+        In 2027 cloud-native deployments, senior engineers have two distinct tools to eliminate JVM cold-start latency: <strong>Project Leyden AOT Cache</strong> (JDK 24/25 <strong>JEP 483, JEP 514, JEP 515</strong>) and <strong>GraalVM Native Image</strong>.
+      </p>
+      <pre><code># JAVA 25 PROJECT LEYDEN ONE-STEP AOT CACHE (JEP 514 + JEP 515 Method Profiles)
+# Step 1 (CI / Docker build): Record loaded classes, linked bytecode &amp; warm method profiles into app.aot
+java -XX:AOTMode=record -XX:AOTConfiguration=app.aotconf -cp app.jar com.acme.App --smoke-test
+java -XX:AOTMode=create -XX:AOTConfiguration=app.aotconf -XX:AOTCache=app.aot -cp app.jar
+# (Or in JDK 25 JEP 514 single-command ergonomics: java -XX:AOTCacheOutput=app.aot -cp app.jar com.acme.App)
+
+# Step 2 (Production Pod): Boots 50%-70% faster with pre-linked classes &amp; pre-recorded JIT profiles!
+java -XX:AOTCache=app.aot -jar app.jar</code></pre>
+      <div class="callout tip">
+        <div class="callout-title">&#9889; Senior Decision Matrix: Project Leyden AOT Cache vs. GraalVM Native Image</div>
+        <ul>
+          <li><strong>Project Leyden (<code>-XX:AOTCache=app.aot</code>):</strong> Runs on the standard OpenJDK 25 HotSpot VM. Preserves 100% dynamic classloading, reflection, JVMTI agents, JFR profiling, and peak C2 JIT throughput while cutting Spring Boot 4 startup from ~2.8s down to ~0.7s. <strong>Default choice for 90% of enterprise microservices in 2027.</strong></li>
+          <li><strong>GraalVM Native Image (Closed-World AOT Binary):</strong> Compiles Java ahead-of-time into a standalone native executable (~40ms startup, tiny RSS memory), ideal for serverless AWS Lambda / scale-to-zero CLI tools—at the cost of long build times, explicit reflection/resource reachability metadata, and no runtime bytecode loading.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>4. Hands-On Practice Workbenches</h2>
+      <div id="ex-1" class="workbench-container"></div>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>5. Senior Concept &amp; Code Quiz</h2>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <ul>
+        <li><a href="https://openjdk.org/jeps/454" target="_blank" rel="noopener"><strong>OpenJDK JEP 454: Foreign Function &amp; Memory API (<code>java.lang.foreign</code>)</strong></a></li>
+        <li><a href="https://openjdk.org/jeps/483" target="_blank" rel="noopener"><strong>OpenJDK JEP 483 / 514 / 515: Project Leyden Ahead-of-Time Class Loading, Linking &amp; Profiling</strong></a></li>
+      </ul>
+
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> "How does HotSpot verify temporal safety (`Arena.close()`) on a `MemorySegment` in zero extra CPU instructions inside a C2-compiled loop?"
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0036-jit-compilation-jfr-and-profiling.html">&larr; Prev: Lesson 0036</a></div>
+      <div><a href="../reference/0082-ffm-panama-and-leyden-aot.html">&#128196; Reference Sheet 0082</a> &bull; <a href="0001-master-plan-and-curriculum.html">Course Hub</a></div>
+      <div><a href="0037-classloading-reflection-annotations.html">Next: Lesson 0037 &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+  {
+    "exercises": [
+      {
+        "id": "ex-1",
+        "filename": "ForeignMemoryVectorDrill.java",
+        "badge": "Implementation Drill",
+        "instructions": "<p>Allocate and sum an off-heap vector deterministically using Java 25's <code>java.lang.foreign</code> FFM API:</p><ol><li>Open a thread-confined off-heap arena via <code>try (Arena arena = Arena.ofConfined())</code>.</li><li>Allocate a contiguous off-heap array of <code>values.length</code> 64-bit longs using <code>arena.allocate(ValueLayout.JAVA_LONG, values.length)</code>.</li><li>Write each element with <code>segment.setAtIndex(ValueLayout.JAVA_LONG, i, values[i])</code>, read them back with <code>segment.getAtIndex(ValueLayout.JAVA_LONG, i)</code>, and return their sum.</li></ol>",
+        "initialCode": "import java.lang.foreign.Arena;\nimport java.lang.foreign.MemorySegment;\nimport java.lang.foreign.ValueLayout;\n\npublic class ForeignMemoryVectorDrill {\n    public static long sumOffHeap(long[] values) {\n        // TODO: Open Arena.ofConfined() in try-with-resources\n        // TODO: Allocate MemorySegment for values.length longs and compute sum\n        return 0L;\n    }\n\n    public static void main(String[] args) {\n        long result = sumOffHeap(new long[]{100L, 250L, 650L});\n        System.out.println(\"offHeapSum=\" + result);\n    }\n}\n",
+        "solution": "import java.lang.foreign.Arena;\nimport java.lang.foreign.MemorySegment;\nimport java.lang.foreign.ValueLayout;\n\npublic class ForeignMemoryVectorDrill {\n    public static long sumOffHeap(long[] values) {\n        try (Arena arena = Arena.ofConfined()) {\n            MemorySegment segment = arena.allocate(ValueLayout.JAVA_LONG, values.length);\n            for (int i = 0; i < values.length; i++) {\n                segment.setAtIndex(ValueLayout.JAVA_LONG, i, values[i]);\n            }\n            long sum = 0L;\n            for (int i = 0; i < values.length; i++) {\n                sum += segment.getAtIndex(ValueLayout.JAVA_LONG, i);\n            }\n            return sum;\n        }\n    }\n\n    public static void main(String[] args) {\n        long result = sumOffHeap(new long[]{100L, 250L, 650L});\n        System.out.println(\"offHeapSum=\" + result);\n    }\n}\n",
+        "solutionExplanation": "Arena.ofConfined() binds the off-heap MemorySegment to the current thread and deterministically releases native OS memory the moment the try-with-resources block exits, with full spatial and temporal bounds checking.",
+        "hints": [
+          "Start with <code>try (Arena arena = Arena.ofConfined()) { ... }</code>.",
+          "Allocate off-heap storage via <code>MemorySegment segment = arena.allocate(ValueLayout.JAVA_LONG, values.length);</code>.",
+          "Use <code>segment.setAtIndex(ValueLayout.JAVA_LONG, i, values[i])</code> and <code>segment.getAtIndex(ValueLayout.JAVA_LONG, i)</code>."
+        ],
+        "tests": [
+          {
+            "name": "Uses try-with-resources Arena.ofConfined()",
+            "regex": "try\\s*\\(\\s*(?:Arena|var)\\s+\\w+\\s*=\\s*Arena\\.ofConfined\\s*\\(\\s*\\)\\s*\\)",
+            "flags": "m",
+            "passMessage": "Manages off-heap memory deterministically with Arena.ofConfined().",
+            "failMessage": "Open Arena.ofConfined() inside a try-with-resources statement."
+          },
+          {
+            "name": "Allocates typed JAVA_LONG MemorySegment",
+            "regex": "allocate\\s*\\(\\s*ValueLayout\\.JAVA_LONG\\s*,\\s*values\\.length\\s*\\)",
+            "flags": "m",
+            "passMessage": "Allocates aligned 64-bit long elements off-heap.",
+            "failMessage": "Call arena.allocate(ValueLayout.JAVA_LONG, values.length)."
+          },
+          {
+            "name": "Uses setAtIndex and getAtIndex with ValueLayout.JAVA_LONG",
+            "regex": "setAtIndex\\s*\\(\\s*ValueLayout\\.JAVA_LONG[\\s\\S]*getAtIndex\\s*\\(\\s*ValueLayout\\.JAVA_LONG",
+            "flags": "m",
+            "passMessage": "Reads and writes off-heap memory safely via ValueLayout.JAVA_LONG.",
+            "failMessage": "Use setAtIndex and getAtIndex with ValueLayout.JAVA_LONG."
+          }
+        ],
+        "simulatedOutput": "offHeapSum=1000\nProcess finished with exit code 0"
+      },
+      {
+        "id": "ex-2",
+        "filename": "UseAfterFreeArenaFix.java",
+        "badge": "Bug-Fix Challenge",
+        "instructions": "<p>Fix <strong>2 off-heap lifecycle bugs</strong> in <code>UseAfterFreeArenaFix</code>:</p><ol><li>Currently <code>readHeaderMagic</code> closes the <code>Arena</code> and returns the dangling <code>MemorySegment</code>, causing <code>segment.get(ValueLayout.JAVA_INT, 0)</code> in <code>main</code> to throw <code>IllegalStateException: Already closed</code>! Fix it by reading and returning the <code>int</code> header value <strong>inside</strong> the <code>try (Arena arena = Arena.ofConfined())</code> block before the arena closes.</li><li>Fix the out-of-bounds offset: write and read at byte offset <code>0</code> rather than byte offset <code>4</code> on a 4-byte allocation.</li></ol>",
+        "initialCode": "import java.lang.foreign.Arena;\nimport java.lang.foreign.MemorySegment;\nimport java.lang.foreign.ValueLayout;\n\npublic class UseAfterFreeArenaFix {\n    public static int readHeaderMagic(int magic) {\n        MemorySegment leaked;\n        try (Arena arena = Arena.ofConfined()) {\n            leaked = arena.allocate(ValueLayout.JAVA_INT);\n            leaked.set(ValueLayout.JAVA_INT, 4, magic); // BUG 1: Offset 4 is out of bounds for 4-byte int!\n        }\n        // BUG 2: Arena is already closed here -> throws IllegalStateException!\n        return leaked.get(ValueLayout.JAVA_INT, 0);\n    }\n\n    public static void main(String[] args) {\n        System.out.println(\"magic=\" + readHeaderMagic(2027));\n    }\n}\n",
+        "solution": "import java.lang.foreign.Arena;\nimport java.lang.foreign.MemorySegment;\nimport java.lang.foreign.ValueLayout;\n\npublic class UseAfterFreeArenaFix {\n    public static int readHeaderMagic(int magic) {\n        try (Arena arena = Arena.ofConfined()) {\n            MemorySegment segment = arena.allocate(ValueLayout.JAVA_INT);\n            segment.set(ValueLayout.JAVA_INT, 0, magic);\n            return segment.get(ValueLayout.JAVA_INT, 0);\n        }\n    }\n\n    public static void main(String[] args) {\n        System.out.println(\"magic=\" + readHeaderMagic(2027));\n    }\n}\n",
+        "solutionExplanation": "Unlike C or sun.misc.Unsafe (where reading freed or out-of-bounds pointers silently corrupts memory or segfaults the process), MemorySegment enforces spatial bounds (offset 0 for a 4-byte JAVA_INT) and temporal bounds (throwing IllegalStateException if accessed after Arena.close()).",
+        "hints": [
+          "Change the write offset in <code>set(ValueLayout.JAVA_INT, 0, magic)</code> from <code>4</code> to <code>0</code>.",
+          "Move <code>return segment.get(ValueLayout.JAVA_INT, 0);</code> inside the <code>try (Arena arena = Arena.ofConfined())</code> block so it executes before the arena closes."
+        ],
+        "tests": [
+          {
+            "name": "Writes JAVA_INT at valid byte offset 0",
+            "regex": "set\\s*\\(\\s*ValueLayout\\.JAVA_INT\\s*,\\s*0L?\\s*,\\s*magic\\s*\\)",
+            "flags": "m",
+            "passMessage": "Writes 4-byte integer at valid byte offset 0.",
+            "failMessage": "Change set(ValueLayout.JAVA_INT, 4, magic) to offset 0."
+          },
+          {
+            "name": "Reads MemorySegment inside open Arena scope",
+            "regex": "try\\s*\\(\\s*Arena\\s+arena\\s*=\\s*Arena\\.ofConfined\\s*\\(\\s*\\)\\s*\\)\\s*\\{[\\s\\S]*return\\s+\\w+\\.get\\s*\\(\\s*ValueLayout\\.JAVA_INT\\s*,\\s*0L?\\s*\\)\\s*;\\s*\\}",
+            "flags": "m",
+            "passMessage": "Reads value before Arena closes, preventing use-after-free IllegalStateException.",
+            "failMessage": "Move return segment.get(ValueLayout.JAVA_INT, 0); inside the try-with-resources block."
+          }
+        ],
+        "simulatedOutput": "magic=2027\nProcess finished with exit code 0"
+      }
+    ],
+    "quiz": {
+      "id": "quiz-main",
+      "questions": [
+        {
+          "question": "What happens in Java 25 when code attempts to read from a `MemorySegment` after its owning `Arena` has been closed?",
+          "correctIndex": 2,
+          "options": [
+            {
+              "text": "The JVM crashes with a native OS `SIGSEGV` segmentation fault immediately.",
+              "explanation": "That was the hazard of `sun.misc.Unsafe`; the FFM API checks temporal liveness in Java before dereferencing the address."
+            },
+            {
+              "text": "The read silently returns zeroed bytes until the GC `Cleaner` runs later.",
+              "explanation": "`Arena.close()` unmaps/frees memory immediately and marks the scope closed rather than deferring to a GC `Cleaner`."
+            },
+            {
+              "text": "`MemorySegment` throws a deterministic `IllegalStateException` to prevent any use-after-free bug.",
+              "explanation": "Every `MemorySegment` is bound to an `Arena` scope; once `arena.close()` runs, any subsequent access throws `IllegalStateException`."
+            },
+            {
+              "text": "HotSpot transparently copies the off-heap bytes onto the young generation heap.",
+              "explanation": "Off-heap segments never auto-migrate to the heap on close; they are deterministically deallocated."
+            }
+          ]
+        },
+        {
+          "question": "Why do most enterprise Spring Boot 4 teams choose Project Leyden's AOT Cache (`-XX:AOTCache=app.aot`) over GraalVM Native Image for Kubernetes microservices?",
+          "correctIndex": 0,
+          "options": [
+            {
+              "text": "Leyden cuts startup latency by 50–70% while keeping full JIT, JFR, and dynamic reflection.",
+              "explanation": "Leyden caches pre-parsed, pre-linked classes and method profiles directly in HotSpot, delivering sub-second startup without losing C2 peak throughput, JFR, or dynamic classloading."
+            },
+            {
+              "text": "Project Leyden compiles Java code into native ARM64 assembly without needing a JVM.",
+              "explanation": "GraalVM Native Image emits standalone binaries without a JVM; Leyden runs on the standard OpenJDK HotSpot runtime using an AOT cache file."
+            },
+            {
+              "text": "GraalVM Native Image is incompatible with Spring Boot 4 and Virtual Threads.",
+              "explanation": "Spring Boot 4 supports both GraalVM Native Image and Virtual Threads; the trade-off is build time, closed-world reflection limits, and peak GC/C2 throughput."
+            },
+            {
+              "text": "Leyden eliminates the need for heap memory by storing all Spring beans off-heap.",
+              "explanation": "Application objects still live on the normal Java heap; the AOT cache stores class metadata, linked bytecode, and warmup profiles."
+            }
+          ]
+        },
+        {
+          "question": "When must you choose `Arena.ofShared()` instead of `Arena.ofConfined()` in the `java.lang.foreign` FFM API?",
+          "correctIndex": 1,
+          "options": [
+            {
+              "text": "Whenever allocating an off-heap `MemorySegment` larger than 2 GiB in size.",
+              "explanation": "Both `ofConfined()` and `ofShared()` support 64-bit `long` byte sizes well beyond 2 GiB."
+            },
+            {
+              "text": "When multiple Virtual or Platform threads read or write the segment concurrently.",
+              "explanation": "`Arena.ofConfined()` restricts access strictly to the creating thread (throwing `WrongThreadException` otherwise); `Arena.ofShared()` permits multi-threaded access with safe atomic closure."
+            },
+            {
+              "text": "Whenever invoking a native C function via `Linker.nativeLinker().downcallHandle(...)` in Java.",
+              "explanation": "Single-threaded downcalls work cleanly with `Arena.ofConfined()`, which has lower close overhead."
+            },
+            {
+              "text": "When you want the garbage collector to free native memory instead of `try-with-resources`.",
+              "explanation": "Automatic GC-managed lifetime uses `Arena.ofAuto()`; `Arena.ofShared()` is still closed deterministically via `.close()`."
+            }
+          ]
+        }
+      ]
+    }
+  }
+  </script>
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/workbench.js"></script>
+</body>
+</html>

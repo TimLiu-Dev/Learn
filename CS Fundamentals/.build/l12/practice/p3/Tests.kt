@@ -1,14 +1,19 @@
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+
+// A plain message: the page's test view hides text written inside <…>, which assertEquals uses.
+fun assertText(expected: String, actual: String?, what: String = "") =
+    assertTrue("$what expected \"$expected\" but was \"$actual\"".trim(), expected == actual)
 
 class RepoTest {
     @Test fun `a new branch points at the current commit and makes no commit`() {
         val repo = Repo()
         repo.commit()
         repo.createBranch("fix")
-        assertEquals("c2", repo.branches["fix"])
-        assertEquals("HEAD stays on main", "main", repo.head)
+        assertText("c2", repo.branches["fix"])
+        assertText("main", repo.head, "HEAD stays on main")
         assertEquals("no new commit", 2, repo.parent.size)
     }
 
@@ -16,7 +21,7 @@ class RepoTest {
         val repo = Repo()
         repo.createBranch("fix")
         repo.switch("fix")
-        assertEquals("c2", repo.commit())
+        assertText("c2", repo.commit())
         assertEquals(mapOf("main" to "c1", "fix" to "c2"), repo.branches)
     }
 
@@ -26,7 +31,7 @@ class RepoTest {
         repo.switch("fix")
         repo.commit()
         repo.switch("main")
-        assertEquals("main", repo.head)
+        assertText("main", repo.head)
         assertEquals(mapOf("main" to "c1", "fix" to "c2"), repo.branches)
     }
 

@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0003 — Linux Processes, Signals (SIGTERM), File Descriptors &amp; DNS Tools</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0003</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0003-linux-processes-signals-fds-shell.html" class="active">Lesson 0003</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part1">Part 1 &middot; Module 1.1</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>Linux Processes, Signals (<code>SIGTERM</code>), File Descriptors &amp; DNS Tools</h1>
+    <p class="lead">
+      On Android, the OS manages your app lifecycle via callbacks and kills background processes silently. In the cloud, your backend container <em>is</em> Linux PID 1: mishandling <code>SIGTERM</code> causes 30-second deploy stalls and <code>502</code> errors, leaking sockets triggers <code>EMFILE</code> outages at low CPU, and blind DNS lookups double latency.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            On Android, <code>ProcessLifecycleOwner</code> and <code>Service.onDestroy()</code> notify you to flush state before Android's Zygote / ActivityManager terminates your process&mdash;and if you forget to close a <code>Cursor</code> or <code>ParcelFileDescriptor</code>, Android StrictMode warns about leaked file descriptors. On AWS ECS and EKS, <strong>Linux signals (<code>SIGTERM</code> &rarr; <code>SIGKILL</code>)</strong> play the role of <code>onDestroy()</code>, your container entrypoint runs as <strong>PID 1</strong>, and every open socket shares a hard kernel budget enforced by <strong><code>ulimit -n</code></strong>.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Container PID 1 &amp; Graceful Shutdown (<code>SIGTERM</code> vs. <code>SIGKILL</code>)</h2>
+        <p>
+          When AWS ECS or Kubernetes replaces a container during a rolling deploy or scale-in event, it does not magically wait for user requests to finish. Instead, the orchestrator follows a strict two-stage POSIX signal contract:
+        </p>
+        <ol>
+          <li><strong>Step 1 &mdash; <code>SIGTERM</code> (Signal 15, catchable):</strong> Sent immediately when termination begins. A healthy backend catches <code>SIGTERM</code>, flips its health/readiness endpoint to <code>503</code> so the <a href="../reference/glossary.html#alb">ALB</a> stops routing new traffic, stops accepting new sockets, waits for active in-flight requests to finish, closes database pools, and exits with code <code>0</code>.</li>
+          <li><strong>Step 2 &mdash; Grace Period Expiration &rarr; <code>SIGKILL</code> (Signal 9, uncatchable):</strong> If the process is still alive after <code>stopTimeout</code> on AWS ECS (default <strong>30 seconds</strong>, configurable up to <strong>120 seconds</strong>) or <code>terminationGracePeriodSeconds</code> on EKS (default <strong>30 seconds</strong>), the kernel destroys it instantly with exit code <code>137</code> (<code>128 + 9</code>). Any in-flight HTTP call is severed with TCP <code>RST</code>, producing <code>HTTP 502 Bad Gateway</code> errors for clients.</li>
+        </ol>
+
+        <div class="callout warning">
+          <div class="callout-title">The Dockerfile Shell-Form <code>CMD</code> Trap (PID 1 Swallows <code>SIGTERM</code>)</div>
+          <p style="margin: 0;">
+            In Linux, <strong>PID 1</strong> ignores default signal actions unless it explicitly registers a signal handler. If your Dockerfile uses shell form (<code>CMD node dist/server.js</code>), Docker spawns <code>/bin/sh -c "node dist/server.js"</code> as PID 1 and <code>node</code> as PID 7. Because <code>/bin/sh</code> does <em>not</em> forward <code>SIGTERM</code> to child processes, your Node server never hears the shutdown signal. Every deployment stalls for the full 30-second <code>stopTimeout</code> before ECS fires <code>SIGKILL</code>. Always use <strong>exec form</strong> (<code>CMD ["node", "dist/server.js"]</code>) or an init shim such as <code>tini</code>.
+          </p>
+        </div>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 235" width="100%" height="auto" role="img" aria-label="SIGTERM Graceful Drain vs Shell-Form PID 1 SIGKILL Timeline">
+            <rect x="0" y="0" width="680" height="235" fill="#fdfcf8" rx="6" />
+
+            <!-- Scenario A -->
+            <text x="16" y="30" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Exec Form (PID 1 = app): Graceful Drain Finishes at 8s &rarr; Exit 0</text>
+            <rect x="16" y="44" width="95" height="32" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="63" y="64" text-anchor="middle" font-family="monospace" font-size="11" fill="#b45309">t=0s SIGTERM</text>
+
+            <rect x="119" y="44" width="145" height="32" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="191" y="64" text-anchor="middle" font-family="monospace" font-size="11" fill="#0f4c81">Drain In-Flight (5s)</text>
+
+            <rect x="272" y="44" width="130" height="32" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="337" y="64" text-anchor="middle" font-family="monospace" font-size="11" fill="#0f4c81">Close DB Pool (3s)</text>
+
+            <rect x="410" y="44" width="110" height="32" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="465" y="64" text-anchor="middle" font-family="monospace" font-size="11" fill="#166534">Exit 0 (Clean)</text>
+
+            <text x="532" y="64" font-family="sans-serif" font-size="11" fill="#575c66">0 dropped requests</text>
+
+            <!-- Divider -->
+            <line x1="16" y1="104" x2="664" y2="104" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Scenario B -->
+            <text x="16" y="132" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Shell Form (PID 1 = /bin/sh): Swallows SIGTERM &rarr; SIGKILL at 30s (Exit 137)</text>
+            <rect x="16" y="146" width="95" height="32" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="63" y="166" text-anchor="middle" font-family="monospace" font-size="11" fill="#991b1b">SIGTERM Lost</text>
+
+            <rect x="119" y="146" width="295" height="32" rx="4" fill="#f5f2ea" stroke="#c2b9a7" />
+            <text x="266" y="166" text-anchor="middle" font-family="monospace" font-size="11" fill="#575c66">App keeps accepting traffic for 30s stopTimeout</text>
+
+            <rect x="422" y="146" width="120" height="32" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="482" y="166" text-anchor="middle" font-family="monospace" font-size="11" fill="#991b1b">t=30s SIGKILL</text>
+
+            <text x="552" y="166" font-family="sans-serif" font-size="11" fill="#991b1b">TCP RST &rarr; HTTP 502</text>
+            <text x="16" y="210" font-family="sans-serif" font-size="11" fill="#575c66">Tip: Pair exec-form CMD with ALB deregistration_delay.timeout_seconds &lt;= stopTimeout so the load balancer drains first.</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Exec-form containers receive <code>SIGTERM</code> directly and exit cleanly before <code>stopTimeout</code>. Shell-form containers trap <code>SIGTERM</code> in <code>/bin/sh</code> until the kernel issues <code>SIGKILL</code>.
+          </div>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. Everything Is a File Descriptor (<code>ulimit -n</code> &amp; <code>EMFILE</code> Outages)</h2>
+        <p>
+          In Linux, almost every I/O resource is tracked in a per-process <strong>file descriptor (FD)</strong> table: standard streams (<code>0</code> stdin, <code>1</code> stdout, <code>2</code> stderr), loaded shared libraries, open log files, <code>epoll</code> event loops, and <strong>every single TCP or UDP socket</strong> (both inbound client connections from the ALB and outbound connections to RDS, Redis, or DynamoDB).
+        </p>
+        <p>
+          The kernel caps how many FDs a process can hold open concurrently via <code>RLIMIT_NOFILE</code> (inspected in the shell with <code>ulimit -Sn</code> for the soft limit and <code>ulimit -Hn</code> for the hard limit). On many base Linux distributions and older Docker daemon defaults, the soft limit is just <strong>1,024 file descriptors</strong>.
+        </p>
+        <p>
+          Consider a microservice with a seemingly modest footprint:
+        </p>
+        <ul>
+          <li><code>60</code> baseline FDs (runtime libraries, log files, <code>epoll</code>, pipes)</li>
+          <li><code>450</code> concurrent client TCP sockets behind an ALB</li>
+          <li><code>450</code> outbound upstream/database sockets (1:1 fan-out during a slow downstream call)</li>
+          <li><code>100</code> leaked sockets stuck in <code>CLOSE_WAIT</code> because an exception path skipped <code>socket.close()</code></li>
+        </ul>
+        <p>
+          Total = <strong>1,060 FDs</strong>. The moment the process crosses <strong>1,024</strong>, the next <code>accept()</code> or <code>socket()</code> system call fails immediately with <code>EMFILE: Too many open files</code>. Your metrics dashboard shows CPU at 18% and RAM at 35%, yet the service refuses every new connection and fails ALB health checks.
+        </p>
+
+        <!-- SECTION 3 -->
+        <h2>3. Production Shell Diagnostics: DNS (<code>dig</code>) &amp; Sockets (<code>ss</code>, <code>lsof</code>)</h2>
+        <p>
+          When an ECS task or EC2 instance misbehaves in production, senior engineers skip guesswork and inspect the kernel and resolver directly from the shell:
+        </p>
+        <ul>
+          <li>
+            <strong><code>ss -tanp</code> and <code>ss -s</code> (Socket Statistics):</strong> Modern replacement for <code>netstat</code>. Shows every TCP socket state and owning PID. A surge of sockets in <code>CLOSE_WAIT</code> means the remote peer already closed its side (sent <code>FIN</code>), but <em>your application code</em> forgot to call <code>close()</code>&mdash;a classic FD leak. (By contrast, many <code>TIME_WAIT</code> sockets indicate rapid short-lived outbound connections without pooling.)
+          </li>
+          <li>
+            <strong><code>lsof -p &lt;pid&gt; | wc -l</code> and <code>cat /proc/&lt;pid&gt;/limits</code>:</strong> Counts live open file descriptors for a running process and confirms its active soft/hard <code>Max open files</code> limit.
+          </li>
+          <li>
+            <strong><code>dig +noall +answer +stats api.internal.corp</code>:</strong> Queries DNS directly and prints the resolved IP, <strong>remaining TTL</strong>, <code>CNAME</code> chain, and query time in milliseconds. Inside an AWS VPC, AmazonProvidedDNS lives at <strong><code>169.254.169.253</code></strong> (and VPC CIDR base + 2, e.g., <code>10.0.0.2</code>).
+          </li>
+          <li>
+            <strong>Checking <code>/etc/resolv.conf</code> (<code>ndots:5</code> in EKS):</strong> Kubernetes sets <code>options ndots:5</code> by default. Any hostname with fewer than 5 dots (like <code>rds.us-east-1.amazonaws.com</code>, which has 3 dots) is first queried against 3&ndash;4 cluster search suffixes (<code>.svc.cluster.local</code>, <code>.cluster.local</code>, etc.) before trying the absolute domain&mdash;multiplying DNS traffic and latency by 4&ndash;8&times; unless you append a trailing dot or set <code>ndots:2</code>.
+          </li>
+        </ul>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production Configuration: Dockerfile, ECS Ulimits &amp; Signal Handler</h2>
+        <p>
+          Below is the complete production triad: exec-form container startup, ECS Task Definition <code>ulimits</code> and <code>stopTimeout</code>, and a non-leaking Node.js <code>SIGTERM</code> drain handler.
+        </p>
+<pre><code># 1. Dockerfile — Exec form ensures Node runs as PID 1 (receives SIGTERM directly)
+FROM node:22-alpine
+WORKDIR /app
+COPY dist/ ./dist/
+CMD ["node", "dist/server.js"]
+
+// 2. ECS Task Definition snippet — Raise NOFILE above 1024 default &amp; set drain window
+{
+  "name": "orders-api",
+  "stopTimeout": 30,
+  "ulimits": [
+    { "name": "nofile", "softLimit": 65536, "hardLimit": 65536 }
+  ]
+}
+
+// 3. Backend Graceful Shutdown (Node.js / TypeScript)
+let isShuttingDown = false;
+app.get("/health", (_req, res) =&gt; {
+  res.status(isShuttingDown ? 503 : 200).send(isShuttingDown ? "draining" : "ok");
+});
+
+process.on("SIGTERM", () =&gt; {
+  isShuttingDown = true;                 // Fail ALB readiness checks immediately
+  server.close(async () =&gt; {             // Stop new connections; drain in-flight
+    await dbPool.end();                  // Close outbound DB sockets cleanly
+    process.exit(0);                     // Exit cleanly before ECS fires SIGKILL
+  });
+  setTimeout(() =&gt; process.exit(1), 25_000).unref(); // Failsafe before 30s SIGKILL
+});
+
+# 4. On-host shell triage commands
+$ ulimit -Sn &amp;&amp; ulimit -Hn              # Inspect soft/hard FD limits
+$ ss -tanp | grep CLOSE-WAIT | wc -l    # Detect app-side leaked sockets
+$ dig @169.254.169.253 api.myapp.com +noall +answer +stats</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build a graceful shutdown and file-descriptor budget simulator in <code>simulateShutdown(config, activeRequests)</code> to audit whether a container leaks FDs into <code>EMFILE</code> or suffers a forced <code>SIGKILL</code> during deployment.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Diagnose three realistic production incidents involving container signals, socket FD exhaustion, and VPC/EKS DNS resolution.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>AWS ECS Docs:</strong> <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html" target="_blank" rel="noopener">Amazon ECS Task Definition Parameters</a> (Review <code>stopTimeout</code> and <code>ulimits</code>).
+          </li>
+          <li>
+            <strong>AWS VPC DNS:</strong> <a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-dns.html" target="_blank" rel="noopener">DNS attributes for your VPC</a> (Route 53 Resolver at <code>169.254.169.253</code> / CIDR+2).
+          </li>
+          <li>
+            <strong>Linux Kernel Docs:</strong> <a href="https://man7.org/linux/man-pages/man7/signal.7.html" target="_blank" rel="noopener">signal(7) &mdash; Linux Programmer's Manual</a> and <a href="https://man7.org/linux/man-pages/man2/getrlimit.2.html" target="_blank" rel="noopener">getrlimit(2) / RLIMIT_NOFILE</a>.
+          </li>
+          <li>
+            <strong>Kubernetes Lifecycle:</strong> <a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination" target="_blank" rel="noopener">Pod Lifecycle &mdash; Termination of Pods</a> (<code>SIGTERM</code> &amp; <code>terminationGracePeriodSeconds</code>).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0004 (API Design at Scale)</strong>, ask me anything that feels fuzzy&mdash;for example: <em>"Why does an ALB keep sending traffic for a few seconds after ECS sends SIGTERM unless we tune deregistration delay?"</em> or <em>"When does TIME_WAIT cause ephemeral port exhaustion vs. CLOSE_WAIT causing FD exhaustion?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0002-cidr-subnetting-routing-nat.html">&larr; Lesson 0002: IPv4/CIDR Subnetting, Routing Tables, NAT & Ports</a>
+          <a href="./0004-api-design-pagination-rate-limiting.html">Lesson 0004: API Design at Scale: REST Semantics, Pagination & Rate Limiting &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why Exit Code 137?</strong>
+          Unix shells encode a signal kill as <code>128 + signal_number</code>. Since <code>SIGKILL</code> is signal <code>9</code>, any container killed by <code>SIGKILL</code> (or Linux OOM killer) reports exit code <code>137</code>. A clean <code>SIGTERM</code> handler exits with <code>0</code>.
+        </div>
+        <div class="sidenote">
+          <strong>ALB Deregistration Race</strong>
+          On ECS/EKS, <code>SIGTERM</code> is sent to the container at the same moment the ALB begins target deregistration. Add a short pre-stop pause (or ensure ALB deregistration finishes) before closing the listening socket.
+        </div>
+        <div class="sidenote">
+          <strong>TIME_WAIT vs. CLOSE_WAIT</strong>
+          <code>TIME_WAIT</code> is normal after <em>your side</em> closes first (waiting 2&times;MSL for stray packets). <code>CLOSE_WAIT</code> means the <em>remote peer</em> closed, and your code forgot to close its FD.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0003",
+      title: "Lab 0003: Graceful Shutdown & File-Descriptor Budget Simulator",
+      filename: "process-lifecycle-sim.js",
+      description:
+        "Complete <code>simulateShutdown(config, activeRequests)</code>. Inputs: <code>config = { pid1Form: \"exec\" | \"shell\", handlesSigterm: boolean, stopTimeoutMs: number, softFdLimit: number, baseFds: number, leakedFds: number, fdsPerRequest: number }</code> and <code>activeRequests = [{ id: string, remainingMs: number }, ...]</code>. Rules: (1) <code>totalFds = config.baseFds + config.leakedFds + activeRequests.length * config.fdsPerRequest</code>, <code>fdBudgetRemaining = config.softFdLimit - totalFds</code>, and <code>emfileRisk = totalFds >= config.softFdLimit</code>. (2) If <code>config.pid1Form !== \"exec\" || !config.handlesSigterm</code>, <code>SIGTERM</code> is ignored/swallowed: return <code>outcome: \"SIGKILL_IGNORED\"</code>, <code>exitCode: 137</code>, <code>elapsedMs: config.stopTimeoutMs</code>, <code>drainedCount: 0</code>, <code>droppedCount: activeRequests.length</code>. (3) Otherwise, requests with <code>remainingMs <= config.stopTimeoutMs</code> drain cleanly (<code>drainedCount</code>) and requests with <code>remainingMs > config.stopTimeoutMs</code> are killed (<code>droppedCount</code>). If <code>droppedCount === 0</code>, return <code>outcome: \"GRACEFUL_DRAIN\"</code>, <code>exitCode: 0</code>, and <code>elapsedMs</code> equal to the max <code>remainingMs</code> (<code>0</code> if empty). Else return <code>outcome: \"SIGKILL_TIMEOUT\"</code>, <code>exitCode: 137</code>, and <code>elapsedMs: config.stopTimeoutMs</code>.",
+      exports: ["simulateShutdown"],
+      starterCode: `function simulateShutdown(config, activeRequests) {
+  // config: { pid1Form, handlesSigterm, stopTimeoutMs, softFdLimit, baseFds, leakedFds, fdsPerRequest }
+  // activeRequests: [{ id: string, remainingMs: number }]
+
+  // TODO 1: compute totalFds, fdBudgetRemaining, and emfileRisk (>= softFdLimit)
+  const totalFds = 0;
+  const fdBudgetRemaining = 0;
+  const emfileRisk = false;
+
+  // TODO 2: handle shell-form PID 1 or missing SIGTERM handler -> SIGKILL_IGNORED (exitCode 137)
+
+  // TODO 3: otherwise simulate draining requests <= stopTimeoutMs vs SIGKILL_TIMEOUT
+  return {
+    totalFds,
+    fdBudgetRemaining,
+    emfileRisk,
+    outcome: "GRACEFUL_DRAIN",
+    exitCode: 0,
+    elapsedMs: 0,
+    drainedCount: 0,
+    droppedCount: 0
+  };
+}
+
+console.log(
+  "Shell-form sample:",
+  simulateShutdown(
+    {
+      pid1Form: "shell",
+      handlesSigterm: true,
+      stopTimeoutMs: 30000,
+      softFdLimit: 1024,
+      baseFds: 60,
+      leakedFds: 0,
+      fdsPerRequest: 2
+    },
+    [
+      { id: "req-1", remainingMs: 120 },
+      { id: "req-2", remainingMs: 450 }
+    ]
+  )
+);`,
+      hints: [
+        "Calculate FD budget first: <code>const totalFds = config.baseFds + config.leakedFds + activeRequests.length * config.fdsPerRequest;</code>, then <code>const fdBudgetRemaining = config.softFdLimit - totalFds;</code> and <code>const emfileRisk = totalFds >= config.softFdLimit;</code>.",
+        "If <code>config.pid1Form !== \"exec\" || !config.handlesSigterm</code>, return immediately with <code>outcome: \"SIGKILL_IGNORED\"</code>, <code>exitCode: 137</code>, <code>elapsedMs: config.stopTimeoutMs</code>, <code>drainedCount: 0</code>, and <code>droppedCount: activeRequests.length</code>.",
+        "In the graceful drain branch, loop over <code>activeRequests</code>: increment <code>drainedCount</code> and track <code>maxDrainMs = Math.max(maxDrainMs, req.remainingMs)</code> when <code>req.remainingMs <= config.stopTimeoutMs</code>; otherwise increment <code>droppedCount</code>."
+      ],
+      solutionExplanation:
+        "A container only drains cleanly when PID 1 is launched in exec form AND registers a SIGTERM handler, and all active requests complete within stopTimeoutMs. Meanwhile, baseline FDs, leaked CLOSE_WAIT sockets, and per-request client+upstream sockets all draw from the same RLIMIT_NOFILE budget.",
+      solutionCode: `function simulateShutdown(config, activeRequests) {
+  const totalFds =
+    config.baseFds + config.leakedFds + activeRequests.length * config.fdsPerRequest;
+  const fdBudgetRemaining = config.softFdLimit - totalFds;
+  const emfileRisk = totalFds >= config.softFdLimit;
+
+  if (config.pid1Form !== "exec" || !config.handlesSigterm) {
+    return {
+      totalFds,
+      fdBudgetRemaining,
+      emfileRisk,
+      outcome: "SIGKILL_IGNORED",
+      exitCode: 137,
+      elapsedMs: config.stopTimeoutMs,
+      drainedCount: 0,
+      droppedCount: activeRequests.length
+    };
+  }
+
+  let drainedCount = 0;
+  let droppedCount = 0;
+  let maxDrainMs = 0;
+
+  for (const req of activeRequests) {
+    if (req.remainingMs <= config.stopTimeoutMs) {
+      drainedCount++;
+      if (req.remainingMs > maxDrainMs) {
+        maxDrainMs = req.remainingMs;
+      }
+    } else {
+      droppedCount++;
+    }
+  }
+
+  if (droppedCount === 0) {
+    return {
+      totalFds,
+      fdBudgetRemaining,
+      emfileRisk,
+      outcome: "GRACEFUL_DRAIN",
+      exitCode: 0,
+      elapsedMs: maxDrainMs,
+      drainedCount,
+      droppedCount
+    };
+  }
+
+  return {
+    totalFds,
+    fdBudgetRemaining,
+    emfileRisk,
+    outcome: "SIGKILL_TIMEOUT",
+    exitCode: 137,
+    elapsedMs: config.stopTimeoutMs,
+    drainedCount,
+    droppedCount
+  };
+}`,
+      tests: [
+        {
+          name: "Exec-form PID 1 with SIGTERM handler drains all fast requests cleanly (exit 0)",
+          run: (scope) => {
+            const out = scope.simulateShutdown(
+              {
+                pid1Form: "exec",
+                handlesSigterm: true,
+                stopTimeoutMs: 30000,
+                softFdLimit: 65536,
+                baseFds: 60,
+                leakedFds: 0,
+                fdsPerRequest: 2
+              },
+              [
+                { id: "r1", remainingMs: 120 },
+                { id: "r2", remainingMs: 450 }
+              ]
+            );
+            const pass =
+              out.outcome === "GRACEFUL_DRAIN" &&
+              out.exitCode === 0 &&
+              out.elapsedMs === 450 &&
+              out.drainedCount === 2 &&
+              out.droppedCount === 0 &&
+              out.totalFds === 64 &&
+              out.emfileRisk === false;
+            return { pass, message: `got outcome=${out.outcome}, exitCode=${out.exitCode}, elapsedMs=${out.elapsedMs}` };
+          }
+        },
+        {
+          name: "Idle exec-form container with zero active requests exits in 0ms",
+          run: (scope) => {
+            const out = scope.simulateShutdown(
+              {
+                pid1Form: "exec",
+                handlesSigterm: true,
+                stopTimeoutMs: 30000,
+                softFdLimit: 65536,
+                baseFds: 50,
+                leakedFds: 0,
+                fdsPerRequest: 2
+              },
+              []
+            );
+            const pass =
+              out.outcome === "GRACEFUL_DRAIN" &&
+              out.exitCode === 0 &&
+              out.elapsedMs === 0 &&
+              out.drainedCount === 0 &&
+              out.droppedCount === 0;
+            return { pass, message: `got outcome=${out.outcome}, elapsedMs=${out.elapsedMs}` };
+          }
+        },
+        {
+          name: "Shell-form CMD swallows SIGTERM and triggers SIGKILL_IGNORED (exit 137) at stopTimeoutMs",
+          run: (scope) => {
+            const out = scope.simulateShutdown(
+              {
+                pid1Form: "shell",
+                handlesSigterm: true,
+                stopTimeoutMs: 30000,
+                softFdLimit: 65536,
+                baseFds: 60,
+                leakedFds: 0,
+                fdsPerRequest: 2
+              },
+              [
+                { id: "r1", remainingMs: 100 },
+                { id: "r2", remainingMs: 250 },
+                { id: "r3", remainingMs: 500 }
+              ]
+            );
+            const pass =
+              out.outcome === "SIGKILL_IGNORED" &&
+              out.exitCode === 137 &&
+              out.elapsedMs === 30000 &&
+              out.drainedCount === 0 &&
+              out.droppedCount === 3;
+            return { pass, message: `got outcome=${out.outcome}, exitCode=${out.exitCode}, droppedCount=${out.droppedCount}` };
+          }
+        },
+        {
+          name: "Request slower than stopTimeoutMs causes SIGKILL_TIMEOUT with partial drain",
+          run: (scope) => {
+            const out = scope.simulateShutdown(
+              {
+                pid1Form: "exec",
+                handlesSigterm: true,
+                stopTimeoutMs: 30000,
+                softFdLimit: 65536,
+                baseFds: 60,
+                leakedFds: 0,
+                fdsPerRequest: 2
+              },
+              [
+                { id: "fast", remainingMs: 200 },
+                { id: "report-export", remainingMs: 45000 }
+              ]
+            );
+            const pass =
+              out.outcome === "SIGKILL_TIMEOUT" &&
+              out.exitCode === 137 &&
+              out.elapsedMs === 30000 &&
+              out.drainedCount === 1 &&
+              out.droppedCount === 1;
+            return { pass, message: `got outcome=${out.outcome}, drained=${out.drainedCount}, dropped=${out.droppedCount}` };
+          }
+        },
+        {
+          name: "Flags EMFILE risk when base + leaked CLOSE_WAIT + request FDs hit or exceed 1024 ulimit",
+          run: (scope) => {
+            const out = scope.simulateShutdown(
+              {
+                pid1Form: "exec",
+                handlesSigterm: true,
+                stopTimeoutMs: 30000,
+                softFdLimit: 1024,
+                baseFds: 120,
+                leakedFds: 890,
+                fdsPerRequest: 2
+              },
+              [
+                { id: "r1", remainingMs: 100 },
+                { id: "r2", remainingMs: 100 },
+                { id: "r3", remainingMs: 100 },
+                { id: "r4", remainingMs: 100 },
+                { id: "r5", remainingMs: 100 },
+                { id: "r6", remainingMs: 100 },
+                { id: "r7", remainingMs: 100 }
+              ]
+            );
+            const pass =
+              out.totalFds === 1024 &&
+              out.fdBudgetRemaining === 0 &&
+              out.emfileRisk === true;
+            return { pass, message: `got totalFds=${out.totalFds}, fdBudgetRemaining=${out.fdBudgetRemaining}, emfileRisk=${out.emfileRisk}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0003",
+      title: "Quiz 0003: PID 1 Signals, File Descriptors & DNS Triage",
+      questions: [
+        {
+          id: "q1",
+          prompt: "During an ECS rolling deployment, your Node.js service takes exactly 30 seconds to stop per task, and the ALB records spikes of HTTP 502 errors on every deploy. Your Dockerfile ends with `CMD node dist/server.js`, and your ECS task uses the default `stopTimeout`. What is the root cause?",
+          options: [
+            "Shell form launches /bin/sh as PID 1, swallowing SIGTERM until SIGKILL fires",
+            "Node ignores SIGKILL signals by default, forcing ECS tasks into zombie state",
+            "ECS waits thirty seconds before sending SIGTERM when container logs buffer stdout",
+            "ALB closes healthy target sockets early because Node lacks kernel epoll support"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Shell-form CMD wraps the app in /bin/sh as PID 1, which does not forward SIGTERM to Node. ECS waits the full 30s stopTimeout and kills the container with SIGKILL, dropping in-flight connections and causing 502s.",
+            "No process can ignore SIGKILL (signal 9); the Linux kernel terminates the process immediately without letting user-space code intercept it.",
+            "ECS sends SIGTERM immediately when stopping a task; stdout buffering does not delay SIGTERM delivery.",
+            "Node.js uses libuv backed by Linux epoll natively, and ALB socket closes follow its configured idle timeout rather than epoll capability."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "An EC2 API server handles 400 concurrent users smoothly until a downstream microservice slows down. Suddenly CPU is only 20% and memory is 35%, yet new requests fail with `EMFILE: Too many open files`. Running `ss -tanp` shows 980 sockets stuck in `CLOSE_WAIT`. What happened?",
+          options: [
+            "Linux kernel exhausted all ephemeral ports across the public VPC NAT gateway",
+            "Route 53 DNS resolver overflowed UDP socket buffers inside the local subnet",
+            "App code never closed remote sockets, exhausting the process ulimit FD budget",
+            "ALB health checks opened persistent HTTP streams beyond the Linux thread limit"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "Ephemeral port exhaustion triggers EADDRNOTAVAIL on outbound connect() calls and leaves sockets in TIME_WAIT or SYN_SENT, not 980 CLOSE_WAIT entries causing EMFILE.",
+            "UDP resolver buffer overflows drop DNS packets or cause timeouts; they do not accumulate 980 TCP CLOSE_WAIT sockets inside your application process.",
+            "CLOSE_WAIT means the remote peer already closed the TCP connection (sent FIN), but your application never called close(). Those unclosed sockets stay in the FD table until they hit the 1,024 RLIMIT_NOFILE soft limit, producing EMFILE.",
+            "ALB health checks run periodically on short checks and do not open 980 persistent streams, nor is EMFILE a thread limit error."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "After migrating an EKS microservice, latency spikes on every outbound call to `auth.internal.corp`. Running `dig` from a pod shows fast answers, yet packet captures reveal 6 sequential DNS queries before every single lookup succeeds. What `/etc/resolv.conf` behavior causes this?",
+          options: [
+            "VPC DNS server at 169.254.169.253 drops TCP fallback queries from Linux pods",
+            "High ndots threshold tries cluster search suffixes before querying the exact domain",
+            "Kernel conntrack table drops DNS replies whenever local UDP source ports wrap",
+            "Route 53 private hosted zones disable caching whenever CNAME records exceed one"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "The VPC DNS resolver at 169.254.169.253 supports both UDP and TCP DNS queries and does not force 6 sequential search-domain attempts.",
+            "Kubernetes sets options ndots:5 in /etc/resolv.conf by default. Because auth.internal.corp has only 2 dots (< 5), glibc treats it as relative and queries every search suffix (e.g., .svc.cluster.local, .cluster.local) before finally querying the exact FQDN.",
+            "Conntrack drops would cause timeouts and retransmissions of the same query, not 6 distinct sequential queries across search domains.",
+            "Route 53 private hosted zones cache records according to each record's TTL regardless of CNAME chains."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

@@ -1,124 +1,152 @@
-# Computer Networking: Master Curriculum (v3)
+# Course Curriculum — Two-Part Roadmap (87 Core Sessions)
 
-A comprehensive, field-wide syllabus structured across:
-- **Part 0: Shared Foundations** (Sessions 1–3) — Delay, packets, and protocol layers [Live 🟢]
-- **Part 1: Layer 2 & 3 Core** (Sessions 4–12) — MAC, IPv4/IPv6, CIDR, ARP, DHCP, Routing, NAT [Live 🟢]
-- **Part 2: Transport Mechanics** (Sessions 13–20) — Ports, UDP, TCP handshakes, reliability, flow/congestion [Live 🟢]
-- **Part 3: Track A — Professional Developers** (Sessions 21–35) — HTTP/1/2/3, TLS 1.3, WebSockets, gRPC, resilience [Live 🟢]
-- **Part 4: Track B — Professional Network Engineers** (Sessions 36–50) — Switching, VLANs, STP, OSPF, BGP, firewalls, IPsec, QoS [Live 🟢]
-- **Part 5: Track C — Cloud & Modern Infrastructure** (Sessions 51–65) — SDN, VPCs, subnets, route tables, TGW, ALBs, K8s CNI/eBPF [Live 🟢]
-- **Part 6: Capstones & Outage Forensics** (Sessions 66–72) — The URL question, debugging playbook, raw socket server, outage autopsies [Live 🟢]
+Designed to take a **Junior Android Developer** to **Senior Software Developer (Part 1)** and **Senior Network Engineer (Part 2)** in **2027**, benchmarked against `roadmap.sh/network-engineer`.
+
+**Key Upgrade:** Zero lessons are marked optional. Previous optional tags on `0036`, `0039`, `0040`, `0041`, `0048`, and `0049` have been promoted to **Core NetEng** in Part 2, paired with 15 new sessions (`0073`–`0087`) covering Mobile/Android edge, L7 reverse proxies, Linux `iproute2`/`netns`/`nftables`, Containerlab/FRR, FHRP, IS-IS/BFD/ECMP, MP-BGP EVPN, 802.1X/AAA, Multicast, YANG/NETCONF/gNMI, Python/Ansible/Terraform NetDevOps, and Capstone 2.
 
 ---
 
-## Part 0 — Shared Foundations (Live 🟢)
-| # | Session | Focus / Topic | Interview | Hands-on / Tool |
-|---|---------|---------------|-----------|-----------------|
-| 01 | [Packets & Delay](lessons/0001-packets-and-delay.html) | Packet switching, store-and-forward, 4 delays, speed-of-light limits | ★ | 🔧 `ping` RTT physics |
-| 02 | [Layers & Encapsulation](lessons/0002-layers-and-encapsulation.html) | OSI 7-layer vs TCP/IP 4-layer models, headers & payloads | ★★ | 🔧 Wireshark packet dissection |
-| 03 | [Review: Foundations](lessons/0003-review-foundations.html) | Synthesis of delay math and protocol encapsulation | | Retrieval & diagnostic checks |
+## PART 1: Senior Software Developer &amp; Systems Networking (41 Sessions)
 
-## Part 1 — Layer 2 & 3 Core Substrate (Live 🟢)
-| # | Session | Focus / Topic | Interview | Hands-on / Tool |
-|---|---------|---------------|-----------|-----------------|
-| 04 | [MAC Addresses & Frames](lessons/0004-mac-addresses-and-frames.html) | Link layer, Ethernet frames, MAC unicast/multicast/broadcast | | 🔧 `ifconfig`, frame headers |
-| 05 | [IPv4 & ICMP](lessons/0005-ipv4-and-icmp.html) | IP packet format, TTL, checksum, ICMP echo/unreachable | ★ | Wireshark TTL decrement |
-| 06 | [Subnets & CIDR](lessons/0006-subnets-and-cidr.html) | Subnet masks, CIDR prefix math, host ranges, broadcast address | ★ | Subnet math trainer |
-| 07 | [ARP](lessons/0007-arp.html) | Resolving IP to MAC on local LAN, ARP cache, gratuitous ARP | ⚡ | 🔧 `arp -a`, packet capture |
-| 08 | [DHCP](lessons/0008-dhcp.html) | Dynamic address leasing, DORA exchange, DHCP options | ★ | Lease renewal capture |
-| 09 | [Routing Fundamentals](lessons/0009-routing.html) | Default gateways, routing tables, longest-prefix match (LPM) | ★ | 🔧 `netstat -rn`, `traceroute` |
-| 10 | [NAT & PAT](lessons/0010-nat.html) | RFC 1918 private IPs, Port Address Translation, state tables | ★ | Comparing private LAN vs public IP |
-| 11 | [IPv6](lessons/0011-ipv6.html) | 128-bit hex notation, SLAAC, NDP neighbor solicitation, dual-stack | | 🔧 `ping6`, `ndp -a` |
-| 12 | [Review: Link & Internet](lessons/0012-review-link-and-internet.html) | Comprehensive packet trace evaluation across L2 and L3 | | Diagnostic synthesis |
+### Module 1A: Foundations (Sessions 0001–0003)
+| # | Session | Core Focus |
+|---|---|---|
+| 0001 | [Packets, Delay &amp; Queuing](lessons/0001-packets-and-delay.html) | Transmission vs propagation delay, queuing, bandwidth-delay product |
+| 0002 | [Layers &amp; Encapsulation](lessons/0002-layers-and-encapsulation.html) | 5-layer TCP/IP stack, L2 frame / L3 packet / L4 segment |
+| 0003 | [Review: Foundations](lessons/0003-review-foundations.html) | End-to-end RTT, delay composition, layer isolation |
 
----
+### Module 1B: Link &amp; Internet Layers (Sessions 0004–0012)
+| # | Session | Core Focus |
+|---|---|---|
+| 0004 | [MAC Addresses &amp; Ethernet Frames](lessons/0004-mac-addresses-and-frames.html) | OUI, NIC frames, L2 CAM switch learning &amp; flooding |
+| 0005 | [IPv4 Packets, TTL &amp; ICMP](lessons/0005-ipv4-and-icmp.html) | IPv4 header, fragmentation flags, TTL, traceroute internals |
+| 0006 | [Subnets &amp; CIDR](lessons/0006-subnets-and-cidr.html) | Bitmasks, VLSM, longest-prefix match (LPM) |
+| 0007 | [ARP &amp; Local Neighbor Resolution](lessons/0007-arp.html) | Broadcast ARP request, unicast reply, ARP poisoning mechanics |
+| 0008 | [DHCP Lease Lifecycle](lessons/0008-dhcp.html) | DORA flow, relay agents (Option 82), lease renewal &amp; APIPA |
+| 0009 | [IP Routing &amp; Forwarding](lessons/0009-routing.html) | Next-hop vs direct delivery, FIB lookup, asymmetric paths |
+| 0010 | [NAT &amp; PAT](lessons/0010-nat.html) | NAPT state tables, CG-NAT, STUN/TURN traversal |
+| 0011 | [IPv6 Addressing &amp; NDP](lessons/0011-ipv6.html) | 128-bit prefixes, SLAAC, EUI-64, Neighbor Discovery &amp; ICMPv6 |
+| 0012 | [Review: Link &amp; Internet](lessons/0012-review-link-and-internet.html) | Full hop-by-hop MAC/IP rewrite trace |
 
-## Part 2 — Transport Layer Mechanics: TCP, UDP, & Sockets (Complete 🟢)
-| # | Session | Focus / Topic | Importance | Hands-on / Artifact |
-|---|---------|---------------|------------|---------------------|
-| 13 | [Ports & Multiplexing](lessons/0013-ports-and-sockets.html) | Ephemeral vs well-known ports, the 5-tuple, demultiplexing | ★ | 🔧 `lsof -i`, `netstat -an` |
-| 14 | [UDP: Minimal Transport](lessons/0014-udp.html) | Connectionless datagrams, low latency, use cases (VoIP, DNS) | | Single-file Java Datagram socket |
-| 15 | [TCP Connection Lifecycle](lessons/0015-tcp-connections.html) | 3-way handshake (SYN, SYN-ACK, ACK), FIN/RST, TIME_WAIT (2MSL) | ★★ ⚡ | Wireshark handshake capture |
-| 16 | [TCP Reliability](lessons/0016-tcp-reliability.html) | Sequence numbers, cumulative ACKs, SACK, retransmission timeouts | ⚡ | Wireshark TCP stream graphs |
-| 17 | [TCP Flow & Congestion](lessons/0017-tcp-flow-and-congestion.html) | Sliding window (rwnd), congestion window (cwnd), Reno vs Cubic vs BBR | ★ | Throttled transfer experiment |
-| 18 | [Transport Dilemmas](lessons/0018-tcp-dilemmas.html) | Nagle's algorithm (`TCP_NODELAY`), delayed ACKs, HoL blocking | ⚡ | Reproducing Nagle latency spike |
-| 19 | [Sockets in Code](lessons/0019-tcp-sockets-in-code.html) | Berkeley sockets API, `ServerSocket`, stream framing strategies | | Java virtual thread TCP echo server |
-| 20 | [Mixed Review: Transport](lessons/0020-review-transport.html) | Comprehensive transport protocol audit | | Diagnostic review lab |
+### Module 2: Transport &amp; Sockets (Sessions 0013–0020)
+| # | Session | Core Focus |
+|---|---|---|
+| 0013 | [Ports, Multiplexing &amp; Sockets](lessons/0013-ports-and-sockets.html) | 4-tuple demux, ephemeral ports, `TIME_WAIT` &amp; `CLOSE_WAIT` |
+| 0014 | [UDP &amp; Connectionless Apps](lessons/0014-udp.html) | Stateless 8B header, game/VoIP/DNS tradeoffs |
+| 0015 | [TCP Connections &amp; State Machine](lessons/0015-tcp-connections.html) | 3-way handshake, ISNs, FIN vs RST, listen queues |
+| 0016 | [TCP Reliability &amp; Retransmission](lessons/0016-tcp-reliability.html) | RTO/SRTT, SACK, fast retransmit (3 DupACKs) |
+| 0017 | [TCP Flow &amp; Congestion Control](lessons/0017-tcp-flow-and-congestion.html) | rwnd vs cwnd, CUBIC, BBR pacing, ECN |
+| 0018 | [TCP Dilemmas in Production](lessons/0018-tcp-dilemmas.html) | Nagle vs Delayed ACK, HoL blocking, bufferbloat |
+| 0019 | [TCP Sockets in Code](lessons/0019-tcp-sockets-in-code.html) | Java `Socket`/`ServerSocket`, framing, timeouts, virtual threads |
+| 0020 | [Review: Transport Layer](lessons/0020-review-transport.html) | Packet trace &amp; congestion diagnostics |
 
----
+### Module 3A: DNS &amp; HTTP/Web Protocols (Sessions 0021–0029)
+| # | Session | Core Focus |
+|---|---|---|
+| 0021 | [DNS Architecture](lessons/0021-dns-architecture.html) | Root/TLD/Auth hierarchy, CNAME/A/AAAA/MX/SRV, TTLs |
+| 0022 | [DNS in Practice &amp; Security](lessons/0022-dns-in-practice.html) | `dig` debugging, DNSSEC, DoH/DoT |
+| 0023 | [HTTP/1.1 Anatomy](lessons/0023-http1-anatomy.html) | Methods, framing (`Content-Length`/chunked), Keep-Alive |
+| 0024 | [HTTP Semantics &amp; Caching](lessons/0024-http-semantics.html) | Status codes, `ETag`, `Cache-Control`, idempotency |
+| 0025 | [Cookies &amp; Session State](lessons/0025-cookies-and-state.html) | `HttpOnly`, `Secure`, `SameSite`, CSRF tokens |
+| 0026 | [CORS &amp; Same-Origin Policy](lessons/0026-cors-and-sop.html) | Preflight `OPTIONS`, credentials, origin enforcement |
+| 0027 | [HTTP/2 Binary Multiplexing](lessons/0027-http2.html) | Streams, HPACK compression, server push demise, TCP HoL limit |
+| 0028 | [HTTP/3 &amp; QUIC](lessons/0028-http3-and-quic.html) | UDP transport, 0-RTT/1-RTT encrypted handshake, independent streams |
+| 0029 | [Realtime Web: WebSockets &amp; SSE](lessons/0029-realtime-web.html) | Long polling vs SSE vs WebSockets upgrade |
 
-## Part 3 — Track A: Professional Software Developers (Complete 🟢)
-| # | Session | Focus / Topic | Importance | Hands-on / Artifact |
-|---|---------|---------------|------------|---------------------|
-| 21 | [DNS Architecture](lessons/0021-dns-architecture.html) | Root servers, TLDs, authoritative nameservers, iterative vs recursive | ★★ | 🔧 `dig +trace` root walk |
-| 22 | [DNS in Production](lessons/0022-dns-in-practice.html) | Records (A, AAAA, CNAME, MX, TXT), TTL caching, stale cache bugs | ⚡ | Stale DNS diagnosis |
-| 23 | [HTTP/1.1 Protocol Anatomy](lessons/0023-http1-anatomy.html) | Headers, methods, bodies, persistent connections (`Keep-Alive`) | ★★ | 🔧 `nc` manual request, `curl -v` |
-| 24 | [HTTP Semantics](lessons/0024-http-semantics.html) | Idempotency, safe methods, status codes (2xx, 3xx, 4xx, 5xx), caching | ★★ | ETag & `Cache-Control` probes |
-| 25 | [Web State & Cookies](lessons/0025-cookies-and-state.html) | Statelessness, Cookie flags (HttpOnly, Secure, SameSite), JWTs | | DevTools cookie auditing |
-| 26 | [Browser Security & CORS](lessons/0026-cors-and-sop.html) | Same-Origin Policy (SOP), Preflight `OPTIONS`, CORS headers | ⚡ | Triggering & fixing CORS |
-| 27 | [HTTP/2 Deep Dive](lessons/0027-http2.html) | Binary framing, stream multiplexing, HPACK header compression | ★ | 🔧 `curl --http2` multiplexing |
-| 28 | [HTTP/3 & QUIC](lessons/0028-http3-and-quic.html) | UDP-based transport, 0-RTT handshakes, surviving IP migration | ★ | 🔧 `curl --http3` & QUIC capture |
-| 29 | [Real-Time Web Protocols](lessons/0029-realtime-web.html) | Polling vs SSE vs WebSockets vs WebRTC | ★★ | WebSocket upgrade trace |
-| 30 | [Applied Cryptography](lessons/0030-crypto-foundations.html) | Symmetric vs asymmetric ciphers, hashing, digital signatures | | 🔧 `openssl` ECDH keygen |
-| 31 | [PKI & Certificates](lessons/0031-pki-and-certificates.html) | X.509 chains of trust, CAs, intermediate authorities, OCSP | ⚡ | 🔧 `openssl s_client` cert chain |
-| 32 | [TLS 1.3 Handshake](lessons/0032-tls13-handshake.html) | ECDHE key exchange, Perfect Forward Secrecy (PFS), HTTPS encryption | ★★ | Decrypting TLS session keys |
-| 33 | [High-Performance RPC](lessons/0033-grpc-and-rpc.html) | REST vs gRPC, Protocol Buffers binary framing & streaming | | Protobuf serialization bench |
-| 34 | [Resilient Client Architecture](lessons/0034-client-resilience.html) | Connection pooling, exponential backoff, jitter, circuit breakers | ⚡ | Simulating thundering herd |
-| 35 | [Mixed Review: Web & Dev](lessons/0035-review-developer-track.html) | Developer networking security and performance audit | | End-to-end web lab |
+### Module 3B: TLS, RPC &amp; Developer Resilience (Sessions 0030–0035)
+| # | Session | Core Focus |
+|---|---|---|
+| 0030 | [Cryptographic Foundations](lessons/0030-crypto-foundations.html) | AEAD (AES-GCM/ChaCha20), ECDHE PFS, SHA-256 &amp; HMAC |
+| 0031 | [PKI &amp; X.509 Certificates](lessons/0031-pki-and-certificates.html) | CA chains, SAN verification, ACME, OCSP stapling |
+| 0032 | [TLS 1.3 Handshake](lessons/0032-tls13-handshake.html) | 1-RTT encrypted handshake, PSK/0-RTT replay risk |
+| 0033 | [gRPC &amp; Binary RPC](lessons/0033-grpc-and-rpc.html) | Protobuf over HTTP/2, streaming modes, deadline propagation |
+| 0034 | [Client Resilience Engineering](lessons/0034-client-resilience.html) | Connect/read timeouts, exponential backoff + jitter, circuit breakers |
+| 0035 | [Review: Developer Track](lessons/0035-review-developer-track.html) | Full HTTPS/RPC latency &amp; failure diagnosis |
 
----
-
-## Part 4 — Track B: Professional Network Engineers (Complete 🟢)
-> *Note for Software Engineers:* Sessions marked **◇ Optional** cover CCNA-level hardware/ISP mechanics (optics, L3 SVIs, STP, OSPF, router QoS, SNMP) that you can skim or treat as enrichment while keeping VLANs (38), BGP/RPKI (42–44), Firewalls (45), VPNs (46), and VXLAN (47) as core required.
-
-| # | Session | Focus / Topic | Importance | Hands-on / Artifact |
-|---|---------|---------------|------------|---------------------|
-| 36 | [Physical Media & Optics](lessons/0036-physical-media-and-optics.html) | Copper Cat6a, Single-mode vs Multi-mode fiber, SFP+, LACP trunking | ◇ Optional | Optical link budget calculation |
-| 37 | [Enterprise Switching](lessons/0037-enterprise-switching.html) | CAM tables, MAC learning, flooding, aging, broadcast storms | ★ | MAC table inspection |
-| 38 | [VLANs & 802.1Q](lessons/0038-vlans-and-8021q.html) | Segmenting broadcast domains, Access vs Trunk ports, Native VLAN | ★ | Wireshark 802.1Q tag dissection |
-| 39 | [Inter-VLAN Routing](lessons/0039-inter-vlan-routing.html) | Router-on-a-stick vs Layer 3 Switch Switched Virtual Interfaces (SVIs) | ◇ Optional | Routing across tagged trunks |
-| 40 | [Spanning Tree Protocol](lessons/0040-spanning-tree-protocol.html) | STP (802.1D) & RSTP (802.1w), Bridge ID, Root bridge, loop prevention | ◇ Optional | BPDU dissection & election trace |
-| 41 | [Enterprise IGP: OSPF](lessons/0041-ospf-routing.html) | Link-State Advertisements (LSAs), Dijkstra SPF, Area 0, DR/BDR election | ◇ Optional | OSPF adjacency analysis |
-| 42 | [BGP Fundamentals](lessons/0042-bgp-fundamentals.html) | Autonomous Systems (ASNs), Path-Vector protocol, TCP port 179 | ★★ | BGP Looking Glass route check |
-| 43 | [BGP Attributes & Peering](lessons/0043-bgp-attributes-and-peering.html) | eBGP vs iBGP, Route Reflectors, AS-PATH, Local Pref, MED, Transit | ★ | BGP path selection lab |
-| 44 | [Internet Routing Security](lessons/0044-routing-security-and-rpki.html) | BGP route hijacking, route leaks, RPKI ROA verification | ⚡ | Verifying ROA cryptographic validity |
-| 45 | [Perimeter Firewalls](lessons/0045-perimeter-firewalls.html) | Stateless ACLs vs stateful inspection, connection tracking, DMZ | ★ | macOS `pf` state table lab |
-| 46 | [Enterprise VPNs](lessons/0046-enterprise-vpns.html) | IPsec architecture (AH, ESP, IKEv2), Site-to-site tunnels, WireGuard | ⚡ | IPsec ESP packet capture |
-| 47 | [Overlay Encapsulation](lessons/0047-overlay-encapsulation-vxlan.html) | GRE tunnels, VXLAN encapsulation (VNI), Data center network fabric | ★ | Wireshark VXLAN decode |
-| 48 | [Quality of Service (QoS)](lessons/0048-quality-of-service.html) | DSCP marking, queuing (LLQ, WRED), traffic policing vs shaping | ◇ Optional | Rate limiting & shaping test |
-| 49 | [Network Telemetry](lessons/0049-network-telemetry.html) | SNMP v3, Syslog, NetFlow, sFlow, Streaming Telemetry | ◇ Optional | NetFlow record decoding |
-| 50 | [Mixed Review: NetEng](lessons/0050-review-network-engineering.html) | Enterprise & ISP architecture troubleshooting | ★ Master | Complex topology audit |
+### Module 3C: Senior Dev Edge, Playbook &amp; Capstone 1 (Sessions 0073–0074, 0066–0069)
+| # | Session | Core Focus |
+|---|---|---|
+| 0073 | [Mobile, Android &amp; Edge Networking](lessons/0073-mobile-and-edge-networking.html) | Happy Eyeballs v2 (RFC 8305), OkHttp pool, QUIC migration, NAT64/DNS64, cert pinning |
+| 0074 | [Reverse Proxies &amp; Graceful Draining](lessons/0074-reverse-proxies-and-graceful-draining.html) | `X-Forwarded-For` security, CL.TE request smuggling, rate limiting, `SIGTERM` draining |
+| 0066 | [The Classic URL Question](lessons/0066-the-url-question.html) | Every packet/handshake from pressing Enter to pixels |
+| 0067 | [Network Diagnostic Playbook](lessons/0067-network-diagnostic-playbook.html) | Structured L1–L7 isolation methodology |
+| 0068 | [Capstone 1 Pt 1: Raw-Socket HTTP/1.1 Server](lessons/0068-project-raw-socket-http-server-1.html) | Byte-level HTTP/1.1 parser, framing &amp; status engine |
+| 0069 | [Capstone 1 Pt 2: Concurrency, Reverse Proxy &amp; Drain](lessons/0069-project-raw-socket-http-server-2.html) | Thread pools, `/api/*` L7 forwarding + `XFF`, `/healthz` + `SIGTERM` draining |
 
 ---
 
-## Part 5 — Track C: Cloud & Modern Infrastructure (Complete 🟢)
-| # | Session | Focus / Topic | Importance | Hands-on / Artifact |
-|---|---------|---------------|------------|---------------------|
-| 51 | [SDN Fundamentals](lessons/0051-sdn-fundamentals.html) | Decoupling Control Plane & Data Plane, OpenFlow, virtual overlays | ★ | Flow table inspection |
-| 52 | [Cloud VPC Architecture](lessons/0052-cloud-vpc-architecture.html) | CIDR design, Public/Private subnets, Multi-AZ high availability | ★★ | Multi-tier VPC architecture lab |
-| 53 | [Cloud Egress & Gateways](lessons/0053-cloud-egress-and-gateways.html) | Internet Gateways (IGW), Route Tables, Managed NAT Gateways | ⚡ | Tracing NAT gateway egress |
-| 54 | [Cloud Security & Isolation](lessons/0054-security-groups-and-nacls.html) | Security Groups (Stateful) vs NACLs (Stateless), Ephemeral port drops | ★★ | Ephemeral port drop triage |
-| 55 | [VPC Interconnects](lessons/0055-vpc-interconnects-and-tgw.html) | VPC Peering (non-transitive limits) vs AWS Transit Gateway (TGW) | ★ | Hub-and-spoke route propagation |
-| 56 | [Private SaaS Connectivity](lessons/0056-privatelink-and-vpc-endpoints.html) | AWS PrivateLink, Interface Endpoints, avoiding public internet | ⚡ | Consuming private VPC endpoints |
-| 57 | [Hybrid Cloud Interconnect](lessons/0057-hybrid-cloud-interconnect.html) | DirectConnect / ExpressRoute, redundant BGP over IPsec failover | | Hybrid cloud connectivity design |
-| 58 | [Global Anycast & CDNs](lessons/0058-anycast-and-cdns.html) | Anycast IP routing to closest PoP, CloudFront/Fastly edge caching | ★★ | Anycast latency & cache header audit |
-| 59 | [Cloud Load Balancing](lessons/0059-cloud-load-balancing-alb-nlb.html) | Application Load Balancer (L7) vs Network Load Balancer (L4) | ★★ | ALB vs NLB performance benchmark |
-| 60 | [Kubernetes Network Model](lessons/0060-kubernetes-network-model.html) | Pod IP-per-Pod, flat cluster network, namespaces & veth pairs | ★★ | Linux network namespace audit |
-| 61 | [Container Interfaces (CNI)](lessons/0061-kubernetes-cni-plugins.html) | Calico (BGP/overlay) vs AWS VPC CNI (native ENI) vs Cilium | ⚡ | Overlay vs native routing test |
-| 62 | [Kubernetes Services](lessons/0062-kubernetes-services-and-kubeproxy.html) | ClusterIP, NodePort, LoadBalancer, kube-proxy (iptables vs IPVS) | | Deciphering kube-proxy DNAT rules |
-| 63 | [eBPF Modern Networking](lessons/0063-ebpf-networking-and-cilium.html) | How Cilium bypasses iptables in the Linux kernel via eBPF | ⚡ Modern | eBPF map inspection |
-| 64 | [Service Mesh Architecture](lessons/0064-service-mesh-and-envoy.html) | Envoy sidecars, Istio control plane, mutual TLS (mTLS) enforcement | | mTLS certificate validation |
-| 65 | [Mixed Review: Cloud](lessons/0065-review-cloud-and-modern-infra.html) | Cloud & distributed networking architecture audit | | Full infrastructure design review |
+## PART 2: Senior Network Engineer, Cloud &amp; NetDevOps (46 Sessions)
 
----
+### Module 4A: Linux Stack &amp; Lab Foundation (Sessions 0075–0076, 0036)
+| # | Session | Core Focus |
+|---|---|---|
+| 0075 | [Linux Networking: `iproute2`, `netns` &amp; `nftables`](lessons/0075-linux-networking-and-iproute2.html) | Network namespaces, `veth` pairs, Linux bridges, VRFs, policy routing, `ss`, `nft` |
+| 0076 | [Network Lab Emulation: Containerlab &amp; FRR](lessons/0076-network-lab-emulation-containerlab.html) | Containerlab YAML, FRRouting (`zebra`/`vtysh`), GNS3 &amp; EVE-NG comparison |
+| 0036 | [Physical Media, Optics &amp; LACP ★ Core NetEng](lessons/0036-physical-media-and-optics.html) | SMF/MMF optics, dBm loss budgets, SFP28/QSFP28, 802.3ad LACP bundling |
 
-## Part 6 — Capstones & Outage Forensics (Complete 🟢)
-| # | Session | Focus / Topic | Importance | Hands-on / Artifact |
-|---|---------|---------------|------------|---------------------|
-| 66 | [The URL Question](lessons/0066-the-url-question.html) | "What happens when you type a URL and hit Enter?" — Full end-to-end trace | ★★★ | Full multi-tool trace |
-| 67 | [Diagnostic Playbook](lessons/0067-network-diagnostic-playbook.html) | Systematic layer-by-layer triage: refused vs timeout vs reset vs TLS | ⚡ | Troubleshooting staged outages |
-| 68 | [Project: Raw Socket HTTP Server](lessons/0068-project-raw-socket-http-server-1.html) | Building an HTTP/1.1 server from raw `ServerSocket` in Kotlin/Java (Part 1) | | Byte parser & status codes |
-| 69 | [Project: Concurrency & Static Files](lessons/0069-project-raw-socket-http-server-2.html) | Virtual threads, Keep-Alive, streaming static files, load testing (Part 2) | ★ | High concurrency load test |
-| 70 | [Outage Autopsy: Facebook 2021](lessons/0070-outage-autopsy-facebook-2021.html) | BGP route withdrawal, DNS unreachability, cascading data center lockout | ⚡ Case Study | Dissecting BGP route flapping |
-| 71 | [Outage Autopsy: MTU Black Holes](lessons/0071-outage-autopsy-mtu-black-holes.html) | Path MTU Discovery failure when ICMP is dropped; AWS AZ partition | ⚡ Case Study | Reproducing MTU black hole hang |
-| 72 | [Final Master Challenge](lessons/0072-final-master-challenge.html) | Comprehensive cumulative networking architecture & diagnostic exam | ★ Master | End-to-end certification |
+### Module 4B: Enterprise Switching, IGP &amp; FHRP (Sessions 0037–0041, 0077–0078)
+| # | Session | Core Focus |
+|---|---|---|
+| 0037 | [Enterprise Switching Internals](lessons/0037-enterprise-switching.html) | Cut-through vs store-and-forward ASICs, TCAM, broadcast storms |
+| 0038 | [VLANs &amp; IEEE 802.1Q Trunking](lessons/0038-vlans-and-8021q.html) | 4B tags, native VLAN traps, double-tagging defense |
+| 0039 | [Inter-VLAN Routing &amp; SVIs ★ Core NetEng](lessons/0039-inter-vlan-routing.html) | Router-on-a-stick vs L3 Switch SVIs |
+| 0040 | [Spanning Tree Protocol (STP/RSTP) ★ Core NetEng](lessons/0040-spanning-tree-protocol.html) | Root election, BPDUs, PortFast, BPDU Guard |
+| 0041 | [OSPF Routing Protocol ★ Core NetEng](lessons/0041-ospf-routing.html) | Dijkstra SPF, LSAs, areas, DR/BDR election |
+| 0077 | [FHRP (HSRP, VRRP) &amp; Anycast Gateway](lessons/0077-fhrp-hsrp-vrrp-and-anycast-gw.html) | Virtual MACs + GARP, STP Root alignment, EVPN Anycast GW |
+| 0078 | [IS-IS, BFD, ECMP &amp; Segment Routing](lessons/0078-isis-bfd-and-ecmp-resilience.html) | IS-IS L2/TLVs, BFD sub-second failover, 5-tuple ECMP polarization, SR-MPLS/SRv6 |
+
+### Module 4C: BGP, Overlays &amp; Data Center Fabrics (Sessions 0042–0044, 0047, 0079)
+| # | Session | Core Focus |
+|---|---|---|
+| 0042 | [BGP Fundamentals](lessons/0042-bgp-fundamentals.html) | ASNs, eBGP vs iBGP split-horizon, peering &amp; Route Reflectors |
+| 0043 | [BGP Path Selection &amp; Traffic Engineering](lessons/0043-bgp-attributes-and-peering.html) | Local-Pref, AS-Path prepending, MED, Communities |
+| 0044 | [Routing Security &amp; RPKI](lessons/0044-routing-security-and-rpki.html) | BGP hijacks, route leaks, RPKI ROAs &amp; Route Origin Validation |
+| 0047 | [Overlay Encapsulation: VXLAN](lessons/0047-overlay-encapsulation-vxlan.html) | MAC-in-UDP 4789, VTEPs, VNI scaling &amp; jumbo MTU headroom |
+| 0079 | [MP-BGP EVPN &amp; Spine-Leaf Clos Fabrics](lessons/0079-bgp-evpn-and-spine-leaf-fabrics.html) | Clos ECMP, EVPN Type-2/3/5 routes, ARP suppression, Symmetric IRB |
+
+### Module 4D: Firewalls, VPNs, QoS, Telemetry, Campus Security &amp; Multicast (Sessions 0045–0046, 0048–0049, 0080–0081, 0050)
+| # | Session | Core Focus |
+|---|---|---|
+| 0045 | [Perimeter Firewalls &amp; Stateful ACLs](lessons/0045-perimeter-firewalls.html) | Conntrack state, DMZ zones, asymmetric drop pathology |
+| 0046 | [Enterprise VPNs: IPsec &amp; WireGuard](lessons/0046-enterprise-vpns.html) | IKEv2/ESP transport vs tunnel, WireGuard Cryptokey Routing, MSS clamping |
+| 0048 | [Quality of Service (QoS) ★ Core NetEng](lessons/0048-quality-of-service.html) | DSCP markings, shaping vs policing, Priority Queuing + WFQ |
+| 0049 | [Network Telemetry (SNMP &amp; gNMI) ★ Core NetEng](lessons/0049-network-telemetry.html) | SNMPv3 vs streaming gNMI, NetFlow/IPFIX, active synthetic probing |
+| 0080 | [802.1X, AAA (RADIUS/TACACS+) &amp; ZTNA](lessons/0080-campus-access-security-8021x-aaa.html) | EAPOL port NAC, TACACS+ RBAC, DHCP Snooping + DAI, NTP/NTS, ZTNA/SASE |
+| 0081 | [IP Multicast Essentials](lessons/0081-ip-multicast-essentials.html) | Class D `224.0.0.0/4`, 32:1 MAC aliasing, IGMP Snooping, PIM-SM &amp; RPF |
+| 0050 | [Review: Core Network Engineering](lessons/0050-review-network-engineering.html) | Enterprise L1–L4 switching, routing &amp; security integration |
+
+### Module 5: Cloud, Kubernetes, eBPF &amp; Edge Infrastructure (Sessions 0051–0065)
+| # | Session | Core Focus |
+|---|---|---|
+| 0051 | [SDN &amp; Control/Data Plane Split](lessons/0051-sdn-fundamentals.html) | Programmable controllers, OpenFlow concepts, intent APIs |
+| 0052 | [Cloud VPC Architecture](lessons/0052-cloud-vpc-architecture.html) | Subnets, implicit VPC router, AZs, route tables |
+| 0053 | [Cloud Egress &amp; Gateways](lessons/0053-cloud-egress-and-gateways.html) | IGW vs NAT Gateway vs Egress-Only IGW, NAT hairpinning |
+| 0054 | [Security Groups &amp; Network ACLs](lessons/0054-security-groups-and-nacls.html) | Stateful SGs vs stateless NACLs + ephemeral return ranges |
+| 0055 | [VPC Peering &amp; Transit Gateways](lessons/0055-vpc-interconnects-and-tgw.html) | Non-transitive peering mesh vs hub-and-spoke TGW |
+| 0056 | [PrivateLink &amp; VPC Endpoints](lessons/0056-privatelink-and-vpc-endpoints.html) | Private ENIs solving overlapping CIDRs cleanly |
+| 0057 | [Hybrid Cloud Interconnects](lessons/0057-hybrid-cloud-interconnect.html) | Direct Connect / Interconnect + BGP failover over IPsec |
+| 0058 | [Anycast &amp; Global CDNs](lessons/0058-anycast-and-cdns.html) | Anycast BGP POP routing, CDN cache hit mechanics |
+| 0059 | [Cloud Load Balancing: NLB vs ALB](lessons/0059-cloud-load-balancing-alb-nlb.html) | L4 DSR/Maglev vs L7 proxy termination &amp; health checks |
+| 0060 | [Kubernetes Network Model](lessons/0060-kubernetes-network-model.html) | Flat Pod IPs, Pod-to-Pod without NAT, pause netns |
+| 0061 | [Kubernetes CNI Plugins](lessons/0061-kubernetes-cni-plugins.html) | Overlay (VXLAN/Geneve) vs Native VPC ENI underlays |
+| 0062 | [Kubernetes Services &amp; kube-proxy](lessons/0062-kubernetes-services-and-kubeproxy.html) | ClusterIP DNAT, iptables O(N) vs IPVS O(1) vs Ingress/Gateway API |
+| 0063 | [eBPF Networking &amp; Cilium](lessons/0063-ebpf-networking-and-cilium.html) | XDP DDoS drop, socket bypass, kube-proxy replacement |
+| 0064 | [Service Mesh &amp; Envoy](lessons/0064-service-mesh-and-envoy.html) | Sidecar mTLS/SPIFFE, sidecar tax vs ambient/eBPF |
+| 0065 | [Review: Cloud &amp; Modern Infra](lessons/0065-review-cloud-and-modern-infra.html) | End-to-end VPC + K8s + Cilium debugging |
+
+### Module 6A: NetDevOps, Automation &amp; GitOps (Sessions 0082–0085)
+| # | Session | Core Focus |
+|---|---|---|
+| 0082 | [NetDevOps: YANG, NETCONF, RESTCONF &amp; gNMI](lessons/0082-netdevops-yang-netconf-restconf.html) | Typed schemas, OpenConfig, atomic `confirmed-commit` rollback |
+| 0083 | [Python Network Automation](lessons/0083-python-network-automation.html) | Netmiko, NAPALM replace vs merge diffs, Nornir concurrency, TextFSM |
+| 0084 | [Ansible Network Automation](lessons/0084-ansible-network-automation.html) | Control-node modules, `group_vars`/`host_vars`, Jinja2, `--check --diff` |
+| 0085 | [Terraform Networking IaC &amp; GitOps](lessons/0085-terraform-and-gitops-networking.html) | Remote state locking, `prevent_destroy` guards, Batfish/pyATS CI validation |
+
+### Module 6B: Outage Autopsies, Capstone 2 &amp; Final Exam (Sessions 0070–0071, 0086–0087, 0072)
+| # | Session | Core Focus |
+|---|---|---|
+| 0070 | [Outage 1: Facebook Oct 2021 (BGP + DNS)](lessons/0070-outage-autopsy-facebook-2021.html) | Backbone withdrawal, authoritative DNS invisibility, OOB lockouts |
+| 0071 | [Outage 2: Path MTU Black Holes](lessons/0071-outage-autopsy-mtu-black-holes.html) | ICMP Fragmentation Needed drops &amp; TLS handshake hang pathology |
+| 0086 | [Outage 3: Automation Blast Radius &amp; DNS/Config Cascade](lessons/0086-outage-autopsy-automation-and-dnssec.html) | Zero-canary fleet blasts, retry storms, OOB separation &amp; circuit breakers |
+| 0087 | [Capstone 2 (Part 2): Automated Multi-Site Hybrid Fabric](lessons/0087-capstone-hybrid-network-fabric.html) | Containerlab Clos EVPN-VXLAN + BFD + IPsec symmetry + Terraform TGW + chaos failover |
+| 0072 | [Final Master Challenge](lessons/0072-final-master-challenge.html) | Comprehensive multi-layer architecture &amp; debugging exam |

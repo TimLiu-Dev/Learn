@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0028 — AWS Lambda Internals: Firecracker MicroVMs, Cold Starts, Concurrency &amp; Power Tuning</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0028</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0028-lambda-firecracker-cold-starts-vpc.html" class="active">Lesson 0028</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.3</span>
+      <span class="pill">Serverless Compute</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>AWS Lambda Internals: Firecracker MicroVMs, Cold Starts, Concurrency &amp; Power Tuning</h1>
+    <p class="lead">
+      Serverless does not mean server-free. Every Lambda invocation executes inside a single-concurrency Firecracker microVM where static initialization, Hyperplane VPC attachment, Little's Law concurrency limits, and memory-to-vCPU coupling decide whether your p99 latency and AWS bill look senior-engineered or catastrophic.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            On Android, a <strong>cold app start</strong> forks a fresh process from the Zygote, loads DEX bytecode, builds your Hilt/Dagger dependency graph in <code>Application.onCreate()</code>, and finally renders the first <code>Activity</code>—whereas a <strong>warm start</strong> skips process creation and reuses objects already alive in memory. AWS Lambda works the same way: a cold start boots a <strong>Firecracker microVM</strong> and runs your module-level <code>INIT</code> code once before calling your handler, while warm invocations freeze and unfreeze that exact sandbox—keeping SDK clients, HTTP connection pools, and parsed configs intact across requests.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Firecracker MicroVMs &amp; The <code>INIT</code> / <code>INVOKE</code> Lifecycle</h2>
+        <p>
+          Earlier multi-tenant serverless platforms had an ugly tradeoff: running containers on shared hosts risked kernel escapes, while dedicating one EC2 VM per customer wasted gigabytes of RAM and took tens of seconds to boot. AWS built <a href="https://firecracker-microvm.github.io/" target="_blank" rel="noopener">Firecracker</a>—a minimalist KVM-based Virtual Machine Monitor written in Rust—to get hardware-virtualized isolation at container speed (~125 ms VM boot, ~5 MiB memory overhead per microVM).
+        </p>
+        <p>
+          Each microVM hosts exactly <strong>one execution environment</strong>, and each execution environment processes strictly <strong>one synchronous invocation at a time</strong>. Unlike an ECS or EKS container that multiplexes 200 concurrent HTTP requests onto one event loop or thread pool, Lambda scales out horizontally by launching one microVM per concurrent request.
+        </p>
+        <ol>
+          <li><strong><code>INIT</code> Phase (Cold Start Only):</strong> Lambda downloads your deployment artifact (zip or container image up to 10 GB), starts the microVM, boots the language runtime (Node.js, Python, JVM, custom Rust/Go binary), runs any Lambda Extensions' init hooks, and executes everything <em>outside</em> your handler function (module-level SDK clients, DI containers, TLS cert loading). Standard on-demand runtime init is capped at <strong>10 seconds</strong>.</li>
+          <li><strong><code>INVOKE</code> Phase (Every Request):</strong> Lambda unfreezes the vCPU, passes the event payload to your handler, and waits up to your configured timeout (maximum <strong>15 minutes / 900 seconds</strong>). Once the handler returns, Lambda immediately freezes the microVM CPU—meaning background coroutines or async flushes left running after <code>return</code> pause mid-flight until the next invocation (or die silently!).</li>
+          <li><strong><code>SHUTDOWN</code> Phase (Idle Reclamation):</strong> After roughly 5–15 minutes of inactivity (exact timing is non-deterministic), Lambda reclaims the sandbox, giving registered Lambda Extensions up to <strong>2 seconds</strong> to flush telemetry before terminating the microVM.</li>
+        </ol>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 245" width="100%" height="auto" role="img" aria-label="Lambda Cold Start vs Warm Sandbox Lifecycle">
+            <rect x="0" y="0" width="680" height="245" fill="#fdfcf8" rx="6" />
+
+            <!-- Cold Invocation -->
+            <text x="16" y="30" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Cold Start Invocation (First Request to New Sandbox)</text>
+            <rect x="16" y="44" width="132" height="36" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="82" y="60" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#991b1b">MicroVM + Code</text>
+            <text x="82" y="73" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#991b1b">~125–300 ms</text>
+
+            <rect x="154" y="44" width="196" height="36" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="252" y="60" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#b45309">INIT: Runtime + Static Code</text>
+            <text x="252" y="73" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#b45309">SDK Clients / DI / Pool (10s cap)</text>
+
+            <rect x="356" y="44" width="130" height="36" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="421" y="60" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#166534">INVOKE #1</text>
+            <text x="421" y="73" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#166534">Handler Logic</text>
+
+            <rect x="492" y="44" width="172" height="36" rx="4" fill="#f5f2ea" stroke="#c2b9a7" stroke-dasharray="3 2" />
+            <text x="578" y="60" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#575c66">vCPU Frozen</text>
+            <text x="578" y="73" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#575c66">Heap &amp; Sockets Kept</text>
+
+            <!-- Divider -->
+            <line x1="16" y1="102" x2="664" y2="102" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Warm Invocation -->
+            <text x="16" y="130" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Warm Invocation (Subsequent Sequential Request on Same Sandbox)</text>
+            <rect x="16" y="144" width="128" height="36" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="80" y="160" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#0f4c81">Unfreeze vCPU</text>
+            <text x="80" y="173" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#0f4c81">&lt; 1 ms overhead</text>
+
+            <rect x="150" y="144" width="150" height="36" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="225" y="160" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#166534">INVOKE #2 (Warm)</text>
+            <text x="225" y="173" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#166534">Reuses Static SDK Pool</text>
+
+            <rect x="306" y="144" width="130" height="36" rx="4" fill="#f5f2ea" stroke="#c2b9a7" stroke-dasharray="3 2" />
+            <text x="371" y="160" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#575c66">vCPU Frozen</text>
+            <text x="371" y="173" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#575c66">Awaits INVOKE #3</text>
+
+            <!-- Hyperplane callout strip -->
+            <rect x="16" y="198" width="648" height="34" rx="4" fill="#e9f1f8" stroke="#bfd7ed" />
+            <text x="340" y="219" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#0f4c81">
+              VPC Note: Hyperplane ENIs are provisioned at function deploy/update time—NOT per cold start.
+            </text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Cold starts pay MicroVM bootstrap plus <code>INIT</code> duration once per sandbox. Warm requests unfreeze the existing microVM and reuse module-level clients and connection pools.
+          </div>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. VPC Cold Starts &amp; AWS Hyperplane ENIs</h2>
+        <p>
+          Older AWS blog posts often warn: <em>"Never put Lambda in a VPC unless you can tolerate 10–15 second cold starts."</em> That advice became obsolete when AWS introduced <strong>AWS Hyperplane</strong> for VPC-connected Lambdas.
+        </p>
+        <p>
+          Before Hyperplane, every new concurrent microVM triggered <code>CreateNetworkInterface</code> in your VPC subnet at cold-start time, causing massive latency spikes and rapidly exhausting private subnet IP addresses. Today, AWS provisions shared <strong>Hyperplane ENIs</strong> asynchronously when you create or update your function—one ENI per unique <code>(Subnet, SecurityGroupSet)</code> combination across all functions sharing that tuple. At runtime, Firecracker microVMs open an internal tunnel to that pre-warmed Hyperplane ENI, bringing VPC cold starts down to parity with non-VPC Lambdas.
+        </p>
+
+        <div class="callout warning">
+          <div class="callout-title">Three VPC Lambda Traps That Still Break Production</div>
+          <ul style="margin: 0.4rem 0 0 1.1rem; padding: 0;">
+            <li><strong>Missing NAT Gateway or VPC Endpoints:</strong> Attaching a Lambda to private subnets removes its default AWS-managed internet route. Calls to DynamoDB, S3, Secrets Manager, or Stripe will hang until function timeout unless you route through a <strong>NAT Gateway</strong> or attach <strong>VPC Gateway/Interface Endpoints</strong>.</li>
+            <li><strong>Over-Permissive Security Group Churn:</strong> Hyperplane ENIs are shared per unique <code>(Subnet, SecurityGroupSet)</code>. Giving 40 Lambdas 40 distinct security groups across 3 subnets still consumes 120 subnet IPs.</li>
+            <li><strong>Frozen TCP Sockets:</strong> When a microVM freezes between invocations, an idle RDS or HTTP connection cannot respond to TCP keep-alives or server-side <code>FIN</code> packets—causing stale-socket timeouts on the next warm invoke. Use <strong>Amazon RDS Proxy</strong> for relational databases behind Lambda.</li>
+          </ul>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Concurrency Math, Throttling &amp; Reserved vs. Provisioned Concurrency</h2>
+        <p>
+          Lambda capacity planning starts with <strong>Little's Law</strong>:
+        </p>
+        <p style="font-family: var(--font-mono); background: var(--bg-subtle); padding: 0.65rem 0.9rem; border-radius: 6px; border: 1px solid var(--border); max-width: var(--measure);">
+          Concurrent Executions = Requests per Second (RPS) &times; Average Duration (seconds)
+        </p>
+        <p>
+          Suppose your checkout API serves <strong>100 RPS</strong> and normally finishes in <strong>200 ms (0.2 s)</strong>: it needs <code>100 &times; 0.2 = 20</code> concurrent microVMs. If a downstream PostgreSQL lock slows your handler from 200 ms to <strong>1.0 s</strong> at the same 100 RPS, required concurrency jumps <strong>5&times; to 100</strong>. By default, every AWS account starts with a soft quota of <strong>1,000 concurrent executions per Region</strong> shared across <em>all</em> functions, and individual functions scale up at <strong>1,000 concurrent executions every 10 seconds</strong> until hitting the account quota or a configured cap.
+        </p>
+        <p>
+          Senior engineers confuse <strong>Reserved Concurrency</strong> and <strong>Provisioned Concurrency</strong> constantly, yet they solve opposite problems:
+        </p>
+        <ul>
+          <li>
+            <strong>Reserved Concurrency (Ceiling + Guarantee, \$0 extra):</strong> Carves a dedicated slice out of your 1,000-execution regional pool. It simultaneously <em>guarantees</em> those slots are never stolen by noisy neighbors and acts as a <em>hard ceiling</em>—any request exceeding the reserved cap fails immediately with <code>429 TooManyRequestsException</code> (synchronous) or retries/DLQs (asynchronous). Setting Reserved Concurrency to <code>0</code> is an instant emergency <strong>kill switch</strong>.
+          </li>
+          <li>
+            <strong>Provisioned Concurrency (Pre-Warmed Sandboxes, Continuous Cost):</strong> Tells Lambda to keep <code>N</code> microVMs booted with <code>INIT</code> already completed, eliminating cold starts for those <code>N</code> slots. You pay continuous GB-hour charges while idle plus execution fees. Traffic beyond <code>N</code> overflows into standard on-demand cold-start scaling unless capped by Reserved Concurrency.
+          </li>
+        </ul>
+
+        <!-- SECTION 4 -->
+        <h2>4. Memory, vCPU Coupling &amp; Power Tuning</h2>
+        <p>
+          Lambda exposes no CPU slider. You configure memory from <strong>128 MB to 10,240 MB</strong> (in 1 MB steps), and AWS allocates vCPU, network bandwidth, and disk I/O proportionally—granting <strong>1 full vCPU at 1,769 MB</strong> and up to 6 vCPUs at 10,240 MB.
+        </p>
+        <p>
+          Lambda bills duration rounded up to the nearest <strong>1 ms</strong> in <strong>GB-seconds</strong>: <code>$0.0000166667</code> per GB-second on x86_64, or <strong>~20% cheaper</strong> at <code>$0.0000133334</code> per GB-second on AWS Graviton2 (<code>arm64</code>), plus <code>$0.20</code> per 1 million requests. Because doubling memory doubles vCPU:
+        </p>
+        <ul>
+          <li><strong>CPU-bound workloads</strong> (JSON/Protobuf parsing, JWT verification, PDF/image transforms, JVM/Kotlin cold starts) often finish in <em>less than half the time</em> at 1,024 MB vs. 512 MB—delivering faster p99 latency at the <strong>same or lower monthly bill</strong>.</li>
+          <li><strong>I/O-bound workloads</strong> (waiting 200 ms on DynamoDB or a third-party REST API) leave extra vCPU idle, so raising memory linearly increases cost with near-zero speedup.</li>
+        </ul>
+
+        <h3>Production Code Example: Static <code>INIT</code> Reuse &amp; CDK Sizing</h3>
+        <p>
+          Notice how the handler keeps the AWS SDK v3 client and HTTP keep-alive agent outside <code>handler()</code> so <code>INIT</code> runs once per sandbox, while CDK pins <code>arm64</code>, memory sizing, Hyperplane VPC subnets, and concurrency controls:
+        </p>
+<pre><code>// 1. handler.mjs — Static INIT runs ONCE per Firecracker microVM
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
+
+// Reused across all warm invocations in this execution environment
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+  marshallOptions: { removeUndefinedValues: true },
+});
+
+export const handler = async (event) =&gt; {
+  const orderId = event.pathParameters?.id;
+  const { Item } = await ddb.send(new GetCommand({
+    TableName: process.env.ORDERS_TABLE,
+    Key: { orderId },
+  }));
+  return { statusCode: Item ? 200 : 404, body: JSON.stringify(Item ?? { error: "Not found" }) };
+};
+
+// 2. lambda-stack.ts (AWS CDK) — Graviton2, Hyperplane VPC, Reserved + Provisioned
+const ordersFn = new lambda.Function(this, "OrdersReaderFn", {
+  runtime: lambda.Runtime.NODEJS_20_X,
+  architecture: lambda.Architecture.ARM_64,   // ~20% cheaper per GB-sec
+  memorySize: 1024,                           // Tuned via Power Tuning (sweet spot)
+  timeout: cdk.Duration.seconds(5),
+  reservedConcurrentExecutions: 100,          // Protect downstream DB &amp; isolate quota
+  vpc,
+  vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+  securityGroups: [sharedLambdaSg],           // Reuse SG across functions to save ENIs
+  code: lambda.Code.fromAsset("dist/orders"),
+  handler: "handler.handler",
+});
+
+// Optional: keep 10 pre-initialized sandboxes warm for latency-critical mobile traffic
+const prodAlias = ordersFn.addAlias("live", { provisionedConcurrentExecutions: 10 });</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement both functions in the Lambda Capacity &amp; Power-Tuning Simulator below:
+          <code>simulateConcurrency(workload)</code> to model Little's Law, reserved caps, throttling, and provisioned overflow, and <code>findOptimalPowerProfile(profiles, monthlyRequests, arch)</code> to find the lowest-cost memory tier.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your Lambda internals mental model against production failure scenarios. Every option explains why it succeeds or fails.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html" target="_blank" rel="noopener">AWS Lambda Execution Environment Lifecycle</a> (<code>INIT</code>, <code>INVOKE</code>, <code>SHUTDOWN</code> phases and static initialization reuse).
+          </li>
+          <li>
+            <strong>Concurrency &amp; Scaling:</strong> <a href="https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html" target="_blank" rel="noopener">Managing AWS Lambda Function Concurrency</a> (Reserved vs. Provisioned Concurrency and burst scaling).
+          </li>
+          <li>
+            <strong>VPC &amp; Hyperplane:</strong> <a href="https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html" target="_blank" rel="noopener">Configuring a Lambda Function to Access Resources in a VPC</a> (Hyperplane ENIs and private subnet egress).
+          </li>
+          <li>
+            <strong>Pricing &amp; Memory/vCPU:</strong> <a href="https://docs.aws.amazon.com/lambda/latest/dg/configuration-memory.html" target="_blank" rel="noopener">Configuring Memory Size for AWS Lambda</a> &amp; <a href="https://aws.amazon.com/lambda/pricing/" target="_blank" rel="noopener">AWS Lambda Pricing</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0029 (S3 Deep Dive: Strong Consistency, Block Public Access, Pre-Signed URLs &amp; Lifecycle)</strong>, ask about anything still fuzzy—for example: <em>"How does Lambda SnapStart cut Java/Kotlin JVM cold starts using Firecracker microVM memory snapshots?"</em> or <em>"When does Provisioned Concurrency lose to ECS Fargate on monthly cost?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0027-eks-kubernetes-irsa-tradeoffs.html">&larr; Lesson 0027: EKS (Kubernetes on AWS): Control Plane, IRSA/Pod Identity & When NOT to Use EKS</a>
+          <a href="./0029-s3-consistency-presigned-urls-lifecycle.html">Lesson 0029: S3 Deep Dive: Strong Consistency, Block Public Access, Pre-Signed URLs & Lifecycle &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>1,769 MB = 1 Full vCPU</strong>
+          CPU scales linearly with memory: 512 MB gets ~0.29 vCPU, 1,769 MB gets 1.0 vCPU, and 3,538 MB gets 2.0 vCPUs. For Kotlin/JVM Lambdas, AWS <strong>Lambda SnapStart</strong> snapshots the post-<code>INIT</code> Firecracker memory state to slash JVM cold starts from seconds to ~200 ms.
+        </div>
+        <div class="sidenote">
+          <strong>Frozen vCPU &amp; Stale Sockets</strong>
+          Between invocations, Lambda pauses the microVM completely. Never leave background coroutines running after returning a response, and put <strong>RDS Proxy</strong> in front of PostgreSQL/MySQL so thousands of frozen Lambdas don't exhaust database connections.
+        </div>
+        <div class="sidenote">
+          <strong>Automate Power Tuning</strong>
+          In real projects, run the open-source <a href="https://github.com/alexcasalboni/aws-lambda-power-tuning" target="_blank" rel="noopener">AWS Lambda Power Tuning</a> Step Functions state machine against staging to plot latency vs. cost from 128 MB to 10,240 MB automatically.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0028",
+      title: "Lab 0028: Lambda Concurrency, Throttling & Power-Tuning Simulator",
+      filename: "lambda-simulator.js",
+      description:
+        "Implement two functions:<br>(1) <code>simulateConcurrency(workload)</code> given <code>{ rps, avgDurationMs, accountQuota, reservedCap, provisionedCount }</code>: compute <code>requiredConcurrency = Math.ceil(rps * (avgDurationMs / 1000))</code>. Let <code>effectiveCap = (reservedCap !== null && reservedCap !== undefined) ? Math.min(accountQuota, reservedCap) : accountQuota</code>. Compute <code>activeConcurrency = Math.min(requiredConcurrency, effectiveCap)</code>, <code>throttledConcurrency = Math.max(0, requiredConcurrency - effectiveCap)</code>, <code>warmFromProvisioned = Math.min(activeConcurrency, provisionedCount || 0)</code>, and <code>onDemandOverflow = Math.max(0, activeConcurrency - warmFromProvisioned)</code>. Set <code>status</code> to <code>\"KILL_SWITCH\"</code> if <code>effectiveCap === 0</code>, else <code>\"THROTTLED\"</code> if <code>throttledConcurrency &gt; 0</code>, else <code>\"PROVISIONED_OVERFLOW\"</code> if <code>onDemandOverflow &gt; 0 && (provisionedCount || 0) &gt; 0</code>, else <code>\"HEALTHY\"</code>.<br>(2) <code>findOptimalPowerProfile(profiles, monthlyRequests, arch = \"arm64\")</code>: each profile has <code>{ memoryMb, avgDurationMs }</code>. Bill duration as <code>billedMs = Math.max(1, Math.ceil(avgDurationMs))</code>. Use <code>gbSecPrice = arch === \"arm64\" ? 0.0000133334 : 0.0000166667</code> and <code>requestCost = (monthlyRequests / 1_000_000) * 0.20</code>. Compute <code>totalMonthlyCost = Number((monthlyRequests * (memoryMb / 1024) * (billedMs / 1000) * gbSecPrice + requestCost).toFixed(4))</code>. Pick the lowest-cost profile (break cost ties by lowest <code>avgDurationMs</code>) and return <code>{ bestMemoryMb, bestDurationMs, bestMonthlyCost, evaluated }</code>.",
+      exports: ["simulateConcurrency", "findOptimalPowerProfile"],
+      starterCode: `function simulateConcurrency(workload) {
+  // workload: { rps, avgDurationMs, accountQuota, reservedCap, provisionedCount }
+  // TODO 1: compute requiredConcurrency using Little's Law (Math.ceil)
+  const requiredConcurrency = 0;
+
+  // TODO 2: compute effectiveCap, activeConcurrency, throttledConcurrency
+  const effectiveCap = 0;
+  const activeConcurrency = 0;
+  const throttledConcurrency = 0;
+
+  // TODO 3: compute warmFromProvisioned, onDemandOverflow, and status
+  const warmFromProvisioned = 0;
+  const onDemandOverflow = 0;
+  const status = "HEALTHY";
+
+  return {
+    requiredConcurrency,
+    effectiveCap,
+    activeConcurrency,
+    throttledConcurrency,
+    warmFromProvisioned,
+    onDemandOverflow,
+    status
+  };
+}
+
+function findOptimalPowerProfile(profiles, monthlyRequests, arch = "arm64") {
+  // profiles: Array<{ memoryMb: number, avgDurationMs: number }>
+  const gbSecPrice = arch === "arm64" ? 0.0000133334 : 0.0000166667;
+  const requestCost = (monthlyRequests / 1_000_000) * 0.20;
+
+  // TODO 4: evaluate each profile's totalMonthlyCost (rounded to 4 decimals)
+  const evaluated = [];
+
+  // TODO 5: pick lowest totalMonthlyCost (tie-break by lowest avgDurationMs)
+  return {
+    bestMemoryMb: 0,
+    bestDurationMs: 0,
+    bestMonthlyCost: 0,
+    evaluated
+  };
+}
+
+console.log(
+  "Concurrency sample:",
+  simulateConcurrency({
+    rps: 100,
+    avgDurationMs: 1000,
+    accountQuota: 1000,
+    reservedCap: 40,
+    provisionedCount: 20
+  })
+);
+console.log(
+  "Power tuning sample:",
+  findOptimalPowerProfile(
+    [
+      { memoryMb: 256, avgDurationMs: 420 },
+      { memoryMb: 512, avgDurationMs: 190 },
+      { memoryMb: 1024, avgDurationMs: 85 },
+      { memoryMb: 2048, avgDurationMs: 65 }
+    ],
+    10_000_000,
+    "arm64"
+  )
+);`,
+      hints: [
+        "In <code>simulateConcurrency</code>, check <code>effectiveCap === 0</code> first for <code>\"KILL_SWITCH\"</code>, then <code>throttledConcurrency &gt; 0</code> for <code>\"THROTTLED\"</code>, then <code>onDemandOverflow &gt; 0 && (workload.provisionedCount || 0) &gt; 0</code> for <code>\"PROVISIONED_OVERFLOW\"</code>.",
+        "In <code>findOptimalPowerProfile</code>, <code>billedMs = Math.max(1, Math.ceil(p.avgDurationMs))</code>. Compare candidates with <code>cand.totalMonthlyCost &lt; best.totalMonthlyCost || (cand.totalMonthlyCost === best.totalMonthlyCost && cand.avgDurationMs &lt; best.avgDurationMs)</code>."
+      ],
+      solutionExplanation:
+        "Little's Law (RPS * durationSeconds) immediately reveals how latency spikes multiply concurrency demand and trigger 429 throttles against reserved caps. Meanwhile, evaluating GB-seconds across memory tiers proves why CPU-bound functions often cost less at 1024 MB than at 256 MB.",
+      solutionCode: `function simulateConcurrency(workload) {
+  const { rps, avgDurationMs, accountQuota, reservedCap, provisionedCount } = workload;
+  const requiredConcurrency = Math.ceil(rps * (avgDurationMs / 1000));
+
+  const effectiveCap = (reservedCap !== null && reservedCap !== undefined)
+    ? Math.min(accountQuota, reservedCap)
+    : accountQuota;
+
+  const activeConcurrency = Math.min(requiredConcurrency, effectiveCap);
+  const throttledConcurrency = Math.max(0, requiredConcurrency - effectiveCap);
+
+  const provisioned = provisionedCount || 0;
+  const warmFromProvisioned = Math.min(activeConcurrency, provisioned);
+  const onDemandOverflow = Math.max(0, activeConcurrency - warmFromProvisioned);
+
+  let status = "HEALTHY";
+  if (effectiveCap === 0) {
+    status = "KILL_SWITCH";
+  } else if (throttledConcurrency > 0) {
+    status = "THROTTLED";
+  } else if (onDemandOverflow > 0 && provisioned > 0) {
+    status = "PROVISIONED_OVERFLOW";
+  }
+
+  return {
+    requiredConcurrency,
+    effectiveCap,
+    activeConcurrency,
+    throttledConcurrency,
+    warmFromProvisioned,
+    onDemandOverflow,
+    status
+  };
+}
+
+function findOptimalPowerProfile(profiles, monthlyRequests, arch = "arm64") {
+  const gbSecPrice = arch === "arm64" ? 0.0000133334 : 0.0000166667;
+  const requestCost = (monthlyRequests / 1_000_000) * 0.20;
+
+  const evaluated = profiles.map((p) => {
+    const billedMs = Math.max(1, Math.ceil(p.avgDurationMs));
+    const gbSeconds = (p.memoryMb / 1024) * (billedMs / 1000);
+    const computeCost = monthlyRequests * gbSeconds * gbSecPrice;
+    const totalMonthlyCost = Number((computeCost + requestCost).toFixed(4));
+    return {
+      memoryMb: p.memoryMb,
+      avgDurationMs: p.avgDurationMs,
+      totalMonthlyCost
+    };
+  });
+
+  let best = evaluated[0];
+  for (let i = 1; i < evaluated.length; i++) {
+    const cand = evaluated[i];
+    if (
+      cand.totalMonthlyCost < best.totalMonthlyCost ||
+      (cand.totalMonthlyCost === best.totalMonthlyCost && cand.avgDurationMs < best.avgDurationMs)
+    ) {
+      best = cand;
+    }
+  }
+
+  return {
+    bestMemoryMb: best.memoryMb,
+    bestDurationMs: best.avgDurationMs,
+    bestMonthlyCost: best.totalMonthlyCost,
+    evaluated
+  };
+}`,
+      tests: [
+        {
+          name: "Healthy traffic fits inside provisioned concurrency without overflow",
+          run: (scope) => {
+            const out = scope.simulateConcurrency({
+              rps: 100,
+              avgDurationMs: 150,
+              accountQuota: 1000,
+              reservedCap: 50,
+              provisionedCount: 20
+            });
+            const pass =
+              out.requiredConcurrency === 15 &&
+              out.activeConcurrency === 15 &&
+              out.throttledConcurrency === 0 &&
+              out.warmFromProvisioned === 15 &&
+              out.onDemandOverflow === 0 &&
+              out.status === "HEALTHY";
+            return { pass, message: `got status=${out.status}, required=${out.requiredConcurrency}, warm=${out.warmFromProvisioned}` };
+          }
+        },
+        {
+          name: "Downstream slowdown throttles excess concurrency past reservedCap",
+          run: (scope) => {
+            const out = scope.simulateConcurrency({
+              rps: 100,
+              avgDurationMs: 1000,
+              accountQuota: 1000,
+              reservedCap: 40,
+              provisionedCount: 20
+            });
+            const pass =
+              out.requiredConcurrency === 100 &&
+              out.effectiveCap === 40 &&
+              out.activeConcurrency === 40 &&
+              out.throttledConcurrency === 60 &&
+              out.warmFromProvisioned === 20 &&
+              out.onDemandOverflow === 20 &&
+              out.status === "THROTTLED";
+            return { pass, message: `got status=${out.status}, throttled=${out.throttledConcurrency}, overflow=${out.onDemandOverflow}` };
+          }
+        },
+        {
+          name: "Detects PROVISIONED_OVERFLOW when burst exceeds provisionedCount but stays under cap",
+          run: (scope) => {
+            const out = scope.simulateConcurrency({
+              rps: 150,
+              avgDurationMs: 200,
+              accountQuota: 1000,
+              reservedCap: null,
+              provisionedCount: 20
+            });
+            const pass =
+              out.requiredConcurrency === 30 &&
+              out.effectiveCap === 1000 &&
+              out.warmFromProvisioned === 20 &&
+              out.onDemandOverflow === 10 &&
+              out.status === "PROVISIONED_OVERFLOW";
+            return { pass, message: `got status=${out.status}, overflow=${out.onDemandOverflow}` };
+          }
+        },
+        {
+          name: "Flags KILL_SWITCH when reservedCap is 0",
+          run: (scope) => {
+            const out = scope.simulateConcurrency({
+              rps: 25,
+              avgDurationMs: 100,
+              accountQuota: 1000,
+              reservedCap: 0,
+              provisionedCount: 0
+            });
+            const pass =
+              out.effectiveCap === 0 &&
+              out.activeConcurrency === 0 &&
+              out.throttledConcurrency === 3 &&
+              out.status === "KILL_SWITCH";
+            return { pass, message: `got status=${out.status}, throttled=${out.throttledConcurrency}` };
+          }
+        },
+        {
+          name: "Power tuning picks 1024 MB over slower low-memory tiers on arm64 CPU-bound work",
+          run: (scope) => {
+            const out = scope.findOptimalPowerProfile(
+              [
+                { memoryMb: 256, avgDurationMs: 420 },
+                { memoryMb: 512, avgDurationMs: 190 },
+                { memoryMb: 1024, avgDurationMs: 85 },
+                { memoryMb: 2048, avgDurationMs: 65 }
+              ],
+              10_000_000,
+              "arm64"
+            );
+            const pass =
+              out.bestMemoryMb === 1024 &&
+              out.bestDurationMs === 85 &&
+              out.bestMonthlyCost === 13.3334 &&
+              out.evaluated.length === 4;
+            return { pass, message: `got bestMemoryMb=${out.bestMemoryMb}, bestMonthlyCost=${out.bestMonthlyCost}` };
+          }
+        },
+        {
+          name: "Power tuning breaks equal-cost ties in favor of faster duration (x86_64)",
+          run: (scope) => {
+            const out = scope.findOptimalPowerProfile(
+              [
+                { memoryMb: 512, avgDurationMs: 200 },
+                { memoryMb: 1024, avgDurationMs: 100 }
+              ],
+              5_000_000,
+              "x86_64"
+            );
+            const pass = out.bestMemoryMb === 1024 && out.bestDurationMs === 100;
+            return { pass, message: `got bestMemoryMb=${out.bestMemoryMb}, cost=${out.bestMonthlyCost}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0028",
+      title: "Quiz 0028: Firecracker, VPC Hyperplane & Concurrency Traps",
+      questions: [
+        {
+          id: "q1",
+          prompt: "An Android engineer migrates a Kotlin backend to AWS Lambda and instantiates a new DynamoDbClient and OkHttpClient inside the handler() method on every request. Under steady traffic, why do p95 latencies and cold-start costs stay unnecessarily high?",
+          options: [
+            "Every warm invocation repeats SDK initialization instead of reusing static sandbox state.",
+            "Firecracker microVMs destroy their local memory heap immediately after each handler finishes.",
+            "Lambda routes each warm request through a fresh Hyperplane elastic network interface.",
+            "AWS charges an extra socket fee whenever Lambda handlers open TLS connections."
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Moving client creation inside handler() forces every warm invocation to re-run SDK reflection, credential resolution, and TLS handshakes instead of reusing clients initialized once during INIT.",
+            "Firecracker microVMs freeze vCPU execution between invocations while preserving the process heap and open sockets in memory for subsequent warm requests.",
+            "Hyperplane ENIs are provisioned per (subnet, security group) tuple at deploy/update time, not rotated per warm invocation.",
+            "AWS bills Lambda by request count and GB-seconds of memory-duration; there is no separate per-socket TLS surcharge."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "You attach a Lambda function to two private VPC subnets so it can query RDS. After deploying, invocations hang and time out whenever the handler calls Secrets Manager or an external Stripe API—even though RDS queries succeed. What is missing?",
+          options: [
+            "Private subnets lack a NAT Gateway or VPC endpoints for outbound calls.",
+            "Hyperplane ENIs require at least thirty seconds to attach during every invoke.",
+            "Lambda execution roles automatically block HTTPS egress whenever RDS subnets are attached.",
+            "Firecracker microVMs disable all public DNS resolution inside every single private subnet."
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Once placed in private VPC subnets, Lambda loses its default AWS-managed internet path and needs a NAT Gateway (for Stripe) or VPC Interface Endpoints (for Secrets Manager).",
+            "Hyperplane ENIs are attached asynchronously when the function is created or updated, not for 30 seconds on every invocation.",
+            "IAM execution roles authorize AWS API calls (such as secretsmanager:GetSecretValue); they do not block outbound TCP/HTTPS routing at the VPC layer.",
+            "Route 53 Resolver still resolves public DNS names inside private subnets; the packets simply drop without an outbound route via NAT or an endpoint."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "A checkout Lambda handles 100 RPS with an average duration of 200 ms, protected by ReservedConcurrency = 40 and ProvisionedConcurrency = 20. During a payment gateway slowdown, average duration jumps to 1.0 s while traffic stays at 100 RPS. What happens?",
+          options: [
+            "Concurrency demand climbs to 100, capping active executions at 40 and throttling 60.",
+            "Provisioned capacity automatically scales to 40 warm sandboxes while avoiding all cold starts.",
+            "Lambda borrows unused regional concurrency above 40 until account limits hit 1,000 total.",
+            "Reserved capacity drops to 20 sandboxes because provisioned workers use half the pool."
+          ],
+          correctIndex: 0,
+          explanations: [
+            "By Little's Law, 100 RPS x 1.0 s = 100 required concurrent executions. ReservedConcurrency = 40 acts as a hard ceiling: 20 run on provisioned sandboxes, 20 burst on-demand (with cold starts), and 60 are throttled (429).",
+            "Provisioned Concurrency stays fixed at 20 unless configured with Application Auto Scaling, and slots 21–40 still incur on-demand cold starts.",
+            "Reserved Concurrency is a strict upper bound; Lambda never borrows regional capacity above a function's reserved limit.",
+            "Provisioned Concurrency (20) sits inside Reserved Concurrency (40) rather than reducing the 40-execution ceiling down to 20."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

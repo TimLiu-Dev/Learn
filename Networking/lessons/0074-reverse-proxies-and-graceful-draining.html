@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>74 · Reverse Proxies, L7 Routing &amp; Graceful Draining</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<article class="page">
+
+<header>
+  <p class="crumbs"><a href="../index.html">Networking</a> · Part 1 &amp;rsaquo; Module 3C: Applied Dev &amp;rsaquo; Session 0074 · Session 74</p>
+  <h1>Reverse Proxies, Request Smuggling &amp;amp; Graceful Draining</h1>
+  <p class="subtitle">How Nginx, Envoy, and API Gateways terminate TLS, rewrite hop-by-hop headers, stop CL.TE request smuggling, enforce rate limits, and drain connections cleanly on SIGTERM.</p>
+  <div class="meta"><span>~30 minutes</span><span>Tools: Java 25, curl, kill -TERM</span><span class="badge interview">★ Senior Dev Core</span><span class="badge prod">⚡ Zero-Downtime</span></div>
+</header>
+
+<section>
+  <div class="win">
+    <span class="box-label">Your win today</span>
+    <p>Trace exact L7 proxy header transforms (X-Forwarded-For, X-Forwarded-Proto, Connection/TE removal), prevent HTTP/1.1 CL.TE smuggling, distinguish token-bucket from sliding-window rate limits, and implement zero-502 SIGTERM graceful shutdown.</p>
+  </div>
+
+  <div class="warmup">
+    <span class="box-label">Warm-up · from earlier sessions</span>
+    <p>Two minutes, from memory, before you read on:</p>
+    <div class="recall" data-key="0074-warmup">
+      <p class="r-prompt">Your API server sits behind an ALB/Nginx reverse proxy. During a rolling deploy you stop the old backend container and see a spike of <code>502 Bad Gateway</code> errors even though Kubernetes already marked the pod <code>Terminating</code>. Why did in-flight or queued requests still hit the dead container?</p>
+      <div class="keypoints">
+        Two simultaneous race windows occur: (1) iptables/conntrack/Envoy endpoint removal is asynchronous with the pod receiving <code>SIGTERM</code>, so new TCP SYNs or pooled keep-alive requests still arrive for 1–5 seconds after <code>SIGTERM</code>; and (2) killing the HTTP listener immediately drops active in-flight requests mid-response. Returning <code>503</code> on <code>/healthz</code>, keeping the listener open briefly with <code>Connection: close</code>, and waiting for active requests to finish eliminates 502s.
+      </div>
+    </div>
+  </div>
+
+
+<section>
+  <h2>1 &middot; What a Reverse Proxy Actually Changes on the Wire</h2>
+  <p>Clients speak to the edge proxy (Nginx, Envoy, Cloudflare, AWS ALB) over TCP+TLS; the proxy maintains a <strong>separate pool of backend TCP connections</strong> to your application servers. Because backend sockets show the proxy's private IP as <code>remoteAddr</code>, the proxy injects forwarding metadata:</p>
+  <ul>
+    <li><code>X-Forwarded-For: &lt;client-ip&gt;, &lt;proxy1-ip&gt;</code> — <strong>Security trap:</strong> Never blindly trust the <em>leftmost</em> entry if clients can spoof <code>X-Forwarded-For</code> directly! Count backwards by your known number of trusted proxies (<code>rightmost minus N</code>), or parse <code>Forwarded</code> (RFC 7239).</li>
+    <li><code>X-Forwarded-Proto: https</code> and <code>X-Forwarded-Host</code> — Essential so your app generates <code>https://</code> redirects and validates OAuth callback URLs rather than seeing plain backend HTTP.</li>
+    <li><strong>Hop-by-hop header stripping (RFC 9110 §7.6.1):</strong> Proxies <strong>must strip</strong> <code>Connection</code>, <code>Keep-Alive</code>, <code>Proxy-Authenticate</code>, <code>TE</code>, <code>Transfer-Encoding</code>, and <code>Upgrade</code> (unless explicitly proxying WebSockets) so upstream framing doesn't corrupt downstream parsing.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>2 &middot; HTTP Request Smuggling (CL.TE &amp; TE.CL)</h2>
+  <p>In HTTP/1.1, message body length can be specified either by <code>Content-Length</code> (bytes) or <code>Transfer-Encoding: chunked</code>. If a front-end proxy trusts <code>Content-Length</code> while the backend honors <code>Transfer-Encoding</code> (a <strong>CL.TE</strong> desynchronization), an attacker's extra bytes inside one body spill into the backend's keep-alive buffer and get prepended as a hijacked prefix to the <em>next victim user's request</em> on that pooled connection.</p>
+  <div class="callout warn">
+    <strong>Defenses Required on Modern Proxies &amp; Apps:</strong>
+    <ul>
+      <li>Reject any HTTP/1.1 request containing <strong>both</strong> <code>Content-Length</code> and <code>Transfer-Encoding</code> (RFC 9112 §6.3 requires <code>400 Bad Request</code> and closing the connection) or duplicate conflicting <code>Content-Length</code> headers.</li>
+      <li>Upgrade proxy-to-origin links to <strong>HTTP/2</strong> (binary length-prefixed DATA frames eliminate ambiguous chunked vs CL text parsing — except beware improper H2-to-H1 downgrade proxies).</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>3 &middot; Rate Limiting &amp; Load Shedding Algorithms</h2>
+  <p>Edge proxies protect backends with L7 rate limiting (returning <code>429 Too Many Requests</code> + <code>Retry-After</code>):</p>
+  <ul>
+    <li><strong>Fixed Window Counter:</strong> Simple (<code>Redis INCR</code> per minute), but allows <strong>2&times; burst spike</strong> at window boundaries (e.g., 100 requests at 00:59 + 100 requests at 01:00 = 200 in 2 seconds).</li>
+    <li><strong>Token Bucket (Burst-friendly):</strong> Tokens refill at steady rate <em>r</em> up to capacity <em>B</em>. Allows legitimate short bursts (loading a dashboard) while capping sustained rate.</li>
+    <li><strong>Sliding Window Log / Weighted Counter:</strong> Smooths boundary spikes at slightly higher memory/state cost.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>4 &middot; Zero-Downtime Graceful Draining Lifecycle</h2>
+  <p>Never treat <code>SIGTERM</code> as "exit immediately". Follow this 4-step drain state machine (which you will implement directly in Capstone 1 / Session 0069):</p>
+  <ol>
+    <li><strong>Enter Draining State:</strong> Flip an atomic <code>draining = true</code> flag immediately upon receiving <code>SIGTERM</code>.</li>
+    <li><strong>Fail Readiness Probe:</strong> Make <code>GET /healthz</code> (or <code>/readyz</code>) immediately return <code>503 Service Unavailable</code> while keeping <code>/livez</code> (if separate) returning <code>200</code> so the orchestrator removes the pod from Service/ALB endpoints without force-killing it early.</li>
+    <li><strong>Stop Keep-Alive Reuse &amp; Wait for Drain Window:</strong> Wait a short preStop propagation delay (~2–5 s) so load balancers stop sending new requests, add <code>Connection: close</code> on responses, stop accepting new connections cleanly, and wait until <code>inFlight.sum() == 0</code> (bounded by a hard deadline before force-exit).</li>
+  </ol>
+</section>
+
+
+</section>
+
+<section>
+  <h2>Hands-On Inspection (macOS Terminal)</h2>
+  <ol class="steps" data-key="0074-steps">
+    <li>Use two netcat/Java terminals or <code>curl -v</code> against a local server to observe how <code>Connection: keep-alive</code> vs <code>Connection: close</code> changes socket reuse after response bytes finish.</li>
+    <li>Test readiness vs liveness probes visually with <code>curl -i http://localhost:8080/healthz</code> before and after signaling <code>kill -TERM &lt;pid&gt;</code> during a slow request.</li>
+    <li>Inspect request headers echoed by <code>https://httpbin.org/headers</code> (or a local Java echo server) to verify whether your edge proxy/VPN injected <code>X-Forwarded-For</code> or <code>Via</code>.</li>
+  </ol>
+</section>
+
+<section>
+  <h2>Zero-502 SIGTERM Drain Hook + Trusted Proxy IP Parser</h2>
+  <div class="code-tabs">
+    <div class="tab-buttons">
+      <button type="button" class="tab-btn active" data-lang="java">Java 25</button>
+      <button type="button" class="tab-btn" data-lang="kotlin">Kotlin</button>
+    </div>
+    <div class="tab-panel active" data-lang="java">
+      <div class="code-block-header">
+        <span class="code-lang-label">Java 25</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// 1. Safe right-to-left X-Forwarded-For extraction (trustedProxyCount = hops you control)
+public static String realClientIp(String xff, String remoteAddr, int trustedProxyCount) {
+    if (xff == null || xff.isBlank() || trustedProxyCount &lt;= 0) return remoteAddr;
+    String[] parts = xff.split(&quot;,&quot;);
+    int clientIdx = parts.length - trustedProxyCount;
+    if (clientIdx &lt; 0) return parts[0].trim(); // fewer hops than expected
+    return parts[clientIdx].trim();
+}
+
+// 2. Graceful shutdown hook (Java JVM / Raw ServerSocket)
+Runtime.getRuntime().addShutdownHook(new Thread(() -&gt; {
+    draining.set(true);               // /healthz immediately returns 503
+    try { Thread.sleep(2000); } catch (InterruptedException ignored) {} // LB propagation
+    try { serverSocket.close(); } catch (IOException ignored) {}
+    long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
+    while (inFlight.sum() &gt; 0 &amp;&amp; System.nanoTime() &lt; deadline) {
+        try { Thread.sleep(25); } catch (InterruptedException ignored) {}
+    }
+}));</code></pre>
+    </div>
+    <div class="tab-panel" data-lang="kotlin">
+      <div class="code-block-header">
+        <span class="code-lang-label">Kotlin</span>
+        <button type="button" class="btn-copy" title="Copy code">Copy</button>
+      </div>
+      <pre><code>// Ktor / Spring / Netty graceful drain configuration snippet
+val server = embeddedServer(Netty, port = 8080) {
+    routing {
+        get(&quot;/healthz&quot;) {
+            if (draining.get()) call.respond(HttpStatusCode.ServiceUnavailable, &quot;draining&quot;)
+            else call.respondText(&quot;ok&quot;)
+        }
+    }
+}
+Runtime.getRuntime().addShutdownHook(Thread {
+    draining.set(true)
+    server.stop(gracePeriodMillis = 3000, timeoutMillis = 15000)
+})</code></pre>
+    </div>
+  </div>
+
+  <h2>Lab: Anti-Smuggling Validator &amp; Trusted Client IP Extractor</h2>
+  <div class="code-practice" data-key="0074-practice">
+    <div class="practice-bar">
+      <span class="practice-title">Interactive Code Practice · Java 25</span>
+      <span class="runner-badge" title="Daemon connection status">checking runner…</span>
+    </div>
+    <p class="practice-desc">Implement two critical edge-proxy security checks in Java 25: (1) <code>rejectAmbiguousFraming(Map&lt;String, List&lt;String&gt;&gt; headers)</code> returning <code>true</code> (must reject with 400) if both <code>content-length</code> and <code>transfer-encoding</code> exist OR if multiple differing <code>content-length</code> values exist; and (2) <code>extractClientIp(String xff, String socketIp, int trustedHops)</code> parsing XFF safely from the right.</p>
+    <div class="editor-shell">
+      <textarea class="practice-editor" spellcheck="false" autocomplete="off" autocapitalize="off" rows="15">import java.util.*;
+
+public class Solution {
+    /**
+     * Header keys are lowercase. Reject (return true) if BOTH transfer-encoding and
+     * content-length appear, OR if content-length has &gt;1 distinct/invalid values.
+     */
+    public static boolean rejectAmbiguousFraming(Map&lt;String, List&lt;String&gt;&gt; headers) {
+        // TODO: implement RFC 9112 §6.3 smuggling defense
+        return false;
+    }
+
+    /**
+     * Given &quot;spoofed, realClient, cdn1, alb2&quot; with trustedHops=2,
+     * the proxy appended [cdn1, alb2]? Wait: normally each proxy appends the peer IP it saw!
+     * Let&#x27;s follow standard reverse-proxy append semantics:
+     * With remoteAddr = lastProxy and XFF list [client_or_spoof, ..., prevProxy],
+     * the full chain from left to right is [xff..., socketIp].
+     * Counting trustedHops from the right (including socketIp as hop 1), return the untrusted client IP.
+     */
+    public static String extractClientIp(String xff, String socketIp, int trustedHops) {
+        // TODO: parse right-to-left over combined [xff..., socketIp]
+        return socketIp;
+    }
+}
+</textarea>
+    </div>
+    <div class="practice-actions">
+      <button type="button" class="btn btn-run">▶ Run &amp; Check</button>
+      <button type="button" class="btn btn-secondary btn-reset">Reset</button>
+      <button type="button" class="btn btn-secondary btn-hint">💡 Hint</button>
+      <button type="button" class="btn btn-secondary btn-solution">Show Solution</button>
+    </div>
+    <div class="practice-hints" hidden></div>
+    <div class="practice-solution" hidden></div>
+    <div class="practice-console" hidden>
+      <div class="console-head">Test Output:</div>
+      <pre class="console-body"></pre>
+    </div>
+    <script type="text/plain" class="starter-code">import java.util.*;
+
+public class Solution {
+    /**
+     * Header keys are lowercase. Reject (return true) if BOTH transfer-encoding and
+     * content-length appear, OR if content-length has >1 distinct/invalid values.
+     */
+    public static boolean rejectAmbiguousFraming(Map<String, List<String>> headers) {
+        // TODO: implement RFC 9112 §6.3 smuggling defense
+        return false;
+    }
+
+    /**
+     * Given "spoofed, realClient, cdn1, alb2" with trustedHops=2,
+     * the proxy appended [cdn1, alb2]? Wait: normally each proxy appends the peer IP it saw!
+     * Let's follow standard reverse-proxy append semantics:
+     * With remoteAddr = lastProxy and XFF list [client_or_spoof, ..., prevProxy],
+     * the full chain from left to right is [xff..., socketIp].
+     * Counting trustedHops from the right (including socketIp as hop 1), return the untrusted client IP.
+     */
+    public static String extractClientIp(String xff, String socketIp, int trustedHops) {
+        // TODO: parse right-to-left over combined [xff..., socketIp]
+        return socketIp;
+    }
+}
+</script>
+    <script type="text/plain" class="test-harness">import java.util.*;
+
+public class Lab {
+    public static void main(String[] args) {
+        int passed = 0, total = 5;
+
+        // 1. Both CL and TE present -> must reject!
+        Map<String, List<String>> clTe = Map.of(
+            "content-length", List.of("10"),
+            "transfer-encoding", List.of("chunked")
+        );
+        if (Solution.rejectAmbiguousFraming(clTe)) passed++;
+        else System.out.println("FAIL 1: should reject CL+TE");
+
+        // 2. Conflicting duplicate CL -> must reject!
+        Map<String, List<String>> dupCl = Map.of(
+            "content-length", List.of("5", "12")
+        );
+        if (Solution.rejectAmbiguousFraming(dupCl)) passed++;
+        else System.out.println("FAIL 2: should reject duplicate differing CL");
+
+        // 3. Normal valid single CL -> must allow (false)
+        Map<String, List<String>> okCl = Map.of("content-length", List.of("42"));
+        if (!Solution.rejectAmbiguousFraming(okCl)) passed++;
+        else System.out.println("FAIL 3: valid CL rejected");
+
+        // 4. Anti-spoofing XFF: client spoofed "1.1.1.1", real client was "198.51.100.9",
+        // Nginx (10.0.1.5) saw 198.51.100.9, ALB (10.0.2.8) saw 10.0.1.5, app sees socketIp=10.0.2.8.
+        // Chain = ["1.1.1.1", "198.51.100.9", "10.0.1.5", "10.0.2.8"].
+        // trustedHops = 2 (ALB + Nginx) -> step 2 hops from right: lands on "198.51.100.9"
+        String ip1 = Solution.extractClientIp("1.1.1.1, 198.51.100.9, 10.0.1.5", "10.0.2.8", 2);
+        if ("198.51.100.9".equals(ip1)) passed++;
+        else System.out.println("FAIL 4: expected 198.51.100.9 got " + ip1);
+
+        // 5. Direct client without trusted proxies (trustedHops = 0) -> socketIp wins
+        String ip2 = Solution.extractClientIp("9.9.9.9", "203.0.113.7", 0);
+        if ("203.0.113.7".equals(ip2)) passed++;
+        else System.out.println("FAIL 5: expected socketIp 203.0.113.7 got " + ip2);
+
+        System.out.println("SUMMARY:" + passed + "/" + total);
+        if (passed != total) System.exit(1);
+    }
+}
+</script>
+    <script type="text/plain" class="solution-code">import java.util.*;
+
+public class Solution {
+    public static boolean rejectAmbiguousFraming(Map<String, List<String>> headers) {
+        List<String> cls = headers.getOrDefault("content-length", List.of());
+        List<String> tes = headers.getOrDefault("transfer-encoding", List.of());
+        if (!cls.isEmpty() && !tes.isEmpty()) return true;
+        if (cls.size() > 1) {
+            Set<String> distinct = new HashSet<>();
+            for (String v : cls) distinct.add(v.trim());
+            if (distinct.size() > 1) return true;
+        }
+        return false;
+    }
+
+    public static String extractClientIp(String xff, String socketIp, int trustedHops) {
+        if (trustedHops <= 0 || xff == null || xff.isBlank()) return socketIp;
+        List<String> chain = new ArrayList<>();
+        for (String p : xff.split(",")) {
+            String trimmed = p.trim();
+            if (!trimmed.isEmpty()) chain.add(trimmed);
+        }
+        chain.add(socketIp);
+        int idx = chain.size() - 1 - trustedHops;
+        if (idx < 0) return chain.get(0);
+        return chain.get(idx);
+    }
+}
+</script>
+    <script type="application/json" class="hints-data">["Check <code>!cls.isEmpty() &amp;&amp; !tes.isEmpty()</code> first, then verify whether trimmed entries in <code>cls</code> contain more than one unique value.", "Build <code>chain</code> by splitting <code>xff</code> by commas and appending <code>socketIp</code> at the end; walking <code>trustedHops</code> left from the last element lands at index <code>chain.size() - 1 - trustedHops</code>."]</script>
+  </div>
+</section>
+
+<section>
+  <h2>Free Recall Practice</h2>
+  <div class="recall" data-key="0074-recall">
+    <p class="r-prompt">Without looking back: (1) Why is reading X-Forwarded-For from left-to-right an IP spoofing vulnerability? (2) What makes CL.TE smuggling possible? (3) Name the 4 steps of graceful SIGTERM shutdown.</p>
+    <div class="keypoints">
+      <ul>
+        <li>Clients can forge arbitrary leftmost XFF values; only the last N hops added by trusted proxies are authentic.</li>
+        <li>CL.TE arises when front proxy parses Content-Length while backend parses Transfer-Encoding: chunked on a shared keep-alive connection.</li>
+        <li>Enter draining -> fail /healthz with 503 -> wait LB deregistration propagation + reject/close new keep-alive -> drain in-flight counter to 0.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="q" data-answer="3">
+      <p class="q-prompt">A client sends <code>X-Forwarded-For: 127.0.0.1</code> directly to your single Nginx proxy (which connects to your backend over 10.0.0.5). What full value does Nginx typically forward, and how must the backend pick the true client IP?</p>
+      <ol class="options">
+        <li data-why="Incorrect: By default proxy_set_header X-Forwarded-For appends to any client-supplied header.">Nginx strips 127.0.0.1 automatically and sends only the backend loopback address.</li>
+        <li data-why="Incorrect: Proxies append on the right, making leftmost entries completely spoofable by any HTTP client.">The backend picks the leftmost entry in the list because proxies prepend from left to right.</li>
+        <li data-why="Incorrect: SNI contains the destination hostname, never the source client IP address.">The backend ignores X-Forwarded-For completely and trusts only the TLS ClientHello SNI field.</li>
+        <li data-why="Correct! Walking backwards from the trusted proxy connection skips attacker-controlled leftmost entries.">Pick the rightmost trusted-proxy offset from [127.0.0.1, realClientIp, socketIp], defeating the spoof.</li>
+      </ol>
+      <div class="q-explain">Always walk XFF right-to-left stripping only the exact number of trusted edge proxies you control.</div>
+    </div>
+    <div class="q" data-answer="0">
+      <p class="q-prompt">What is the exact HTTP/1.1 violation that enables CL.TE request smuggling across a reverse proxy?</p>
+      <ol class="options">
+        <li data-why="Correct! Differing framing interpretation causes trailing body bytes to sit in the pooled backend socket as the next user&#x27;s request prefix.">Both Content-Length and Transfer-Encoding appear; the proxy obeys CL while the origin obeys TE.</li>
+        <li data-why="Incorrect: Query strings carry application text and cannot hijack keep-alive TCP framing on the backend pool.">The client transmits a TLS 1.2 session ticket inside a GET query string parameter.</li>
+        <li data-why="Incorrect: User-Agent is an end-to-end informational header and does not govern byte framing.">The proxy fails to strip the User-Agent header before forwarding to the backend server.</li>
+        <li data-why="Incorrect: Encoding mismatch causes unreadable body bytes on one response, not cross-request smuggling.">The backend compresses responses with Brotli while the client only accepts gzip.</li>
+      </ol>
+      <div class="q-explain">RFC 9112 forbids accepting ambiguous Content-Length + Transfer-Encoding combinations.</div>
+    </div>
+    <div class="q" data-answer="2">
+      <p class="q-prompt">Why does returning 503 on /healthz immediately on SIGTERM, followed by a brief delay before closing the server socket, prevent 502 Bad Gateway spikes during deploys?</p>
+      <ol class="options">
+        <li data-why="Incorrect: Established TCP sockets cannot migrate between containers cleanly; 503 signals the external load balancer.">Returning 503 instructs the Linux kernel to migrate live TCP sockets to the replacement pod automatically.</li>
+        <li data-why="Incorrect: Clients do not call internal /healthz probes; orchestrators and load balancers poll /healthz.">A 503 health check forces clients to clear their local DNS caches and reconnect straight to the DB.</li>
+        <li data-why="Correct! Asynchronous endpoint removal takes a couple seconds, so continuing to serve arriving traffic avoids abrupt resets.">Load balancers stop routing new traffic once probes fail while existing in-flight requests finish cleanly.</li>
+        <li data-why="Incorrect: Health probes only control load-balancer pool membership, not protocol semantics.">It converts HTTP/1.1 requests automatically into asynchronous webhooks stored on disk.</li>
+      </ol>
+      <div class="q-explain">Combining immediate /healthz 503 with a propagation sleep and in-flight wait closes the K8s/LB deregistration race window.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="source">
+    <span class="box-label">Primary source</span>
+    <p><a href="https://datatracker.ietf.org/doc/html/rfc9112#section-6.3" target="_blank" rel="noopener">RFC 9112 §6.3 — HTTP/1.1 Message Body Length &amp; Request Smuggling Rules</a></p>
+    <p><a href="https://datatracker.ietf.org/doc/html/rfc7239" target="_blank" rel="noopener">RFC 7239 — Forwarded HTTP Extension</a></p>
+    <p><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination" target="_blank" rel="noopener">Kubernetes Docs — Pod Termination &amp; Endpoint Drain Race</a></p>
+  </div>
+  <div class="ask">
+    <span class="box-label">Ask your teacher</span>
+    <p>How does HTTP/2-to-HTTP/1.1 request smuggling (H2.CL or H2.TE) work when a proxy converts binary HTTP/2 frames into text HTTP/1.1 upstream?</p>
+  </div>
+</section>
+
+<nav class="lesson-nav">
+  <a class="prev" href="0073-mobile-and-edge-networking.html"><small>&larr; Previous</small>0073 · Mobile, Android &amp; Edge Client Networking</a>
+  <a class="next" href="0066-the-url-question.html"><small>Next &rarr;</small>0066 · Capstone: The URL Question</a>
+</nav>
+
+</article>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/steps.js"></script>
+<script src="../assets/fill-in.js"></script>
+<script src="../assets/recall.js"></script>
+<script src="../assets/code-tabs.js"></script>
+<script src="../assets/code-practice.js"></script>
+</body>
+</html>

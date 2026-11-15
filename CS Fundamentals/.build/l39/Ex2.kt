@@ -6,8 +6,8 @@ data class Email(
     val html: Boolean = false,
 ) {
     init {
-        check("@" in to) { "bad address: $to" }
-        check(subject.isNotBlank()) { "subject is required" }
+        require("@" in to) { "bad address: $to" }
+        require(subject.isNotBlank()) { "subject is required" }
     }
 
     companion object {

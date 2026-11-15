@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0004 — API Design at Scale: REST Semantics, Pagination &amp; Rate Limiting</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0004</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0004-api-design-pagination-rate-limiting.html" class="active">Lesson 0004</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part1">Part 1 &middot; Module 1.2</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>API Design at Scale: REST Semantics, Pagination &amp; Rate Limiting</h1>
+    <p class="lead">
+      An API that feels instant with 50 rows and 5 test devices breaks violently at 50 million rows and 100,000 mobile clients. Here is how senior backend engineers design idempotent writes for flaky cellular links, replace <code>O(N)</code> offset queries with <code>O(log N)</code> cursor pagination, and protect databases with token-bucket rate limiters and <code>HTTP 429 Retry-After</code>.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, <strong>Jetpack Paging 3</strong> asks your <code>PagingSource&lt;String, Item&gt;</code> for an opaque <code>LoadParams.Append(key)</code> and passes it through <strong>Retrofit</strong> as <code>@Query("cursor")</code>. If the backend implements that parameter with SQL <code>OFFSET</code>, users see duplicate feed items whenever new rows arrive—and page 5,000 takes hundreds of milliseconds to scan. Worse, if Retrofit retries a timed-out <code>POST /orders</code> or ignores <code>HTTP 429 Retry-After</code>, your mobile app causes duplicate charges and synchronized retry storms.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. REST Semantics &amp; Idempotency Over Flaky Mobile Networks</h2>
+        <p>
+          Per <a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2" target="_blank" rel="noopener">RFC 9110 (HTTP Semantics, &sect;9.2)</a>, HTTP methods carry strict contracts that load balancers, OkHttp caches, and retry interceptors rely on:
+        </p>
+        <ul>
+          <li><strong>Safe &amp; Idempotent (<code>GET</code>, <code>HEAD</code>):</strong> Read-only. Calling them 1 time or 10 times changes zero server state, so clients and CDNs may retry safely.</li>
+          <li><strong>Unsafe &amp; Idempotent (<code>PUT</code>, <code>DELETE</code>):</strong> Mutates state, but repeating the exact same request yields the same resource state (e.g., <code>PUT /users/42/preferences</code> replaces the document; <code>DELETE /sessions/abc</code> leaves the session absent whether called once or twice).</li>
+          <li><strong>Unsafe &amp; Non-Idempotent (<code>POST</code>):</strong> Creates a new side effect every time it executes (e.g., <code>POST /v1/charges</code> or <code>POST /v1/orders</code>).</li>
+        </ul>
+        <p>
+          Here is the mobile failure mode: an Android user taps <em>"Confirm Order ($49)"</em> in an elevator. Your backend behind an <a href="../reference/glossary.html#alb">ALB</a> commits the order and sends <code>201 Created</code>, but the cellular tunnel drops before Android reads the bytes. The user taps again—or an automatic retry fires—and your server processes a <strong>second</strong> <code>POST /v1/orders</code>, charging the customer twice.
+        </p>
+        <p>
+          As documented in the <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/" target="_blank" rel="noopener">Amazon Builders' Library ("Making retries safe with idempotent APIs")</a>, the production fix is an explicit <strong><code>Idempotency-Key</code></strong> header (a UUIDv4 generated once per user action on Android):
+        </p>
+        <ol>
+          <li>Android generates <code>idempotencyKey = UUID.randomUUID()</code> when the checkout sheet opens and sends <code>Idempotency-Key: &lt;uuid&gt;</code> on every retry of that attempt.</li>
+          <li>The backend performs an atomic insert/conditional write (e.g., PostgreSQL <code>INSERT ... ON CONFLICT DO NOTHING</code> or DynamoDB <code>attribute_not_exists(idempotency_key)</code>) keyed by <code>(tenant_id, idempotency_key)</code> with a 24-hour TTL.</li>
+          <li>If the key already exists with the <strong>same payload hash</strong>, the server returns the stored <code>201</code> response without re-running business logic. If the payload hash differs, it rejects with <strong><code>409 Conflict</code></strong> or <strong><code>422 Unprocessable Content</code></strong> to expose client bugs.</li>
+        </ol>
+        <p>
+          For partial updates, prefer <code>PATCH</code> with explicit semantics (JSON Merge Patch, RFC 7396) and evolve response schemas additively: add optional fields, never change a field's type in place, and version breaking contracts via URI (<code>/v2/orders</code>) or media-type versioning with deprecation headers.
+        </p>
+
+        <!-- SECTION 2 -->
+        <h2>2. Offset vs. Cursor (Keyset) Pagination at 10M+ Rows</h2>
+        <p>
+          Small admin dashboards often use <code>LIMIT 20 OFFSET 40</code>. At consumer scale (10 million orders or social posts), <strong>offset pagination fails in two ways</strong>:
+        </p>
+        <ol>
+          <li><strong>Linear <code>O(offset + limit)</code> Database Cost:</strong> To serve <code>LIMIT 20 OFFSET 100000</code>, PostgreSQL must still walk and discard <strong>100,000</strong> index entries (and often heap pages) before returning rows 100,001–100,020. Latency climbs from <strong>2 ms</strong> on page 1 to <strong>350–800 ms</strong> at deep pages, burning RDS IOPS.</li>
+          <li><strong>Page Drift (Duplicates &amp; Skips):</strong> If 2 new orders arrive while a user scrolls from page 1 to page 2, every row shifts down by 2 positions. Items #19 and #20 from page 1 reappear at the top of page 2—breaking Jetpack Paging 3's <code>DiffUtil</code> list integrity.</li>
+        </ol>
+        <p>
+          <strong>Cursor (Keyset) Pagination</strong> solves both problems by encoding the deterministic sort boundary of the last item returned—for example <code>{"v":1,"ts":1731648000000,"id":"ord_987"}</code> as an opaque Base64URL string—and seeking directly in the B-Tree index:
+        </p>
+        <p>
+          <code>WHERE (created_at, id) &lt; ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 21</code>
+        </p>
+        <p>
+          Notice two senior details: first, the unique tie-breaker <code>id</code> guarantees rows sharing the exact same millisecond timestamp are never skipped; second, requesting <code>limit + 1</code> (21 rows when the client asked for 20) reveals <code>hasMore = rows.length &gt; 20</code> in a single <strong>~2 ms</strong> query, eliminating expensive <code>SELECT COUNT(*)</code> scans.
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 230" width="100%" height="auto" role="img" aria-label="Offset Scan vs Cursor Keyset B-Tree Seek">
+            <rect x="0" y="0" width="680" height="230" fill="#fdfcf8" rx="6" />
+
+            <!-- Offset Row -->
+            <text x="16" y="30" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Offset Pagination: LIMIT 20 OFFSET 100000 — O(N) Scan + Row Drift</text>
+            <rect x="16" y="44" width="380" height="36" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="206" y="66" text-anchor="middle" font-family="monospace" font-size="11" fill="#991b1b">Scans &amp; discards 100,000 rows (~420 ms)</text>
+
+            <rect x="404" y="44" width="110" height="36" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="459" y="66" text-anchor="middle" font-family="monospace" font-size="11" fill="#b45309">Return 20 rows</text>
+
+            <text x="526" y="60" font-family="sans-serif" font-size="11" fill="#991b1b">New insert at #1</text>
+            <text x="526" y="75" font-family="sans-serif" font-size="11" fill="#991b1b">shifts rows &rarr; dupes!</text>
+
+            <!-- Divider -->
+            <line x1="16" y1="106" x2="664" y2="106" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Cursor Row -->
+            <text x="16" y="136" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Cursor (Keyset) Pagination: WHERE (ts, id) &lt; cursor LIMIT 21 — O(log N) Seek</text>
+            <rect x="16" y="150" width="165" height="36" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="98" y="172" text-anchor="middle" font-family="monospace" font-size="11" fill="#0f4c81">B-Tree Seek (~1.5 ms)</text>
+
+            <line x1="181" y1="168" x2="396" y2="168" stroke="#0f4c81" stroke-width="2" stroke-dasharray="5 3" />
+            <polygon points="396,163 404,168 396,173" fill="#0f4c81" />
+            <text x="292" y="160" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#0f4c81">Skips 100,000 rows directly</text>
+
+            <rect x="404" y="150" width="130" height="36" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="469" y="172" text-anchor="middle" font-family="monospace" font-size="11" fill="#166534">Read 21 rows (~0.5 ms)</text>
+
+            <text x="546" y="166" font-family="sans-serif" font-size="11" fill="#166534">Stable boundary:</text>
+            <text x="546" y="181" font-family="sans-serif" font-size="11" fill="#166534">zero duplicate items</text>
+
+            <text x="16" y="212" font-family="sans-serif" font-size="11.5" fill="#575c66">Always validate &amp; bound decoded cursor fields (and optionally HMAC-sign them) so tampered client cursors return 400, never 500.</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Keyset cursor pagination keeps page 5,000 nearly as fast as page 1 (~2 ms) and eliminates insert-induced duplicates in Android Paging 3 feeds.
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Rate Limiting: Token Bucket Math &amp; <code>HTTP 429 Retry-After</code></h2>
+        <p>
+          Without rate limiting, a single buggy mobile release or credential-stuffing botnet can exhaust your RDS connection pool and take down every customer. Naive <strong>Fixed Window Counters</strong> (e.g., "100 req/min per user") suffer from a classic <strong>2x boundary spike</strong>: a client sends 100 requests at <code>12:00:59</code> and another 100 at <code>12:01:01</code>, pushing 200 requests in 2 seconds.
+        </p>
+        <p>
+          Production cloud gateways—including <a href="https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html" target="_blank" rel="noopener">AWS API Gateway</a> and AWS WAF—use the <strong>Token Bucket</strong> algorithm, defined by two numbers:
+        </p>
+        <ul>
+          <li><strong>Capacity / Burst Limit (<code>B</code>):</strong> Maximum tokens the bucket can hold (e.g., API Gateway's account-level default is <code>5,000</code> concurrent burst requests). Allows legitimate short mobile bursts (app launch fetching 5 screens in parallel).</li>
+          <li><strong>Refill Rate (<code>R</code> tokens/sec):</strong> Steady-state sustained throughput (e.g., API Gateway's default is <code>10,000 req/s</code>; per-tenant plans are often <code>10–100 req/s</code>).</li>
+        </ul>
+        <p>
+          On each request at timestamp <code>nowMs</code>, the limiter refills lazily without background timers:
+        </p>
+        <p>
+          <code>tokens = Math.min(capacity, tokens + ((nowMs - lastRefillMs) / 1000) * refillPerSec)</code>
+        </p>
+        <p>
+          If <code>tokens &gt;= cost</code> (normally <code>1</code>), deduct <code>cost</code> and allow the request (<code>200</code>). Otherwise reject with <strong><code>HTTP 429 Too Many Requests</code></strong> and include <strong><code>Retry-After</code></strong> (<a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3" target="_blank" rel="noopener">RFC 9110 &sect;10.2.3</a>), computed as <code>Math.ceil((cost - tokens) / refillPerSec)</code> seconds.
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 205" width="100%" height="auto" role="img" aria-label="Token Bucket Rate Limiter Flow">
+            <rect x="0" y="0" width="680" height="205" fill="#fdfcf8" rx="6" />
+
+            <!-- Refill -->
+            <rect x="20" y="24" width="175" height="44" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="107" y="43" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f4c81">Steady Refill</text>
+            <text x="107" y="59" text-anchor="middle" font-family="monospace" font-size="11" fill="#0f4c81">+ R tokens / sec</text>
+
+            <line x1="107" y1="68" x2="107" y2="96" stroke="#0f4c81" stroke-width="2" />
+            <polygon points="102,96 112,96 107,104" fill="#0f4c81" />
+
+            <!-- Bucket -->
+            <rect x="20" y="106" width="175" height="74" rx="6" fill="#fef3c7" stroke="#b45309" stroke-width="2" />
+            <text x="107" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#b45309">Token Bucket</text>
+            <text x="107" y="149" text-anchor="middle" font-family="monospace" font-size="11" fill="#1b1d21">0 &le; tokens &le; Capacity (B)</text>
+            <text x="107" y="167" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#575c66">Caps burst at B tokens</text>
+
+            <!-- Decision -->
+            <line x1="195" y1="143" x2="262" y2="143" stroke="#575c66" stroke-width="2" />
+            <polygon points="262,138 270,143 262,148" fill="#575c66" />
+
+            <rect x="272" y="113" width="138" height="60" rx="4" fill="#ffffff" stroke="#c2b9a7" />
+            <text x="341" y="138" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">Request arrives</text>
+            <text x="341" y="156" text-anchor="middle" font-family="monospace" font-size="11" fill="#0f4c81">tokens &gt;= cost?</text>
+
+            <!-- Allow branch -->
+            <line x1="410" y1="128" x2="472" y2="86" stroke="#166534" stroke-width="2" />
+            <polygon points="468,82 478,82 474,91" fill="#166534" />
+            <rect x="480" y="42" width="180" height="58" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="570" y="64" text-anchor="middle" font-family="monospace" font-size="11.5" font-weight="700" fill="#166534">YES: tokens -= cost</text>
+            <text x="570" y="83" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#166534">Forward to API (200 OK)</text>
+
+            <!-- Reject branch -->
+            <line x1="410" y1="158" x2="472" y2="158" stroke="#991b1b" stroke-width="2" />
+            <polygon points="472,153 480,158 472,163" fill="#991b1b" />
+            <rect x="480" y="122" width="180" height="64" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="570" y="144" text-anchor="middle" font-family="monospace" font-size="11.5" font-weight="700" fill="#991b1b">NO: HTTP 429</text>
+            <text x="570" y="162" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#991b1b">Retry-After: ceil(deficit/R)</text>
+            <text x="570" y="177" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#991b1b">Client adds random jitter</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 2: Lazy token-bucket evaluation computes elapsed refill on demand—no background timer per user required—and emits exact <code>Retry-After</code> seconds when exhausted.
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-title">Beware the Synchronized Retry Herd on <code>Retry-After</code></div>
+          <p style="margin: 0;">
+            If 5,000 Android devices receive <code>HTTP 429</code> with <code>Retry-After: 5</code> at <code>12:00:00</code> and every device schedules a coroutine <code>delay(5_000)</code>, all 5,000 devices slam your API again at <code>12:00:05.000</code>. Always teach mobile clients to add <strong>random jitter</strong> (e.g., <code>retryAfterMs + Random.nextLong(0, 1500)</code>) and cap retry attempts.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production Code: Android Paging 3 + Postgres Keyset + AWS CDK Throttle</h2>
+        <p>
+          Notice how cleanly the mobile client, database index, and AWS API Gateway configuration align:
+        </p>
+<pre><code>// 1. Android Client (Kotlin — Paging 3 PagingSource + 429 Retry-After with jitter)
+override suspend fun load(params: LoadParams&lt;String&gt;): LoadResult&lt;String, OrderDto&gt; {
+    return try {
+        val resp = api.listOrders(cursor = params.key, limit = params.loadSize)
+        LoadResult.Page(data = resp.items, prevKey = null, nextKey = resp.nextCursor)
+    } catch (e: HttpException) {
+        if (e.code() == 429) {
+            val retrySec = e.response()?.headers()?.get("Retry-After")?.toLongOrNull() ?: 2L
+            delay(retrySec * 1000L + Random.nextLong(250L, 1250L)) // Honor + jitter
+        }
+        LoadResult.Error(e)
+    }
+}
+
+-- 2. PostgreSQL / Amazon RDS Schema &amp; Keyset Query (O(log N) regardless of depth)
+CREATE INDEX CONCURRENTLY idx_orders_created_id
+  ON orders (created_at DESC, id DESC);
+
+SELECT id, created_at, total_cents
+FROM orders
+WHERE (created_at, id) &lt; ($1, $2) -- Decoded &amp; validated from Base64URL cursor
+ORDER BY created_at DESC, id DESC
+LIMIT $3; -- Pass limit + 1 to detect nextCursor without SELECT COUNT(*)
+
+// 3. AWS API Gateway Stage / Usage Plan Throttling (AWS CDK TypeScript)
+new apigateway.RestApi(this, "OrdersApi", {
+  deployOptions: {
+    stageName: "prod",
+    throttlingRateLimit: 500,   // Steady-state refill: 500 req/s
+    throttlingBurstLimit: 1000, // Bucket capacity: 1,000 burst requests
+  },
+});</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement both halves of a production API edge guard in <code>api-guard.js</code>: a stateful lazy <code>createTokenBucket(capacity, refillPerSec)</code> rate limiter and a strict <code>decodeCursor(cursorStr, maxAgeMs, nowMs)</code> pagination validator.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Check your engineering intuition on three real production incidents. Every option shows why the right choice works and why each distractor breaks.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCES & TEACHER CHECK-IN -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>HTTP Semantics &amp; 429:</strong> <a href="https://www.rfc-editor.org/rfc/rfc9110.html" target="_blank" rel="noopener">RFC 9110 — HTTP Semantics</a> (Safe/Idempotent Methods &sect;9.2, <code>Retry-After</code> &sect;10.2.3).
+          </li>
+          <li>
+            <strong>AWS API Gateway Throttling:</strong> <a href="https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html" target="_blank" rel="noopener">Throttle API requests for better throughput</a> (Token bucket rate &amp; burst limits).
+          </li>
+          <li>
+            <strong>Amazon Builders' Library:</strong> <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/" target="_blank" rel="noopener">Making retries safe with idempotent APIs</a> — Malcolm Featonby.
+          </li>
+          <li>
+            <strong>Android Architecture:</strong> <a href="https://developer.android.com/topic/libraries/architecture/paging/v3-overview" target="_blank" rel="noopener">Android Paging 3 library overview</a> (<code>PagingSource</code> key-driven pagination).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0005 (Authentication &amp; Authorization: OAuth 2.0, OIDC, JWT &amp; RBAC/ABAC)</strong>, ask about anything still fuzzy—for example: <em>"How do we distribute a token bucket across 10 ECS containers using Redis Lua scripts?"</em> or <em>"Why should we HMAC-sign pagination cursors if the payload contains user-specific filter fields?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0003-linux-processes-signals-fds-shell.html">&larr; Lesson 0003: Linux Processes, Signals (SIGTERM), File Descriptors &amp; DNS Tools</a>
+          <a href="./0005-auth-oauth2-oidc-jwt-rbac.html">Lesson 0005: Authentication &amp; Authorization: OAuth 2.0, OIDC, JWT &amp; RBAC/ABAC &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why <code>LIMIT + 1</code> Beats <code>COUNT(*)</code></strong>
+          Fetching <code>limit + 1</code> rows tells Paging 3 whether a next page exists in the same index seek. In Postgres MVCC, <code>SELECT COUNT(*)</code> must scan millions of visible rows just to compute a total page count.
+        </div>
+        <div class="sidenote">
+          <strong>DynamoDB Has No <code>OFFSET</code></strong>
+          When you reach Module 2.2 (DynamoDB), you will see AWS enforces cursor pagination natively: every query returns a <code>LastEvaluatedKey</code> that you pass back as <code>ExclusiveStartKey</code>.
+        </div>
+        <div class="sidenote">
+          <strong>Always Add a Tie-Breaker</strong>
+          Two orders created in the same millisecond share <code>created_at</code>. A tuple comparison <code>(created_at, id) &lt; ($1, $2)</code> guarantees deterministic ordering and zero skipped rows.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0004",
+      title: "Lab 0004: Token Bucket Rate Limiter & Cursor Validator",
+      filename: "api-guard.js",
+      description:
+        "Implement two functions: (1) <code>createTokenBucket(capacity, refillPerSec)</code> returning <code>{ consume(nowMs, cost = 1) }</code>. Start full (<code>tokens = capacity</code>, <code>lastRefillMs = null</code>). On first call set <code>lastRefillMs = nowMs</code>; on each call refill <code>tokens = Math.min(capacity, tokens + (Math.max(0, nowMs - lastRefillMs) / 1000) * refillPerSec)</code> and advance <code>lastRefillMs = Math.max(lastRefillMs, nowMs)</code>. If <code>tokens &gt;= cost</code>, deduct <code>cost</code> and return <code>{ allowed: true, status: 200, remaining: Math.floor(tokens), retryAfterSec: 0 }</code>; else return <code>{ allowed: false, status: 429, remaining: Math.floor(tokens), retryAfterSec: Math.ceil((cost - tokens) / refillPerSec) }</code>. (2) <code>decodeCursor(cursorStr, maxAgeMs = 86400000, nowMs = Date.now())</code>: return <code>{ valid: false, status: 400, error: \"EMPTY_CURSOR\" }</code> if non-string/blank; Base64URL-decode via <code>atob</code> + <code>JSON.parse</code> (returning <code>\"MALFORMED_CURSOR\"</code> on error); verify <code>v === 1</code>, positive integer <code>ts</code>, non-empty string <code>id</code> (else <code>\"INVALID_CURSOR_FIELDS\"</code>); check <code>nowMs - ts &gt; maxAgeMs</code> (else <code>\"EXPIRED_CURSOR\"</code>); otherwise return <code>{ valid: true, status: 200, ts, id }</code>.",
+      exports: ["createTokenBucket", "decodeCursor"],
+      starterCode: `function createTokenBucket(capacity, refillPerSec) {
+  let tokens = capacity;
+  let lastRefillMs = null;
+
+  return {
+    consume(nowMs, cost = 1) {
+      // TODO 1: Initialize lastRefillMs on first call, refill lazily, cap at capacity
+      // TODO 2: If tokens >= cost, deduct cost and return { allowed: true, status: 200, ... }
+      // TODO 3: Otherwise return { allowed: false, status: 429, remaining: Math.floor(tokens), retryAfterSec: ... }
+      return { allowed: false, status: 429, remaining: 0, retryAfterSec: 1 };
+    }
+  };
+}
+
+function decodeCursor(cursorStr, maxAgeMs = 86400000, nowMs = Date.now()) {
+  // TODO 4: Reject missing/empty cursorStr with { valid: false, status: 400, error: "EMPTY_CURSOR" }
+  // TODO 5: Normalize Base64URL (- -> +, _ -> /, pad =) and atob + JSON.parse ("MALFORMED_CURSOR")
+  // TODO 6: Validate v === 1, positive integer ts, non-empty string id ("INVALID_CURSOR_FIELDS")
+  // TODO 7: Reject if nowMs - ts > maxAgeMs ("EXPIRED_CURSOR"), else return { valid: true, status: 200, ts, id }
+  return { valid: false, status: 400, error: "EMPTY_CURSOR" };
+}
+
+const sampleBucket = createTokenBucket(2, 0.5);
+console.log("Req 1:", sampleBucket.consume(1000));
+console.log("Req 2:", sampleBucket.consume(1000));
+console.log("Req 3 (throttled):", sampleBucket.consume(1000));
+const sampleCursor = btoa(JSON.stringify({ v: 1, ts: 1700000000000, id: "ord_42" }))
+  .replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+console.log("Decoded:", decodeCursor(sampleCursor, 86400000, 1700000005000));`,
+      hints: [
+        "For the token bucket: guard against clock regression with <code>const elapsedSec = Math.max(0, (nowMs - lastRefillMs) / 1000)</code> and <code>lastRefillMs = Math.max(lastRefillMs, nowMs)</code>. When rejecting, do not subtract <code>cost</code> from <code>tokens</code>; compute <code>Math.ceil((cost - tokens) / refillPerSec)</code>.",
+        "For Base64URL decoding: replace <code>-</code> with <code>+</code> and <code>_</code> with <code>/</code>, then pad with <code>\"=\".repeat((4 - (b64.length % 4)) % 4)</code> before calling <code>atob(b64)</code> and <code>JSON.parse(...)</code> inside a <code>try/catch</code>."
+      ],
+      solutionExplanation:
+        "Lazy token-bucket evaluation computes elapsed refill only when a request arrives, capping at capacity to bound bursts and returning RFC 9110 Retry-After seconds when empty. Strict cursor decoding rejects malformed, wrong-version, non-integer, or expired cursors with HTTP 400 before touching PostgreSQL.",
+      solutionCode: `function createTokenBucket(capacity, refillPerSec) {
+  let tokens = capacity;
+  let lastRefillMs = null;
+
+  return {
+    consume(nowMs, cost = 1) {
+      if (lastRefillMs === null) {
+        lastRefillMs = nowMs;
+      } else {
+        const elapsedSec = Math.max(0, (nowMs - lastRefillMs) / 1000);
+        tokens = Math.min(capacity, tokens + elapsedSec * refillPerSec);
+        lastRefillMs = Math.max(lastRefillMs, nowMs);
+      }
+
+      if (tokens >= cost) {
+        tokens -= cost;
+        return {
+          allowed: true,
+          status: 200,
+          remaining: Math.floor(tokens),
+          retryAfterSec: 0
+        };
+      }
+
+      const retryAfterSec = Math.ceil((cost - tokens) / refillPerSec);
+      return {
+        allowed: false,
+        status: 429,
+        remaining: Math.floor(tokens),
+        retryAfterSec
+      };
+    }
+  };
+}
+
+function decodeCursor(cursorStr, maxAgeMs = 86400000, nowMs = Date.now()) {
+  if (typeof cursorStr !== "string" || cursorStr.trim().length === 0) {
+    return { valid: false, status: 400, error: "EMPTY_CURSOR" };
+  }
+
+  let payload;
+  try {
+    let b64 = cursorStr.trim().replace(/-/g, "+").replace(/_/g, "/");
+    const pad = (4 - (b64.length % 4)) % 4;
+    b64 += "=".repeat(pad);
+    payload = JSON.parse(atob(b64));
+  } catch (_) {
+    return { valid: false, status: 400, error: "MALFORMED_CURSOR" };
+  }
+
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    payload.v !== 1 ||
+    !Number.isInteger(payload.ts) ||
+    payload.ts <= 0 ||
+    typeof payload.id !== "string" ||
+    payload.id.trim().length === 0
+  ) {
+    return { valid: false, status: 400, error: "INVALID_CURSOR_FIELDS" };
+  }
+
+  if (nowMs - payload.ts > maxAgeMs) {
+    return { valid: false, status: 400, error: "EXPIRED_CURSOR" };
+  }
+
+  return {
+    valid: true,
+    status: 200,
+    ts: payload.ts,
+    id: payload.id
+  };
+}`,
+      tests: [
+        {
+          name: "Token bucket allows burst up to capacity and rejects excess with 429 + Retry-After",
+          run: (scope) => {
+            const b = scope.createTokenBucket(3, 0.5); // 1 token per 2s
+            const r1 = b.consume(1000);
+            const r2 = b.consume(1000);
+            const r3 = b.consume(1000);
+            const r4 = b.consume(1000);
+            const pass =
+              r1.allowed && r1.status === 200 && r1.remaining === 2 &&
+              r2.allowed && r2.remaining === 1 &&
+              r3.allowed && r3.remaining === 0 &&
+              !r4.allowed && r4.status === 429 && r4.remaining === 0 && r4.retryAfterSec === 2;
+            return { pass, message: `r3=${JSON.stringify(r3)}, r4=${JSON.stringify(r4)}` };
+          }
+        },
+        {
+          name: "Token bucket refills over elapsed time, supports partial fractional tokens, and caps at capacity",
+          run: (scope) => {
+            const b = scope.createTokenBucket(3, 0.5);
+            b.consume(1000);
+            b.consume(1000);
+            b.consume(1000); // 0 tokens at t=1000
+            const rPartial = b.consume(2000); // +0.5 tokens -> still < 1, deficit 0.5 -> ceil(0.5/0.5) = 1s
+            const rRecovered = b.consume(3000); // +0.5 more -> 1.0 token -> allowed, remaining 0
+            const rCapped = b.consume(30000); // +13.5 tokens capped at 3 -> consumes 1 -> remaining 2
+            const pass =
+              !rPartial.allowed && rPartial.retryAfterSec === 1 &&
+              rRecovered.allowed && rRecovered.status === 200 && rRecovered.remaining === 0 &&
+              rCapped.allowed && rCapped.remaining === 2;
+            return { pass, message: `partial=${JSON.stringify(rPartial)}, capped=${JSON.stringify(rCapped)}` };
+          }
+        },
+        {
+          name: "decodeCursor accepts a valid unpadded Base64URL cursor within maxAgeMs",
+          run: (scope) => {
+            const raw = JSON.stringify({ v: 1, ts: 1700000000000, id: "ord_987" });
+            const b64url = btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+            const out = scope.decodeCursor(b64url, 60000, 1700000005000);
+            const pass = out.valid === true && out.status === 200 && out.ts === 1700000000000 && out.id === "ord_987";
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "decodeCursor rejects empty, malformed, and invalid-field cursors with HTTP 400",
+          run: (scope) => {
+            const empty = scope.decodeCursor("   ", 60000, 1000);
+            const badB64 = scope.decodeCursor("%%%not-base64%%%", 60000, 1000);
+            const badVer = scope.decodeCursor(btoa(JSON.stringify({ v: 2, ts: 100, id: "a" })), 60000, 200);
+            const badTs = scope.decodeCursor(btoa(JSON.stringify({ v: 1, ts: -5, id: "a" })), 60000, 200);
+            const badId = scope.decodeCursor(btoa(JSON.stringify({ v: 1, ts: 100, id: "" })), 60000, 200);
+            const pass =
+              !empty.valid && empty.status === 400 && empty.error === "EMPTY_CURSOR" &&
+              !badB64.valid && badB64.status === 400 && badB64.error === "MALFORMED_CURSOR" &&
+              !badVer.valid && badVer.status === 400 && badVer.error === "INVALID_CURSOR_FIELDS" &&
+              !badTs.valid && badTs.error === "INVALID_CURSOR_FIELDS" &&
+              !badId.valid && badId.error === "INVALID_CURSOR_FIELDS";
+            return { pass, message: `empty=${empty.error}, badB64=${badB64.error}, badVer=${badVer.error}` };
+          }
+        },
+        {
+          name: "decodeCursor rejects expired cursors when nowMs - ts exceeds maxAgeMs",
+          run: (scope) => {
+            const cur = btoa(JSON.stringify({ v: 1, ts: 1000000, id: "ord_1" }));
+            const fresh = scope.decodeCursor(cur, 5000, 1005000);
+            const expired = scope.decodeCursor(cur, 5000, 1005001);
+            const pass = fresh.valid === true && expired.valid === false && expired.status === 400 && expired.error === "EXPIRED_CURSOR";
+            return { pass, message: `fresh=${fresh.valid}, expired=${JSON.stringify(expired)}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0004",
+      title: "Quiz 0004: Pagination, Idempotency & Rate Limiting",
+      questions: [
+        {
+          id: "q1",
+          prompt: "An Android feed powered by Jetpack Paging 3 queries an RDS PostgreSQL table sorted newest-first. Users report duplicate items when scrolling to page 2 during active traffic, and page 5,000 latency spikes to 420 ms. Which change fixes both problems?",
+          options: [
+            "Enable Retrofit response caching and raise the database query timeout limit",
+            "Replace SQL offset clauses with keyset cursor pagination on indexed columns",
+            "Execute parallel database count queries and preload ten pages during scroll",
+            "Switch HTTP GET endpoints to POST requests carrying JSON offset bodies"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Response caching serves stale pages and higher timeouts merely mask slow scans; neither fixes O(N) offset work or row drift.",
+            "Keyset cursor pagination uses a B-Tree index seek on (created_at, id) in O(log N) time regardless of page depth and anchors the boundary against new inserts.",
+            "Adding SELECT COUNT(*) queries adds extra full/index scans on top of OFFSET, increasing RDS load without fixing page drift.",
+            "Changing the HTTP verb from GET to POST leaves the underlying SQL OFFSET query untouched and breaks HTTP caching semantics."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "An Android user taps Confirm Order over LTE. The AWS ALB logs HTTP 201 Created, but the cellular connection drops before the device receives the response. A retry creates a second order. What prevents this duplicate side effect?",
+          options: [
+            "Replace HTTP POST checkout calls with cached HTTP GET query requests",
+            "Disable all OkHttp read timeouts so cellular sockets wait indefinitely long",
+            "Require a unique client Idempotency-Key header stored atomically with the response",
+            "Increase the ALB idle timeout above the Android read timeout threshold"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "GET must remain safe and read-only per RFC 9110; mutating orders over GET violates HTTP semantics and enables unintended proxy/prefetch execution.",
+            "Infinite read timeouts hang UI coroutines and leak sockets when the TCP connection is silently dropped by a carrier NAT.",
+            "An Idempotency-Key persisted atomically (e.g., conditional insert with TTL) lets the server detect the replay and return the original 201 result without double-charging.",
+            "ALB idle timeout governs server-side keep-alive and target reads; it cannot recover bytes lost on a broken mobile radio link."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "An AWS API Gateway stage throttles bursts with a token bucket and returns HTTP 429 Too Many Requests with Retry-After: 5 during a push-notification spike. What happens if 5,000 Android clients sleep for exactly 5.000 seconds without jitter?",
+          options: [
+            "API Gateway raises the stage burst limit automatically for mobile clients",
+            "Token buckets flip to negative balances and block traffic for hours",
+            "OkHttp automatically converts HTTP 429 responses into cached HTTP 304 replies",
+            "Clients wake in lockstep and trigger another synchronized thundering herd spike"
+          ],
+          correctIndex: 3,
+          explanations: [
+            "API Gateway enforces the configured throttlingRateLimit and throttlingBurstLimit strictly; it does not auto-raise quotas on client retries.",
+            "Token buckets floor at 0 (or reject before deducting below zero) and refill continuously at rate R, rather than locking out for hours.",
+            "HTTP 304 Not Modified requires conditional ETag/Last-Modified validation; OkHttp never fabricates 304s from 429 throttling responses.",
+            "Without random jitter added to Retry-After, all 5,000 clients retry at the exact same millisecond, recreating the burst that tripped the bucket."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

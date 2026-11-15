@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 13: CPython Memory, GC, Weakrefs &amp; Free-Threaded Python — Py27</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.27.6/full/pyodide.js"></script>
+</head>
+<body data-page="lesson" data-lesson-id="lesson-13">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <a href="../master-plan.html" class="brand-badge" title="Back to Master Plan">Py27</a>
+        <span>Lesson 13 · CPython Memory, GIL &amp; Free-Threaded Python</span>
+      </div>
+      <div class="topbar-actions">
+        <span id="runtime-pill" class="runtime-pill">
+          <span class="runtime-dot"></span>
+          <span id="runtime-label">Initializing Python...</span>
+        </span>
+        <a href="../reference/13-cpython-memory-gil-cheatsheet.html" class="btn btn-sm">Cheat Sheet</a>
+        <a href="../master-plan.html" class="btn btn-sm">← Master Plan</a>
+        <button id="theme-toggle" class="btn btn-sm" type="button">Light Mode</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="lesson-layout">
+      <!-- Sticky Sidebar TOC -->
+      <aside class="sidebar">
+        <h3>Lesson 13 Contents</h3>
+        <ul class="toc-list">
+          <li><a href="#sec-spaced-review">0. Spaced Review (L12)</a></li>
+          <li><a href="#sec-refcount">1. Reference Counting (<code>sys.getrefcount</code>)</a></li>
+          <li><a href="#sec-gc-weakref">2. Cycles, Generational <code>gc</code> &amp; <code>weakref</code></a></li>
+          <li><a href="#sec-gil-pep703">3. The GIL, Subinterpreters &amp; PEP 703</a></li>
+          <li><a href="#sec-quiz">4. Diagnostic Quiz (6 Qs)</a></li>
+        </ul>
+
+        <div class="progress-box">
+          <div class="progress-label">
+            <span>Lesson Progress</span>
+            <span id="lesson-progress-text">0%</span>
+          </div>
+          <div class="progress-track">
+            <div id="lesson-progress-fill" class="progress-fill"></div>
+          </div>
+          <p id="lesson-progress-stats" style="margin: 0.55rem 0 0; font-size: 0.78rem; color: var(--text-dim);">
+            Practices: 0/3 · Quizzes: 0/6
+          </p>
+        </div>
+      </aside>
+
+      <!-- Main Content -->
+      <article>
+        <section class="hero">
+          <span class="tag tag-senior">Lesson 13 · Phase 4: CPython Internals &amp; Concurrency Foundations</span>
+          <h1>CPython Memory Management, GIL &amp; Free-Threaded Python</h1>
+          <p>
+            To debug memory leaks in long-running FastAPI / AI agent services—and choose the right concurrency model—you
+            need to know how CPython manages heap objects. In this lesson you will inspect live reference counts via
+            <code>sys.getrefcount</code>, break reference cycles with generational <code>gc</code> and <code>weakref</code>,
+            understand why the Global Interpreter Lock (GIL) exists, and learn the 2026–2027 shift to
+            subinterpreters and Free-Threaded Python (PEP 703 / <code>python3.13t</code>–<code>3.14t</code>).
+          </p>
+          <div class="meta-row">
+            <span class="topic-chip">roadmap.sh: Global Interpreter Lock (GIL)</span>
+            <span class="topic-chip">sys.getrefcount · gc · weakref</span>
+            <span class="topic-chip">PEP 703 Free-Threading · PEP 684 Subinterpreters</span>
+            <span class="topic-chip"><a href="../reference/13-cpython-memory-gil-cheatsheet.html">Open Printable Cheat Sheet ↗</a></span>
+          </div>
+        </section>
+
+        <!-- SECTION 0: SPACED REVIEW -->
+        <section class="section-block" id="sec-spaced-review">
+          <div class="section-header">
+            <span class="tag tag-capstone">[SPACED REVIEW]</span>
+            <h2>0. Quick Retrieval Check From Lesson 12</h2>
+          </div>
+          <p>
+            In Lesson 12 you saw why patching must target <em>where a name is looked up</em>, not where it originated.
+            Run this warm-up and fix the broken <code>patch(...)</code> target so the test passes deterministically.
+          </p>
+          <div class="code-box">
+            <div class="code-box-header">
+              <div class="code-box-title">
+                <span class="tag tag-example">[WARM-UP]</span>
+                <span>Fix the <code>unittest.mock.patch</code> Lookup Target</span>
+              </div>
+            </div>
+            <div class="editor-wrap">
+              <textarea class="code-editor" rows="13">import types
+from unittest.mock import patch
+import math
+
+# Simulated module holding its own bound reference:
+mod = types.SimpleNamespace(sqrt=math.sqrt)
+def compute_norm(x: float) -> float:
+    return mod.sqrt(x)
+
+# BUG: patching "math.sqrt" does NOT change mod.sqrt!
+# Fix the target below to patch (mod, "sqrt") via patch.object(mod, "sqrt", return_value=99.0):
+with patch("math.sqrt", return_value=99.0):
+    print("Result (should be 99.0):", compute_norm(16.0))
+</textarea>
+            </div>
+            <div class="code-toolbar">
+              <div class="code-toolbar-left">
+                <button class="btn btn-primary btn-sm btn-run" type="button">▶ Run Code</button>
+                <button class="btn btn-sm btn-reset" type="button">Reset</button>
+              </div>
+              <span class="shortcut-hint">Change patch(...) to patch.object(mod, "sqrt", ...)</span>
+            </div>
+            <div class="output-panel"></div>
+          </div>
+        </section>
+
+        <!-- SECTION 1: REFERENCE COUNTING -->
+        <section class="section-block" id="sec-refcount">
+          <div class="section-header">
+            <span class="tag tag-concept">[CONCEPT]</span>
+            <h2>1. CPython Memory Management &amp; <code>sys.getrefcount</code></h2>
+          </div>
+
+          <p>
+            Unlike Java or Android ART (which rely purely on background tracing garbage collectors), CPython's
+            <strong>primary</strong> memory manager is <strong>immediate reference counting</strong>. Every heap object
+            (<code>PyObject</code>) stores an integer counter <code>ob_refcnt</code> tracking how many variables,
+            containers, or stack frames point to it.
+          </p>
+          <ul>
+            <li><strong>Deterministic cleanup:</strong> As soon as <code>ob_refcnt</code> drops to <code>0</code>, CPython immediately deallocates the object and runs any finalizer (<code>__del__</code>).</li>
+            <li><strong>Why <code>sys.getrefcount(x)</code> looks 1 higher than expected:</strong> Calling <code>sys.getrefcount(x)</code> temporarily passes <code>x</code> as an argument into the function frame, adding <code>+1</code> while the call runs!</li>
+            <li><strong>Immortal Objects (Python 3.12+ / PEP 683):</strong> Singletons like <code>None</code>, <code>True</code>, <code>False</code>, and small integers have huge sentinel refcounts (e.g. <code>&gt; 1,000,000,000</code>) and are never freed or refcount-mutated.</li>
+          </ul>
+
+          <div class="code-box">
+            <div class="code-box-header">
+              <div class="code-box-title">
+                <span class="tag tag-example">[EXAMPLE 1]</span>
+                <span>Watching <code>sys.getrefcount</code> &amp; Immediate Deallocation</span>
+              </div>
+            </div>
+            <div class="editor-wrap">
+              <textarea class="code-editor" rows="18">import sys
+
+class TrackedBuffer:
+    def __init__(self, name: str):
+        self.name = name
+    def __del__(self):
+        print(f"[freed immediately] {self.name}")
+
+buf = TrackedBuffer("embedding_batch")
+print("After creation (1 local + 1 arg):", sys.getrefcount(buf))
+
+holder = [buf, buf]
+print("After adding 2 list refs (+2):", sys.getrefcount(buf))
+
+holder.clear()
+print("After clearing list:", sys.getrefcount(buf))
+
+del buf  # Refcount hits 0 -> __del__ runs right now!
+print("Line after del buf.")
+</textarea>
+            </div>
+            <div class="code-toolbar">
+              <div class="code-toolbar-left">
+                <button class="btn btn-primary btn-sm btn-run" type="button">▶ Run Code</button>
+                <button class="btn btn-sm btn-reset" type="button">Reset</button>
+              </div>
+              <span class="shortcut-hint">Notice [freed immediately] prints BEFORE the last line!</span>
+            </div>
+            <div class="output-panel"></div>
+          </div>
+
+          <!-- PRACTICE 1 -->
+          <div class="code-box practice" data-practice-id="p1">
+            <div class="code-box-header">
+              <div class="code-box-title">
+                <span class="tag tag-practice">[PRACTICE 1]</span>
+                <span>Measure Reference Count Deltas with <code>sys.getrefcount</code></span>
+              </div>
+              <span class="solved-badge">Solved ✓</span>
+            </div>
+            <div class="practice-prompt">
+              <p>
+                Write <code>measure_refcount_delta(n: int) -&gt; tuple[int, int]</code> to prove how container aliases
+                increment and release <code>ob_refcnt</code>:
+              </p>
+              <p>
+                - Create a fresh list <code>target = [10, 20, 30]</code>.<br />
+                - Record <code>base = sys.getrefcount(target)</code>.<br />
+                - Create a list <code>aliases = [target for _ in range(n)]</code> holding <code>n</code> extra references.<br />
+                - Record <code>during = sys.getrefcount(target)</code>.<br />
+                - Call <code>aliases.clear()</code> and record <code>after = sys.getrefcount(target)</code>.<br />
+                - Return <code>(during - base, after - base)</code>.
+              </p>
+            </div>
+            <div class="editor-wrap">
+              <textarea class="code-editor" rows="13">import sys
+
+def measure_refcount_delta(n: int) -> tuple[int, int]:
+    target = [10, 20, 30]
+    base = sys.getrefcount(target)
+
+    # Step 1: hold n extra references to target in a list
+    aliases = []
+    # TODO: populate aliases with n references to target and capture during
+
+    # Step 2: clear aliases and capture after
+    # TODO: clear aliases and return (during - base, after - base)
+    return (0, 0)
+
+print("Delta for n=4:", measure_refcount_delta(4))  # Expect (4, 0)
+</textarea>
+            </div>
+            <div class="code-toolbar">
+              <div class="code-toolbar-left">
+                <button class="btn btn-primary btn-sm btn-run" type="button">▶ Run Code</button>
+                <button class="btn btn-success btn-sm btn-check" type="button">✓ Check Solution</button>
+                <button class="btn btn-sm btn-reset" type="button">Reset</button>
+              </div>
+              <div class="code-toolbar-right">
+                <button class="btn btn-sm btn-hint" type="button">Hint</button>
+                <button class="btn btn-sm btn-answer" type="button">Final Answer</button>
+              </div>
+            </div>
+            <div class="output-panel"></div>
+            <div class="test-results"></div>
+            <div class="hint-drawer">
+              <div class="hint-step"><strong>Hint 1:</strong> Set <code>aliases = [target for _ in range(n)]</code>, then <code>during = sys.getrefcount(target)</code>.</div>
+              <div class="hint-step"><strong>Hint 2:</strong> Call <code>aliases.clear()</code>, set <code>after = sys.getrefcount(target)</code>, and return <code>(during - base, after - base)</code>.</div>
+            </div>
+            <div class="solution-drawer">
+              <strong>Final Answer &amp; Rationale:</strong>
+              <div class="solution-code"><pre>import sys
+
+def measure_refcount_delta(n: int) -> tuple[int, int]:
+    target = [10, 20, 30]
+    base = sys.getrefcount(target)
+    aliases = [target for _ in range(n)]
+    during = sys.getrefcount(target)
+    aliases.clear()
+    after = sys.getrefcount(target)
+    return (during - base, after - base)</pre></div>
+              <p style="margin: 0; font-size: 0.9rem; color: var(--text-muted);">
+                Measuring deltas cancels out CPython's temporary call-frame <code>+1</code> reference and proves aliases only add pointers—never deep copies.
+              </p>
+              <button class="btn btn-sm btn-load-answer" style="margin-top: 0.6rem;" type="button">Load Answer into Editor</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECTION 2: CYCLES, GENERATIONAL GC & WEAKREF -->
+        <section class="section-block" id="sec-gc-weakref">
+          <div class="section-header">
+            <span class="tag tag-concept">[CONCEPT]</span>
+            <h2>2. Reference Cycles, Generational <code>gc</code> &amp; <code>weakref</code></h2>
+          </div>
+
+          <p>
+            Reference counting has one famous blind spot: <strong>reference cycles</strong>. If object <code>A</code> points
+            to <code>B</code> and <code>B</code> points back to <code>A</code>, deleting all external variables leaves
+            both objects with <code>ob_refcnt == 1</code> forever!
+          </p>
+          <ul>
+            <li><strong>Generational Cyclic GC (<code>gc</code>):</strong> CPython runs a backup cycle detector over <em>container</em> objects (lists, dicts, tuples, class instances) grouped into 3 generations (<code>Gen 0</code> young &rarr; <code>Gen 1</code> &rarr; <code>Gen 2</code> long-lived). Surviving collections promote objects to older generations so short-lived objects are scanned often and long-lived ones rarely.</li>
+            <li><strong><code>weakref</code> (Zero-Overhead Cycle Breaker &amp; Caches):</strong> A weak reference (<code>weakref.ref(obj)</code> or <code>weakref.WeakValueDictionary</code>) lets you point to an object <strong>without incrementing <code>ob_refcnt</code></strong>. Calling a weakref returns the live object, or <code>None</code> once all strong references vanish!</li>
+            <li><strong>Common Python Memory Leaks:</strong> Module-level caches/registries holding strong refs (like <code>@lru_cache</code> on methods!), unclosed cycles with legacy hooks, and global logger/handler lists that grow unboundedly.</li>
+          </ul>
+
+          <div class="code-box">
+            <div class="code-box-header">
+              <div class="code-box-title">
+                <span class="tag tag-example">[EXAMPLE 2]</span>
+                <span>Reference Cycle Reclaimed by <code>gc.collect()</code> &amp; <code>weakref</code></span>
+              </div>
+            </div>
+            <div class="editor-wrap">
+              <textarea class="code-editor" rows="21">import gc
+import weakref
+
+class AgentNode:
+    def __init__(self, label: str):
+        self.label = label
+        self.peer = None
+
+# 1. Create a reference cycle (a <-> b) and watch weakref stay alive after del!
+a, b = AgentNode("planner"), AgentNode("executor")
+a.peer = b
+b.peer = a
+watch_a = weakref.ref(a)
+
+del a, b
+print("After del a, b -> weakref alive (trapped in cycle!):", watch_a() is not None)
+
+collected = gc.collect()
+print("gc.collect() reclaimed objects:", collected, "| weakref alive now?", watch_a() is not None)
+print("GC generation counts:", gc.get_count())
+</textarea>
+            </div>
+            <div class="code-toolbar">
+              <div class="code-toolbar-left">
+                <button class="btn btn-primary btn-sm btn-run" type="button">▶ Run Code</button>
+                <button class="btn btn-sm btn-reset" type="button">Reset</button>
+              </div>
+              <span class="shortcut-hint">Watch watch_a() turn into None after gc.collect()!</span>
+            </div>
+            <div class="output-panel"></div>
+          </div>
+
+          <!-- PRACTICE 2 -->
+          <div class="code-box practice" data-practice-id="p2">
+            <div class="code-box-header">
+              <div class="code-box-title">
+                <span class="tag tag-practice">[PRACTICE 2]</span>
+                <span>Auto-Evicting Cache with <code>weakref.WeakValueDictionary</code></span>
+              </div>
+              <span class="solved-badge">Solved ✓</span>
+            </div>
+            <div class="practice-prompt">
+              <p>
+                An AI chat server caches active <code>Session</code> objects by <code>session_id</code> so duplicate
+                requests reuse them, <em>without</em> preventing disconnected sessions from being freed.
+                Complete <code>SessionCache</code> using <code>weakref.WeakValueDictionary</code>:
+              </p>
+              <p>
+                - <code>__init__(self)</code>: creates <code>self._store = weakref.WeakValueDictionary()</code>.<br />
+                - <code>put(self, session_id: str, session: Session) -&gt; None</code>: stores <code>session</code> under <code>session_id</code>.<br />
+                - <code>get(self, session_id: str) -&gt; Session | None</code>: returns the live session or <code>None</code>.<br />
+                - <code>live_count(self) -&gt; int</code>: returns <code>len(self._store)</code>.
+              </p>
+            </div>
+            <div class="editor-wrap">
+              <textarea class="code-editor" rows="18">import weakref
+
+class Session:
+    def __init__(self, user: str):
+        self.user = user
+
+class SessionCache:
+    def __init__(self):
+        # TODO: initialize self._store as a WeakValueDictionary
+        pass
+
+    def put(self, session_id: str, session: Session) -> None:
+        # TODO: store session by session_id
+        pass
+
+    def get(self, session_id: str) -> Session | None:
+        # TODO: return session or None
+        pass
+
+    def live_count(self) -> int:
+        # TODO: return number of live entries
+        return 0
+
+cache = SessionCache()
+s1 = Session("alice")
+cache.put("s1", s1)
+print("While s1 alive:", cache.live_count(), cache.get("s1").user)
+del s1
+print("After del s1:", cache.live_count(), cache.get("s1"))
+</textarea>
+            </div>
+            <div class="code-toolbar">
+              <div class="code-toolbar-left">
+                <button class="btn btn-primary btn-sm btn-run" type="button">▶ Run Code</button>
+                <button class="btn btn-success btn-sm btn-check" type="button">✓ Check Solution</button>
+                <button class="btn btn-sm btn-reset" type="button">Reset</button>
+              </div>
+              <div class="code-toolbar-right">
+                <button class="btn btn-sm btn-hint" type="button">Hint</button>
+                <button class="btn btn-sm btn-answer" type="button">Final Answer</button>
+              </div>
+            </div>
+            <div class="output-panel"></div>
+            <div class="test-results"></div>
+            <div class="hint-drawer">
+              <div class="hint-step"><strong>Hint 1:</strong> Set <code>self._store = weakref.WeakValueDictionary()</code> in <code>__init__</code>.</div>
+              <div class="hint-step"><strong>Hint 2:</strong> Implement <code>self._store[session_id] = session</code>, <code>return self._store.get(session_id)</code>, and <code>return len(self._store)</code>.</div>
+            </div>
+            <div class="solution-drawer">
+              <strong>Final Answer &amp; Rationale:</strong>
+              <div class="solution-code"><pre>class SessionCache:
+    def __init__(self):
+        self._store = weakref.WeakValueDictionary()
+
+    def put(self, session_id: str, session: Session) -> None:
+        self._store[session_id] = session
+
+    def get(self, session_id: str) -> Session | None:
+        return self._store.get(session_id)
+
+    def live_count(self) -> int:
+        return len(self._store)</pre></div>
+              <p style="margin: 0; font-size: 0.9rem; color: var(--text-muted);">
+                Because <code>WeakValueDictionary</code> holds weak references to values, entries automatically vanish as soon as callers drop their strong references.
+              </p>
+              <button class="btn btn-sm btn-load-answer" style="margin-top: 0.6rem;" type="button">Load Answer into Editor</button>
+            </div>
+          </div>
+
+          <!-- PRACTICE 3 -->
+          <div class="code-box practice" data-practice-id="p3">
+            <div class="code-box-header">
+              <div class="code-box-title">
+                <span class="tag tag-practice">[PRACTICE 3]</span>
+                <span>Break a Parent-Child Cycle with <code>weakref.ref</code></span>
+              </div>
+              <span class="solved-badge">Solved ✓</span>
+            </div>
+            <div class="practice-prompt">
+              <p>
+                In tree structures, a <code>Parent</code> holds strong references to <code>children</code>, while each
+                <code>Child</code> wants a back-pointer <code>child.parent</code>. Storing a strong reference back to
+                <code>Parent</code> creates a cycle! Fix <code>Child</code> using <code>weakref.ref</code>:
+              </p>
+              <p>
+                - In <code>Child.__init__(self, name: str, parent: Parent)</code>, store <code>self._parent_ref = weakref.ref(parent)</code>.<br />
+                - Add a <code>@property def parent(self)</code> that returns <code>self._parent_ref()</code>.<br />
+                - Result: deleting <code>Parent</code> drops its refcount to <code>0</code> immediately—no <code>gc.collect()</code> required!
+              </p>
+            </div>
+            <div class="editor-wrap">
+              <textarea class="code-editor" rows="19">import weakref
+
+class Parent:
+    def __init__(self, name: str):
+        self.name = name
+        self.children = []
+
+    def add_child(self, child_name: str):
+        c = Child(child_name, self)
+        self.children.append(c)
+        return c
+
+class Child:
+    def __init__(self, name: str, parent: Parent):
+        self.name = name
+        # TODO: store a weakref.ref to parent in self._parent_ref
+        self._parent_ref = None
+
+    @property
+    def parent(self):
+        # TODO: return the dereferenced parent (or None if freed)
+        return None
+
+p = Parent("root")
+c = p.add_child("leaf")
+print("Child's parent:", c.parent.name)
+del p
+print("After del p (no gc.collect!):", c.parent)
+</textarea>
+            </div>
+            <div class="code-toolbar">
+              <div class="code-toolbar-left">
+                <button class="btn btn-primary btn-sm btn-run" type="button">▶ Run Code</button>
+                <button class="btn btn-success btn-sm btn-check" type="button">✓ Check Solution</button>
+                <button class="btn btn-sm btn-reset" type="button">Reset</button>
+              </div>
+              <div class="code-toolbar-right">
+                <button class="btn btn-sm btn-hint" type="button">Hint</button>
+                <button class="btn btn-sm btn-answer" type="button">Final Answer</button>
+              </div>
+            </div>
+            <div class="output-panel"></div>
+            <div class="test-results"></div>
+            <div class="hint-drawer">
+              <div class="hint-step"><strong>Hint 1:</strong> Inside <code>Child.__init__</code>, set <code>self._parent_ref = weakref.ref(parent)</code>.</div>
+              <div class="hint-step"><strong>Hint 2:</strong> Inside <code>@property def parent(self)</code>, return <code>self._parent_ref()</code> (calling the weakref object).</div>
+            </div>
+            <div class="solution-drawer">
+              <strong>Final Answer &amp; Rationale:</strong>
+              <div class="solution-code"><pre>class Child:
+    def __init__(self, name: str, parent: Parent):
+        self.name = name
+        self._parent_ref = weakref.ref(parent)
+
+    @property
+    def parent(self):
+        return self._parent_ref()</pre></div>
+              <p style="margin: 0; font-size: 0.9rem; color: var(--text-muted);">
+                By keeping downward references strong and upward back-pointers weak, ownership forms a clean DAG and objects free immediately at zero refcount.
+              </p>
+              <button class="btn btn-sm btn-load-answer" style="margin-top: 0.6rem;" type="button">Load Answer into Editor</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECTION 3: THE GIL, SUBINTERPRETERS & PEP 703 FREE-THREADED PYTHON -->
+        <section class="section-block" id="sec-gil-pep703">
+          <div class="section-header">
+            <span class="tag tag-concept">[CONCEPT]</span>
+            <h2>3. Why the GIL Exists &amp; 2026–2027 Free-Threaded Python (PEP 703)</h2>
+          </div>
+
+          <p>
+            In classic CPython, updating <code>ob_refcnt += 1</code> and mutating shared dictionaries are <strong>not atomic</strong>
+            CPU operations. Without synchronization, two OS threads running Python bytecode simultaneously would corrupt
+            reference counts and crash the interpreter. CPython's historical solution was the <strong>GIL (Global Interpreter Lock)</strong>:
+            a single mutex allowing only <strong>one thread to execute Python bytecode at a time</strong> per process.
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Runtime Mode</th>
+                  <th>How It Works</th>
+                  <th>CPU-Bound Python Threads?</th>
+                  <th>Best Use Case (2027)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Standard CPython (GIL on)</strong></td>
+                  <td>1 mutex guards interpreter state; released during C I/O syscalls &amp; NumPy/PyTorch C loops.</td>
+                  <td>Serialized (~1 core for pure Python)</td>
+                  <td><code>asyncio</code> / I/O services + C-accelerated ML libs</td>
+                </tr>
+                <tr>
+                  <td><strong>Subinterpreters (PEP 684 / 3.14 <code>concurrent.interpreters</code>)</strong></td>
+                  <td>Multiple isolated interpreters in 1 OS process, each with its own heap and private GIL.</td>
+                  <td>Parallel across cores (isolated memory)</td>
+                  <td>Sandboxed plugins, multi-tenant workers with fast IPC</td>
+                </tr>
+                <tr>
+                  <td><strong>Free-Threaded CPython (PEP 703: <code>python3.13t</code> / <code>3.14t</code>)</strong></td>
+                  <td>No GIL! Uses biased refcounting, immortal objects, <code>mimalloc</code> heaps, and fine-grained locks.</td>
+                  <td>True multi-core Python threads!</td>
+                  <td>CPU-bound Python parallel pipelines sharing memory</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout senior">
+            <div class="callout-title">[SENIOR MINDSET] What PEP 703 Does NOT Fix Automatically</div>
+            <p style="margin: 0;">
+              Running on <code>python3.14t</code> (free-threaded) keeps CPython's own objects from crashing,
+              <strong>but your own shared lists/counters still need locks!</strong> A race condition like
+              <code>counter += 1</code> across two threads is still unsafe without <code>threading.Lock</code>.
+              You will practice locks, deadlocks, and thread vs process tradeoffs in Lesson 14!
+            </p>
+          </div>
+
+          <div class="code-box">
+            <div class="code-box-header">
+              <div class="code-box-title">
+                <span class="tag tag-example">[EXAMPLE 3]</span>
+                <span>Probing Runtime Version, GIL Status &amp; Object Sizes</span>
+              </div>
+            </div>
+            <div class="editor-wrap">
+              <textarea class="code-editor" rows="13">import sys
+
+gil_fn = getattr(sys, "_is_gil_enabled", None)
+gil_status = gil_fn() if callable(gil_fn) else True
+
+print("Python version:", sys.version.split()[0])
+print("GIL enabled in this build?", gil_status)
+print("sizeof(int 1):", sys.getsizeof(1), "bytes")
+print("sizeof(empty list):", sys.getsizeof([]), "bytes")
+print("sizeof(empty dict):", sys.getsizeof({}), "bytes")
+print("Immortal None refcount:", sys.getrefcount(None))
+</textarea>
+            </div>
+            <div class="code-toolbar">
+              <div class="code-toolbar-left">
+                <button class="btn btn-primary btn-sm btn-run" type="button">▶ Run Code</button>
+                <button class="btn btn-sm btn-reset" type="button">Reset</button>
+              </div>
+              <span class="shortcut-hint">Notice None's sentinel refcount!</span>
+            </div>
+            <div class="output-panel"></div>
+          </div>
+        </section>
+
+        <!-- SECTION 4: DIAGNOSTIC QUIZ -->
+        <section class="section-block" id="sec-quiz">
+          <div class="section-header">
+            <span class="tag tag-quiz">[QUIZ]</span>
+            <h2>4. Diagnostic Quiz (With Full Per-Option Rationales)</h2>
+          </div>
+
+          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1rem;">
+            <strong id="quiz-score-banner">Quiz Score: 0 / 6 correct</strong>
+            <button id="reset-quiz-btn" class="btn btn-sm" type="button">Reset Quiz Answers</button>
+          </div>
+
+          <div id="quiz-container"></div>
+        </section>
+
+        <!-- Primary Source & Teacher Prompt -->
+        <div class="callout">
+          <div class="callout-title">Recommended Primary Source &amp; Citations</div>
+          <p style="margin: 0 0 0.45rem; font-size: 0.93rem;">
+            <strong>Primary Reading:</strong>
+            <a href="https://peps.python.org/pep-0703/" target="_blank" rel="noopener">PEP 703 — Making the Global Interpreter Lock Optional in CPython</a> and
+            <a href="https://docs.python.org/3/howto/free-threading-python.html" target="_blank" rel="noopener">Python Free-Threading HOWTO</a>.
+          </p>
+          <p style="margin: 0; font-size: 0.88rem; color: var(--text-muted);">
+            Official Spec Citations:
+            <a href="https://docs.python.org/3/library/gc.html" target="_blank" rel="noopener">gc — Garbage Collector Interface</a> ·
+            <a href="https://docs.python.org/3/library/weakref.html" target="_blank" rel="noopener">weakref — Weak References</a> ·
+            <a href="https://peps.python.org/pep-0684/" target="_blank" rel="noopener">PEP 684 — A Per-Interpreter GIL</a>
+          </p>
+        </div>
+
+        <div class="callout senior">
+          <div class="callout-title">Have Questions? Ask Your Teacher</div>
+          <p style="margin: 0; font-size: 0.93rem;">
+            If reference cycles, why <code>gc</code> only tracks containers, or how PEP 703 biased refcounting works feels abstract, ask me in chat before we build multi-threaded and profiled code in Lesson 14!
+          </p>
+        </div>
+
+        <div class="card" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+          <a href="lesson-12-testing-ruff-docs.html" class="btn">← Lesson 12: Testing, Ruff &amp; Docs</a>
+          <a href="../master-plan.html" class="btn">Master Plan</a>
+          <a href="lesson-14-threading-multiprocessing-profiling.html" class="btn btn-primary">Lesson 14: Threading, Multiprocessing &amp; Profiling →</a>
+        </div>
+      </article>
+    </div>
+  </main>
+
+  <script>
+    window.LESSON_DATA = {
+      practices: {
+        p1: {
+          solution: `import sys\n\ndef measure_refcount_delta(n: int) -> tuple[int, int]:\n    target = [10, 20, 30]\n    base = sys.getrefcount(target)\n    aliases = [target for _ in range(n)]\n    during = sys.getrefcount(target)\n    aliases.clear()\n    after = sys.getrefcount(target)\n    return (during - base, after - base)`,
+          tests: [
+            {
+              name: "Refcount increases by n aliases and returns to baseline delta 0",
+              code: `assert measure_refcount_delta(0) == (0, 0)\nassert measure_refcount_delta(5) == (5, 0)\nassert measure_refcount_delta(12) == (12, 0)`
+            }
+          ]
+        },
+        p2: {
+          solution: `import weakref\n\nclass Session:\n    def __init__(self, user: str):\n        self.user = user\n\nclass SessionCache:\n    def __init__(self):\n        self._store = weakref.WeakValueDictionary()\n\n    def put(self, session_id: str, session: Session) -> None:\n        self._store[session_id] = session\n\n    def get(self, session_id: str) -> Session | None:\n        return self._store.get(session_id)\n\n    def live_count(self) -> int:\n        return len(self._store)`,
+          tests: [
+            {
+              name: "Returns cached Session while strong reference exists",
+              code: `c = SessionCache()\ns = Session("ada")\nc.put("k1", s)\nassert c.live_count() == 1\nassert c.get("k1") is s`
+            },
+            {
+              name: "Automatically evicts Session when caller drops strong reference",
+              code: `import gc\nc = SessionCache()\ns = Session("grace")\nc.put("k2", s)\nassert c.live_count() == 1\ndel s\ngc.collect()\nassert c.get("k2") is None\nassert c.live_count() == 0`
+            }
+          ]
+        },
+        p3: {
+          solution: `import weakref\n\nclass Parent:\n    def __init__(self, name: str):\n        self.name = name\n        self.children = []\n\n    def add_child(self, child_name: str):\n        c = Child(child_name, self)\n        self.children.append(c)\n        return c\n\nclass Child:\n    def __init__(self, name: str, parent: Parent):\n        self.name = name\n        self._parent_ref = weakref.ref(parent)\n\n    @property\n    def parent(self):\n        return self._parent_ref()`,
+          tests: [
+            {
+              name: "child.parent returns Parent while alive",
+              code: `p = Parent("root")\nc = p.add_child("c1")\nassert c.parent is p and c.parent.name == "root"`
+            },
+            {
+              name: "Deleting Parent frees it immediately without gc.collect()",
+              code: `p = Parent("root")\nc = p.add_child("c1")\ndel p\nassert c.parent is None, "Parent stayed alive in a strong reference cycle!"`
+            }
+          ]
+        }
+      },
+      quizzes: [
+        {
+          id: "q1",
+          question: "Why does sys.getrefcount(x) immediately after 'x = [1, 2]' typically return 2 instead of 1?",
+          answer: "C",
+          options: [
+            {
+              key: "A",
+              text: "Every Python list stores an internal self-pointer back to its own header.",
+              why: "Lists do not hold a reference to themselves unless you explicitly append the list inside itself."
+            },
+            {
+              key: "B",
+              text: "The generational GC always reserves one reference slot for container types.",
+              why: "The cyclic GC tracks containers in an internal doubly linked list without incrementing ob_refcnt."
+            },
+            {
+              key: "C",
+              text: "Passing x into sys.getrefcount(x) creates a temporary argument reference.",
+              why: "Correct! While sys.getrefcount executes, its parameter holds a second reference to x alongside your local variable."
+            },
+            {
+              key: "D",
+              text: "CPython doubles reference counts on mutable objects to prevent races.",
+              why: "CPython stores exact 1-per-reference counts; only immortal singletons use special sentinel values."
+            }
+          ]
+        },
+        {
+          id: "q2",
+          question: "Why can reference counting alone never reclaim two objects pointing to each other (a <-> b)?",
+          answer: "B",
+          options: [
+            {
+              key: "A",
+              text: "CPython disables reference counting whenever a class defines custom attributes.",
+              why: "Reference counting works identically on custom classes, built-in containers, and all other objects."
+            },
+            {
+              key: "B",
+              text: "Both objects remain at refcount >= 1 from each other even when unreachable.",
+              why: "Correct! Deleting external names drops their counts from 2 to 1, never hitting 0—so the cyclic gc detector is required."
+            },
+            {
+              key: "C",
+              text: "Mutual references automatically promote objects into immortal static memory.",
+              why: "Immortality is only for built-in singletons and code constants; cyclic objects stay heap-allocated until gc runs."
+            },
+            {
+              key: "D",
+              text: "The GIL prevents CPython from decrementing counts inside __del__ methods.",
+              why: "The GIL guards thread safety; it never blocks refcount decrements on single-threaded object cleanup."
+            }
+          ]
+        },
+        {
+          id: "q3",
+          question: "Which types of objects does CPython's cyclic garbage collector (gc) track?",
+          answer: "A",
+          options: [
+            {
+              key: "A",
+              text: "Container objects that can reference other objects, like lists and instances.",
+              why: "Correct! Only containers (list, dict, tuple, class instances, closures) can participate in reference cycles; ints and strings cannot."
+            },
+            {
+              key: "B",
+              text: "Only objects created inside background threads or multiprocessing pools.",
+              why: "All container objects created on any thread are tracked by the cyclic collector regardless of origin."
+            },
+            {
+              key: "C",
+              text: "Only primitive values such as int, float, bool, and immutable strings.",
+              why: "Primitives cannot hold pointers to other Python objects, so CPython skips tracking them in gc for speed."
+            },
+            {
+              key: "D",
+              text: "Only objects wrapped inside weakref.ref or WeakValueDictionary.",
+              why: "Weakrefs exist specifically to avoid strong cycles and do not keep referenced objects alive."
+            }
+          ]
+        },
+        {
+          id: "q4",
+          question: "What happens in a weakref.WeakValueDictionary when the last strong reference to a value is deleted?",
+          answer: "D",
+          options: [
+            {
+              key: "A",
+              text: "The value stays cached forever until cache.clear() is called manually.",
+              why: "Keeping values alive forever describes a normal dict, not a WeakValueDictionary."
+            },
+            {
+              key: "B",
+              text: "Accessing the key raises WeakReferenceError instead of returning None.",
+              why: "WeakValueDictionary removes the dead entry automatically, so .get(key) cleanly returns None."
+            },
+            {
+              key: "C",
+              text: "The dictionary converts the deleted value into a deep copy inside RAM.",
+              why: "WeakValueDictionary never copies values; it drops the key-value entry once the object is collected."
+            },
+            {
+              key: "D",
+              text: "The object is freed immediately and its entry disappears from the dict.",
+              why: "Correct! Because the dict holds only a weak reference, deleting the last strong reference frees the object and removes its key."
+            }
+          ]
+        },
+        {
+          id: "q5",
+          question: "What was the primary technical reason CPython introduced the Global Interpreter Lock (GIL)?",
+          answer: "C",
+          options: [
+            {
+              key: "A",
+              text: "To restrict Python web servers to handling one HTTP socket at a time.",
+              why: "Python threads release the GIL during blocking socket I/O, allowing concurrent I/O even with the GIL enabled."
+            },
+            {
+              key: "B",
+              text: "To enforce deterministic FIFO scheduling inside asyncio event loops.",
+              why: "The GIL predates asyncio by two decades and schedules OS threads, not asyncio coroutine tasks."
+            },
+            {
+              key: "C",
+              text: "To keep non-atomic ob_refcnt updates and C-API state safe without per-object locks.",
+              why: "Correct! Protecting reference counts and internal structures with one coarse lock kept single-threaded Python fast and C extensions simple."
+            },
+            {
+              key: "D",
+              text: "To prevent Python from allocating more than 2 GB of heap memory per process.",
+              why: "The GIL has nothing to do with memory limits; 64-bit Python processes can allocate all available system RAM."
+            }
+          ]
+        },
+        {
+          id: "q6",
+          question: "How does Free-Threaded CPython (PEP 703, python3.13t/3.14t) differ from Subinterpreters (PEP 684)?",
+          answer: "B",
+          options: [
+            {
+              key: "A",
+              text: "Free-threaded Python spawns separate OS processes; subinterpreters share one GIL.",
+              why: "Free-threaded Python runs OS threads inside one process sharing one heap, while PEP 684 gives each subinterpreter its own isolated GIL."
+            },
+            {
+              key: "B",
+              text: "Free-threaded Python shares one heap with no GIL; subinterpreters isolate heaps.",
+              why: "Correct! PEP 703 removes the GIL so threads share objects across cores (using biased refcounting + locks), whereas subinterpreters isolate state."
+            },
+            {
+              key: "C",
+              text: "Free-threaded Python disables reference counting; subinterpreters remove async/await.",
+              why: "PEP 703 still uses reference counting (biased/deferred refcounting), and both modes fully support async/await."
+            },
+            {
+              key: "D",
+              text: "Free-threaded Python eliminates race conditions in user code without any Locks.",
+              why: "PEP 703 protects interpreter memory safety, but user-level shared mutations (like shared lists/counters) still need threading.Lock."
+            }
+          ]
+        }
+      ]
+    };
+  </script>
+  <script src="../assets/engine.js"></script>
+</body>
+</html>

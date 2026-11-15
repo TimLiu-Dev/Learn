@@ -32,12 +32,14 @@
 - Post-edit verification (`kotlinc-jvm 2.3.10`): `133/133` model answers compile + run + match `expectedOutput` (with `0051-ex2` verified deterministic over 5 runs); `0` broken HTML/links/skewed quizzes/missing `.source`/`.ask`/solution leaks.
 - See `learning-records/0006-roadmap-audit-and-full-qa.md` for full verification stats and `roadmap.sh/kotlin` Add/Defer/Lighten recommendations.
 
-## Session 0007 (2026-11-12) · Section 13 Expansion (`0066–0069` & Modern Tooling Reference)
+## Session 0007 (2026-11-12 / 2026-11-14) · Section 13 Expansion (`0066–0070`), Staff Internals & Full Quiz Expansion
 - Built Section `13 · Modern Kotlin 2.2–2.4, Production Flow & Android Tooling (2027 Track)` in response to the `roadmap.sh/kotlin` 2027 audit:
   - `lessons/0066-modern-kotlin-dsls-recursion.html` (`13.1`: `when` guards, non-local `break`/`continue`, Context Parameters, Explicit Backing Fields, `@DslMarker`, `fun interface`, `tailrec`, `DeepRecursiveFunction`)
   - `lessons/0067-android-flow-concurrency-patterns.html` (`13.2`: `callbackFlow` + `awaitClose`, `stateIn(WhileSubscribed(5_000))`, `flatMapLatest`, `Mutex.withLock`)
   - `lessons/0068-gradle-kts-serialization-interop.html` (`13.3`: `build.gradle.kts`, `libs.versions.toml`, `kotlinx.serialization`, `@JvmOverloads`, `@JvmName`, `@JvmStatic`, `@Throws`)
-  - `lessons/0069-review-2027-android-mastery.html` (`13.R`: cumulative quiz + offline-sync capstone lab + 4-bug PR hunt)
-  - `reference/modern-kotlin-tooling.html` (17th reference cheat sheet)
-- Wired `0065 -> 0066 -> 0067 -> 0068 -> 0069 -> ../index.html`, updated `index.html`, `CURRICULUM.md`, `RESOURCES.md`, and added 8 verified model answers (`0066-ex1`..`0069-ex2`) to `assets/answers.js` (141 total exercises).
+  - `lessons/0069-contracts-r8-binary-compat.html` (`13.4`: Staff Internals — Kotlin Contracts `callsInPlace` & `returns(true) implies`, `@PublishedApi internal`, binary compatibility, and Android R8 shrinking/obfuscation)
+  - `lessons/0070-review-2027-android-mastery.html` (`13.R`: cumulative quiz + offline-sync capstone lab + 4-bug PR hunt)
+  - `reference/modern-kotlin-tooling.html` (17th reference cheat sheet, including Contracts, `@PublishedApi`, and R8 rules)
+- Expanded all 49 lessons that previously had only 1–2 quizzes (`0000`, `0013`–`0056`, `0062`–`0065`) by adding 91 balanced Senior-level quizzes so every single lesson (`0000`–`0070`) has `>= 3` quizzes, and fixed the partial starter leak in `0054-ex2`.
+- Wired `0065 -> 0066 -> 0067 -> 0068 -> 0069 -> 0070 -> ../index.html`, updated `index.html`, `CURRICULUM.md`, `RESOURCES.md`, `GLOSSARY.md`, and added 10 verified model answers (`0066-ex1`..`0070-ex2`) to `assets/answers.js` (71 lessons, 143 total exercises).
 - See `learning-records/0007-section13-modern-kotlin-modules.md` for details and post-edit verification counts.

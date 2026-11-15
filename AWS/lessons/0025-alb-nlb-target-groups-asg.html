@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0025 — ALB vs NLB, Target Groups, Health Checks, Deregistration Delay &amp; Auto Scaling</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0025</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0025-alb-nlb-target-groups-asg.html" class="active">Lesson 0025</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.3</span>
+      <span class="pill">Est. Time: 30 mins</span>
+    </div>
+
+    <h1>ALB vs NLB, Target Groups, Health Checks, Deregistration Delay &amp; Auto Scaling</h1>
+    <p class="lead">
+      Scaling compute behind a single static endpoint requires mastering two halves of AWS traffic management: choosing between Layer 7 (ALB) and Layer 4 (NLB) load balancing, and orchestrating health checks, connection draining, target-tracking math, and warm pools so deploys and traffic spikes never drop a single user request.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, when a DNS lookup returns multiple A records, <code>OkHttp</code> automatically loops through them on connection failure (client-side failover), and a gRPC channel uses a client-side picker to spread RPCs across subchannels. On AWS, you cannot rely on millions of mobile clients to detect dead EC2 instances or rebalance hot nodes. Instead, an <a href="../reference/glossary.html#alb">Application Load Balancer (ALB)</a> or <strong>Network Load Balancer (NLB)</strong> acts as the server-side router: polling backend health, draining in-flight sockets before shutdown, and feeding per-target metrics to an <strong>EC2 Auto Scaling Group (ASG)</strong>.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. L7 ALB vs. L4 NLB: Choosing the Right Edge</h2>
+        <p>
+          AWS Elastic Load Balancing offers two primary workhorses that solve fundamentally different networking problems. Picking the wrong one forces painful workarounds later (such as proxying TCP streams through HTTP or losing AWS WAF protection).
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 22%;">Dimension</th>
+              <th style="width: 39%;">Application Load Balancer (ALB)</th>
+              <th style="width: 39%;">Network Load Balancer (NLB)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>OSI Layer &amp; Protocols</strong></td>
+              <td>Layer 7: HTTP/1.1, HTTP/2, gRPC, WebSockets.</td>
+              <td>Layer 4: TCP, UDP, TCP_UDP, TLS passthrough/termination.</td>
+            </tr>
+            <tr>
+              <td><strong>Proxy Behavior</strong></td>
+              <td>Full reverse proxy: terminates client TCP+TLS, parses HTTP, opens <a href="../reference/glossary.html#keep-alive">pooled backend connections</a>, adds <code>X-Forwarded-For</code>.</td>
+              <td>Flow-based Hyperplane forwarding: routes 5-tuple flows at ultra-low latency (~microseconds) without buffering HTTP payloads.</td>
+            </tr>
+            <tr>
+              <td><strong>Static IPs &amp; DNS</strong></td>
+              <td>Dynamic public IPs (DNS-only); use Global Accelerator or NLB-in-front-of-ALB if partners require static IPs.</td>
+              <td>Native static Elastic IP (EIP) per Availability Zone; required for AWS PrivateLink providers.</td>
+            </tr>
+            <tr>
+              <td><strong>Client Source IP</strong></td>
+              <td>Hidden at TCP level (backend sees ALB ENI IP); read HTTP <code>X-Forwarded-For</code> header instead.</td>
+              <td>Preserved automatically for <code>instance</code> targets (and optionally <code>ip</code> targets, or via Proxy Protocol v2).</td>
+            </tr>
+            <tr>
+              <td><strong>Idle Timeout</strong></td>
+              <td>Default <strong>60s</strong> (configurable 1&ndash;4,000s). Watch out for the <a href="../reference/glossary.html#502-race">502 keep-alive close race</a>.</td>
+              <td>Fixed <strong>350s</strong> for TCP flows and <strong>120s</strong> for UDP flows.</td>
+            </tr>
+            <tr>
+              <td><strong>Cross-Zone LB Default</strong></td>
+              <td><strong>Always ON</strong> (cannot disable) at $0 extra cross-AZ data transfer charge.</td>
+              <td><strong>OFF by default</strong>; turning it on bills inter-AZ data transfer ($0.01/GB each way) but prevents zonal hot spots.</td>
+            </tr>
+            <tr>
+              <td><strong>Security &amp; Routing</strong></td>
+              <td>Security Groups, AWS WAF, host/path/header/query routing, OIDC/Cognito auth.</td>
+              <td>Security Groups (added for NLB in 2023), zero HTTP inspection, handles millions of RPS and instant flash spikes.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout">
+          <div class="callout-title">Senior Pattern: NLB &rarr; ALB Chaining</div>
+          <p style="margin: 0;">
+            Need static Elastic IPs for a banking partner's firewall allowlist <em>and</em> AWS WAF + path-based HTTP routing? AWS supports placing an <strong>ALB as a target</strong> (target type <code>alb</code>) behind an NLB. The NLB gives you static EIPs per AZ and passes TCP packets straight to the ALB for L7 inspection.
+          </p>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. Target Groups, Target Types &amp; The Health Check Trap</h2>
+        <p>
+          Both ALB and NLB route traffic to <strong>Target Groups</strong>. Every target group picks an immutable <code>target_type</code> at creation time:
+        </p>
+        <ul>
+          <li><code>instance</code>: Routes to EC2 instance IDs on a host port. Even if containers run on the instance, traffic hits the instance's primary ENI first (an extra hop).</li>
+          <li><code>ip</code>: Routes directly to private IPv4/IPv6 addresses—mandatory for ECS Fargate (<code>awsvpc</code> mode), EKS pod IPs, and on-premises targets across Direct Connect/VPN.</li>
+          <li><code>alb</code> / <code>lambda</code>: Routes NLB to an ALB (<code>alb</code>), or ALB to serverless functions (<code>lambda</code>).</li>
+        </ul>
+
+        <h3>Shallow vs. Deep Health Checks &amp; ALB "Fail Open"</h3>
+        <p>
+          An ALB polls every target on a configured path (e.g., <code>GET /healthz</code>) every <code>interval</code> (default <strong>30s</strong>, timeout <strong>5s</strong>), requiring <code>healthy_threshold</code> (default <strong>5</strong>) consecutive 2xx responses to restore a target and <code>unhealthy_threshold</code> (default <strong>2</strong>) consecutive failures to pull it out of rotation.
+        </p>
+        <p>
+          Here is the classic production outage: a developer makes <code>/healthz</code> run <code>SELECT 1</code> against RDS PostgreSQL. When RDS undergoes a 15-second failover:
+        </p>
+        <ol>
+          <li>Every backend instance in every AZ fails <code>/healthz</code> twice in a row.</li>
+          <li>All targets transition to <code>unhealthy</code> simultaneously.</li>
+          <li><strong>ALB Fail-Open (Panic Mode):</strong> When <em>100%</em> of targets in a target group are unhealthy, the ALB assumes the health check itself may be broken and <strong>routes traffic to all targets anyway</strong>.</li>
+          <li><strong>ASG Cascading Termination:</strong> Worse, if your Auto Scaling group uses <code>health_check_type = "ELB"</code>, ASG sees every instance past its <code>health_check_grace_period</code> marked unhealthy and begins <strong>terminating your entire healthy compute fleet</strong> at the exact moment the database recovers.</li>
+        </ol>
+
+        <div class="callout warning">
+          <div class="callout-title">Rule: Liveness Is Shallow; Readiness Is Careful</div>
+          <p style="margin: 0;">
+            Keep load-balancer health checks <strong>local to the process</strong> (e.g., verify the event loop, worker threads, and local configuration are alive—return <code>200 OK</code> in &lt;5 ms). Never fail an ELB health check because a shared downstream database or third-party API blipped. Report downstream dependency degradation through metrics, alarms, and circuit breakers instead.
+          </p>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Deregistration Delay &amp; Zero-Downtime Draining</h2>
+        <p>
+          When you deploy a new AMI, scale in an ASG, or roll an ECS task, the load balancer starts <strong>deregistration</strong>. The Target Group attribute <code>deregistration_delay.timeout_seconds</code> defaults to <strong>300 seconds</strong> (5 minutes)—which guarantees safe draining for slow monoliths, but needlessly stalls CI/CD rollouts when your API requests finish in 200 ms.
+        </p>
+        <p>
+          Conversely, engineers who get impatient and set <code>deregistration_delay = 0</code> trigger instant <code>502 Bad Gateway</code> errors: the load balancer stops waiting immediately and severs in-flight responses. Safe zero-downtime shutdown requires synchronizing <strong>two clocks</strong>:
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 235" width="100%" height="auto" role="img" aria-label="Graceful Deregistration vs Premature Shutdown Timeline">
+            <rect x="0" y="0" width="680" height="235" fill="#fdfcf8" rx="6" />
+
+            <!-- Safe Path -->
+            <text x="16" y="30" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Safe Graceful Drain (deregistration_delay = 60s, stopTimeout = 45s, maxRequest = 25s)</text>
+
+            <rect x="16" y="44" width="110" height="36" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="71" y="60" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#b45309">t=0..2s</text>
+            <text x="71" y="73" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#b45309">Propagation Wait</text>
+
+            <rect x="132" y="44" width="215" height="36" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="239" y="60" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#0f4c81">t=2..27s (draining)</text>
+            <text x="239" y="73" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#0f4c81">In-flight requests finish (200 OK)</text>
+
+            <rect x="353" y="44" width="130" height="36" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="418" y="60" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#166534">t=27s: exit(0)</text>
+            <text x="418" y="73" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#166534">Before 45s SIGKILL</text>
+
+            <rect x="489" y="44" width="175" height="36" rx="4" fill="#f3f1ea" stroke="#9ca3af" stroke-dasharray="3 3" />
+            <text x="576" y="60" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#575c66">45s / 60s ceilings</text>
+            <text x="576" y="73" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Never hit (0 dropped)</text>
+
+            <line x1="16" y1="104" x2="664" y2="104" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Broken Path -->
+            <text x="16" y="132" font-family="sans-serif" font-size="13" font-weight="700" fill="#991b1b">Broken Drain (deregistration_delay = 0s OR process exits immediately on SIGTERM)</text>
+
+            <rect x="16" y="146" width="150" height="36" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="91" y="162" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#b45309">t=0s: SIGTERM</text>
+            <text x="91" y="175" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#b45309">In-flight req @ 12s left</text>
+
+            <rect x="172" y="146" width="230" height="36" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="287" y="162" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#991b1b">TCP RST / Socket Closed</text>
+            <text x="287" y="175" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#991b1b">ALB returns HTTP 502 Bad Gateway</text>
+
+            <text x="16" y="212" font-family="sans-serif" font-size="11.5" fill="#575c66">
+              Propagation note: ALB target state changes take ~1&ndash;2s to reach all LB nodes; waiting 2s before closing the listener avoids last-millisecond arrivals.
+            </text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Both <code>deregistration_delay</code> and compute <code>stopTimeout</code> must strictly exceed <code>propagationBuffer + maxInFlightRequest</code>.
+          </div>
+        </div>
+
+        <p>
+          For Network Load Balancers with long-lived TCP/WebSocket connections, AWS also exposes <code>deregistration_delay.connection_termination.enabled</code> (default <code>false</code>). When disabled, existing TCP flows keep running past the delay; when enabled, NLB forcefully sends TCP <code>RST</code> at the end of the delay so old tasks actually vacate.
+        </p>
+
+        <!-- SECTION 4 -->
+        <h2>4. EC2 Auto Scaling: Target Tracking, Warmup &amp; Warm Pools</h2>
+        <p>
+          Manual step-scaling rules (<em>"add 2 instances when CPU &gt; 75%"</em>) constantly fight oscillation. AWS recommends <strong>Target Tracking Scaling Policies</strong>, which act like a thermostat around a single utilization metric such as <code>ASGAverageCPUUtilization</code> or <code>ALBRequestCountPerTarget</code>:
+        </p>
+        <p>
+          <code>desiredCapacity = clamp(ceil(currentCapacity * (currentMetricPerTarget / targetValue)), minSize, maxSize)</code>
+        </p>
+        <ul>
+          <li><strong>Asymmetric Reaction Speed:</strong> Target tracking scales <em>out</em> rapidly (typically after 3 consecutive 1-minute datapoints above target) and scales <em>in</em> conservatively (typically 15 consecutive 1-minute datapoints ~10&ndash;20% below target) to avoid capacity flapping.</li>
+          <li><strong>The Instance Warmup Trap (<code>default_instance_warmup</code>):</strong> Suppose an EC2 instance needs <strong>240 seconds</strong> to boot, pull containers, and warm JIT/in-memory caches while burning 95% CPU. If you leave <code>default_instance_warmup</code> too low (e.g., 30s), target tracking folds that booting instance's 95% CPU into the group average and assumes the previous scale-out already failed—triggering a runaway launch storm. Setting an accurate warmup excludes warming instances from scale-out calculations and prevents double-counting unmet capacity.</li>
+          <li><strong>EC2 Warm Pools:</strong> Even with perfect target tracking, cold-booting a fresh EC2 instance takes 3&ndash;5 minutes. A <strong>Warm Pool</strong> keeps pre-booted, pre-configured instances in the <code>Stopped</code> state (paying only EBS volume storage, $0 EC2 compute) or <code>Running</code>/<code>Hibernated</code> state. During a sudden traffic spike, ASG pulls from the Warm Pool in <strong>~20&ndash;30 seconds</strong> instead of 4 minutes.</li>
+        </ul>
+
+        <!-- SECTION 5 -->
+        <h2>5. Production Example: Terraform Target Group, Drain &amp; ASG</h2>
+        <p>
+          Notice how every timeout and threshold below aligns across the ALB Target Group, the Auto Scaling Group, and the Warm Pool:
+        </p>
+<pre><code>resource "aws_lb_target_group" "orders_api" {
+  name                 = "orders-api-tg"
+  port                 = 8080
+  protocol             = "HTTP"
+  vpc_id               = aws_vpc.prod.id
+  target_type          = "ip"
+  deregistration_delay = 45 # &gt; propagationBuffer (2s) + maxInFlightRequest (25s)
+
+  health_check {
+    path                = "/healthz" # Shallow process check ONLY (no RDS query!)
+    interval            = 15
+    timeout             = 5
+    healthy_threshold   = 3
+    unhealthy_threshold = 2
+    matcher             = "200"
+  }
+}
+
+resource "aws_autoscaling_group" "orders_api" {
+  name                      = "orders-api-asg"
+  min_size                  = 4
+  max_size                  = 40
+  vpc_zone_identifier       = aws_subnet.private[*].id
+  target_group_arns         = [aws_lb_target_group.orders_api.arn]
+  health_check_type         = "ELB"
+  health_check_grace_period = 240 # Must cover boot + app startup
+  default_instance_warmup   = 240 # Prevents double-scaling during cold boot
+
+  warm_pool {
+    pool_state                  = "Stopped" # Pay EBS only; ~25s resume on spike
+    min_size                    = 2
+    max_group_prepared_capacity = 10
+  }
+}
+
+resource "aws_autoscaling_policy" "req_per_target" {
+  name                   = "orders-alb-req-tracking"
+  autoscaling_group_name = aws_autoscaling_group.orders_api.name
+  policy_type            = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ALBRequestCountPerTarget"
+      resource_label         = "${aws_lb.public.arn_suffix}/${aws_lb_target_group.orders_api.arn_suffix}"
+    }
+    target_value = 800
+  }
+}</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement <code>auditGracefulDrain(cfg)</code> and <code>calculateTargetTracking(asg)</code> to validate zero-downtime deregistration budgets and compute ASG target-tracking scale-out decisions with Warm Pool fallback.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Apply these load-balancing and auto-scaling invariants to realistic production incidents.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>ALB Target Groups &amp; Draining:</strong> <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html" target="_blank" rel="noopener">Target groups for your Application Load Balancers</a> (Review health check thresholds, fail-open behavior, and deregistration delay).
+          </li>
+          <li>
+            <strong>Network Load Balancers:</strong> <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html" target="_blank" rel="noopener">Network Load Balancers documentation</a> (Static EIPs, cross-zone load balancing, and connection termination on deregistration).
+          </li>
+          <li>
+            <strong>EC2 Auto Scaling Target Tracking &amp; Warm Pools:</strong> <a href="https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html" target="_blank" rel="noopener">Target tracking scaling policies</a> and <a href="https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-warm-pools.html" target="_blank" rel="noopener">Warm pools for Amazon EC2 Auto Scaling</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0026 (ECR &amp; ECS on Fargate: Task Definitions, IAM Roles, Service Connect &amp; Blue/Green)</strong>, ask anything that feels fuzzy &mdash; for example: <em>"How do ASG Lifecycle Hooks (`Terminating:Wait`) interact with ALB deregistration delay?"</em> or <em>"When does ALB Least Outstanding Requests beat Round Robin for gRPC/HTTP2 backends?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0024-ec2-amis-graviton-imdsv2-ssm.html">&larr; Lesson 0024: EC2 Deep Dive: AMIs, Graviton/ARM64, IMDSv2 &amp; SSM Session Manager</a>
+          <a href="./0026-ecr-ecs-fargate-blue-green.html">Lesson 0026: ECR &amp; ECS on Fargate: Task Definitions, IAM Roles, Service Connect &amp; Blue/Green &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>ALB Pre-Warming &amp; LCU Reservation</strong>
+          ALB scales automatically, but a sudden 10x flash sale within seconds can outpace node scaling. Use ALB <em>Load Balancer Capacity Unit (LCU) reservation</em> before major mobile launches.
+        </div>
+        <div class="sidenote">
+          <strong>NLB Hairpinning Gotcha</strong>
+          If client IP preservation is enabled on an NLB and a client EC2 instance calls its own NLB target IP, the target tries to reply directly to the client IP and bypasses the NLB—breaking the TCP handshake!
+        </div>
+        <div class="sidenote">
+          <strong>Least Outstanding Requests (LOR)</strong>
+          ALB defaults to Round Robin, but switching your Target Group algorithm to <code>least_outstanding_requests</code> stops fast endpoints from queuing behind one slow, GC-paused target.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0025",
+      title: "Lab 0025: Graceful Drain & Target-Tracking Scaling Calculator",
+      filename: "alb-asg-calculator.js",
+      description:
+        "Complete two functions: (1) <code>auditGracefulDrain(cfg)</code> where <code>requiredDrainSec = cfg.propagationBufferSec + cfg.maxInFlightRequestSec</code>. Set <code>droppedInFlightRequests = cfg.deregistrationDelaySec &lt; requiredDrainSec</code> and <code>prematureSigkill = cfg.appStopTimeoutSec &lt; requiredDrainSec</code>, with <code>safe = !droppedInFlightRequests && !prematureSigkill</code>. Set <code>verdict</code> to <code>\"UNSAFE_BOTH\"</code> if both are true, <code>\"UNSAFE_DRAIN_TOO_SHORT\"</code> if only <code>droppedInFlightRequests</code>, <code>\"UNSAFE_SIGKILL_TOO_EARLY\"</code> if only <code>prematureSigkill</code>, <code>\"SAFE_SLOW_DEPLOY\"</code> if safe and <code>cfg.deregistrationDelaySec &gt;= 300 && requiredDrainSec &lt;= 60</code>, else <code>\"SAFE\"</code>. (2) <code>calculateTargetTracking(asg)</code> computes <code>rawNeeded = asg.currentMetricPerTarget === 0 ? 0 : Math.ceil((asg.currentCapacity * asg.currentMetricPerTarget) / asg.targetValue)</code>, clamps <code>desiredCapacity</code> to <code>[asg.minSize, asg.maxSize]</code>, computes <code>additionalInstancesToLaunch = Math.max(0, desiredCapacity - (asg.currentCapacity + asg.warmingCapacity))</code>, pulls <code>fromWarmPool = Math.min(additionalInstancesToLaunch, asg.warmPoolStoppedCount)</code> and <code>fromColdLaunch = additionalInstancesToLaunch - fromWarmPool</code>, and sets <code>estimatedFullRecoverySec</code> to <code>0</code> if none needed, <code>asg.coldBootSec</code> if <code>fromColdLaunch &gt; 0</code>, else <code>asg.warmPoolBootSec</code>.",
+      exports: ["auditGracefulDrain", "calculateTargetTracking"],
+      starterCode: `function auditGracefulDrain(cfg) {
+  // cfg: { deregistrationDelaySec, maxInFlightRequestSec, propagationBufferSec, appStopTimeoutSec }
+  const requiredDrainSec = 0; // TODO 1: propagationBufferSec + maxInFlightRequestSec
+  const droppedInFlightRequests = false; // TODO 2
+  const prematureSigkill = false; // TODO 3
+  const safe = !droppedInFlightRequests && !prematureSigkill;
+
+  let verdict = "SAFE";
+  // TODO 4: assign UNSAFE_BOTH | UNSAFE_DRAIN_TOO_SHORT | UNSAFE_SIGKILL_TOO_EARLY | SAFE_SLOW_DEPLOY | SAFE
+
+  return { requiredDrainSec, droppedInFlightRequests, prematureSigkill, safe, verdict };
+}
+
+function calculateTargetTracking(asg) {
+  // asg: { currentCapacity, warmingCapacity, currentMetricPerTarget, targetValue, minSize, maxSize, warmPoolStoppedCount, coldBootSec, warmPoolBootSec }
+  // TODO 5: compute rawNeeded and clamp desiredCapacity into [minSize, maxSize]
+  const desiredCapacity = asg.currentCapacity;
+
+  // TODO 6: exclude currentCapacity + warmingCapacity before launching new capacity
+  const additionalInstancesToLaunch = 0;
+  const fromWarmPool = 0;
+  const fromColdLaunch = 0;
+  const estimatedFullRecoverySec = 0;
+
+  return {
+    desiredCapacity,
+    additionalInstancesToLaunch,
+    fromWarmPool,
+    fromColdLaunch,
+    estimatedFullRecoverySec
+  };
+}
+
+console.log(
+  "Drain sample:",
+  auditGracefulDrain({ deregistrationDelaySec: 45, maxInFlightRequestSec: 25, propagationBufferSec: 2, appStopTimeoutSec: 35 })
+);
+console.log(
+  "Scale sample:",
+  calculateTargetTracking({
+    currentCapacity: 6,
+    warmingCapacity: 2,
+    currentMetricPerTarget: 1200,
+    targetValue: 800,
+    minSize: 4,
+    maxSize: 20,
+    warmPoolStoppedCount: 3,
+    coldBootSec: 240,
+    warmPoolBootSec: 25
+  })
+);`,
+      hints: [
+        "In <code>auditGracefulDrain</code>, compute <code>requiredDrainSec = cfg.propagationBufferSec + cfg.maxInFlightRequestSec</code> first. Both <code>deregistrationDelaySec</code> and <code>appStopTimeoutSec</code> must be <code>&gt;= requiredDrainSec</code> to be safe.",
+        "In <code>calculateTargetTracking</code>, remember that instances in <code>warmingCapacity</code> are already launching—subtract <code>(asg.currentCapacity + asg.warmingCapacity)</code> from <code>desiredCapacity</code> so you do not double-provision during warmup."
+      ],
+      solutionExplanation:
+        "Safe zero-downtime draining requires both the Target Group deregistration delay and the compute layer's SIGKILL stopTimeout to exceed the propagation buffer plus slowest in-flight request. On the scaling side, target tracking scales proportionally to total demand while subtracting already-warming instances and prioritizing Stopped Warm Pool instances before slow cold AMIs.",
+      solutionCode: `function auditGracefulDrain(cfg) {
+  const requiredDrainSec = cfg.propagationBufferSec + cfg.maxInFlightRequestSec;
+  const droppedInFlightRequests = cfg.deregistrationDelaySec < requiredDrainSec;
+  const prematureSigkill = cfg.appStopTimeoutSec < requiredDrainSec;
+  const safe = !droppedInFlightRequests && !prematureSigkill;
+
+  let verdict = "SAFE";
+  if (droppedInFlightRequests && prematureSigkill) {
+    verdict = "UNSAFE_BOTH";
+  } else if (droppedInFlightRequests) {
+    verdict = "UNSAFE_DRAIN_TOO_SHORT";
+  } else if (prematureSigkill) {
+    verdict = "UNSAFE_SIGKILL_TOO_EARLY";
+  } else if (cfg.deregistrationDelaySec >= 300 && requiredDrainSec <= 60) {
+    verdict = "SAFE_SLOW_DEPLOY";
+  }
+
+  return { requiredDrainSec, droppedInFlightRequests, prematureSigkill, safe, verdict };
+}
+
+function calculateTargetTracking(asg) {
+  const rawNeeded =
+    asg.currentMetricPerTarget === 0
+      ? 0
+      : Math.ceil((asg.currentCapacity * asg.currentMetricPerTarget) / asg.targetValue);
+  const desiredCapacity = Math.min(asg.maxSize, Math.max(asg.minSize, rawNeeded));
+  const additionalInstancesToLaunch = Math.max(
+    0,
+    desiredCapacity - (asg.currentCapacity + asg.warmingCapacity)
+  );
+  const fromWarmPool = Math.min(additionalInstancesToLaunch, asg.warmPoolStoppedCount);
+  const fromColdLaunch = additionalInstancesToLaunch - fromWarmPool;
+  const estimatedFullRecoverySec =
+    additionalInstancesToLaunch === 0
+      ? 0
+      : fromColdLaunch > 0
+      ? asg.coldBootSec
+      : asg.warmPoolBootSec;
+
+  return {
+    desiredCapacity,
+    additionalInstancesToLaunch,
+    fromWarmPool,
+    fromColdLaunch,
+    estimatedFullRecoverySec
+  };
+}`,
+      tests: [
+        {
+          name: "Graceful drain passes when deregistrationDelay (45s) and stopTimeout (35s) exceed required 27s",
+          run: (scope) => {
+            const out = scope.auditGracefulDrain({
+              deregistrationDelaySec: 45,
+              maxInFlightRequestSec: 25,
+              propagationBufferSec: 2,
+              appStopTimeoutSec: 35
+            });
+            const pass =
+              out.requiredDrainSec === 27 &&
+              out.droppedInFlightRequests === false &&
+              out.prematureSigkill === false &&
+              out.safe === true &&
+              out.verdict === "SAFE";
+            return { pass, message: `got required=${out.requiredDrainSec}, verdict=${out.verdict}` };
+          }
+        },
+        {
+          name: "Flags UNSAFE_DRAIN_TOO_SHORT when deregistrationDelay is 0s (or < requiredDrainSec)",
+          run: (scope) => {
+            const out = scope.auditGracefulDrain({
+              deregistrationDelaySec: 0,
+              maxInFlightRequestSec: 15,
+              propagationBufferSec: 2,
+              appStopTimeoutSec: 30
+            });
+            const pass =
+              out.droppedInFlightRequests === true &&
+              out.prematureSigkill === false &&
+              out.safe === false &&
+              out.verdict === "UNSAFE_DRAIN_TOO_SHORT";
+            return { pass, message: `got safe=${out.safe}, verdict=${out.verdict}` };
+          }
+        },
+        {
+          name: "Flags UNSAFE_BOTH when both drain delay and stopTimeout cut off in-flight work",
+          run: (scope) => {
+            const out = scope.auditGracefulDrain({
+              deregistrationDelaySec: 10,
+              maxInFlightRequestSec: 20,
+              propagationBufferSec: 2,
+              appStopTimeoutSec: 15
+            });
+            const pass =
+              out.droppedInFlightRequests === true &&
+              out.prematureSigkill === true &&
+              out.safe === false &&
+              out.verdict === "UNSAFE_BOTH";
+            return { pass, message: `got verdict=${out.verdict}` };
+          }
+        },
+        {
+          name: "Flags SAFE_SLOW_DEPLOY when default 300s drain is paired with short <=60s request budget",
+          run: (scope) => {
+            const out = scope.auditGracefulDrain({
+              deregistrationDelaySec: 300,
+              maxInFlightRequestSec: 10,
+              propagationBufferSec: 2,
+              appStopTimeoutSec: 30
+            });
+            const pass = out.safe === true && out.verdict === "SAFE_SLOW_DEPLOY";
+            return { pass, message: `got safe=${out.safe}, verdict=${out.verdict}` };
+          }
+        },
+        {
+          name: "Target tracking subtracts warmingCapacity and serves remaining scale-out from Warm Pool",
+          run: (scope) => {
+            const out = scope.calculateTargetTracking({
+              currentCapacity: 6,
+              warmingCapacity: 2,
+              currentMetricPerTarget: 1200,
+              targetValue: 800,
+              minSize: 4,
+              maxSize: 20,
+              warmPoolStoppedCount: 3,
+              coldBootSec: 240,
+              warmPoolBootSec: 25
+            });
+            const pass =
+              out.desiredCapacity === 9 &&
+              out.additionalInstancesToLaunch === 1 &&
+              out.fromWarmPool === 1 &&
+              out.fromColdLaunch === 0 &&
+              out.estimatedFullRecoverySec === 25;
+            return {
+              pass,
+              message: `desired=${out.desiredCapacity}, launch=${out.additionalInstancesToLaunch}, warm=${out.fromWarmPool}, recovery=${out.estimatedFullRecoverySec}s`
+            };
+          }
+        },
+        {
+          name: "Target tracking clamps to maxSize and accounts for cold launch latency when Warm Pool is exhausted",
+          run: (scope) => {
+            const out = scope.calculateTargetTracking({
+              currentCapacity: 5,
+              warmingCapacity: 0,
+              currentMetricPerTarget: 4000,
+              targetValue: 800,
+              minSize: 2,
+              maxSize: 12,
+              warmPoolStoppedCount: 3,
+              coldBootSec: 240,
+              warmPoolBootSec: 25
+            });
+            const pass =
+              out.desiredCapacity === 12 &&
+              out.additionalInstancesToLaunch === 7 &&
+              out.fromWarmPool === 3 &&
+              out.fromColdLaunch === 4 &&
+              out.estimatedFullRecoverySec === 240;
+            return {
+              pass,
+              message: `desired=${out.desiredCapacity}, warm=${out.fromWarmPool}, cold=${out.fromColdLaunch}, recovery=${out.estimatedFullRecoverySec}s`
+            };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0025",
+      title: "Quiz 0025: ALB vs NLB, Health Checks & Auto Scaling",
+      questions: [
+        {
+          id: "q1",
+          prompt: "A payments team exposes a gRPC microservice to external banking partners who require static IP addresses in their corporate firewalls and end-to-end TLS termination inside the backend containers. Which load balancer design meets both requirements?",
+          options: [
+            "Deploy an Application Load Balancer with path routing rules and target groups",
+            "Deploy a Network Load Balancer with Elastic IPs and TCP listener passthrough",
+            "Deploy an Application Load Balancer behind CloudFront with custom HTTP header forwarding",
+            "Deploy an API Gateway HTTP API with mutual TLS on private subnets"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "An Application Load Balancer uses dynamic IP addresses rather than static Elastic IPs and must terminate TLS at the ALB to inspect HTTP/gRPC traffic.",
+            "A Network Load Balancer supports static Elastic IPs per Availability Zone and a Layer 4 TCP listener that forwards encrypted TLS traffic untouched to backend containers.",
+            "Neither CloudFront nor a standard Application Load Balancer provides fixed per-AZ Elastic IPs for firewall allowlisting while preserving end-to-end container TLS termination.",
+            "API Gateway HTTP APIs terminate TLS at the managed API endpoint, do not support native gRPC passthrough, and cannot bind static Elastic IPs in private subnets."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "During an unexpected 15-second primary database failover, every EC2 instance behind an ALB fails its /healthz check because /healthz runs a live SQL query. What happens if the Auto Scaling group uses ELB health checks with a short grace period?",
+          options: [
+            "ALB caches the previous healthy responses while Auto Scaling freezes all scaling actions",
+            "ALB fails open to all targets while Auto Scaling replaces the entire fleet",
+            "ALB pauses connection draining while Auto Scaling promotes standby warm pool instances immediately",
+            "ALB returns HTTP 404 errors while Auto Scaling switches back to EC2 checks"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "ALB never caches backend HTTP responses for health failback, and Auto Scaling does not freeze actions when ELB marks instances unhealthy.",
+            "When 100% of targets fail health checks, ALB enters fail-open mode and routes to all targets anyway, while ASG's ELB health check sees every target unhealthy and begins terminating and replacing the entire fleet.",
+            "ALB does not pause deregistration delay on health check failures, and ASG replaces unhealthy instances rather than merely promoting warm pool capacity ahead of termination.",
+            "ALB returns 503 only when zero targets are registered (or fails open when registered targets are unhealthy) and never automatically alters an ASG's health check type."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "An Auto Scaling group scales a JVM service using Target Tracking at 60% average CPU, but each new EC2 instance takes 4 minutes to boot, download artifacts, and warm its JIT cache at 95% CPU. Without setting an accurate instance warmup, what happens during a traffic spike?",
+          options: [
+            "Target tracking includes booting instances' high CPU and launches unnecessary extra servers immediately",
+            "Target tracking suspends CloudWatch alarms permanently until an operator manually resets desired capacity",
+            "Target tracking lowers the CPU threshold automatically to thirty percent during cold boots",
+            "Target tracking drains existing healthy instances first to balance CPU across availability zones"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "If instance warmup is too short or unset, Target Tracking includes the booting instance's 95% CPU spike in the group metric and assumes existing capacity failed to absorb load, causing runaway over-provisioning.",
+            "Target Tracking never permanently suspends its CloudWatch alarms during instance boot; it continues evaluating every minute.",
+            "Target Tracking uses your configured target value (60% CPU) and does not dynamically rewrite the alarm threshold to 30% during cold boots.",
+            "Scale-out events never drain healthy existing instances; draining only happens during scale-in, replacement, or manual detachment."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

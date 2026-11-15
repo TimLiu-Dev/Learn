@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0043 — Production CI/CD: GitHub Actions + AWS OIDC, Canary Deployments &amp; Rollbacks</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0043</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0043-cicd-github-oidc-canary-rollback.html" class="active">Lesson 0043</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.7</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>Production CI/CD: GitHub Actions + AWS OIDC, Canary Deployments &amp; Rollbacks</h1>
+    <p class="lead">
+      Shipping cloud services safely requires two orthogonal defenses: eliminating static long-lived AWS credentials from CI runners via OIDC federation, and replacing all-or-nothing deploys with automated canary traffic shifting wired to CloudWatch rollback alarms.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Google Play Console, you never push a risky release straight to 100% of devices—you run a <strong>staged rollout (5% &rarr; 20% &rarr; 100%)</strong>, watch Android Vitals crash rates, and click <em>Halt</em> if crashes spike. On AWS, <strong>CodeDeploy</strong> (with ALB target-group weights or Lambda aliases) automates that exact staged rollout via configurations like <code>Canary10Percent5Minutes</code>, while <strong>CloudWatch Alarms</strong> act as your automated Vitals watchdog—rolling back to 100% Blue in seconds if <code>5xx</code> errors breach threshold. Meanwhile, <strong>GitHub Actions OIDC</strong> replaces static IAM access keys with short-lived STS tokens, just as Play App Signing separates your upload key from the production signing key.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Killing Static IAM Keys with GitHub Actions OIDC</h2>
+        <p>
+          Legacy CI/CD pipelines stored an IAM user's <code>AWS_ACCESS_KEY_ID</code> and <code>AWS_SECRET_ACCESS_KEY</code> in GitHub repository secrets. Those keys never expire unless manually rotated; if leaked through a debug print, compromised third-party Action, or misconfigured pull-request workflow, an attacker keeps persistent access to your AWS account.
+        </p>
+        <p>
+          With <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html" target="_blank" rel="noopener">IAM OpenID Connect (OIDC) federation</a>, GitHub acts as an identity provider and AWS Security Token Service (STS) issues <strong>short-lived session credentials</strong> (default <strong>1 hour</strong>, configurable down to <strong>15 minutes / 900 seconds</strong>) on every job run:
+        </p>
+        <ol>
+          <li><strong>Workflow JWT Request:</strong> Because the job declares <code>permissions: { id-token: write }</code>, the GitHub runner requests a signed OIDC JSON Web Token from <code>https://token.actions.githubusercontent.com</code>.</li>
+          <li><strong>Verifiable Claims:</strong> The JWT embeds signed claims including <code>aud: "sts.amazonaws.com"</code> and <code>sub: "repo:acme/orders-api:environment:production"</code> (or <code>ref:refs/heads/main</code>).</li>
+          <li><strong>STS Exchange:</strong> <code>aws-actions/configure-aws-credentials</code> calls <code>sts:AssumeRoleWithWebIdentity</code> with that JWT and your target Role ARN—zero static secrets stored anywhere.</li>
+          <li><strong>Trust Policy Verification:</strong> AWS verifies the JWT signature against GitHub's JWKS endpoint and evaluates your IAM Role's <code>Condition</code> block before returning temporary credentials.</li>
+        </ol>
+
+        <div class="callout warning">
+          <div class="callout-title">Critical OIDC Failure Mode: Over-Broad <code>sub</code> Conditions</div>
+          <p style="margin: 0;">
+            Never trust <code>"token.actions.githubusercontent.com:sub": "repo:acme/*"</code> or omit the <code>sub</code> condition on a production deploy role. Without strict pinning, <em>any</em> branch, sandbox repo, or <code>pull_request_target</code> workflow in your org can mint a valid JWT and assume production admin privileges. Pin production roles to a GitHub <strong>Environment</strong> claim (<code>repo:acme/orders-api:environment:production</code>) backed by required human reviewers and branch protection rules.
+          </p>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. Canary Traffic Shifting &amp; CodeDeploy Mechanics</h2>
+        <p>
+          Once CI builds and pushes an artifact (a container image to ECR or a Lambda zip), <a href="https://docs.aws.amazon.com/codedeploy/latest/userguide/deployment-configurations.html" target="_blank" rel="noopener">AWS CodeDeploy</a> controls how production traffic moves from the incumbent <strong>Blue (v1)</strong> revision to the new <strong>Green (v2)</strong> revision:
+        </p>
+        <ul>
+          <li><strong><code>Canary10Percent5Minutes</code>:</strong> Shifts <strong>10%</strong> of requests to Green for a <strong>5-minute</strong> bake window while 90% stays on Blue. If zero rollback alarms fire after 5 minutes, CodeDeploy shifts the remaining 90% at once. (Variants include <code>10Percent10Minutes</code>, <code>10Percent15Minutes</code>, and <code>10Percent30Minutes</code>.)</li>
+          <li><strong><code>Linear10PercentEvery1Minute</code>:</strong> Advances traffic in equal increments (+10% every 1 minute, finishing in 10 minutes). Prefer <strong>Linear</strong> when Green needs gradual cache warming or autoscaling; prefer <strong>Canary</strong> when you want a fixed low blast radius (10%) to catch startup crashes or bad configuration quickly.</li>
+          <li><strong><code>AllAtOnce</code>:</strong> Cuts 100% of traffic over immediately—appropriate only for dev/staging environments where speed outweighs blast-radius isolation.</li>
+        </ul>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 265" width="100%" height="auto" role="img" aria-label="GitHub Actions OIDC to CodeDeploy Canary Rollout and Alarm Rollback Flow">
+            <rect x="0" y="0" width="680" height="265" fill="#fdfcf8" rx="6" />
+            <defs>
+              <marker id="arrow-slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 10 5 L 0 9 z" fill="#0f4c81" />
+              </marker>
+              <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 10 5 L 0 9 z" fill="#166534" />
+              </marker>
+              <marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 10 5 L 0 9 z" fill="#991b1b" />
+              </marker>
+            </defs>
+
+            <!-- Top Row: OIDC Auth -->
+            <text x="16" y="24" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">Phase A: Passwordless CI Auth (OIDC)</text>
+            <rect x="16" y="34" width="185" height="46" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="108" y="54" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f4c81">GitHub Actions Runner</text>
+            <text x="108" y="70" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">JWT sub: env:production</text>
+
+            <line x1="201" y1="57" x2="245" y2="57" stroke="#0f4c81" stroke-width="1.6" marker-end="url(#arrow-slate)" />
+
+            <rect x="247" y="34" width="195" height="46" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="344" y="54" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#b45309">AWS STS (OIDC Trust)</text>
+            <text x="344" y="70" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Temp Creds (15m–60m)</text>
+
+            <line x1="442" y1="57" x2="486" y2="57" stroke="#0f4c81" stroke-width="1.6" marker-end="url(#arrow-slate)" />
+
+            <rect x="488" y="34" width="176" height="46" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="576" y="54" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f4c81">CodeDeploy Deployment</text>
+            <text x="576" y="70" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Canary10Percent5Minutes</text>
+
+            <!-- Divider -->
+            <line x1="16" y1="98" x2="664" y2="98" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Bottom Row: Traffic Shift + Alarm Loop -->
+            <text x="16" y="120" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">Phase B: Canary Bake &amp; Automated Rollback Loop</text>
+
+            <rect x="16" y="138" width="135" height="62" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="83" y="162" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f4c81">ALB / API GW</text>
+            <text x="83" y="178" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Weighted Listener</text>
+            <text x="83" y="192" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">90% Blue / 10% Green</text>
+
+            <line x1="151" y1="154" x2="205" y2="146" stroke="#0f4c81" stroke-width="1.6" marker-end="url(#arrow-slate)" />
+            <line x1="151" y1="184" x2="205" y2="194" stroke="#166534" stroke-width="1.6" marker-end="url(#arrow-green)" />
+
+            <rect x="207" y="126" width="145" height="36" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="279" y="148" text-anchor="middle" font-family="monospace" font-size="11" fill="#0f4c81">Blue v1 (90%)</text>
+
+            <rect x="207" y="174" width="145" height="36" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="279" y="196" text-anchor="middle" font-family="monospace" font-size="11" fill="#166534">Green v2 (10% · 5m)</text>
+
+            <line x1="352" y1="192" x2="395" y2="192" stroke="#0f4c81" stroke-width="1.6" marker-end="url(#arrow-slate)" />
+
+            <rect x="397" y="150" width="135" height="62" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="464" y="172" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#b45309">CloudWatch Alarm</text>
+            <text x="464" y="188" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">5xx Rate &gt; 1.0%</text>
+            <text x="464" y="202" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">2 of 3 periods</text>
+
+            <!-- Outcomes -->
+            <line x1="532" y1="166" x2="568" y2="146" stroke="#166534" stroke-width="1.6" marker-end="url(#arrow-green)" />
+            <rect x="570" y="124" width="94" height="40" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="617" y="142" text-anchor="middle" font-family="sans-serif" font-size="10" font-weight="700" fill="#166534">OK @ 5m</text>
+            <text x="617" y="156" text-anchor="middle" font-family="monospace" font-size="9" fill="#166534">100% Green</text>
+
+            <line x1="532" y1="196" x2="568" y2="216" stroke="#991b1b" stroke-width="1.6" marker-end="url(#arrow-red)" />
+            <rect x="570" y="198" width="94" height="40" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="617" y="216" text-anchor="middle" font-family="sans-serif" font-size="10" font-weight="700" fill="#991b1b">ALARM</text>
+            <text x="617" y="230" text-anchor="middle" font-family="monospace" font-size="9" fill="#991b1b">100% Blue</text>
+
+            <text x="16" y="248" font-family="sans-serif" font-size="11" fill="#575c66">Keep Blue tasks alive via TerminationWaitTimeInMinutes so rollbacks snap back without cold-booting containers.</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Passwordless GitHub Actions OIDC authentication paired with CodeDeploy weighted canary traffic shifting and CloudWatch alarm rollback.
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. CloudWatch Alarm Rollbacks &amp; Production Traps</h2>
+        <p>
+          As detailed in the <a href="https://aws.amazon.com/builders-library/automating-safe-hands-off-deployments/" target="_blank" rel="noopener">Amazon Builders' Library guide to safe hands-off deployments</a>, a canary pipeline is only as trustworthy as the signals gating promotion. Three operational failure modes bite teams in production:
+        </p>
+        <ol>
+          <li>
+            <strong>Low-Traffic Blindness &amp; <code>TreatMissingData</code>:</strong> At 3:00 AM, a 10% canary may receive only 2 requests per minute. If your alarm sets <code>TreatMissingData: breaching</code>, quiet minutes trigger false rollbacks; if it uses a raw error count (<code>5xx &gt; 0</code>) without a minimum request floor, 1 transient error causes 100% rollback, whereas <code>missing</code> with zero traffic lets broken code promote blindly. <strong>Fix:</strong> Use a CloudWatch Metric Math error-rate expression (<code>100 * m_5xx / m_requests</code>), require <code>DatapointsToAlarm: 2</code> of <code>3</code> 1-minute periods, and keep synthetic canary traffic (Route 53 / CloudWatch Synthetics) hitting critical paths continuously.
+          </li>
+          <li>
+            <strong>Premature Blue Termination:</strong> If CodeDeploy terminates Blue ECS tasks immediately when Green reaches 100%, a slow-burn bug discovered 15 minutes later (such as a connection-pool leak or deadlock) forces ECS to cold-boot Blue tasks from scratch. <strong>Fix:</strong> Set <code>TerminationWaitTimeInMinutes</code> (e.g., 30–60 minutes for stateless ECS services) so reverting to Blue is an instant ALB listener weight change.
+          </li>
+          <li>
+            <strong>Absolute Count vs. Percentage Alarms:</strong> An absolute alarm like <code>HTTPCode_Target_5XX_Count &gt; 5</code> breaks both ways—too sensitive at peak traffic (50,000 req/min) and blind at off-peak (20 req/min). Always alarm on <strong>percentage error rate</strong> and <strong>p99 latency</strong> together.
+          </li>
+        </ol>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production Code: IAM OIDC Trust Policy &amp; GitHub Workflow</h2>
+        <p>
+          Below is a production-hardened IAM Role Trust Policy paired with a GitHub Actions workflow that exchanges an OIDC JWT for 15-minute STS credentials and triggers a CodeDeploy deployment:
+        </p>
+<pre><code>// 1. IAM Role Trust Policy (Terraform/JSON) — pinned to ONE repo + production environment
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:acme/orders-api:environment:production"
+        }
+      }
+    }
+  ]
+}
+
+# 2. .github/workflows/deploy-prod.yml
+permissions:
+  id-token: write   # Required to mint GitHub OIDC JWT
+  contents: read    # Least-privilege checkout only
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production   # Enforces required reviewers + matches IAM sub claim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-orders-prod-deploy
+          aws-region: us-east-1
+          role-duration-seconds: 900   # 15-minute short-lived STS session
+      - name: Trigger CodeDeploy Canary10Percent5Minutes
+        run: |
+          aws deploy create-deployment \
+            --application-name orders-api-ecs \
+            --deployment-group-name orders-prod-dg \
+            --deployment-config-name CodeDeployDefault.ECSCanary10Percent5Minutes \
+            --revision file://appspec-revision.json</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement <code>evaluateCanaryStep(state, metrics, policy)</code> and <code>simulateRollout(stages, minuteMetrics, policy)</code> to model a production canary rollout controller with minimum-volume gating, multi-period CloudWatch alarm hysteresis, stage promotion, and instant rollback.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your production CI/CD instincts on OIDC trust boundaries, canary alarm traps, and blue/green rollback readiness.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>AWS IAM Docs:</strong> <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html" target="_blank" rel="noopener">Creating OpenID Connect (OIDC) identity providers</a> (Trust policy conditions and STS <code>AssumeRoleWithWebIdentity</code>).
+          </li>
+          <li>
+            <strong>GitHub Security Docs:</strong> <a href="https://docs.github.com/en/actions/how-tos/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services" target="_blank" rel="noopener">Configuring OpenID Connect in Amazon Web Services</a> (<code>sub</code> claim syntax for branches and environments).
+          </li>
+          <li>
+            <strong>AWS CodeDeploy Docs:</strong> <a href="https://docs.aws.amazon.com/codedeploy/latest/userguide/deployment-configurations.html" target="_blank" rel="noopener">Working with deployment configurations in CodeDeploy</a> (Canary, Linear, and AllAtOnce definitions).
+          </li>
+          <li>
+            <strong>Deep Engineering Essay:</strong> <a href="https://aws.amazon.com/builders-library/automating-safe-hands-off-deployments/" target="_blank" rel="noopener">Automating safe, hands-off deployments</a> — Clare Liguori (Amazon Builders' Library).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0044 (KMS Envelope Encryption, CMKs, Secrets Manager Rotation &amp; SSM Parameter Store)</strong>, ask me anything that feels fuzzy—for example: <em>"How do CodeDeploy lifecycle hooks like <code>AfterAllowTestTraffic</code> validate Green before any real user sees it?"</em> or <em>"How do we handle backward-incompatible database migrations during a blue/green rollback?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0042-terraform-remote-state-modules.html">&larr; Lesson 0042: Terraform on AWS: Remote S3 State, Locking, Modules &amp; CDK vs Terraform</a>
+          <a href="./0044-kms-envelope-encryption-secrets.html">Lesson 0044: KMS Envelope Encryption, CMKs, Secrets Manager Rotation &amp; SSM Parameter Store &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why <code>id-token: write</code> Matters</strong>
+          GitHub Actions scopes <code>GITHUB_TOKEN</code> permissions per workflow. Explicitly granting <code>id-token: write</code> while keeping <code>contents: read</code> ensures the job can mint an OIDC JWT without accidentally getting write access to your repository code.
+        </div>
+        <div class="sidenote">
+          <strong>Canary vs. Linear Tradeoff</strong>
+          Use <code>Canary10Percent5Minutes</code> when fast failure detection with bounded 10% blast radius matters most. Use <code>Linear10PercentEvery1Minute</code> when cold JVMs, connection pools, or auto-scaling targets need a gradual traffic ramp.
+        </div>
+        <div class="sidenote">
+          <strong>Check the Glossary</strong>
+          Review core AWS and networking primitives anytime in <a href="../reference/glossary.html">reference/glossary.html</a>.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0043",
+      title: "Lab 0043: Canary Rollout & Alarm Rollback Controller",
+      filename: "canary-controller.js",
+      description:
+        "Implement two pure functions:<br>1) <code>evaluateCanaryStep(state, metrics, policy)</code> evaluates one 1-minute metrics tick (<code>{ requests, errors5xx }</code>) against <code>policy</code> (<code>{ bakeMinutes, maxErrorRatePct, minRequestsForEval, breachesToRollback }</code>). Rules: (a) If <code>state.status !== \"RUNNING\"</code>, return a copy with <code>decision: \"NOOP\"</code>, <code>errorRatePct: 0</code>, and unchanged counters. (b) Compute <code>errorRatePct = metrics.requests > 0 ? (metrics.errors5xx / metrics.requests) * 100 : 0</code>. (c) If <code>metrics.requests &lt; policy.minRequestsForEval</code>, increment only <code>totalEvaluations</code>, keep <code>minutesInStage</code> and <code>consecutiveBreaches</code> unchanged, and return <code>decision: \"HOLD_INSUFFICIENT_DATA\"</code> and <code>trafficPct: state.stages[state.stageIndex]</code>. (d) Otherwise increment <code>totalEvaluations</code> and <code>minutesInStage</code> by 1. If <code>errorRatePct &gt; policy.maxErrorRatePct</code>, increment <code>consecutiveBreaches</code>; if <code>consecutiveBreaches &gt;= policy.breachesToRollback</code>, set <code>status: \"ROLLED_BACK\"</code>, <code>trafficPct: 0</code>, <code>decision: \"ROLLBACK\"</code>; else return <code>decision: \"ALARM_PENDING\"</code> and current stage <code>trafficPct</code>. (e) If healthy (<code>errorRatePct &lt;= policy.maxErrorRatePct</code>), reset <code>consecutiveBreaches = 0</code>. When <code>nextMinutes &gt;= policy.bakeMinutes</code>, if at the last stage (<code>stageIndex + 1 &gt;= stages.length</code>), set <code>status: \"PROMOTED\"</code>, <code>trafficPct: 100</code>, <code>decision: \"PROMOTE\"</code>; otherwise advance <code>stageIndex + 1</code>, reset <code>minutesInStage: 0</code>, set <code>decision: \"ADVANCE\"</code> and new stage <code>trafficPct</code>. Otherwise stay in stage with <code>decision: \"BAKE\"</code>.<br>2) <code>simulateRollout(stages, minuteMetrics, policy)</code> initializes <code>{ stageIndex: 0, stages: [...stages], minutesInStage: 0, status: \"RUNNING\", consecutiveBreaches: 0, totalEvaluations: 0, trafficPct: stages[0] }</code> and reduces over <code>minuteMetrics</code> until completion or terminal status, returning <code>{ finalState, history }</code> (each history entry containing <code>minute</code> (1-based), <code>decision</code>, <code>trafficPct</code>, <code>status</code>, <code>errorRatePct</code>).",
+      exports: ["evaluateCanaryStep", "simulateRollout"],
+      starterCode: `function evaluateCanaryStep(state, metrics, policy) {
+  // state:   { stageIndex, stages, minutesInStage, status, consecutiveBreaches, totalEvaluations, trafficPct }
+  // metrics: { requests, errors5xx }
+  // policy:  { bakeMinutes, maxErrorRatePct, minRequestsForEval, breachesToRollback }
+
+  if (state.status !== "RUNNING") {
+    return { ...state, decision: "NOOP", errorRatePct: 0 };
+  }
+
+  const errorRatePct = metrics.requests > 0
+    ? (metrics.errors5xx / metrics.requests) * 100
+    : 0;
+
+  // TODO 1: Guard against low-traffic blindness (metrics.requests < policy.minRequestsForEval)
+
+  // TODO 2: Handle 5xx alarm breach (errorRatePct > policy.maxErrorRatePct)
+  //         -> ALARM_PENDING or ROLLED_BACK (trafficPct: 0)
+
+  // TODO 3: Handle healthy tick -> reset consecutiveBreaches, check bakeMinutes,
+  //         either BAKE, ADVANCE to next stage, or PROMOTE to 100%
+
+  return { ...state, decision: "BAKE", errorRatePct };
+}
+
+function simulateRollout(stages, minuteMetrics, policy) {
+  let state = {
+    stageIndex: 0,
+    stages: [...stages],
+    minutesInStage: 0,
+    status: "RUNNING",
+    consecutiveBreaches: 0,
+    totalEvaluations: 0,
+    trafficPct: stages[0]
+  };
+  const history = [];
+
+  // TODO 4: Step through minuteMetrics using evaluateCanaryStep, push trace entries,
+  //         and stop early once state.status !== "RUNNING"
+
+  return { finalState: state, history };
+}
+
+console.log(
+  "Sample canary:",
+  simulateRollout(
+    [10],
+    [
+      { requests: 200, errors5xx: 0 },
+      { requests: 200, errors5xx: 1 },
+      { requests: 200, errors5xx: 0 },
+      { requests: 200, errors5xx: 0 },
+      { requests: 200, errors5xx: 0 }
+    ],
+    { bakeMinutes: 5, maxErrorRatePct: 1.0, minRequestsForEval: 50, breachesToRollback: 2 }
+  )
+);`,
+      hints: [
+        "When <code>metrics.requests &lt; policy.minRequestsForEval</code>, return <code>{ ...state, totalEvaluations: state.totalEvaluations + 1, trafficPct: state.stages[state.stageIndex], decision: \"HOLD_INSUFFICIENT_DATA\", errorRatePct }</code>. Notice <code>minutesInStage</code> does NOT advance on unverified low-traffic minutes.",
+        "On a breach (<code>errorRatePct &gt; policy.maxErrorRatePct</code>), compute <code>const nextBreaches = state.consecutiveBreaches + 1;</code>. If <code>nextBreaches &gt;= policy.breachesToRollback</code>, return <code>status: \"ROLLED_BACK\"</code>, <code>trafficPct: 0</code>, <code>decision: \"ROLLBACK\"</code>.",
+        "On a healthy minute, compute <code>const nextMinutes = state.minutesInStage + 1;</code>. If <code>nextMinutes &gt;= policy.bakeMinutes</code>, check <code>if (state.stageIndex + 1 &gt;= state.stages.length)</code> for <code>PROMOTE</code> (<code>trafficPct: 100</code>), else increment <code>stageIndex</code> and reset <code>minutesInStage: 0</code> for <code>ADVANCE</code>."
+      ],
+      solutionExplanation:
+        "A production canary controller prevents silent failure on quiet nights by refusing to count minutes with fewer than <code>minRequestsForEval</code> requests toward the bake timer. It also filters single-minute noise using <code>breachesToRollback</code> hysteresis (e.g., 2 consecutive breaching minutes), while snapping traffic back to 0% Green (100% Blue) immediately once the alarm trips.",
+      solutionCode: `function evaluateCanaryStep(state, metrics, policy) {
+  if (state.status !== "RUNNING") {
+    return { ...state, decision: "NOOP", errorRatePct: 0 };
+  }
+
+  const errorRatePct = metrics.requests > 0
+    ? (metrics.errors5xx / metrics.requests) * 100
+    : 0;
+
+  if (metrics.requests < policy.minRequestsForEval) {
+    return {
+      ...state,
+      totalEvaluations: state.totalEvaluations + 1,
+      trafficPct: state.stages[state.stageIndex],
+      decision: "HOLD_INSUFFICIENT_DATA",
+      errorRatePct
+    };
+  }
+
+  const nextEvaluations = state.totalEvaluations + 1;
+  const nextMinutes = state.minutesInStage + 1;
+
+  if (errorRatePct > policy.maxErrorRatePct) {
+    const nextBreaches = state.consecutiveBreaches + 1;
+    if (nextBreaches >= policy.breachesToRollback) {
+      return {
+        ...state,
+        minutesInStage: nextMinutes,
+        consecutiveBreaches: nextBreaches,
+        totalEvaluations: nextEvaluations,
+        status: "ROLLED_BACK",
+        trafficPct: 0,
+        decision: "ROLLBACK",
+        errorRatePct
+      };
+    }
+    return {
+      ...state,
+      minutesInStage: nextMinutes,
+      consecutiveBreaches: nextBreaches,
+      totalEvaluations: nextEvaluations,
+      trafficPct: state.stages[state.stageIndex],
+      decision: "ALARM_PENDING",
+      errorRatePct
+    };
+  }
+
+  if (nextMinutes >= policy.bakeMinutes) {
+    if (state.stageIndex + 1 >= state.stages.length) {
+      return {
+        ...state,
+        minutesInStage: nextMinutes,
+        consecutiveBreaches: 0,
+        totalEvaluations: nextEvaluations,
+        status: "PROMOTED",
+        trafficPct: 100,
+        decision: "PROMOTE",
+        errorRatePct
+      };
+    }
+    const nextStage = state.stageIndex + 1;
+    return {
+      ...state,
+      stageIndex: nextStage,
+      minutesInStage: 0,
+      consecutiveBreaches: 0,
+      totalEvaluations: nextEvaluations,
+      trafficPct: state.stages[nextStage],
+      decision: "ADVANCE",
+      errorRatePct
+    };
+  }
+
+  return {
+    ...state,
+    minutesInStage: nextMinutes,
+    consecutiveBreaches: 0,
+    totalEvaluations: nextEvaluations,
+    trafficPct: state.stages[state.stageIndex],
+    decision: "BAKE",
+    errorRatePct
+  };
+}
+
+function simulateRollout(stages, minuteMetrics, policy) {
+  let state = {
+    stageIndex: 0,
+    stages: [...stages],
+    minutesInStage: 0,
+    status: "RUNNING",
+    consecutiveBreaches: 0,
+    totalEvaluations: 0,
+    trafficPct: stages[0]
+  };
+  const history = [];
+
+  for (let i = 0; i < minuteMetrics.length; i++) {
+    if (state.status !== "RUNNING") break;
+    state = evaluateCanaryStep(state, minuteMetrics[i], policy);
+    history.push({
+      minute: i + 1,
+      decision: state.decision,
+      trafficPct: state.trafficPct,
+      status: state.status,
+      errorRatePct: state.errorRatePct
+    });
+  }
+
+  return { finalState: state, history };
+}`,
+      tests: [
+        {
+          name: "Promotes Canary10Percent5Minutes after 5 healthy minutes under 1% 5xx",
+          run: (scope) => {
+            const policy = { bakeMinutes: 5, maxErrorRatePct: 1.0, minRequestsForEval: 50, breachesToRollback: 2 };
+            const ticks = [
+              { requests: 200, errors5xx: 0 },
+              { requests: 200, errors5xx: 2 }, // 1.0% exactly (<= maxErrorRatePct)
+              { requests: 200, errors5xx: 1 },
+              { requests: 200, errors5xx: 0 },
+              { requests: 200, errors5xx: 0 }
+            ];
+            const res = scope.simulateRollout([10], ticks, policy);
+            const pass =
+              res.finalState.status === "PROMOTED" &&
+              res.finalState.trafficPct === 100 &&
+              res.history.length === 5 &&
+              res.history[4].decision === "PROMOTE";
+            return { pass, message: `status=${res.finalState.status}, traffic=${res.finalState.trafficPct}, last=${res.history[4]?.decision}` };
+          }
+        },
+        {
+          name: "Multi-stage canary advances 10% -> 50% -> 100% across bake windows",
+          run: (scope) => {
+            const policy = { bakeMinutes: 2, maxErrorRatePct: 1.0, minRequestsForEval: 50, breachesToRollback: 2 };
+            const ticks = [
+              { requests: 100, errors5xx: 0 },
+              { requests: 100, errors5xx: 0 },
+              { requests: 100, errors5xx: 1 },
+              { requests: 100, errors5xx: 0 }
+            ];
+            const res = scope.simulateRollout([10, 50], ticks, policy);
+            const pass =
+              res.history[1].decision === "ADVANCE" &&
+              res.history[1].trafficPct === 50 &&
+              res.history[3].decision === "PROMOTE" &&
+              res.finalState.trafficPct === 100;
+            return { pass, message: `decisions=${res.history.map((h) => h.decision).join(",")}` };
+          }
+        },
+        {
+          name: "Rolls back immediately on 2 consecutive 5xx breaches and stops further ticks",
+          run: (scope) => {
+            const policy = { bakeMinutes: 5, maxErrorRatePct: 1.0, minRequestsForEval: 50, breachesToRollback: 2 };
+            const ticks = [
+              { requests: 200, errors5xx: 0 },
+              { requests: 200, errors5xx: 6 }, // 3.0% breach 1
+              { requests: 200, errors5xx: 8 }, // 4.0% breach 2 -> ROLLBACK
+              { requests: 200, errors5xx: 0 }  // must not execute
+            ];
+            const res = scope.simulateRollout([10], ticks, policy);
+            const pass =
+              res.finalState.status === "ROLLED_BACK" &&
+              res.finalState.trafficPct === 0 &&
+              res.history.length === 3 &&
+              res.history[1].decision === "ALARM_PENDING" &&
+              res.history[2].decision === "ROLLBACK";
+            return { pass, message: `status=${res.finalState.status}, len=${res.history.length}, decisions=${res.history.map((h) => h.decision).join(",")}` };
+          }
+        },
+        {
+          name: "Resets consecutiveBreaches after a single transient spike recovers",
+          run: (scope) => {
+            const policy = { bakeMinutes: 3, maxErrorRatePct: 1.0, minRequestsForEval: 50, breachesToRollback: 2 };
+            const ticks = [
+              { requests: 100, errors5xx: 5 }, // breach 1
+              { requests: 100, errors5xx: 0 }, // recovers -> resets breaches to 0
+              { requests: 100, errors5xx: 4 }, // breach 1 again (NOT 2)
+              { requests: 100, errors5xx: 0 }  // healthy minute -> bakeMinutes=4 >= 3 -> PROMOTE
+            ];
+            const res = scope.simulateRollout([10], ticks, policy);
+            const pass =
+              res.finalState.status === "PROMOTED" &&
+              res.history[0].decision === "ALARM_PENDING" &&
+              res.history[2].decision === "ALARM_PENDING" &&
+              res.history[3].decision === "PROMOTE";
+            return { pass, message: `status=${res.finalState.status}, decisions=${res.history.map((h) => h.decision).join(",")}` };
+          }
+        },
+        {
+          name: "Low-traffic minutes hold bake timer instead of promoting unverified code",
+          run: (scope) => {
+            const policy = { bakeMinutes: 2, maxErrorRatePct: 1.0, minRequestsForEval: 50, breachesToRollback: 2 };
+            const ticks = [
+              { requests: 10, errors5xx: 2 },  // insufficient data (even with 20%!)
+              { requests: 100, errors5xx: 0 }, // minute 1
+              { requests: 5, errors5xx: 0 },   // insufficient data
+              { requests: 100, errors5xx: 0 }  // minute 2 -> PROMOTE
+            ];
+            const res = scope.simulateRollout([10], ticks, policy);
+            const pass =
+              res.history[0].decision === "HOLD_INSUFFICIENT_DATA" &&
+              res.history[2].decision === "HOLD_INSUFFICIENT_DATA" &&
+              res.finalState.status === "PROMOTED" &&
+              res.finalState.totalEvaluations === 4 &&
+              res.finalState.minutesInStage === 2;
+            return { pass, message: `status=${res.finalState.status}, evals=${res.finalState.totalEvaluations}, mins=${res.finalState.minutesInStage}` };
+          }
+        },
+        {
+          name: "Calling evaluateCanaryStep on a terminal state returns NOOP without mutating input",
+          run: (scope) => {
+            const terminal = {
+              stageIndex: 0,
+              stages: [10],
+              minutesInStage: 2,
+              status: "ROLLED_BACK",
+              consecutiveBreaches: 2,
+              totalEvaluations: 2,
+              trafficPct: 0
+            };
+            const out = scope.evaluateCanaryStep(
+              terminal,
+              { requests: 500, errors5xx: 0 },
+              { bakeMinutes: 5, maxErrorRatePct: 1.0, minRequestsForEval: 50, breachesToRollback: 2 }
+            );
+            const pass = out.decision === "NOOP" && out.status === "ROLLED_BACK" && out.totalEvaluations === 2;
+            return { pass, message: `decision=${out.decision}, status=${out.status}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0043",
+      title: "Quiz 0043: OIDC Trust, Canary Alarms & Blue/Green Rollbacks",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Your team configures GitHub Actions OIDC so workflows deploy to production AWS without static IAM keys. A security audit flags the IAM role trust policy because any repository under your GitHub organization—including developer sandbox repos and unreviewed feature branches—can assume the production role. Which trust policy fix closes this gap?",
+          options: [
+            "Rotate the GitHub OIDC provider thumbprint weekly inside your IAM role settings",
+            "Restrict the sub condition claim to your exact repo and production environment",
+            "Lower STS maximum session duration from twelve hours down to fifteen minutes",
+            "Require every workflow step to pass AWS account ID via environment variables"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "AWS trusts GitHub's OIDC CA and rotating thumbprints does not restrict which repositories or branches can present valid tokens to STS.",
+            "Pinning token.actions.githubusercontent.com:sub to repo:org/service:environment:production ensures only approved production workflows on that exact repo can assume the role.",
+            "Shortening MaxSessionDuration limits how long leaked temporary credentials live, but unauthorized repos can still mint fresh tokens repeatedly.",
+            "Workflow environment variables are untrusted user-controlled strings; IAM evaluates cryptographic claims signed inside the OIDC JWT, not YAML env vars."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "You deploy an ECS service at 2:00 AM using CodeDeploy <code>Canary10Percent5Minutes</code> with a CloudWatch rollback alarm on ALB <code>HTTPCode_Target_5XX_Count &gt; 0</code> and <code>TreatMissingData: breaching</code>. Only 3 health checks hit the canary during the 5-minute bake, and one minute has zero requests. What happens?",
+          options: [
+            "CodeDeploy extends the canary bake window automatically until enough real requests arrive",
+            "ALB blocks production traffic from reaching the green target group during maintenance",
+            "Missing datapoints breach the alarm and trigger an unnecessary rollback to blue",
+            "CloudWatch converts missing counts to zero and promotes broken builds to production"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "CodeDeploy uses fixed time windows such as 5 minutes and does not automatically extend bake durations waiting for higher request volume.",
+            "Weighted ALB target groups keep routing 10% of incoming traffic to Green regardless of low volume; ALB never pauses canary routing automatically.",
+            "Because ALB emits no HTTPCode_Target_5XX_Count metric when zero 5xx errors occur or zero requests arrive, TreatMissingData: breaching turns quiet minutes into ALARM and aborts the deploy.",
+            "CloudWatch only treats missing datapoints as zero if you configure a metric math FILL(..., 0) expression or TreatMissingData: notBreaching, never with breaching."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "During an ECS Blue/Green deployment behind an ALB, a newly promoted green revision passes the 5-minute canary but hits a database deadlock 8 minutes later. Which CodeDeploy setting lets you revert 100% of traffic back to the warm blue tasks within seconds?",
+          options: [
+            "Set deployment preference to AllAtOnce so ECS replaces tasks without load balancers",
+            "Enable OIDC token caching inside GitHub Actions to skip image rebuild steps",
+            "Reduce ALB health check interval to two seconds for faster container restarts",
+            "Configure a blue instance termination wait window longer than your soak period"
+          ],
+          correctIndex: 3,
+          explanations: [
+            "AllAtOnce removes the canary window entirely and immediately replaces tasks, leaving no warm Blue target group available for instant weight reversal.",
+            "OIDC tokens live 15–60 minutes for CI authentication and have zero effect on ECS task lifecycle or ALB target group rollback latency.",
+            "Shorter ALB health checks detect failing targets faster, but cannot restore terminated Blue containers without waiting minutes for fresh tasks to boot.",
+            "Setting TerminationWaitTimeInMinutes above your post-deploy soak period keeps the old Blue tasks registered and warm so rollback is a near-instant ALB listener shift."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

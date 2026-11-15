@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0031 — Route 53: Hosted Zones, Alias vs CNAME, Health Checks &amp; Routing Policies</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0031</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0031-route53-dns-routing-failover.html" class="active">Lesson 0031</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.4</span>
+      <span class="pill">Est. Time: 30 mins</span>
+    </div>
+
+    <h1>Route 53: Hosted Zones, Alias vs CNAME, Health Checks &amp; Routing Policies</h1>
+    <p class="lead">
+      Every cold mobile connection begins with a DNS lookup. A senior engineer knows why you cannot put a <code>CNAME</code> at your domain apex, how Split-Horizon Private Hosted Zones keep internal services invisible from the internet, and why DNS TTLs and mobile socket pools govern your real failover recovery time.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, <code>OkHttpClient</code> delegates hostname lookup to <code>Dns.SYSTEM</code> (which invokes Android's <code>netd</code> / bionic <code>getaddrinfo</code> resolver and respects Private DNS over TLS), then opens a TCP+TLS socket to the first reachable IP and stores it in <code>ConnectionPool</code>. Two crucial mobile realities collide with AWS DNS here: (1) while a socket stays pooled, OkHttp does <strong>not</strong> re-query DNS even after the record's TTL expires, and (2) mobile carrier resolvers strictly cache records for up to the record's TTL. <strong>Amazon Route 53</strong> sits on the authoritative side of that lookup—controlling which regional IP Android sees, failing over around dead ALBs, and keeping internal microservice hostnames private inside your VPC.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Authoritative Anycast DNS, Public vs. Private Hosted Zones &amp; Split-Horizon</h2>
+        <p>
+          <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/Welcome.html" target="_blank" rel="noopener">Amazon Route 53</a> is an authoritative <a href="../reference/glossary.html#dns">DNS</a> service backed by a <strong>100% availability SLA</strong> for the DNS query data plane. When your domain registrar delegates <code>myapp.com</code> to Route 53, it assigns <strong>four authoritative name servers</strong> spread across four distinct top-level domains (<code>.com</code>, <code>.net</code>, <code>.org</code>, <code>.co.uk</code>) so even an entire TLD outage cannot take your domain offline.
+        </p>
+        <p>
+          Inside Route 53, records live inside <strong>Hosted Zones</strong>—containers that answer queries for a domain and its subdomains:
+        </p>
+        <ul>
+          <li><strong>Public Hosted Zones:</strong> Route internet traffic (from Android devices, browsers, and partners) to public entry points such as CloudFront distributions, Application Load Balancers, or API Gateways.</li>
+          <li><strong>Private Hosted Zones (PHZs):</strong> Associated with one or more VPCs (requiring both <code>enableDnsSupport = true</code> and <code>enableDnsHostnames = true</code> on the VPC). Queries from EC2/ECS/Lambda workloads go to the VPC's Route 53 Resolver at <code>VPC_CIDR + 2</code> (for example, <code>10.0.0.2</code>) or <code>169.254.169.253</code> and never cross the public internet.</li>
+          <li><strong>Split-Horizon (Split-View) DNS:</strong> You create <em>both</em> a Public Hosted Zone and a Private Hosted Zone for the exact same domain (<code>myapp.com</code>). External Android clients resolve <code>api.myapp.com</code> to a public CloudFront/ALB IP, while internal services resolve <code>api.myapp.com</code> or <code>orders-db.myapp.com</code> to private <code>10.0.x.x</code> Interface Endpoints or ALB IPs.</li>
+        </ul>
+
+        <div class="callout warning">
+          <div class="callout-title">Split-Horizon Trap: No Fallback From Private to Public</div>
+          <p style="margin: 0;">
+            When a VPC is associated with a Private Hosted Zone for <code>myapp.com</code>, Route 53 Resolver considers that PHZ authoritative for the entire namespace inside that VPC. If an ECS task queries <code>status.myapp.com</code> and that record exists <strong>only</strong> in your Public Hosted Zone (not in the PHZ), Route 53 Resolver returns <code>NXDOMAIN</code>—it does <strong>not</strong> fall back to the Public Hosted Zone. Always mirror any public records needed by internal workloads inside the PHZ.
+          </p>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. Zone Apex, Alias Records vs. <code>CNAME</code></h2>
+        <p>
+          Suppose you want users to reach <code>https://myapp.com</code> (the <strong>zone apex</strong>, or naked/root domain) backed by an AWS ALB or CloudFront distribution. AWS load balancers scale horizontally behind the scenes and rotate their IP addresses constantly, so you cannot hardcode static <code>A</code> record IPs. Why not point <code>myapp.com</code> to <code>my-alb-123.us-east-1.elb.amazonaws.com</code> using a standard <code>CNAME</code>?
+        </p>
+        <p>
+          Because <a href="https://datatracker.ietf.org/doc/html/rfc1034#section-3.6.2" target="_blank" rel="noopener">RFC 1034 Section 3.6.2</a> and <a href="https://datatracker.ietf.org/doc/html/rfc1912#section-2.4" target="_blank" rel="noopener">RFC 1912 Section 2.4</a> forbid a <code>CNAME</code> from coexisting with any other DNS record type at the same name. The zone apex <strong>must</strong> carry <code>NS</code> (Name Server) and <code>SOA</code> (Start of Authority) records—so placing a <code>CNAME</code> at <code>myapp.com</code> breaks DNS compliance and causes resolvers to fail <code>NS</code>, <code>SOA</code>, and <code>MX</code> lookups.
+        </p>
+        <p>
+          Route 53 solves this with <strong>Alias records</strong>—an AWS-specific extension on standard <code>A</code> (IPv4) and <code>AAAA</code> (IPv6) records:
+        </p>
+        <ul>
+          <li><strong>Zone Apex Support:</strong> Because an Alias record presents externally as an <code>A</code> or <code>AAAA</code> record, it legally coexists with <code>NS</code>, <code>SOA</code>, and <code>MX</code> records at <code>myapp.com</code>.</li>
+          <li><strong>Zero Extra RTT &amp; Zero Query Cost:</strong> Route 53 internally resolves the target AWS resource (CloudFront, ALB, NLB, API Gateway, S3 website, Global Accelerator, or VPC Interface Endpoint) and returns the target's IP addresses directly—saving one recursive DNS lookup and eliminating Route 53 per-query charges (standard CNAME queries are billed at \$0.40 per million queries, whereas Alias queries to AWS resources are <strong>free</strong>).</li>
+          <li><strong>Automatic Target Health &amp; Managed TTL:</strong> Setting <code>EvaluateTargetHealth = true</code> lets Route 53 check the ALB/NLB's own target group health without creating a separate HTTP health check. Note the tradeoff: you <strong>cannot</strong> set a custom TTL on an Alias record; Route 53 inherits the target AWS service's TTL (typically <strong>60 seconds</strong> for ALBs).</li>
+        </ul>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 700 295" width="100%" height="auto" role="img" aria-label="Route 53 Resolution, Routing Policies, Health Checks, and Split-Horizon Architecture">
+            <rect x="0" y="0" width="700" height="295" fill="#fdfcf8" rx="6" />
+
+            <!-- Android Client -->
+            <rect x="16" y="34" width="142" height="84" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="87" y="54" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f4c81">Android App</text>
+            <text x="87" y="72" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Dns.SYSTEM</text>
+            <text x="87" y="88" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">OkHttp Pool</text>
+            <text x="87" y="104" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#575c66">(keeps socket open)</text>
+
+            <!-- Recursive Resolver -->
+            <rect x="184" y="42" width="128" height="68" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="248" y="62" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#b45309">ISP / Carrier DNS</text>
+            <text x="248" y="80" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Caches for TTL</text>
+            <text x="248" y="96" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#575c66">e.g. TTL = 60s</text>
+
+            <!-- Arrow Android -> Resolver -->
+            <line x1="158" y1="76" x2="182" y2="76" stroke="#1b1d21" stroke-width="1.5" />
+            <polygon points="184,76 177,72 177,80" fill="#1b1d21" />
+
+            <!-- Route 53 Public Hosted Zone -->
+            <rect x="338" y="20" width="174" height="114" rx="5" fill="#ede9fe" stroke="#5b21b6" />
+            <text x="425" y="40" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#5b21b6">Route 53 Anycast DNS</text>
+            <text x="425" y="57" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Public Zone: myapp.com</text>
+            <text x="425" y="75" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#1b1d21">Apex Alias A (TTL 60s)</text>
+            <text x="425" y="91" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#1b1d21">Policy: Failover / LBR</text>
+            <text x="425" y="109" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#5b21b6">4 TLDs (.com .net .org .co.uk)</text>
+
+            <!-- Arrow Resolver -> Route 53 -->
+            <line x1="312" y1="76" x2="336" y2="76" stroke="#1b1d21" stroke-width="1.5" />
+            <polygon points="338,76 331,72 331,80" fill="#1b1d21" />
+
+            <!-- Primary & Secondary Regions -->
+            <rect x="542" y="18" width="142" height="54" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="613" y="37" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#991b1b">Primary: us-east-1</text>
+            <text x="613" y="53" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#991b1b">ALB Unhealthy (3x10s)</text>
+            <text x="613" y="66" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#991b1b">Excluded by Health Check</text>
+
+            <rect x="542" y="84" width="142" height="54" rx="5" fill="#dcfce7" stroke="#166534" />
+            <text x="613" y="103" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#166534">Secondary: us-west-2</text>
+            <text x="613" y="119" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#166534">ALB Healthy &rarr; Returned</text>
+            <text x="613" y="132" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#166534">Alias A IPs direct</text>
+
+            <!-- Arrows Route 53 -> Regions -->
+            <line x1="512" y1="54" x2="539" y2="45" stroke="#991b1b" stroke-width="1.4" stroke-dasharray="4 3" />
+            <line x1="512" y1="96" x2="539" y2="110" stroke="#166534" stroke-width="1.8" />
+            <polygon points="542,111 534,104 536,113" fill="#166534" />
+
+            <!-- Divider -->
+            <line x1="16" y1="158" x2="684" y2="158" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Private Hosted Zone / Split-Horizon -->
+            <rect x="16" y="176" width="668" height="102" rx="6" fill="#f5f3ef" stroke="#c8c1b4" />
+            <text x="30" y="196" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1b1d21">Inside VPC (10.0.0.0/16) — Split-Horizon Private Hosted Zone</text>
+
+            <rect x="30" y="210" width="150" height="54" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="105" y="230" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f4c81">ECS Service</text>
+            <text x="105" y="246" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#1b1d21">api.myapp.com?</text>
+
+            <rect x="218" y="210" width="198" height="54" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="317" y="230" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#b45309">VPC Resolver (10.0.0.2)</text>
+            <text x="317" y="246" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#1b1d21">Checks PHZ first (no public fallback)</text>
+
+            <rect x="454" y="210" width="214" height="54" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="561" y="230" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#166534">Private ALB / PrivateLink</text>
+            <text x="561" y="246" text-anchor="middle" font-family="monospace" font-size="9.5" fill="#166534">10.0.12.44 (never leaves VPC)</text>
+
+            <line x1="180" y1="237" x2="216" y2="237" stroke="#1b1d21" stroke-width="1.5" />
+            <polygon points="218,237 211,233 211,241" fill="#1b1d21" />
+            <line x1="416" y1="237" x2="452" y2="237" stroke="#166534" stroke-width="1.5" />
+            <polygon points="454,237 447,233 447,241" fill="#166534" />
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Top: External Android queries pass through carrier TTL caches to Route 53, which filters out unhealthy regions and returns healthy Alias IPs directly. Bottom: Split-horizon DNS resolves the same hostname privately via <code>10.0.0.2</code> inside the VPC.
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Routing Policies, Health Checks &amp; TTL Failover Tradeoffs</h2>
+        <p>
+          Choosing the right Route 53 routing policy determines both normal-state latency and blast radius during regional incidents:
+        </p>
+        <ul>
+          <li><strong>Simple:</strong> Returns one or more IPs in random order. Does not support per-record health checks. Use only for single-region static endpoints.</li>
+          <li><strong>Failover (Active-Passive):</strong> Routes 100% of traffic to <code>PRIMARY</code> while its health check passes, switching to <code>SECONDARY</code> when <code>PRIMARY</code> fails. <em>Important Route 53 behavior:</em> if <strong>both</strong> Primary and Secondary health checks fail, Route 53 <strong>fails open</strong> and returns Primary anyway (assuming the health-checker network might be partitioned rather than blackholing all traffic).</li>
+          <li><strong>Weighted (<code>0</code>&ndash;<code>255</code>):</strong> Splits traffic proportionally across records (for example, <code>95</code> to v1 and <code>5</code> to canary v2). Setting weight to <code>0</code> stops traffic to that record unless <em>every</em> record has weight <code>0</code> (in which case all receive equal weight). Unhealthy records are removed before normalizing remaining weights.</li>
+          <li><strong>Latency-Based Routing (LBR):</strong> Routes each user to the AWS Region with the lowest measured network latency (using <code>us-east-1</code>, <code>eu-west-1</code>, etc.). If the closest region fails its health check, Route 53 automatically selects the next-lowest-latency healthy region.</li>
+          <li><strong>Geolocation vs. Geoproximity:</strong> Geolocation maps strictly by country, continent, or US state (ideal for GDPR/data-residency compliance, with an optional <code>*</code> default fallback). Geoproximity routes by physical distance and supports a numeric <strong>Bias</strong> (<code>-99</code> to <code>+99</code>) to expand or shrink a region's catchment area.</li>
+          <li><strong>Multivalue Answer:</strong> Returns up to <strong>8 healthy records</strong> selected randomly—essentially Simple routing upgraded with health checks for client-side redundancy.</li>
+        </ul>
+
+        <h3>Health Checks &amp; Real-World Failover Math</h3>
+        <p>
+          Route 53 supports three health check modes: (1) <strong>Endpoint checks</strong> (HTTP/HTTPS/TCP probes sent from distributed AWS checkers every <strong>30s standard</strong> or <strong>10s fast</strong>, requiring <strong>3 consecutive failures</strong> by default to flip unhealthy), (2) <strong>Calculated health checks</strong> (aggregating up to 256 child checks with AND/OR/M-of-N logic to prevent noisy single-host flaps), and (3) <strong>CloudWatch Alarm-backed health checks</strong>—essential when monitoring private VPC resources like Aurora or internal ALBs that public Route 53 health checkers cannot reach directly.
+        </p>
+        <p>
+          Total failover time for an Android user is <strong>not</strong> just the health check speed:
+        </p>
+        <p>
+          <code>Worst-Case Failover = Health Check Detection (e.g., 3 &times; 10s = 30s) + DNS Record TTL (e.g., 60s) + Client Connection Pool Lifetime</code>
+        </p>
+        <p>
+          A <code>300s</code> or <code>3600s</code> TTL lowers DNS billings and keeps carrier caches warm, but traps new sessions on a dead region for 5&ndash;60 minutes. Conversely, setting TTL to <code>0s</code> forces fresh lookups on every cold connection, hurting Android P95 startup latency and increasing query costs. In production, <strong>60 seconds</strong> (matching ALB Alias TTL) is the standard sweet spot for dynamic APIs—and on Android, configuring reasonable OkHttp pool eviction or retry-on-connection-failure ensures active clients rotate off dead sockets promptly.
+        </p>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production Code Example: Terraform Route 53 Failover &amp; Private Zone</h2>
+        <p>
+          Notice how the Terraform configuration below separates the public apex Alias, the 10-second fast health check for active-passive regional failover, and the split-horizon Private Hosted Zone:
+        </p>
+<pre><code># 1. Public Hosted Zone + Fast 10s Health Check for Primary Region
+resource "aws_route53_zone" "public" {
+  name = "myapp.com"
+}
+
+resource "aws_route53_health_check" "primary_api" {
+  fqdn              = "primary-origin.myapp.com"
+  port              = 443
+  type              = "HTTPS"
+  resource_path     = "/healthz"
+  request_interval  = 10   # Fast health check (10s vs 30s default)
+  failure_threshold = 3    # 3 consecutive failures = ~30s detection
+}
+
+# 2. Zone Apex Active-Passive Failover using Alias (free queries, legal at apex)
+resource "aws_route53_record" "apex_primary" {
+  zone_id        = aws_route53_zone.public.zone_id
+  name           = "myapp.com"
+  type           = "A"
+  set_identifier = "us-east-1-primary"
+
+  failover_routing_policy { type = "PRIMARY" }
+  health_check_id = aws_route53_health_check.primary_api.id
+
+  alias {
+    name                   = aws_lb.us_east_1.dns_name
+    zone_id                = aws_lb.us_east_1.zone_id
+    evaluate_target_health = true
+  }
+}
+
+resource "aws_route53_record" "apex_secondary" {
+  zone_id        = aws_route53_zone.public.zone_id
+  name           = "myapp.com"
+  type           = "A"
+  set_identifier = "us-west-2-secondary"
+
+  failover_routing_policy { type = "SECONDARY" }
+
+  alias {
+    name                   = aws_lb.us_west_2.dns_name
+    zone_id                = aws_lb.us_west_2.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# 3. Split-Horizon Private Hosted Zone (internal VPCs only)
+resource "aws_route53_zone" "private" {
+  name = "myapp.com"
+  vpc { vpc_id = aws_vpc.prod.id } # Requires enable_dns_support &amp; enable_dns_hostnames
+}</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build a deterministic Route 53 routing-policy and health-check failover simulator in <code>resolveRoute53(query, records, healthStatus)</code>.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your Route 53 architecture instincts against production failure modes. Every option includes an explanation of why it works or fails.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy.html" target="_blank" rel="noopener">Amazon Route 53 — Choosing a routing policy</a> and <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-choosing-alias-non-alias.html" target="_blank" rel="noopener">Choosing between alias and non-alias records</a>.
+          </li>
+          <li>
+            <strong>Private DNS &amp; Health Checks:</strong> <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/hosted-zones-private.html" target="_blank" rel="noopener">Working with private hosted zones</a> and <a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-determining-health-of-endpoints.html" target="_blank" rel="noopener">How Route 53 determines whether a health check is healthy</a>.
+          </li>
+          <li>
+            <strong>DNS RFC Specification:</strong> <a href="https://datatracker.ietf.org/doc/html/rfc1034#section-3.6.2" target="_blank" rel="noopener">RFC 1034 &sect;3.6.2 — Domain Names: Concepts and Facilities (CNAME rules)</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0032 (RDS PostgreSQL &amp; Aurora)</strong>, ask anything you want to probe further—for example: <em>"How do Route 53 Application Recovery Controller (ARC) readiness checks and routing controls improve on DNS-based failover?"</em> or <em>"How does EDNS0-client-subnet affect Latency-Based Routing when users enable iCloud Private Relay or VPNs?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0030-cloudfront-oac-cache-policies-edge.html">&larr; Lesson 0030: CloudFront CDN: Origin Access Control (OAC), Cache Keys & Edge Functions</a>
+          <a href="./0032-rds-aurora-multiaz-rds-proxy.html">Lesson 0032: RDS PostgreSQL & Aurora: Multi-AZ Failover, Read Replicas & RDS Proxy &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>4-TLD NS Resilience</strong>
+          Route 53 assigns every hosted zone four authoritative name servers across <code>.com</code>, <code>.net</code>, <code>.org</code>, and <code>.co.uk</code> so a registry failure in one TLD cannot blackhole your entire domain.
+        </div>
+        <div class="sidenote">
+          <strong>EDNS0 Client Subnet (ECS)</strong>
+          For Latency and Geolocation routing, Route 53 reads the truncated <code>ECS</code> IP prefix forwarded by recursive resolvers like Google <code>8.8.8.8</code> or Cloudflare—falling back to the resolver's IP if privacy relays strip <code>ECS</code>.
+        </div>
+        <div class="sidenote">
+          <strong>OkHttp Pool vs. TTL</strong>
+          Android's <code>OkHttpClient</code> keeps idle HTTP/1.1 &amp; HTTP/2 sockets open for 5 minutes by default. Existing requests stay pinned to the old IP until the socket closes, errors out, or hits idle eviction.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0031",
+      title: "Lab 0031: Route 53 Routing Policy & Failover Resolver",
+      filename: "route53-resolver.js",
+      description:
+        "Implement <code>resolveRoute53(query, records, healthStatus)</code>. Inputs: <code>query = { fqdn, policy, clientRegionLatencies?, randomRoll? }</code> (<code>policy</code> is <code>\"FAILOVER\" | \"WEIGHTED\" | \"LATENCY\"</code>), <code>records</code> is an array of <code>{ id, fqdn, type, value, ttl, healthCheckId?, failoverRole?, weight?, region? }</code>, and <code>healthStatus</code> maps <code>healthCheckId -> boolean</code>. Rules: (1) Filter <code>records</code> to <code>r.fqdn === query.fqdn</code>; if empty return <code>{ status: \"NXDOMAIN\", selectedId: null, type: null, answers: [], effectiveTtl: 0, failOpen: false }</code>. (2) A record is healthy if <code>!r.healthCheckId || healthStatus[r.healthCheckId] !== false</code>. If zero matching records are healthy, Route 53 <strong>fails open</strong>: set <code>failOpen = true</code> and treat all matching records as <code>candidates</code>; otherwise <code>candidates = healthy</code> and <code>failOpen = false</code>. (3) Select one record from <code>candidates</code>: for <code>\"FAILOVER\"</code>, pick the first <code>failoverRole === \"PRIMARY\"</code> if present, else first <code>\"SECONDARY\"</code> (or <code>candidates[0]</code>); for <code>\"WEIGHTED\"</code>, sum <code>Math.max(0, r.weight ?? 0)</code> across <code>candidates</code>—if total is <code>0</code>, pick <code>candidates[Math.floor(roll * candidates.length)]</code>, else pick from records with <code>weight &gt; 0</code> where <code>roll * totalWeight &lt; cumulativeWeight</code> (<code>roll = query.randomRoll ?? 0</code>); for <code>\"LATENCY\"</code>, pick the candidate with lowest <code>query.clientRegionLatencies?.[r.region] ?? Infinity</code> (keep earliest on ties). (4) Return <code>{ status: \"NOERROR\", selectedId: selected.id, type: selected.type, answers: [selected.value], effectiveTtl: selected.ttl, failOpen }</code>.",
+      exports: ["resolveRoute53"],
+      starterCode: `function resolveRoute53(query, records, healthStatus) {
+  const matching = records.filter((r) => r.fqdn === query.fqdn);
+  if (matching.length === 0) {
+    return { status: "NXDOMAIN", selectedId: null, type: null, answers: [], effectiveTtl: 0, failOpen: false };
+  }
+
+  // TODO 1: Partition matching records by healthStatus; apply Route 53 fail-open rule if none are healthy
+  let candidates = matching;
+  let failOpen = false;
+
+  // TODO 2: Select record according to query.policy ("FAILOVER" | "WEIGHTED" | "LATENCY")
+  let selected = candidates[0];
+
+  return {
+    status: "NOERROR",
+    selectedId: selected.id,
+    type: selected.type,
+    answers: [selected.value],
+    effectiveTtl: selected.ttl,
+    failOpen
+  };
+}
+
+const sampleRecords = [
+  { id: "r-use1", fqdn: "api.myapp.com", type: "ALIAS", value: "52.10.20.1", ttl: 60, healthCheckId: "hc-east", failoverRole: "PRIMARY", weight: 80, region: "us-east-1" },
+  { id: "r-usw2", fqdn: "api.myapp.com", type: "ALIAS", value: "54.210.40.2", ttl: 60, healthCheckId: "hc-west", failoverRole: "SECONDARY", weight: 20, region: "us-west-2" }
+];
+
+console.log(
+  "Failover sample (primary down):",
+  resolveRoute53({ fqdn: "api.myapp.com", policy: "FAILOVER" }, sampleRecords, { "hc-east": false, "hc-west": true })
+);`,
+      hints: [
+        "Filter healthy records with <code>const healthy = matching.filter((r) => !r.healthCheckId || healthStatus[r.healthCheckId] !== false);</code>. Then set <code>const failOpen = healthy.length === 0;</code> and <code>const candidates = failOpen ? matching : healthy;</code>.",
+        "For <code>WEIGHTED</code>, filter <code>const positive = candidates.filter((r) => (r.weight ?? 0) &gt; 0);</code>, sum their weights into <code>totalWeight</code>, compute <code>const target = (query.randomRoll ?? 0) * totalWeight;</code>, and accumulate weights until <code>target &lt; cumulative</code>. For <code>LATENCY</code>, track the minimum latency using <code>query.clientRegionLatencies?.[r.region] ?? Infinity</code>."
+      ],
+      solutionExplanation:
+        "Route 53 evaluates health checks before applying Failover, Weighted, or Latency routing, and uniquely fails open (falling back to all records) when zero candidates are healthy so a health-checker partition never turns into a total DNS blackout.",
+      solutionCode: `function resolveRoute53(query, records, healthStatus) {
+  const matching = records.filter((r) => r.fqdn === query.fqdn);
+  if (matching.length === 0) {
+    return { status: "NXDOMAIN", selectedId: null, type: null, answers: [], effectiveTtl: 0, failOpen: false };
+  }
+
+  const healthy = matching.filter((r) => !r.healthCheckId || healthStatus[r.healthCheckId] !== false);
+  const failOpen = healthy.length === 0;
+  const candidates = failOpen ? matching : healthy;
+
+  let selected = candidates[0];
+  const roll = query.randomRoll ?? 0;
+
+  if (query.policy === "FAILOVER") {
+    selected =
+      candidates.find((r) => r.failoverRole === "PRIMARY") ||
+      candidates.find((r) => r.failoverRole === "SECONDARY") ||
+      candidates[0];
+  } else if (query.policy === "WEIGHTED") {
+    const positive = candidates.filter((r) => Math.max(0, r.weight ?? 0) > 0);
+    if (positive.length === 0) {
+      const idx = Math.min(candidates.length - 1, Math.floor(roll * candidates.length));
+      selected = candidates[idx];
+    } else {
+      const totalWeight = positive.reduce((sum, r) => sum + r.weight, 0);
+      const target = roll * totalWeight;
+      let cumulative = 0;
+      selected = positive[positive.length - 1];
+      for (const rec of positive) {
+        cumulative += rec.weight;
+        if (target < cumulative) {
+          selected = rec;
+          break;
+        }
+      }
+    }
+  } else if (query.policy === "LATENCY") {
+    const latMap = query.clientRegionLatencies || {};
+    let bestLatency = Infinity;
+    for (const rec of candidates) {
+      const lat = rec.region && latMap[rec.region] !== undefined ? latMap[rec.region] : Infinity;
+      if (lat < bestLatency) {
+        bestLatency = lat;
+        selected = rec;
+      }
+    }
+  }
+
+  return {
+    status: "NOERROR",
+    selectedId: selected.id,
+    type: selected.type,
+    answers: [selected.value],
+    effectiveTtl: selected.ttl,
+    failOpen
+  };
+}`,
+      tests: [
+        {
+          name: "Returns NXDOMAIN when no record matches the queried FQDN",
+          run: (scope) => {
+            const out = scope.resolveRoute53(
+              { fqdn: "missing.myapp.com", policy: "FAILOVER" },
+              [{ id: "r1", fqdn: "api.myapp.com", type: "A", value: "1.2.3.4", ttl: 60 }],
+              {}
+            );
+            const pass = out.status === "NXDOMAIN" && out.selectedId === null && out.answers.length === 0 && out.failOpen === false;
+            return { pass, message: `got status=${out.status}, selectedId=${out.selectedId}` };
+          }
+        },
+        {
+          name: "FAILOVER routes to PRIMARY when healthy and switches to SECONDARY when PRIMARY is unhealthy",
+          run: (scope) => {
+            const recs = [
+              { id: "sec", fqdn: "api.myapp.com", type: "ALIAS", value: "54.210.40.2", ttl: 60, healthCheckId: "hc-sec", failoverRole: "SECONDARY" },
+              { id: "pri", fqdn: "api.myapp.com", type: "ALIAS", value: "52.10.20.1", ttl: 60, healthCheckId: "hc-pri", failoverRole: "PRIMARY" }
+            ];
+            const healthyOut = scope.resolveRoute53({ fqdn: "api.myapp.com", policy: "FAILOVER" }, recs, { "hc-pri": true, "hc-sec": true });
+            const failedOut = scope.resolveRoute53({ fqdn: "api.myapp.com", policy: "FAILOVER" }, recs, { "hc-pri": false, "hc-sec": true });
+            const pass =
+              healthyOut.selectedId === "pri" &&
+              healthyOut.failOpen === false &&
+              failedOut.selectedId === "sec" &&
+              failedOut.failOpen === false;
+            return { pass, message: `healthy=${healthyOut.selectedId}, failed=${failedOut.selectedId}` };
+          }
+        },
+        {
+          name: "FAILOVER fails open to PRIMARY when both PRIMARY and SECONDARY are unhealthy",
+          run: (scope) => {
+            const recs = [
+              { id: "pri", fqdn: "api.myapp.com", type: "ALIAS", value: "52.10.20.1", ttl: 60, healthCheckId: "hc-pri", failoverRole: "PRIMARY" },
+              { id: "sec", fqdn: "api.myapp.com", type: "ALIAS", value: "54.210.40.2", ttl: 60, healthCheckId: "hc-sec", failoverRole: "SECONDARY" }
+            ];
+            const out = scope.resolveRoute53({ fqdn: "api.myapp.com", policy: "FAILOVER" }, recs, { "hc-pri": false, "hc-sec": false });
+            const pass = out.status === "NOERROR" && out.selectedId === "pri" && out.failOpen === true;
+            return { pass, message: `got selectedId=${out.selectedId}, failOpen=${out.failOpen}` };
+          }
+        },
+        {
+          name: "WEIGHTED excludes unhealthy records and re-normalizes remaining weights",
+          run: (scope) => {
+            const recs = [
+              { id: "v1", fqdn: "api.myapp.com", type: "A", value: "10.0.1.1", ttl: 60, healthCheckId: "hc-v1", weight: 90 },
+              { id: "v2", fqdn: "api.myapp.com", type: "A", value: "10.0.2.1", ttl: 60, healthCheckId: "hc-v2", weight: 10 },
+              { id: "v3", fqdn: "api.myapp.com", type: "A", value: "10.0.3.1", ttl: 60, healthCheckId: "hc-v3", weight: 30 }
+            ];
+            // v1 is unhealthy -> remaining healthy weights: v2 (10) + v3 (30) = 40
+            const lowRoll = scope.resolveRoute53({ fqdn: "api.myapp.com", policy: "WEIGHTED", randomRoll: 0.2 }, recs, { "hc-v1": false, "hc-v2": true, "hc-v3": true });
+            const highRoll = scope.resolveRoute53({ fqdn: "api.myapp.com", policy: "WEIGHTED", randomRoll: 0.5 }, recs, { "hc-v1": false, "hc-v2": true, "hc-v3": true });
+            const pass = lowRoll.selectedId === "v2" && highRoll.selectedId === "v3" && lowRoll.failOpen === false;
+            return { pass, message: `roll 0.2 -> ${lowRoll.selectedId}, roll 0.5 -> ${highRoll.selectedId}` };
+          }
+        },
+        {
+          name: "LATENCY selects lowest-latency healthy region and falls back when closest is unhealthy",
+          run: (scope) => {
+            const recs = [
+              { id: "eu", fqdn: "api.myapp.com", type: "ALIAS", value: "18.200.1.1", ttl: 60, healthCheckId: "hc-eu", region: "eu-west-1" },
+              { id: "us", fqdn: "api.myapp.com", type: "ALIAS", value: "52.10.20.1", ttl: 60, healthCheckId: "hc-us", region: "us-east-1" },
+              { id: "ap", fqdn: "api.myapp.com", type: "ALIAS", value: "13.228.1.1", ttl: 60, healthCheckId: "hc-ap", region: "ap-southeast-1" }
+            ];
+            const latencies = { "eu-west-1": 22, "us-east-1": 85, "ap-southeast-1": 190 };
+            const normalOut = scope.resolveRoute53({ fqdn: "api.myapp.com", policy: "LATENCY", clientRegionLatencies: latencies }, recs, { "hc-eu": true, "hc-us": true, "hc-ap": true });
+            const degradedOut = scope.resolveRoute53({ fqdn: "api.myapp.com", policy: "LATENCY", clientRegionLatencies: latencies }, recs, { "hc-eu": false, "hc-us": true, "hc-ap": true });
+            const pass = normalOut.selectedId === "eu" && degradedOut.selectedId === "us";
+            return { pass, message: `normal=${normalOut.selectedId}, eu-down=${degradedOut.selectedId}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0031",
+      title: "Quiz 0031: Route 53 Architecture & Failover Tradeoffs",
+      questions: [
+        {
+          id: "q1",
+          prompt: "You need `myapp.com` (the zone apex) to route directly to an AWS Application Load Balancer whose IP addresses scale automatically. Why must you configure a Route 53 Alias record instead of a CNAME?",
+          options: [
+            "CNAME records cannot coexist with mandatory zone apex NS and SOA records under DNS standards",
+            "CNAME records store static regional IPv4 addresses that fail whenever AWS replaces load balancer nodes",
+            "CNAME records require an additional TLS certificate validation round trip inside the Route 53 resolver",
+            "CNAME records prohibit Route 53 from returning AAAA records to dual-stack Android mobile clients"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Per RFC 1034 and RFC 1912, a CNAME cannot coexist with any other record type at the same name, and every zone apex must carry NS and SOA records. Alias records expose standard A/AAAA answers instead.",
+            "CNAMEs store a target hostname (such as an ALB DNS name), not static IPv4 addresses; it is standard A records that hardcode static IPs.",
+            "DNS resolution happens before any TLS handshake; CNAME records do not perform TLS certificate validation inside Route 53.",
+            "A CNAME delegates all record types (including A and AAAA) to the canonical target hostname, so dual-stack resolution still works on subdomains."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "Your team configures split-horizon DNS for `example.com` using both a Public Hosted Zone and a VPC-attached Private Hosted Zone. An ECS task queries `status.example.com`, which exists only in the Public Hosted Zone, and receives `NXDOMAIN`. Why?",
+          options: [
+            "Route 53 Resolver stops inside the matching Private Hosted Zone without querying the public zone",
+            "VPC security groups block outbound UDP port 53 packets traveling toward public Route 53 servers",
+            "ECS tasks require disabling VPC enableDnsSupport flags before querying records in public hosted zones",
+            "Private Hosted Zones automatically suppress matching records inside the public zone for mobile clients"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "When a VPC is associated with a Private Hosted Zone for `example.com`, Route 53 Resolver treats that PHZ as authoritative inside the VPC and returns NXDOMAIN rather than falling back to the public zone.",
+            "ECS tasks send DNS queries internally to the VPC's Route 53 Resolver (`VPC_CIDR + 2`), which bypasses security groups and does not require outbound UDP 53 rules to public name servers.",
+            "Disabling `enableDnsSupport` breaks the VPC's Route 53 Resolver entirely, preventing private DNS resolution and AWS service name lookups.",
+            "Private Hosted Zones are isolated to their associated VPCs and never alter or suppress records returned to external mobile clients."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "You configure Route 53 active-passive Failover for `api.myapp.com` (`us-east-1` Primary ALB, `us-west-2` Secondary ALB) with a 60-second TTL and a 10s x 3 health check. When `us-east-1` fails, some active Android users keep hitting `us-east-1` for 4 minutes. What explains this?",
+          options: [
+            "OkHttp reuses existing pooled TCP sockets without re-querying DNS until connections close or time out",
+            "Route 53 delays secondary DNS propagation for five minutes until global Anycast caches expire naturally",
+            "Route 53 fails open to the unhealthy primary record whenever regional health checks exceed three retries",
+            "Android OkHttp enforces a mandatory minimum five-minute DNS TTL override inside the system network stack"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "OkHttp's `ConnectionPool` keeps established HTTP/1.1 and HTTP/2 TCP+TLS sockets alive (5 minutes by default) and skips `Dns.SYSTEM.lookup()` until a new connection is opened or an active socket errors out.",
+            "Route 53 evaluates health checks continuously at its edge and flips DNS responses immediately once 3 consecutive 10s probes fail (~30s); only downstream resolver TTL caches take up to 60s.",
+            "Route 53 only fails open to Primary if BOTH Primary and Secondary health checks are unhealthy; when Secondary is healthy, Route 53 returns Secondary.",
+            "OkHttp and Android do not impose a 5-minute minimum DNS TTL override; the delay on already-connected clients comes from connection pooling."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

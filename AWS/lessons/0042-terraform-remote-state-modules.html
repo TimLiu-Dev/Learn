@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0042 — Terraform on AWS: Remote S3 State, Locking, Modules &amp; CDK vs Terraform</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0042</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0042-terraform-remote-state-modules.html" class="active">Lesson 0042</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.7</span>
+      <span class="pill">Est. Time: 30 mins</span>
+    </div>
+
+    <h1>Terraform on AWS: Remote S3 State, Locking, Modules &amp; CDK vs Terraform</h1>
+    <p class="lead">
+      In AWS CDK, CloudFormation tracks what exists in your AWS account for you. In Terraform, <strong>you own the state file</strong>. Understanding how S3 remote state, state locking, <code>plan</code> vs <code>apply</code>, reusable modules, and <code>moved</code> refactors work separates engineers who safely ship multi-account infrastructure from engineers who accidentally destroy production databases.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android/Gradle projects, you commit <code>gradle.lockfile</code> (and <code>libs.versions.toml</code>) so every developer and CI runner resolves the exact same dependency graph, while Gradle acquires a file lock on <code>.gradle/</code> caches so two builds do not corrupt artifacts concurrently. Terraform uses that exact same discipline at cloud scale: <code>.terraform.lock.hcl</code> pins provider binaries and SHA-256 checksums, remote S3 state replaces your local <code>build/</code> folder as the single source of truth, and state locking prevents two CI pipelines from mutating the same VPC or RDS instance at the exact same second.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Remote S3 State &amp; Locking (Preventing Split-Brain Infrastructure)</h2>
+        <p>
+          Terraform maps every resource block in your <code>.tf</code> files (e.g., <code>aws_rds_cluster.orders</code>) to its real AWS identifier (ARN, VPC ID, DB endpoint) inside a JSON file called <strong>state</strong> (<code>terraform.tfstate</code>). Leaving state on a laptop breaks immediately in teams:
+        </p>
+        <ul>
+          <li><strong>No shared truth:</strong> Teammate B runs <code>terraform apply</code> without Teammate A's local state and Terraform tries to recreate resources that already exist—or overwrites them.</li>
+          <li><strong>Secrets exposure:</strong> State JSON stores attributes in plaintext (including initial DB passwords or TLS private keys if generated in HCL), so it must never be committed to Git.</li>
+          <li><strong>Concurrent corruption:</strong> Two CI jobs running <code>apply</code> simultaneously read the same old state, write conflicting AWS changes, and overwrite each other's state JSON—orphaning live AWS resources.</li>
+        </ul>
+
+        <p>
+          The production AWS solution is an encrypted, versioned <strong>Amazon S3 backend</strong> paired with <strong>atomic state locking</strong>:
+        </p>
+        <ol>
+          <li><strong>S3 Bucket Hardening:</strong> Enable S3 Versioning (so a corrupted state file can be rolled back to a prior version ID), enforce server-side encryption (SSE-S3 or KMS CMK), and enable S3 Block Public Access.</li>
+          <li><strong>State Locking Evolution (DynamoDB vs. Native S3 Lockfile):</strong> Historically, AWS teams paired S3 with a DynamoDB table (partition key <code>LockID</code>) because S3 lacked atomic compare-and-swap writes. Since <strong>Terraform 1.10+</strong> (GA in 1.11, per the <a href="https://developer.hashicorp.com/terraform/language/backend/s3" target="_blank" rel="noopener">HashiCorp S3 Backend Documentation</a>), Terraform supports <code>use_lockfile = true</code> using <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html" target="_blank" rel="noopener">S3 Conditional Writes</a> (<code>If-None-Match: *</code>) to create a <code>.tflock</code> object atomically—eliminating the DynamoDB table while preserving legacy <code>dynamodb_table</code> support in older codebases.</li>
+        </ol>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 235" width="100%" height="auto" role="img" aria-label="Terraform S3 Remote State and Conditional Lock Workflow">
+            <rect x="0" y="0" width="680" height="235" fill="#fdfcf8" rx="6" />
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Concurrent CI Applies Against S3 Remote State + Conditional Lock</text>
+
+            <!-- CI Run 1 -->
+            <rect x="16" y="48" width="175" height="58" rx="5" fill="#dcfce7" stroke="#166534" />
+            <text x="103" y="72" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#166534">CI Run 1 (PR #412)</text>
+            <text x="103" y="90" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#166534">Acquires .tflock (200 OK)</text>
+
+            <!-- CI Run 2 -->
+            <rect x="16" y="138" width="175" height="58" rx="5" fill="#fee2e2" stroke="#991b1b" />
+            <text x="103" y="162" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#991b1b">CI Run 2 (PR #413)</text>
+            <text x="103" y="180" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#991b1b">412 Precondition Failed</text>
+
+            <!-- Arrows to S3 -->
+            <line x1="191" y1="77" x2="268" y2="96" stroke="#166534" stroke-width="2" />
+            <polygon points="268,96 259,90 261,99" fill="#166534" />
+            <line x1="191" y1="167" x2="268" y2="148" stroke="#991b1b" stroke-width="2" stroke-dasharray="4 3" />
+            <polygon points="268,148 259,145 261,154" fill="#991b1b" />
+
+            <!-- S3 Backend Box -->
+            <rect x="272" y="48" width="215" height="148" rx="6" fill="#e9f1f8" stroke="#0f4c81" stroke-width="1.5" />
+            <text x="379" y="70" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f4c81">S3 State Bucket (Versioned)</text>
+            <rect x="288" y="84" width="183" height="44" rx="4" fill="#ffffff" stroke="#0f4c81" />
+            <text x="379" y="103" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#1b1d21">prod/network/terraform.tfstate</text>
+            <text x="379" y="119" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">SSE-KMS + Versioning</text>
+
+            <rect x="288" y="138" width="183" height="44" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="379" y="157" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#b45309">...terraform.tfstate.tflock</text>
+            <text x="379" y="173" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#b45309">LockID + Holder + Timestamp</text>
+
+            <!-- Arrow to AWS APIs -->
+            <line x1="487" y1="106" x2="532" y2="106" stroke="#0f4c81" stroke-width="2" />
+            <polygon points="532,106 524,101 524,111" fill="#0f4c81" />
+
+            <!-- AWS Control Plane -->
+            <rect x="536" y="64" width="128" height="110" rx="6" fill="#f5f2ea" stroke="#c2b9a7" />
+            <text x="600" y="92" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1b1d21">AWS APIs</text>
+            <text x="600" y="114" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#575c66">VPC / IAM / RDS</text>
+            <text x="600" y="134" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">Run 1 updates AWS,</text>
+            <text x="600" y="149" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">writes new state,</text>
+            <text x="600" y="164" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#575c66">then releases lock.</text>
+
+            <text x="16" y="220" font-family="sans-serif" font-size="11.5" fill="#575c66">Rule: Never pass -lock=false in CI. Only run force-unlock after verifying the lock holder process is dead.</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Atomic locking serializes writes to the state file. Run 2 aborts safely with zero infrastructure corruption and retries only after Run 1 releases the lock.
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-title">Two State-Locking Mistakes That Cause Outages</div>
+          <p style="margin: 0;">
+            <strong>1. Passing <code>-lock=false</code>:</strong> Disabling locks forces concurrent applies to race on state writes, leaving real AWS resources untracked.<br />
+            <strong>2. Blindly running <code>terraform force-unlock &lt;LOCK_ID&gt;</code>:</strong> If another engineer or GitHub Actions job is still mid-apply, breaking their lock causes split-brain state corruption. Always inspect the lock's <code>Who</code> and <code>Created</code> timestamp first.
+          </p>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. <code>plan</code> vs. <code>apply</code> &amp; Destructive Replacement Traps</h2>
+        <p>
+          Terraform splits every deployment into two distinct phases:
+        </p>
+        <ol>
+          <li><strong><code>terraform plan -out=tfplan</code>:</strong> Reads state, refreshes live AWS APIs, constructs the resource dependency graph (DAG), and outputs an exact diff showing <code>+ create</code>, <code>~ update in-place</code>, <code>- destroy</code>, or <code>-/+ destroy and then create replacement</code>. Saving <code>tfplan</code> freezes the exact execution graph.</li>
+          <li><strong><code>terraform apply tfplan</code>:</strong> Executes only the approved plan artifact without re-calculating against changes merged by someone else minutes later.</li>
+        </ol>
+        <p>
+          The deadliest Terraform failure mode for newcomers is missing a <strong>forced replacement</strong> (<code>-/+</code>) in a noisy plan diff. Changing an immutable AWS property—such as an <code>aws_db_instance</code> <code>identifier</code>, an <code>aws_s3_bucket</code> <code>bucket</code> name, an <code>aws_subnet</code> <code>cidr_block</code>, or an <code>aws_kms_key</code> policy/key spec—cannot be updated in place. Terraform destroys the live resource and creates a brand-new empty one.
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 24%;">Mechanism</th>
+              <th style="width: 34%;">What It Does</th>
+              <th style="width: 42%;">Production Rule</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>prevent_destroy = true</code></td>
+              <td>Fails the plan/apply with an error if any change would delete the resource.</td>
+              <td>Mandatory on stateful data stores (RDS, DynamoDB, KMS keys, S3 state buckets).</td>
+            </tr>
+            <tr>
+              <td><code>create_before_destroy = true</code></td>
+              <td>Reorders replacement from <code>["delete", "create"]</code> to <code>["create", "delete"]</code>.</td>
+              <td>Use on stateless/edge resources (Launch Templates, ACM certs, SGs)—requires unique or <code>name_prefix</code> names.</td>
+            </tr>
+            <tr>
+              <td><code>moved { from = ... to = ... }</code></td>
+              <td>Rewrites the resource address in state without touching the live AWS resource.</td>
+              <td>Use whenever renaming blocks or extracting root resources into reusable modules (zero downtime).</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- SECTION 3 -->
+        <h2>3. Reusable Modules, Version Pinning &amp; Environment Isolation</h2>
+        <p>
+          A Terraform <strong>module</strong> is any directory containing <code>.tf</code> files with explicit <code>variables.tf</code> inputs and <code>outputs.tf</code> exports—identical to extracting an Android Gradle library module with a clean public API. Senior platform teams enforce three module rules:
+        </p>
+        <ul>
+          <li><strong>Pin module versions strictly:</strong> Pin registry modules with semantic constraints (<code>version = "~> 5.8"</code>) or Git modules to an immutable 40-character commit SHA (<code>?ref=8f3c...</code>), never floating <code>main</code> branches.</li>
+          <li><strong>Validate inputs at plan time:</strong> Use Terraform <code>validation { condition = ... }</code> blocks on variables (e.g., enforcing private-only RDS snapshots or valid CIDR blocks) so bad configs fail before AWS API calls run.</li>
+          <li><strong>Directories over Terraform Workspaces for prod isolation:</strong> While <code>terraform workspace select prod</code> swaps state keys inside one backend, every workspace shares the same code branch, variable defaults, and backend IAM permissions. Separate root directories (<code>envs/dev/</code>, <code>envs/prod/</code>) give each environment its own AWS account role, S3 state key, and blast radius—calling the same pinned module.</li>
+        </ul>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production HCL Example: Remote State, Pinned Module &amp; Lifecycle Guardrails</h2>
+        <p>
+          Notice how the root environment configuration combines S3 native locking, a committed <code>.terraform.lock.hcl</code> workflow, a version-pinned module, and zero-downtime <code>moved</code> refactoring:
+        </p>
+<pre><code># envs/prod/backend.tf — Terraform 1.11+ with native S3 conditional locking
+terraform {
+  required_version = "~&gt; 1.11.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~&gt; 5.80" # Exact checksums locked in .terraform.lock.hcl
+    }
+  }
+
+  backend "s3" {
+    bucket       = "acme-tfstate-prod-123456789012"
+    key          = "orders-service/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true # Atomic S3 conditional write (.tflock); replaces legacy dynamodb_table
+  }
+}
+
+# envs/prod/main.tf — Pin module version &amp; refactor safely with moved {}
+module "orders_db" {
+  source  = "git::https://github.com/acme/tf-modules.git//rds-postgres?ref=a4b92d18e7c2f3b91c0a"
+  env     = "prod"
+  db_name = "orders"
+  multi_az = true
+}
+
+# Migrating a live DB into the module without destroying &amp; recreating it:
+moved {
+  from = aws_db_instance.orders
+  to   = module.orders_db.aws_db_instance.this
+}
+
+# Inside modules/rds-postgres/main.tf — Guardrail against accidental replacement
+resource "aws_db_instance" "this" {
+  identifier     = "${var.env}-${var.db_name}"
+  engine         = "postgres"
+  multi_az       = var.multi_az
+  lifecycle {
+    prevent_destroy = true
+  }
+}</code></pre>
+
+        <!-- SECTION 5 -->
+        <h2>5. AWS CDK vs. Terraform: Senior Architectural Tradeoffs</h2>
+        <p>
+          In <a href="./0041-aws-cdk-constructs-aspects-nag.html">Lesson 0041</a>, you built infrastructure with AWS CDK in TypeScript. In senior interviews, never say one tool is universally better—frame the tradeoff around <strong>state ownership, provider scope, and team ergonomics</strong>:
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 22%;">Dimension</th>
+              <th style="width: 39%;">AWS CDK (CloudFormation Engine)</th>
+              <th style="width: 39%;">Terraform (HCL + Provider Graph)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>State &amp; Rollback</strong></td>
+              <td>AWS manages state inside CloudFormation; failed deploys auto-roll back, but stack drift or stuck rollbacks are painful.</td>
+              <td>You manage S3 state + locks; no automatic rollback on partial failure, but <code>state</code> commands give surgical control.</td>
+            </tr>
+            <tr>
+              <td><strong>Provider Scope</strong></td>
+              <td>AWS-only (plus limited CloudFormation registry types).</td>
+              <td>Unified DAG across AWS, Cloudflare, GitHub, Datadog, Auth0, and Kubernetes in one apply.</td>
+            </tr>
+            <tr>
+              <td><strong>Abstractions</strong></td>
+              <td>Full TypeScript/Java/Python loops, L2/L3 constructs, and <code>.grantRead()</code> least-privilege IAM helpers.</td>
+              <td>Declarative HCL + versioned modules; explicit IAM policies (clearer auditability, more boilerplate).</td>
+            </tr>
+            <tr>
+              <td><strong>Scale &amp; Speed</strong></td>
+              <td>Subject to CloudFormation 500-resource stack limit and slower stack change-set previews.</td>
+              <td>Parallel API graph execution; fast local <code>plan</code> diffs across thousands of resources.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build a CI guardrail function <code>analyzeTerraformRun(lockState, planChanges)</code> that inspects both S3 state-lock metadata and parsed <code>terraform plan -json</code> resource changes to block unsafe runs and catch destructive database or storage replacements before <code>apply</code> runs.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your judgment on real Terraform locking, module refactoring, and IaC tool selection scenarios.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCE & NEXT STEPS -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Terraform S3 Backend &amp; Native Locking:</strong> <a href="https://developer.hashicorp.com/terraform/language/backend/s3" target="_blank" rel="noopener">HashiCorp Terraform — Backend Type: s3</a> (See <code>use_lockfile</code>, encryption, and conditional lock semantics).
+          </li>
+          <li>
+            <strong>AWS S3 Conditional Writes:</strong> <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html" target="_blank" rel="noopener">Amazon S3 User Guide — Checking object integrity and conditional writes</a>.
+          </li>
+          <li>
+            <strong>Refactoring Without Destruction:</strong> <a href="https://developer.hashicorp.com/terraform/language/modules/develop/refactoring" target="_blank" rel="noopener">HashiCorp Terraform — Refactoring Configuration with <code>moved</code> Blocks</a>.
+          </li>
+          <li>
+            <strong>Dependency Lockfiles:</strong> <a href="https://developer.hashicorp.com/terraform/language/files/dependency-lock" target="_blank" rel="noopener">HashiCorp Terraform — Provider Dependency Lock File (<code>.terraform.lock.hcl</code>)</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0043 (Production CI/CD: GitHub Actions + AWS OIDC, Canary Deployments &amp; Rollbacks)</strong>, ask me anything that feels unclear—for example: <em>"How do we bootstrap the S3 state bucket itself before remote state exists?"</em> or <em>"When would a team pair CDK for app services with Terraform for VPC/landing-zone infrastructure?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0041-aws-cdk-constructs-aspects-nag.html">&larr; Lesson 0041: AWS CDK (TypeScript): L1/L2/L3 Constructs, Aspects, cdk-nag &amp; Assertions</a>
+          <a href="./0043-cicd-github-oidc-canary-rollback.html">Lesson 0043: Production CI/CD: GitHub Actions + AWS OIDC, Canary Deployments &amp; Rollbacks &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Bootstrap Chicken-and-Egg</strong>
+          You cannot store the state bucket's own state inside itself on day zero. Platform teams create the S3 state bucket once via a small bootstrap stack (or AWS Organizations baseline), then reference it from all workload repos.
+        </div>
+        <div class="sidenote">
+          <strong>Commit <code>.terraform.lock.hcl</code></strong>
+          Just like Gradle's <code>gradle.lockfile</code>, committing <code>.terraform.lock.hcl</code> pins exact provider hashes across macOS laptops and Linux CI runners (run <code>terraform providers lock -platform=linux_amd64 -platform=darwin_arm64</code>).
+        </div>
+        <div class="sidenote">
+          <strong>OpenTofu Context</strong>
+          OpenTofu (the Linux Foundation fork of Terraform) shares HCL syntax and S3 state semantics, adding native client-side state encryption—making S3 state + module skills 100% portable across both engines.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0042",
+      title: "Lab 0042: Terraform State-Lock & Plan-Diff Risk Analyzer",
+      filename: "tf-plan-guard.js",
+      description:
+        "Complete <code>analyzeTerraformRun(lockState, planChanges)</code>. Rules: (1) Lock gate: if <code>!lockState.locked</code>, <code>lockStatus = \"UNLOCKED\"</code>; else if <code>lockState.forceUnlock</code>, <code>lockStatus = \"FORCE_UNLOCK_DANGEROUS\"</code>; else if <code>lockState.ageSeconds &gt;= 1800</code>, <code>lockStatus = \"STALE_LOCK_REVIEW\"</code>; else <code>lockStatus = \"LOCKED_ABORT\"</code>. Set <code>lockBlocked = lockState.locked &amp;&amp; !lockState.forceUnlock</code>. (2) Inspect each change <code>{ address, type, actions, preventDestroy }</code>: if <code>actions.includes(\"delete\")</code>, push <code>address</code> to <code>destructiveResources</code>; if <code>actions.includes(\"delete\") &amp;&amp; actions.includes(\"create\")</code>, push <code>address</code> to <code>recreateReplacements</code> (and if <code>actions[0] === \"delete\"</code>, also push to <code>downtimeReplacements</code>); if <code>actions.includes(\"delete\") &amp;&amp; preventDestroy</code>, push <code>address</code> to <code>preventDestroyBlocked</code>; if <code>actions.includes(\"delete\")</code> and <code>type</code> is stateful (<code>aws_db_instance</code>, <code>aws_rds_cluster</code>, <code>aws_dynamodb_table</code>, <code>aws_s3_bucket</code>, <code>aws_kms_key</code>), push <code>address</code> to <code>statefulDestructions</code>. (3) Compute <code>riskLevel</code>: <code>\"BLOCKED\"</code> if <code>lockBlocked || preventDestroyBlocked.length &gt; 0</code>; else <code>\"CRITICAL\"</code> if <code>statefulDestructions.length &gt; 0 || lockStatus === \"FORCE_UNLOCK_DANGEROUS\"</code>; else <code>\"HIGH\"</code> if <code>destructiveResources.length &gt; 0</code>; else <code>\"LOW\"</code>. Set <code>canApply = riskLevel !== \"BLOCKED\"</code>.",
+      exports: ["analyzeTerraformRun"],
+      starterCode: `const STATEFUL_TYPES = new Set([
+  "aws_db_instance",
+  "aws_rds_cluster",
+  "aws_dynamodb_table",
+  "aws_s3_bucket",
+  "aws_kms_key"
+]);
+
+function analyzeTerraformRun(lockState, planChanges) {
+  // lockState: { locked: boolean, lockId: string|null, holder: string|null, ageSeconds: number, forceUnlock: boolean }
+  // planChanges: Array<{ address: string, type: string, actions: string[], preventDestroy: boolean }>
+
+  let lockStatus = "UNLOCKED";
+  let lockBlocked = false;
+  // TODO 1: evaluate lockStatus and lockBlocked
+
+  const destructiveResources = [];
+  const recreateReplacements = [];
+  const downtimeReplacements = [];
+  const preventDestroyBlocked = [];
+  const statefulDestructions = [];
+  // TODO 2: classify each resource change in planChanges
+
+  let riskLevel = "LOW";
+  // TODO 3: compute riskLevel ("BLOCKED" | "CRITICAL" | "HIGH" | "LOW")
+
+  const canApply = riskLevel !== "BLOCKED";
+  return {
+    canApply,
+    lockStatus,
+    riskLevel,
+    destructiveResources,
+    recreateReplacements,
+    downtimeReplacements,
+    preventDestroyBlocked,
+    statefulDestructions
+  };
+}
+
+console.log(
+  "Sample RDS replacement:",
+  analyzeTerraformRun(
+    { locked: false, lockId: null, holder: null, ageSeconds: 0, forceUnlock: false },
+    [
+      {
+        address: "module.orders_db.aws_db_instance.this",
+        type: "aws_db_instance",
+        actions: ["delete", "create"],
+        preventDestroy: true
+      }
+    ]
+  )
+);`,
+      hints: [
+        "For <code>lockStatus</code>, check <code>if (!lockState.locked)</code> first, then <code>else if (lockState.forceUnlock)</code>, then <code>else if (lockState.ageSeconds >= 1800)</code>, and default to <code>\"LOCKED_ABORT\"</code>. Only set <code>lockBlocked = true</code> when <code>lockState.locked && !lockState.forceUnlock</code>.",
+        "Inside the <code>planChanges</code> loop: check <code>const hasDelete = change.actions.includes(\"delete\")</code> and <code>const hasCreate = change.actions.includes(\"create\")</code>. A replacement has both <code>hasDelete && hasCreate</code>, and causes downtime when <code>change.actions[0] === \"delete\"</code>.",
+        "Order <code>riskLevel</code> checks from strictest to lightest: <code>BLOCKED</code> (if <code>lockBlocked || preventDestroyBlocked.length > 0</code>), then <code>CRITICAL</code> (if <code>statefulDestructions.length > 0 || lockStatus === \"FORCE_UNLOCK_DANGEROUS\"</code>), then <code>HIGH</code> (if <code>destructiveResources.length > 0</code>), else <code>LOW</code>."
+      ],
+      solutionExplanation:
+        "CI pipelines must distinguish safe in-place updates from destructive replacements, especially on stateful resources like RDS, DynamoDB, S3, and KMS. Active state locks block concurrent runs immediately, stale locks (>= 30 mins) require human inspection, and prevent_destroy blocks destructive plans before AWS APIs are touched.",
+      solutionCode: `const STATEFUL_TYPES = new Set([
+  "aws_db_instance",
+  "aws_rds_cluster",
+  "aws_dynamodb_table",
+  "aws_s3_bucket",
+  "aws_kms_key"
+]);
+
+function analyzeTerraformRun(lockState, planChanges) {
+  let lockStatus = "UNLOCKED";
+  if (lockState.locked) {
+    if (lockState.forceUnlock) {
+      lockStatus = "FORCE_UNLOCK_DANGEROUS";
+    } else if (lockState.ageSeconds >= 1800) {
+      lockStatus = "STALE_LOCK_REVIEW";
+    } else {
+      lockStatus = "LOCKED_ABORT";
+    }
+  }
+
+  const lockBlocked = Boolean(lockState.locked && !lockState.forceUnlock);
+
+  const destructiveResources = [];
+  const recreateReplacements = [];
+  const downtimeReplacements = [];
+  const preventDestroyBlocked = [];
+  const statefulDestructions = [];
+
+  for (const change of planChanges) {
+    const actions = change.actions || [];
+    const hasDelete = actions.includes("delete");
+    const hasCreate = actions.includes("create");
+
+    if (hasDelete) {
+      destructiveResources.push(change.address);
+      if (hasCreate) {
+        recreateReplacements.push(change.address);
+        if (actions[0] === "delete") {
+          downtimeReplacements.push(change.address);
+        }
+      }
+      if (change.preventDestroy) {
+        preventDestroyBlocked.push(change.address);
+      }
+      if (STATEFUL_TYPES.has(change.type)) {
+        statefulDestructions.push(change.address);
+      }
+    }
+  }
+
+  let riskLevel = "LOW";
+  if (lockBlocked || preventDestroyBlocked.length > 0) {
+    riskLevel = "BLOCKED";
+  } else if (statefulDestructions.length > 0 || lockStatus === "FORCE_UNLOCK_DANGEROUS") {
+    riskLevel = "CRITICAL";
+  } else if (destructiveResources.length > 0) {
+    riskLevel = "HIGH";
+  }
+
+  const canApply = riskLevel !== "BLOCKED";
+
+  return {
+    canApply,
+    lockStatus,
+    riskLevel,
+    destructiveResources,
+    recreateReplacements,
+    downtimeReplacements,
+    preventDestroyBlocked,
+    statefulDestructions
+  };
+}`,
+      tests: [
+        {
+          name: "Allows unlocked plan with only in-place updates and creates (LOW risk)",
+          run: (scope) => {
+            const out = scope.analyzeTerraformRun(
+              { locked: false, lockId: null, holder: null, ageSeconds: 0, forceUnlock: false },
+              [
+                { address: "aws_iam_role.app", type: "aws_iam_role", actions: ["update"], preventDestroy: false },
+                { address: "aws_cloudwatch_log_group.api", type: "aws_cloudwatch_log_group", actions: ["create"], preventDestroy: false }
+              ]
+            );
+            const pass =
+              out.canApply === true &&
+              out.lockStatus === "UNLOCKED" &&
+              out.riskLevel === "LOW" &&
+              out.destructiveResources.length === 0;
+            return { pass, message: `got canApply=${out.canApply}, riskLevel=${out.riskLevel}` };
+          }
+        },
+        {
+          name: "Blocks active state lock (< 1800s) with LOCKED_ABORT",
+          run: (scope) => {
+            const out = scope.analyzeTerraformRun(
+              { locked: true, lockId: "9a2b-lock", holder: "gha-run-412", ageSeconds: 120, forceUnlock: false },
+              [{ address: "aws_sqs_queue.jobs", type: "aws_sqs_queue", actions: ["update"], preventDestroy: false }]
+            );
+            const pass =
+              out.canApply === false &&
+              out.lockStatus === "LOCKED_ABORT" &&
+              out.riskLevel === "BLOCKED";
+            return { pass, message: `got lockStatus=${out.lockStatus}, canApply=${out.canApply}` };
+          }
+        },
+        {
+          name: "Flags stale lock (>= 1800s) as STALE_LOCK_REVIEW and blocks auto-apply",
+          run: (scope) => {
+            const out = scope.analyzeTerraformRun(
+              { locked: true, lockId: "old-lock", holder: "crashed-runner", ageSeconds: 2400, forceUnlock: false },
+              []
+            );
+            const pass =
+              out.canApply === false &&
+              out.lockStatus === "STALE_LOCK_REVIEW" &&
+              out.riskLevel === "BLOCKED";
+            return { pass, message: `got lockStatus=${out.lockStatus}, riskLevel=${out.riskLevel}` };
+          }
+        },
+        {
+          name: "Blocks prevent_destroy replacement on stateful RDS database",
+          run: (scope) => {
+            const out = scope.analyzeTerraformRun(
+              { locked: false, lockId: null, holder: null, ageSeconds: 0, forceUnlock: false },
+              [
+                {
+                  address: "module.orders_db.aws_db_instance.this",
+                  type: "aws_db_instance",
+                  actions: ["delete", "create"],
+                  preventDestroy: true
+                }
+              ]
+            );
+            const pass =
+              out.canApply === false &&
+              out.riskLevel === "BLOCKED" &&
+              out.preventDestroyBlocked.length === 1 &&
+              out.statefulDestructions.length === 1 &&
+              out.downtimeReplacements.length === 1;
+            return { pass, message: `got riskLevel=${out.riskLevel}, preventDestroyBlocked=${out.preventDestroyBlocked.length}` };
+          }
+        },
+        {
+          name: "Distinguishes create_before_destroy (zero-downtime) vs destroy-before-create replacement",
+          run: (scope) => {
+            const out = scope.analyzeTerraformRun(
+              { locked: false, lockId: null, holder: null, ageSeconds: 0, forceUnlock: false },
+              [
+                {
+                  address: "aws_security_group.api",
+                  type: "aws_security_group",
+                  actions: ["create", "delete"],
+                  preventDestroy: false
+                },
+                {
+                  address: "aws_ecs_cluster.main",
+                  type: "aws_ecs_cluster",
+                  actions: ["delete", "create"],
+                  preventDestroy: false
+                }
+              ]
+            );
+            const pass =
+              out.canApply === true &&
+              out.riskLevel === "HIGH" &&
+              out.recreateReplacements.length === 2 &&
+              out.downtimeReplacements.length === 1 &&
+              out.downtimeReplacements[0] === "aws_ecs_cluster.main";
+            return {
+              pass,
+              message: `got riskLevel=${out.riskLevel}, recreate=${out.recreateReplacements.length}, downtime=${JSON.stringify(out.downtimeReplacements)}`
+            };
+          }
+        },
+        {
+          name: "Flags stateful destruction without prevent_destroy or forceUnlock as CRITICAL",
+          run: (scope) => {
+            const out = scope.analyzeTerraformRun(
+              { locked: true, lockId: "stale-7", holder: "unknown", ageSeconds: 3600, forceUnlock: true },
+              [
+                {
+                  address: "aws_dynamodb_table.sessions",
+                  type: "aws_dynamodb_table",
+                  actions: ["delete"],
+                  preventDestroy: false
+                }
+              ]
+            );
+            const pass =
+              out.canApply === true &&
+              out.lockStatus === "FORCE_UNLOCK_DANGEROUS" &&
+              out.riskLevel === "CRITICAL" &&
+              out.statefulDestructions[0] === "aws_dynamodb_table.sessions";
+            return { pass, message: `got lockStatus=${out.lockStatus}, riskLevel=${out.riskLevel}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0042",
+      title: "Quiz 0042: S3 State Locking, Module Refactors & CDK vs Terraform",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Two GitHub Actions workflows trigger simultaneously on the same Terraform environment backed by Amazon S3 with use_lockfile = true. Workflow B fails immediately with 'Error acquiring the state lock'. What is the safest senior response?",
+          options: [
+            "Pass the -lock=false flag in Workflow B so both runs complete",
+            "Wait for Workflow A to finish before retrying Workflow B safely",
+            "Run force-unlock inside Workflow B so the locked apply can proceed",
+            "Store separate local state files inside each GitHub runner job cache"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Disabling locking with -lock=false lets both pipelines write conflicting state JSON concurrently, corrupting state and orphaning live AWS resources.",
+            "The S3 conditional lock worked as designed by serializing applies. Waiting for Workflow A to commit updated state and release the lock prevents split-brain corruption.",
+            "Calling force-unlock while Workflow A is still actively modifying AWS resources breaks mutual exclusion and causes two concurrent applies to collide.",
+            "Local runner state files diverge immediately across jobs and disappear when ephemeral GitHub-hosted runners terminate."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "You move an existing production aws_db_instance.orders resource from the root module into ./modules/database. Before updating state, terraform plan shows one destroy on the old address and one create on the new address. How do you refactor safely without downtime?",
+          options: [
+            "Set create_before_destroy true inside the database block to keep uptime",
+            "Apply the current plan twice so Terraform merges both addresses",
+            "Declare a moved block remapping the existing resource into module",
+            "Set prevent_destroy true and remove the old root database block"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "create_before_destroy still provisions a brand-new empty RDS database and deletes the old one (and also fails if both share the same identifier).",
+            "Applying a destructive plan even once immediately deletes the production RDS instance rather than merging state addresses.",
+            "A moved { from = aws_db_instance.orders  to = module.database.aws_db_instance.this } block updates the address inside state with zero AWS API mutations.",
+            "Removing the old root block with prevent_destroy true causes Terraform to error out instead of transferring ownership to the module."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "Your platform team provisions shared AWS multi-account VPCs alongside Cloudflare DNS rules, GitHub repositories, and Datadog monitors in one unified deployment pipeline. Which IaC tradeoff best justifies choosing Terraform over AWS CDK here?",
+          options: [
+            "Terraform eliminates remote state files by delegating tracking to AWS CloudFormation",
+            "Terraform compiles TypeScript constructs natively without requiring any provider plugin binaries",
+            "Terraform skips plan previews because it directly mutates live cloud resources",
+            "Terraform manages AWS and external SaaS providers inside one dependency graph"
+          ],
+          correctIndex: 3,
+          explanations: [
+            "AWS CDK delegates state to CloudFormation; Terraform explicitly stores its own state file (typically in S3) rather than using CloudFormation.",
+            "AWS CDK uses TypeScript constructs; Terraform uses declarative HCL and downloads provider plugin binaries pinned in .terraform.lock.hcl.",
+            "Terraform centers its workflow on explicit pre-apply plan diffs rather than skipping previews.",
+            "Terraform's provider ecosystem lets one unified DAG wire AWS outputs (like ALB DNS or IAM roles) directly into Cloudflare, GitHub, and Datadog."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

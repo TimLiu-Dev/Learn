@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0034 — DynamoDB Production Patterns: Single-Table Design, Optimistic Locking &amp; Streams</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0034</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0034-dynamodb-single-table-streams.html" class="active">Lesson 0034</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.5</span>
+      <span class="pill">Production Patterns</span>
+      <span class="pill">Est. Time: 30 mins</span>
+    </div>
+
+    <h1>DynamoDB Production Patterns: Single-Table Design, Optimistic Locking &amp; Streams</h1>
+    <p class="lead">
+      DynamoDB has no server-side <code>JOIN</code> and no interactive row locks. To hit consistent single-digit millisecond p99 latency at scale, senior engineers pack related entities into one partition using overloaded <code>PK</code>/<code>SK</code> keys, invert relationships with sparse Global Secondary Indexes, guard mutations with <code>ConditionExpression</code> versions, and react to state transitions via DynamoDB Streams.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android Room, you normalize entities into separate tables and write <code>@Transaction @Relation</code> queries so SQLite joins <code>User</code>, <code>Order</code>, and <code>LineItem</code> on the device. That works locally on one phone, but distributed joins across storage nodes wreck tail latency at cloud scale. Instead, <strong>Single-Table Design</strong> pre-joins those entities inside one DynamoDB <em>item collection</em> (<code>PK</code> + <code>SK</code> prefixing), <strong>GSI inverted indexes</strong> replace reverse foreign-key lookups, <strong><code>ConditionExpression</code></strong> plays the role of Room's <code>OnConflictStrategy.ABORT</code> plus a version check, and <strong>DynamoDB Streams + Lambda</strong> acts like a server-side <code>Flow&lt;List&lt;Event&gt;&gt;</code> observer for async side effects.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Single-Table Design &amp; PK/SK Overloading (Pre-Joined Item Collections)</h2>
+        <p>
+          In DynamoDB, a <code>Query</code> hits <strong>one storage partition</strong> via an <code>O(1)</code> hash of the partition key (<code>PK</code>), then reads a contiguous B-tree range sorted by the sort key (<code>SK</code>). Because all items sharing a <code>PK</code> live together in the same <em>item collection</em>, fetching a heterogeneous group of entities in one <code>Query</code> replaces multi-table SQL joins with a single network round trip.
+        </p>
+        <p>
+          To store different entity types side-by-side, name your table keys generically (<code>PK</code>, <code>SK</code>) and prefix values with entity namespaces:
+        </p>
+        <ul>
+          <li><strong>Customer Profile:</strong> <code>PK = "USER#u_42"</code>, <code>SK = "PROFILE"</code></li>
+          <li><strong>Customer Orders (time-ordered):</strong> <code>PK = "USER#u_42"</code>, <code>SK = "ORDER#2026-11-15T08:10:00Z#ord_9"</code></li>
+          <li><strong>Saved Addresses:</strong> <code>PK = "USER#u_42"</code>, <code>SK = "ADDR#home"</code></li>
+          <li><strong>Order Line Items:</strong> <code>PK = "ORDER#ord_9"</code>, <code>SK = "ITEM#sku_7"</code></li>
+        </ul>
+        <p>
+          With one <code>Query(PK = "USER#u_42", SK begins_with "ORDER#")</code>, you read the customer's chronological orders. With <code>Query(PK = "USER#u_42")</code> (no <code>SK</code> filter), you read their profile, addresses, and recent orders in one call—bounded only by DynamoDB's <strong>1 MB per-page response limit</strong> and <strong>400 KB max item size</strong> (attributes plus values combined).
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 285" width="100%" height="auto" role="img" aria-label="Single-Table PK/SK Item Collection and Inverted GSI1 Mapping">
+            <rect x="0" y="0" width="680" height="285" fill="#fdfcf8" rx="6" />
+
+            <!-- Base Table Header -->
+            <text x="16" y="26" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Base Table (PK + SK Item Collections)</text>
+
+            <rect x="16" y="38" width="648" height="24" rx="3" fill="#f5f2ea" stroke="#dfd9cc" />
+            <text x="26" y="54" font-family="monospace" font-size="11" font-weight="700" fill="#575c66">PK</text>
+            <text x="148" y="54" font-family="monospace" font-size="11" font-weight="700" fill="#575c66">SK</text>
+            <text x="358" y="54" font-family="monospace" font-size="11" font-weight="700" fill="#575c66">GSI1PK (Inverted)</text>
+            <text x="500" y="54" font-family="monospace" font-size="11" font-weight="700" fill="#575c66">GSI1SK</text>
+
+            <!-- Row 1: Profile -->
+            <rect x="16" y="66" width="648" height="28" rx="3" fill="#e9f1f8" stroke="#bfd7ed" />
+            <text x="26" y="84" font-family="monospace" font-size="11" fill="#0f4c81">USER#u_42</text>
+            <text x="148" y="84" font-family="monospace" font-size="11" fill="#1b1d21">PROFILE</text>
+            <text x="358" y="84" font-family="monospace" font-size="11" fill="#575c66">(omitted — sparse)</text>
+            <text x="500" y="84" font-family="monospace" font-size="11" fill="#575c66">—</text>
+
+            <!-- Row 2: Order -->
+            <rect x="16" y="98" width="648" height="28" rx="3" fill="#e9f1f8" stroke="#bfd7ed" />
+            <text x="26" y="116" font-family="monospace" font-size="11" fill="#0f4c81">USER#u_42</text>
+            <text x="148" y="116" font-family="monospace" font-size="11" fill="#1b1d21">ORDER#2026-11-15#ord_9</text>
+            <text x="358" y="116" font-family="monospace" font-size="11" fill="#b45309">ORDER#ord_9</text>
+            <text x="500" y="116" font-family="monospace" font-size="11" fill="#b45309">USER#u_42</text>
+
+            <!-- Row 3: Order Item -->
+            <rect x="16" y="130" width="648" height="28" rx="3" fill="#fef3c7" stroke="#f3d08a" />
+            <text x="26" y="148" font-family="monospace" font-size="11" fill="#b45309">ORDER#ord_9</text>
+            <text x="148" y="148" font-family="monospace" font-size="11" fill="#1b1d21">ITEM#sku_7</text>
+            <text x="358" y="148" font-family="monospace" font-size="11" fill="#166534">SKU#sku_7</text>
+            <text x="500" y="148" font-family="monospace" font-size="11" fill="#166534">ORDER#ord_9</text>
+
+            <!-- Arrow to GSI1 -->
+            <line x1="340" y1="164" x2="340" y2="188" stroke="#0f4c81" stroke-width="1.5" stroke-dasharray="4 3" />
+            <polygon points="335,184 345,184 340,192" fill="#0f4c81" />
+            <text x="352" y="182" font-family="sans-serif" font-size="11" fill="#0f4c81">Async GSI1 replication flips access direction</text>
+
+            <!-- GSI1 Header -->
+            <text x="16" y="208" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">GSI1 Inverted View (Lookup Order &rarr; User, or SKU &rarr; All Orders)</text>
+            <rect x="16" y="218" width="648" height="26" rx="3" fill="#dcfce7" stroke="#a7f3d0" />
+            <text x="26" y="235" font-family="monospace" font-size="11" fill="#166534">GSI1PK = ORDER#ord_9</text>
+            <text x="220" y="235" font-family="monospace" font-size="11" fill="#1b1d21">GSI1SK = USER#u_42</text>
+            <text x="410" y="235" font-family="sans-serif" font-size="11" fill="#575c66">&larr; Support lookup by orderId alone</text>
+
+            <rect x="16" y="248" width="648" height="26" rx="3" fill="#dcfce7" stroke="#a7f3d0" />
+            <text x="26" y="265" font-family="monospace" font-size="11" fill="#166534">GSI1PK = SKU#sku_7</text>
+            <text x="220" y="265" font-family="monospace" font-size="11" fill="#1b1d21">GSI1SK = ORDER#ord_9</text>
+            <text x="410" y="265" font-family="sans-serif" font-size="11" fill="#575c66">&larr; Adjacency list: orders holding SKU</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Overloaded <code>PK</code>/<code>SK</code> values co-locate user profile and order headers in one partition, while <code>GSI1PK</code>/<code>GSI1SK</code> invert the key graph for reverse lookups without duplicating tables.
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-title">When NOT to Use Single-Table Design</div>
+          <p style="margin: 0;">
+            Single-table design optimizes for <strong>known, high-throughput OLTP access patterns</strong>. Skip it—or keep separate tables—when product requirements change weekly, when teams need ad-hoc BI/SQL analytics (Athena/Glue exports become painful when every row has a different schema), or when fine-grained IAM row/table isolation per microservice is required. Also avoid unbounded item collections: storing millions of audit events under one hot <code>PK</code> can exceed the single-partition limit (<strong>1,000 WCU / 3,000 RCU</strong>), and if any Local Secondary Index (LSI) exists, caps that item collection at <strong>10 GB</strong>.
+          </p>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. Inverted Indexes, Adjacency Lists &amp; Sparse GSIs</h2>
+        <p>
+          Base tables only query forward from <code>PK</code>. To query the reverse direction—for example, looking up an order by <code>orderId</code> without knowing <code>userId</code>, or finding every order containing <code>SKU#sku_7</code>—add a <strong>Global Secondary Index (GSI)</strong> with generic attributes <code>GSI1PK</code> and <code>GSI1SK</code>.
+        </p>
+        <ul>
+          <li><strong>Adjacency List Pattern:</strong> Many-to-many graphs (Users &harr; Groups, Orders &harr; SKUs) live cleanly in one table. Put <code>PK = "ORDER#ord_9"</code>, <code>SK = "ITEM#sku_7"</code> on the base table, and mirror <code>GSI1PK = "SKU#sku_7"</code>, <code>GSI1SK = "ORDER#ord_9"</code>. Querying the base table returns an order's items; querying <code>GSI1</code> returns all orders for a SKU.</li>
+          <li><strong>Sparse Indexes:</strong> DynamoDB only projects an item into a GSI if <em>both</em> the GSI partition key and sort key attributes exist on that item. Setting <code>GSI2PK = "STATUS#OPEN"</code> only while an order is open—and deleting <code>GSI2PK</code> on completion—creates a tiny, fast work-queue index over active orders without scanning millions of archived rows.</li>
+        </ul>
+        <p>
+          <strong>Senior Failure Mode — GSI Write Backpressure:</strong> GSIs replicate asynchronously (typically under 10 ms; strong consistency is <em>not</em> supported on GSIs). Every GSI maintains its own provisioned or on-demand capacity. If a GSI has a low-cardinality key like <code>GSI2PK = "STATUS#OPEN"</code> under heavy write load, or its provisioned WCU is too low, <strong>GSI throttling propagates backward and stalls writes on the base table</strong>. Choose projection carefully (<code>KEYS_ONLY</code>, <code>INCLUDE</code>, or <code>ALL</code>) because projecting large attributes doubles storage and WCU cost.
+        </p>
+
+        <!-- SECTION 3 -->
+        <h2>3. Optimistic Locking with <code>ConditionExpression</code> &amp; Transactions</h2>
+        <p>
+          Consider two concurrent Lambda invocations (or an Android client retrying a flaky cellular request) both reading <code>ORDER#ord_9</code> at <code>stock = 5</code> and decrementing it by 1. Without a concurrency guard, the second writer blindly overwrites the first, leaving <code>stock = 4</code> instead of <code>3</code>.
+        </p>
+        <p>
+          Instead of holding pessimistic row locks across network calls, DynamoDB enforces <strong>Optimistic Concurrency Control (OCC)</strong> via <code>ConditionExpression</code>:
+        </p>
+        <ol>
+          <li>Store a monotonically increasing <code>version</code> attribute on every mutable item (starting at <code>1</code> on insert).</li>
+          <li>On create (idempotent insert), pass <code>ConditionExpression: "attribute_not_exists(PK)"</code> so duplicate mobile retries fail safely instead of clobbering existing orders.</li>
+          <li>On update, read the item's current <code>version</code> (say <code>7</code>), then send <code>UpdateItem</code> with <code>ConditionExpression: "version = :expectedVersion"</code> and <code>UpdateExpression: "SET #s = :status, version = version + :one"</code>.</li>
+        </ol>
+        <p>
+          DynamoDB evaluates the condition atomically on the storage leader node. If another writer bumped <code>version</code> to <code>8</code> first, DynamoDB rejects the stale write with <code>ConditionalCheckFailedException</code> (HTTP 400). Note the billing trap: <strong>a failed conditional write still consumes normal WCU</strong> based on the item's size (minimum 1 WCU).
+        </p>
+        <p>
+          When a business invariant spans multiple items—such as deducting inventory from <code>SKU#sku_7</code> <em>and</em> creating <code>ORDER#ord_9</code> together—use <code>TransactWriteItems</code>. It executes all-or-nothing across up to <strong>100 items or 4 MB</strong> total within one AWS Region, at <strong>2&times; WCU cost</strong> (prepare + commit phases), returning <code>TransactionCanceledException</code> with per-item <code>CancellationReasons</code> if any condition fails.
+        </p>
+
+        <!-- SECTION 4 -->
+        <h2>4. DynamoDB Streams + Lambda (CDC, Poison Pills &amp; Loop Prevention)</h2>
+        <p>
+          Once an order commits, downstream systems need to charge cards, push FCM notifications to Android, or update OpenSearch—without slowing down the checkout API. Enabling <strong>DynamoDB Streams</strong> emits a time-ordered sequence of item mutations (<code>INSERT</code>, <code>MODIFY</code>, <code>REMOVE</code>) per partition shard, retained for <strong>24 hours</strong>, with strict per-item ordering and no duplicate stream records per write.
+        </p>
+        <p>
+          Choose your <code>StreamViewType</code> intentionally: <code>KEYS_ONLY</code> minimizes payload size, <code>NEW_IMAGE</code> shows the post-write item, and <code>NEW_AND_OLD_IMAGES</code> lets your Lambda compute exact attribute diffs (e.g., triggering only when <code>status</code> changed from <code>OPEN</code> to <code>PAID</code>).
+        </p>
+        <p>
+          Watch out for three classic DynamoDB Streams production outages:
+        </p>
+        <ul>
+          <li><strong>The Infinite Self-Trigger Loop:</strong> Your Stream Lambda reads an <code>INSERT</code>/<code>MODIFY</code> event and writes an <code>enrichedAt</code> attribute back to the same table, emitting another <code>MODIFY</code> event forever until your AWS bill explodes. <strong>Fix:</strong> attach an <a href="https://docs.aws.amazon.com/lambda/latest/dg/invocation-eventfiltering.html" target="_blank" rel="noopener">Event Source Mapping (ESM) filter</a> matching only <code>eventName: ["INSERT"]</code> or specific status transitions, and avoid redundant writes.</li>
+          <li><strong>The Poison-Pill Shard Block:</strong> By default, a Lambda ESM retries an unhandled exception on the same batch until the 24-hour stream retention expires—freezing every newer item on that shard. <strong>Fix:</strong> set <code>BisectBatchOnFunctionError: true</code>, <code>MaximumRetryAttempts: 3</code>, and an <code>OnFailure</code> SQS/SNS dead-letter destination, or return <code>batchItemFailures</code> with <code>ReportBatchItemFailures</code>.</li>
+          <li><strong>Consumer Fan-Out Limits:</strong> At most <strong>2 concurrent consumers</strong> should poll a DynamoDB Stream shard before <code>LimitExceededException</code> throttling occurs. If 5+ microservices need the stream, route events through EventBridge Pipes or enable <strong>Kinesis Data Streams for DynamoDB</strong> (up to 365-day retention, though without DynamoDB Streams' strict single-record deduplication guarantee on shard splits).</li>
+        </ul>
+
+        <!-- SECTION 5: CODE EXAMPLE -->
+        <h2>5. Code Example: AWS SDK v3 Optimistic Lock &amp; Stream Handler</h2>
+        <p>
+          Below is a production TypeScript pattern using <code>@aws-sdk/lib-dynamodb</code> for conditional versioned updates and a hardened Lambda Stream consumer with ESM filtering and partial batch failure reporting:
+        </p>
+<pre><code>// 1. Optimistic Lock Update (AWS SDK v3 DocumentClient)
+import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+
+export async function markOrderPaid(userId: string, orderSk: string, expectedVersion: number) {
+  try {
+    const res = await docClient.send(
+      new UpdateCommand({
+        TableName: process.env.TABLE_NAME,
+        Key: { PK: `USER#${userId}`, SK: orderSk },
+        UpdateExpression: "SET #st = :paid, version = version + :one REMOVE GSI2PK, GSI2SK",
+        ConditionExpression: "attribute_exists(PK) AND version = :expectedVersion",
+        ExpressionAttributeNames: { "#st": "status" },
+        ExpressionAttributeValues: {
+          ":paid": "PAID",
+          ":expectedVersion": expectedVersion,
+          ":one": 1
+        },
+        ReturnValues: "ALL_NEW"
+      })
+    );
+    return res.Attributes;
+  } catch (err: any) {
+    if (err.name === "ConditionalCheckFailedException") {
+      // Stale read: re-fetch item and retry with jitter, or return HTTP 409 Conflict
+      throw new ConflictError("Order modified concurrently; reload and retry.");
+    }
+    throw err;
+  }
+}
+
+// 2. ESM Filter Criteria (CDK / SAM) — prevents infinite loop on enrichments
+// Only triggers Lambda when an Order transitions into status = "PAID"
+const streamFilter = {
+  Filters: [
+    {
+      Pattern: JSON.stringify({
+        eventName: ["INSERT", "MODIFY"],
+        dynamodb: {
+          NewImage: {
+            entityType: { S: ["Order"] },
+            status: { S: ["PAID"] }
+          }
+        }
+      })
+    }
+  ]
+};</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build two core production building blocks: <code>mapOrderEntities(order)</code> to map an order and its line items into a Single-Table layout (with inverted <code>GSI1</code> and sparse <code>GSI2</code>), and <code>applyOptimisticUpdate(table, key, expectedVersion, patch, streamBuffer)</code> to enforce <code>ConditionExpression</code> version checks and emit DynamoDB Stream records.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Validate your architectural instincts on key overloading, optimistic concurrency billing/failures, and DynamoDB Stream loops.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCES -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-general-nosql-design.html" target="_blank" rel="noopener">AWS DynamoDB Developer Guide — Best Practices for Designing and Architecting with DynamoDB</a> (Single-table design, composite keys, and sparse GSIs).
+          </li>
+          <li>
+            <strong>Concurrency &amp; Transactions:</strong> <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithItems.html#WorkingWithItems.ConditionalUpdate" target="_blank" rel="noopener">Conditional Writes &amp; Optimistic Locking</a> and <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html" target="_blank" rel="noopener">DynamoDB Transactions</a>.
+          </li>
+          <li>
+            <strong>Streams &amp; Lambda ESM:</strong> <a href="https://docs.aws.amazon.com/lambda/latest/dg/with-ddb.html" target="_blank" rel="noopener">Using AWS Lambda with Amazon DynamoDB Streams</a> (Batching, bisection, DLQ, and event filtering).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0035 (ElastiCache Redis/Valkey &amp; Choosing RDS vs DynamoDB vs ElastiCache)</strong>, ask me anything that feels uncertain—for instance: <em>"How do we handle write sharding when a single <code>GSI2PK = 'STATUS#OPEN'</code> exceeds 1,000 WCU?"</em> or <em>"Should Android offline sync mutations use DynamoDB <code>version</code> numbers or Lamport timestamps?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0033-dynamodb-keys-hot-partitions-capacity.html">&larr; Lesson 0033: DynamoDB Fundamentals: Partition &amp; Sort Keys, Hot Partitions, Capacity &amp; GSIs</a>
+          <a href="./0035-elasticache-redis-valkey-db-choice.html">Lesson 0035: ElastiCache (Redis/Valkey) Cluster Mode &amp; Choosing RDS vs DynamoDB vs ElastiCache &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Remove vs. Null in Sparse GSIs</strong>
+          Never store <code>GSI2PK = null</code> or <code>""</code> when closing an order—DynamoDB rejects empty key strings and only omits items from a sparse GSI when the key attribute is completely <code>REMOVE</code>d.
+        </div>
+        <div class="sidenote">
+          <strong>Why Failed Writes Cost WCU</strong>
+          Because DynamoDB must fetch and evaluate the existing item on the storage leader to check your <code>ConditionExpression</code>, a rejected write still consumes WCU proportional to the item size.
+        </div>
+        <div class="sidenote">
+          <strong>Room Migration Analogy</strong>
+          Single-table schemas trade flexible SQLite <code>ALTER TABLE</code> migrations for backfill jobs via DynamoDB Scans or Streams when adding a brand-new <code>GSI3PK</code> pattern.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0034",
+      title: "Lab 0034: Single-Table Mapper & Optimistic Lock Simulator",
+      filename: "dynamodb-patterns.js",
+      description:
+        "Implement two functions:<br/>1. <code>mapOrderEntities(order)</code>: Given <code>{ userId, orderId, createdAtIso, status, totalCents, items }</code>, return an array starting with the Order header item (<code>PK: \"USER#\" + userId</code>, <code>SK: \"ORDER#\" + createdAtIso + \"#\" + orderId</code>, <code>GSI1PK: \"ORDER#\" + orderId</code>, <code>GSI1SK: \"USER#\" + userId</code>, <code>entityType: \"Order\"</code>, <code>orderId</code>, <code>status</code>, <code>totalCents</code>, <code>version: 1</code>; and ONLY if <code>status === \"OPEN\"</code>, include sparse keys <code>GSI2PK: \"STATUS#OPEN\"</code> and <code>GSI2SK: createdAtIso + \"#\" + orderId</code>), followed by one item per entry in <code>order.items</code> (<code>PK: \"ORDER#\" + orderId</code>, <code>SK: \"ITEM#\" + item.sku</code>, <code>GSI1PK: \"SKU#\" + item.sku</code>, <code>GSI1SK: \"ORDER#\" + orderId</code>, <code>entityType: \"OrderItem\"</code>, <code>orderId</code>, <code>sku</code>, <code>qty</code>, <code>priceCents</code>).<br/>2. <code>applyOptimisticUpdate(table, key, expectedVersion, patch, streamBuffer)</code>: Look up <code>table[key.PK + \"|\" + key.SK]</code>. If <code>expectedVersion === 0</code>, enforce <code>attribute_not_exists(PK)</code>: reject if item exists, otherwise insert with <code>version: 1</code> and push an <code>\"INSERT\"</code> stream event. If <code>expectedVersion &gt; 0</code>, enforce <code>existing &amp;&amp; existing.version === expectedVersion</code>: reject if missing/mismatched, otherwise merge <code>patch</code>, increment <code>version</code>, and push a <code>\"MODIFY\"</code> stream event. Always return <code>wcuConsumed: 1</code>.",
+      exports: ["mapOrderEntities", "applyOptimisticUpdate"],
+      starterCode: `function mapOrderEntities(order) {
+  const mapped = [];
+
+  // TODO 1: Build the Order header item with PK, SK, GSI1PK, GSI1SK, version: 1,
+  // and sparse GSI2PK/GSI2SK ONLY when order.status === "OPEN".
+
+  // TODO 2: Map each item in order.items into an OrderItem with PK = ORDER#<orderId>,
+  // SK = ITEM#<sku>, and inverted GSI1PK = SKU#<sku>, GSI1SK = ORDER#<orderId>.
+
+  return mapped;
+}
+
+function applyOptimisticUpdate(table, key, expectedVersion, patch, streamBuffer) {
+  const compositeKey = key.PK + "|" + key.SK;
+  const existing = table[compositeKey] || null;
+
+  // TODO 3: Handle expectedVersion === 0 (create only if absent -> version: 1, INSERT stream event)
+  // TODO 4: Handle expectedVersion > 0 (update only if existing.version === expectedVersion -> version + 1, MODIFY stream event)
+  // On failure, do not mutate table or streamBuffer; return:
+  // { ok: false, error: "ConditionalCheckFailedException", currentVersion: existing ? existing.version : null, wcuConsumed: 1 }
+
+  return { ok: false, error: "NOT_IMPLEMENTED", currentVersion: null, wcuConsumed: 1 };
+}
+
+const sampleOrder = {
+  userId: "u_42",
+  orderId: "ord_9",
+  createdAtIso: "2026-11-15T08:10:00Z",
+  status: "OPEN",
+  totalCents: 4500,
+  items: [{ sku: "sku_7", qty: 2, priceCents: 2250 }]
+};
+console.log("Mapped:", mapOrderEntities(sampleOrder));`,
+      hints: [
+        "For the sparse GSI on <code>Order</code>, build the base object first, then conditionally assign <code>header.GSI2PK = \"STATUS#OPEN\"</code> and <code>header.GSI2SK = order.createdAtIso + \"#\" + order.orderId</code> only when <code>order.status === \"OPEN\"</code> so closed orders omit those keys completely.",
+        "In <code>applyOptimisticUpdate</code>, use <code>Object.assign({}, existing)</code> to snapshot <code>oldImage</code> before building <code>newItem = Object.assign({}, existing, patch, { version: existing.version + 1 })</code>, and push <code>{ eventName, keys: { PK: key.PK, SK: key.SK }, oldImage, newImage: Object.assign({}, newItem) }</code> onto <code>streamBuffer</code>."
+      ],
+      solutionExplanation:
+        "Overloading PK/SK places the Order header inside the user's item collection while placing OrderItems inside the order's item collection and inverting them via GSI1. Omitting GSI2PK/GSI2SK when status !== 'OPEN' creates a true sparse index. Optimistic concurrency rejects stale versions with ConditionalCheckFailedException while still charging 1 WCU, and successful writes emit ordered INSERT/MODIFY stream records.",
+      solutionCode: `function mapOrderEntities(order) {
+  const header = {
+    PK: "USER#" + order.userId,
+    SK: "ORDER#" + order.createdAtIso + "#" + order.orderId,
+    GSI1PK: "ORDER#" + order.orderId,
+    GSI1SK: "USER#" + order.userId,
+    entityType: "Order",
+    orderId: order.orderId,
+    status: order.status,
+    totalCents: order.totalCents,
+    version: 1
+  };
+
+  if (order.status === "OPEN") {
+    header.GSI2PK = "STATUS#OPEN";
+    header.GSI2SK = order.createdAtIso + "#" + order.orderId;
+  }
+
+  const lineItems = (order.items || []).map(function (item) {
+    return {
+      PK: "ORDER#" + order.orderId,
+      SK: "ITEM#" + item.sku,
+      GSI1PK: "SKU#" + item.sku,
+      GSI1SK: "ORDER#" + order.orderId,
+      entityType: "OrderItem",
+      orderId: order.orderId,
+      sku: item.sku,
+      qty: item.qty,
+      priceCents: item.priceCents
+    };
+  });
+
+  return [header].concat(lineItems);
+}
+
+function applyOptimisticUpdate(table, key, expectedVersion, patch, streamBuffer) {
+  const compositeKey = key.PK + "|" + key.SK;
+  const existing = table[compositeKey] || null;
+
+  if (expectedVersion === 0) {
+    if (existing !== null) {
+      return {
+        ok: false,
+        error: "ConditionalCheckFailedException",
+        currentVersion: existing.version,
+        wcuConsumed: 1
+      };
+    }
+
+    const newItem = Object.assign({}, key, patch, { version: 1 });
+    table[compositeKey] = newItem;
+    streamBuffer.push({
+      eventName: "INSERT",
+      keys: { PK: key.PK, SK: key.SK },
+      oldImage: null,
+      newImage: Object.assign({}, newItem)
+    });
+    return { ok: true, item: newItem, wcuConsumed: 1 };
+  }
+
+  if (!existing || existing.version !== expectedVersion) {
+    return {
+      ok: false,
+      error: "ConditionalCheckFailedException",
+      currentVersion: existing ? existing.version : null,
+      wcuConsumed: 1
+    };
+  }
+
+  const oldImage = Object.assign({}, existing);
+  const newItem = Object.assign({}, existing, patch, { version: existing.version + 1 });
+  table[compositeKey] = newItem;
+  streamBuffer.push({
+    eventName: "MODIFY",
+    keys: { PK: key.PK, SK: key.SK },
+    oldImage: oldImage,
+    newImage: Object.assign({}, newItem)
+  });
+
+  return { ok: true, item: newItem, wcuConsumed: 1 };
+}`,
+      tests: [
+        {
+          name: "Maps OPEN order and line items with PK/SK overloading, inverted GSI1, and sparse GSI2",
+          run: (scope) => {
+            const rows = scope.mapOrderEntities({
+              userId: "u_42",
+              orderId: "ord_9",
+              createdAtIso: "2026-11-15T08:10:00Z",
+              status: "OPEN",
+              totalCents: 4500,
+              items: [
+                { sku: "sku_7", qty: 2, priceCents: 2000 },
+                { sku: "sku_8", qty: 1, priceCents: 500 }
+              ]
+            });
+            const h = rows[0];
+            const i1 = rows[1];
+            const pass =
+              rows.length === 3 &&
+              h.PK === "USER#u_42" &&
+              h.SK === "ORDER#2026-11-15T08:10:00Z#ord_9" &&
+              h.GSI1PK === "ORDER#ord_9" &&
+              h.GSI1SK === "USER#u_42" &&
+              h.GSI2PK === "STATUS#OPEN" &&
+              h.GSI2SK === "2026-11-15T08:10:00Z#ord_9" &&
+              h.version === 1 &&
+              i1.PK === "ORDER#ord_9" &&
+              i1.SK === "ITEM#sku_7" &&
+              i1.GSI1PK === "SKU#sku_7" &&
+              i1.GSI1SK === "ORDER#ord_9";
+            return { pass, message: `mapped ${rows.length} items, headerPK=${h && h.PK}, GSI2PK=${h && h.GSI2PK}` };
+          }
+        },
+        {
+          name: "Omits sparse GSI2 attributes completely when order status is not OPEN",
+          run: (scope) => {
+            const rows = scope.mapOrderEntities({
+              userId: "u_99",
+              orderId: "ord_12",
+              createdAtIso: "2026-11-15T09:00:00Z",
+              status: "PAID",
+              totalCents: 1200,
+              items: []
+            });
+            const h = rows[0];
+            const pass =
+              rows.length === 1 &&
+              !("GSI2PK" in h) &&
+              !("GSI2SK" in h) &&
+              h.status === "PAID";
+            return { pass, message: `hasGSI2PK=${"GSI2PK" in h}, hasGSI2SK=${"GSI2SK" in h}` };
+          }
+        },
+        {
+          name: "Idempotent insert succeeds at expectedVersion=0 and rejects duplicate retry",
+          run: (scope) => {
+            const table = {};
+            const stream = [];
+            const key = { PK: "USER#u_1", SK: "ORDER#2026-11-15#ord_1" };
+            const first = scope.applyOptimisticUpdate(table, key, 0, { status: "OPEN", totalCents: 500 }, stream);
+            const dup = scope.applyOptimisticUpdate(table, key, 0, { status: "OPEN", totalCents: 500 }, stream);
+            const pass =
+              first.ok === true &&
+              first.item.version === 1 &&
+              first.wcuConsumed === 1 &&
+              dup.ok === false &&
+              dup.error === "ConditionalCheckFailedException" &&
+              dup.currentVersion === 1 &&
+              dup.wcuConsumed === 1 &&
+              stream.length === 1 &&
+              stream[0].eventName === "INSERT" &&
+              stream[0].oldImage === null;
+            return { pass, message: `first.ok=${first.ok}, dup.error=${dup.error}, streamLen=${stream.length}` };
+          }
+        },
+        {
+          name: "Optimistic update increments version and emits MODIFY stream record with old/new images",
+          run: (scope) => {
+            const table = {};
+            const stream = [];
+            const key = { PK: "USER#u_2", SK: "ORDER#2026-11-15#ord_2" };
+            scope.applyOptimisticUpdate(table, key, 0, { status: "OPEN" }, stream);
+            const upd = scope.applyOptimisticUpdate(table, key, 1, { status: "PAID" }, stream);
+            const pass =
+              upd.ok === true &&
+              upd.item.version === 2 &&
+              upd.item.status === "PAID" &&
+              stream.length === 2 &&
+              stream[1].eventName === "MODIFY" &&
+              stream[1].oldImage.status === "OPEN" &&
+              stream[1].oldImage.version === 1 &&
+              stream[1].newImage.status === "PAID" &&
+              stream[1].newImage.version === 2;
+            return { pass, message: `newVersion=${upd.item && upd.item.version}, stream1=${stream[1] && stream[1].eventName}` };
+          }
+        },
+        {
+          name: "Stale concurrent writer receives ConditionalCheckFailedException without mutating state or stream",
+          run: (scope) => {
+            const table = {};
+            const stream = [];
+            const key = { PK: "USER#u_3", SK: "ORDER#2026-11-15#ord_3" };
+            scope.applyOptimisticUpdate(table, key, 0, { status: "OPEN", stock: 5 }, stream);
+            scope.applyOptimisticUpdate(table, key, 1, { status: "PAID", stock: 4 }, stream);
+            const stale = scope.applyOptimisticUpdate(table, key, 1, { status: "CANCELLED", stock: 5 }, stream);
+            const stored = table[key.PK + "|" + key.SK];
+            const pass =
+              stale.ok === false &&
+              stale.error === "ConditionalCheckFailedException" &&
+              stale.currentVersion === 2 &&
+              stale.wcuConsumed === 1 &&
+              stored.version === 2 &&
+              stored.status === "PAID" &&
+              stream.length === 2;
+            return { pass, message: `stale.error=${stale.error}, currentVersion=${stale.currentVersion}, storedStatus=${stored.status}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0034",
+      title: "Quiz 0034: Single-Table Design, Locking & Streams",
+      questions: [
+        {
+          id: "q1",
+          prompt: "An Android commerce app needs two queries: fetch a customer's profile plus their 20 most recent orders in one call, and look up which customer placed a specific order ID. How should you model this in DynamoDB?",
+          options: [
+            "Keep separate tables and join items inside an API Gateway mapping template",
+            "Overload PK and SK by customer plus an inverted GSI on orderId",
+            "Run a full table Scan with FilterExpression on orderId for support lookups",
+            "Duplicate each order item into a second DynamoDB table using client retries"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "API Gateway mapping templates transform JSON payloads; they cannot perform multi-table database joins across separate DynamoDB tables.",
+            "Overloading PK = USER#<id> and SK = PROFILE / ORDER#<ts>#<id> fetches profile and recent orders in one Query, while an inverted GSI (GSI1PK = ORDER#<id>) serves direct orderId lookups.",
+            "A full table Scan reads every partition and discards non-matching items after charging RCU, collapsing performance as the table grows.",
+            "Dual-writing from clients risks partial failures and drift between tables, whereas DynamoDB manages GSI replication atomically on the server."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "Two concurrent checkout Lambdas read an inventory item at version 7, decrement stock, and call UpdateItem with ConditionExpression 'version = :v' where ':v' is 7. What happens to the second writer?",
+          options: [
+            "DynamoDB queues the second update automatically until the first Lambda commits safely",
+            "DynamoDB merges both stock decrements atomically because UpdateItem uses server-side delta math",
+            "DynamoDB rejects the second write with ConditionalCheckFailedException and consumes normal write capacity",
+            "DynamoDB retries the failed condition internally up to three times before aborting"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "DynamoDB does not queue or hold locks across external Lambda read-modify-write cycles; conditions evaluate immediately against current item state.",
+            "Although UpdateItem supports atomic counters without a condition, here ConditionExpression requires version = 7, which fails once the first writer sets version = 8.",
+            "The first Lambda bumps version to 8; the second Lambda fails the condition check with ConditionalCheckFailedException (HTTP 400) and still consumes WCU for evaluating the write.",
+            "DynamoDB never auto-retries failed ConditionalCheckFailedException responses because the client's precondition is genuinely false."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "A DynamoDB Stream triggers a Lambda function that enriches new orders and writes an 'enrichedAt' timestamp back to the same DynamoDB table. After deployment, Lambda invocations spike uncontrollably. What caused this and how do you fix it?",
+          options: [
+            "Stream retention replayed old shard records; switch the StreamViewType setting to KEYS_ONLY",
+            "Writes emit MODIFY events re-triggering Lambda; configure Event Source Mapping filter rules",
+            "ParallelizationFactor spawned duplicate shard readers; lower the batch size to one record",
+            "Missing BisectBatchOnFunctionError caused poison retries; enable batch bisection with an SQS DLQ"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Stream shards track each consumer's checkpoint rather than replaying 24-hour history endlessly, and KEYS_ONLY still emits MODIFY events on every update.",
+            "Writing back to the same table generates a new MODIFY stream event that re-invokes the same Lambda in an infinite loop; Event Source Mapping filters drop self-induced updates before Lambda runs.",
+            "ParallelizationFactor shards processing by partition key without duplicating records, and lowering batch size increases invocation overhead rather than stopping loops.",
+            "Batch bisection and DLQs handle failing poison-pill records, whereas here the Lambda is succeeding and intentionally writing back to the table."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

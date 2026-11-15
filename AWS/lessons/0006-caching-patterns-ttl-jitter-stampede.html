@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0006 — Caching Patterns: Cache-Aside, Write-Through, TTL Jitter &amp; Stampedes</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0006</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0006-caching-patterns-ttl-jitter-stampede.html" class="active">Lesson 0006</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part1">Part 1 &middot; Module 1.2</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>Caching Patterns: Cache-Aside, Write-Through, TTL Jitter &amp; Stampedes</h1>
+    <p class="lead">
+      A cache turns 30 ms database queries into 1 ms memory reads—until a single expired hot key sends 5,000 concurrent requests straight into PostgreSQL at once. Learn how distributed caching on AWS differs from Android's device-local <code>OkHttp</code> and <code>Coil</code> caches, and how to engineer stampede-proof cache-aside layers.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, you rely on <strong>OkHttp's disk <code>Cache</code></strong> (respecting <code>Cache-Control: max-age</code>) and <strong>Coil's two-tier <code>MemoryCache</code> + <code>DiskCache</code></strong>. Those caches live inside <em>one user's phone</em>: if an entry expires, only that single device hits the network. In AWS, an <strong>Amazon ElastiCache (Redis / Valkey)</strong> cluster sits in front of your database for <em>every user simultaneously</em>. One expired key or cold cache node exposes RDS PostgreSQL or DynamoDB to the combined concurrency of your entire fleet—a failure mode called a <strong>cache stampede</strong> (or thundering herd).
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Cache-Aside vs. Write-Through vs. Write-Behind</h2>
+        <p>
+          In the <a href="https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/welcome.html" target="_blank" rel="noopener">AWS Database Caching Strategies Using Redis</a> whitepaper, three canonical topologies govern how application servers coordinate Redis and the primary database:
+        </p>
+        <ul>
+          <li>
+            <strong>Cache-Aside (Lazy Loading):</strong> Your API checks Redis first (<code>~0.5&ndash;1.5 ms</code> inside a VPC). On a <em>hit</em>, it returns immediately. On a <em>miss</em>, the API queries the database (<code>~10&ndash;50 ms</code>), writes the result to Redis with a TTL, and returns it.
+            <br /><em>Tradeoff:</em> Only actively read keys consume expensive RAM, and a Redis outage degrades latency instead of blocking writes. However, cold misses pay full DB latency, and if a write updates the DB and fails to <code>DEL</code> the stale cache key, readers see stale data until the TTL expires.
+          </li>
+          <li>
+            <strong>Write-Through:</strong> Every application write updates the cache and the primary database synchronously in the write path (e.g., via your repository layer or <strong>Amazon DynamoDB Accelerator (DAX)</strong>).
+            <br /><em>Tradeoff:</em> Cache entries stay warm and consistent with recent writes, eliminating cold misses on newly created items. The cost is higher write latency (two network hops) and wasted Redis memory storing keys that may never be read unless paired with TTLs and eviction.
+          </li>
+          <li>
+            <strong>Write-Behind (Write-Back):</strong> Writes land in the cache immediately and acknowledge to the client, while a background worker batches and flushes dirty entries to the database asynchronously.
+            <br /><em>Tradeoff:</em> Blazing write throughput (coalescing 1,000 counter increments into 1 SQL <code>UPDATE</code>), but if a cache node crashes before flushing, acknowledged writes are permanently lost. Never use write-behind for financial balances or orders.
+          </li>
+        </ul>
+
+        <!-- SECTION 2 -->
+        <h2>2. Thundering Herds &amp; Why TTL Jitter Is Mandatory</h2>
+        <p>
+          Suppose a cron job warms 200,000 user feed keys in ElastiCache at <code>08:00:00</code> with an exact 15-minute TTL (<code>900 s</code>). At <code>08:15:00</code>, all 200,000 keys expire in the same second. Thousands of mobile clients suddenly experience simultaneous cache misses, slamming RDS PostgreSQL with identical queries. As DB connections saturate, query latency climbs from 15 ms to 5,000 ms, mobile clients time out and retry, and the database enters a death spiral.
+        </p>
+        <p>
+          <strong>TTL Jitter</strong> solves synchronized multi-key expiration waves by adding bounded randomness to every TTL at write time:
+        </p>
+        <p>
+          <code>ttlMs = baseTtlMs + Math.round(Math.random() * jitterMs)</code>
+        </p>
+        <p>
+          Instead of 200,000 keys expiring at second 900, adding <code>0&ndash;180 s</code> of jitter spreads those refreshes smoothly across a 3-minute window, keeping RDS CPU flat. As documented in the <a href="https://aws.amazon.com/builders-library/caching-challenges-and-strategies/" target="_blank" rel="noopener">Amazon Builders' Library: Caching challenges and strategies</a>, jitter decouples batch populations from synchronized load spikes—just like jittered backoff prevents retry storms.
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 250" width="100%" height="auto" role="img" aria-label="Cache Stampede vs Single-Flight Coalescing and TTL Jitter">
+            <rect x="0" y="0" width="680" height="250" fill="#fdfcf8" rx="6" />
+
+            <!-- Top Row: Unprotected Stampede -->
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#991b1b">Unprotected Cache-Aside (Hot Key Expires &rarr; Thundering Herd)</text>
+
+            <rect x="16" y="42" width="150" height="58" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="91" y="66" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#991b1b">500 Concurrent Calls</text>
+            <text x="91" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">GET product:999</text>
+
+            <line x1="166" y1="71" x2="226" y2="71" stroke="#991b1b" stroke-width="2" />
+            <polygon points="226,66 236,71 226,76" fill="#991b1b" />
+
+            <rect x="236" y="42" width="145" height="58" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="308" y="66" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#b45309">Redis (MISS)</text>
+            <text x="308" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#b45309">500 misses @ T=0</text>
+
+            <line x1="381" y1="60" x2="455" y2="54" stroke="#991b1b" stroke-width="1.5" />
+            <line x1="381" y1="71" x2="455" y2="71" stroke="#991b1b" stroke-width="1.5" />
+            <line x1="381" y1="82" x2="455" y2="88" stroke="#991b1b" stroke-width="1.5" />
+
+            <rect x="460" y="42" width="204" height="58" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="562" y="66" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#991b1b">RDS PostgreSQL (Overload)</text>
+            <text x="562" y="84" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">500 duplicate SELECTs!</text>
+
+            <!-- Divider -->
+            <line x1="16" y1="122" x2="664" y2="122" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Bottom Row: Single-Flight + Jitter -->
+            <text x="16" y="148" font-family="sans-serif" font-size="13" font-weight="700" fill="#166534">Single-Flight Coalescing + TTL Jitter (1 Origin Fetch Shared by All)</text>
+
+            <rect x="16" y="162" width="150" height="64" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="91" y="186" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f4c81">500 Concurrent Calls</text>
+            <text x="91" y="204" text-anchor="middle" font-family="monospace" font-size="10" fill="#0f4c81">Join inFlight["p:999"]</text>
+
+            <line x1="166" y1="194" x2="226" y2="194" stroke="#0f4c81" stroke-width="2" />
+            <polygon points="226,189 236,194 226,199" fill="#0f4c81" />
+
+            <rect x="236" y="162" width="160" height="64" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="316" y="184" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#166534">1 Leader + 499 Waiters</text>
+            <text x="316" y="202" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Writes TTL + Jitter</text>
+            <text x="316" y="217" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Cleans inFlight in finally</text>
+
+            <line x1="396" y1="194" x2="455" y2="194" stroke="#166534" stroke-width="2" />
+            <polygon points="455,189 465,194 455,199" fill="#166534" />
+
+            <rect x="465" y="162" width="199" height="64" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="564" y="186" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#166534">RDS PostgreSQL (Healthy)</text>
+            <text x="564" y="204" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">1 SELECT total (99.8% saved)</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: TTL jitter spreads multi-key expirations across time, while single-flight coalescing collapses concurrent misses on the <em>same</em> hot key into a single database fetch.
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Single-Flight, Negative Caching &amp; Hot-Key Traps</h2>
+        <p>
+          A common senior interview mistake is claiming that TTL jitter alone stops all stampedes. Jitter staggers <em>different</em> keys—it does nothing when 4,000 requests hit the <em>exact same</em> hot key (<code>product:999</code>) within the 20 ms window while it is missing! To stop single-key stampedes, combine three defenses:
+        </p>
+        <ol>
+          <li>
+            <strong>Single-Flight Request Coalescing:</strong> Maintain an in-process map of active loads keyed by cache key (<code>inFlight.get(key)</code>). When 500 concurrent requests inside an ECS container miss on <code>product:999</code>, only the first request queries Redis/RDS; the other 499 attach to the same in-flight promise/waiter list and share the result. Across 20 ECS containers, 10,000 concurrent misses collapse to at most 20 DB queries.
+          </li>
+          <li>
+            <strong>Negative Caching (Stopping Cache Penetration):</strong> If a buggy client or attacker floods <code>GET /users/-1</code> (an ID that does not exist in PostgreSQL), naive cache-aside skips writing to Redis because the DB returned <code>null</code>. Every request pierces straight through to RDS. Fix this by validating IDs upfront and caching explicit <code>null</code> sentinel values with a short TTL (e.g., <code>30&ndash;60 s</code>).
+          </li>
+          <li>
+            <strong>L1 Micro-Cache &amp; Redis Eviction Policy:</strong> Even at a 99.9% hit rate, one viral celebrity key routed to a single Redis shard can saturate that shard's network interface. Adding a 1&ndash;5 second in-process L1 LRU map on ECS absorb viral bursts. Meanwhile, configure ElastiCache <code>maxmemory-policy</code> intentionally: use <code>volatile-lru</code> if Redis holds both session tokens (no TTL) and cache keys (with TTL), or <code>allkeys-lru</code> when Redis is dedicated purely to caching.
+          </li>
+        </ol>
+
+        <div class="callout warning">
+          <div class="callout-title">Always Clean Up the In-Flight Map on Failure</div>
+          <p style="margin: 0;">
+            If the single-flight leader's DB query throws an error and you forget to remove <code>key</code> from <code>inFlight</code> inside a <code>finally</code> block (or before invoking error callbacks), every future request for that key hangs onto the dead promise forever. Never cache transient DB errors, and always delete the in-flight entry before resolving or rejecting waiters.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production Code: Android Device Cache vs. Cloud Single-Flight</h2>
+        <p>
+          Notice how Android caches per-device HTTP responses cleanly via <code>OkHttp</code>/<code>Coil</code>, while the cloud API must coalesce concurrent misses across thousands of users and add TTL jitter on Redis writes:
+        </p>
+<pre><code>// 1. Android Client (Kotlin) — OkHttp + Coil cache per device
+val httpCache = Cache(File(context.cacheDir, "http_cache"), maxSize = 50L * 1024 * 1024)
+val okHttp = OkHttpClient.Builder().cache(httpCache).build()
+
+val imageLoader = ImageLoader.Builder(context)
+    .okHttpClient(okHttp) // Honors Cache-Control: max-age + ETag per device
+    .build()
+
+// 2. Cloud Backend (TypeScript / Redis) — Cache-Aside + Single-Flight + TTL Jitter
+const inFlight = new Map&lt;string, Promise&lt;Product | null&gt;&gt;();
+
+export async function getProduct(id: string): Promise&lt;Product | null&gt; {
+  const key = `product:${id}`;
+  const cached = await redis.get(key);
+  if (cached !== null) {
+    return cached === "__NULL__" ? null : JSON.parse(cached);
+  }
+
+  let pending = inFlight.get(key);
+  if (!pending) {
+    pending = (async () =&gt; {
+      const row = await db.queryProduct(id);
+      if (!row) {
+        await redis.set(key, "__NULL__", "EX", 30); // Short negative cache
+        return null;
+      }
+      const jitterSec = Math.floor(Math.random() * 120); // 0-120s jitter
+      await redis.set(key, JSON.stringify(row), "EX", 600 + jitterSec);
+      return row;
+    })().finally(() =&gt; {
+      inFlight.delete(key); // Critical: always release even on DB error
+    });
+    inFlight.set(key, pending);
+  }
+  return pending;
+}</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Build <code>createCacheEngine(config)</code> to implement a cache-aside store with deterministic TTL jitter, single-flight coalescing across concurrent misses, negative caching for <code>null</code> records, and safe error cleanup.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Apply your mental model to three production incidents. Every option shows immediate rationale for why the correct architecture holds and why each alternative breaks down.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCES & NEXT STEPS -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>AWS Whitepaper:</strong> <a href="https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/welcome.html" target="_blank" rel="noopener">Database Caching Strategies Using Redis</a> (Review <em>Cache-aside</em>, <em>Write-through</em>, and <em>Managing Cache Validity</em>).
+          </li>
+          <li>
+            <strong>Amazon Builders' Library:</strong> <a href="https://aws.amazon.com/builders-library/caching-challenges-and-strategies/" target="_blank" rel="noopener">Caching challenges and strategies</a> — Matt Brinkley &amp; Jas Chhabra (Focus on <em>Cold caches</em>, <em>Request coalescing</em>, and <em>Prewarming</em>).
+          </li>
+          <li>
+            <strong>Amazon Builders' Library:</strong> <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">Timeouts, retries, and backoff with jitter</a> — Marc Brooker (Why deterministic timers create synchronized waves).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0007 (PostgreSQL Internals)</strong>, ask about anything that feels subtle—for example: <em>"How does probabilistic early expiration (XFetch) eliminate even the single leader wait during a cache refresh?"</em> or <em>"Why can dual-writing DB + Redis in cache-aside still race under concurrent updates?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0005-auth-oauth2-oidc-jwt-rbac.html">&larr; Lesson 0005: Authentication & Authorization: OAuth 2.0, OIDC, JWT & RBAC/ABAC</a>
+          <a href="./0007-postgresql-indexes-explain-pooling.html">Lesson 0007: PostgreSQL Internals: B-Tree Indexes, EXPLAIN Plans & Connection Pooling &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why Check <code>value === null</code>?</strong>
+          Never test <code>if (!value)</code> for negative caching. Values like <code>0</code>, <code>false</code>, or <code>""</code> are valid cached payloads that deserve the full <code>baseTtlMs + jitter</code> rather than a short negative TTL.
+        </div>
+        <div class="sidenote">
+          <strong>Distributed Lock vs. Single-Flight</strong>
+          In-process single-flight collapses concurrency per ECS task with zero extra Redis hops. A Redis <code>SET NX PX</code> lock collapses across tasks, but risks stalling callers if the lock holder crashes before lease expiry.
+        </div>
+        <div class="sidenote">
+          <strong>Check the Glossary</strong>
+          Review core cloud and networking terms anytime in <a href="../reference/glossary.html">reference/glossary.html</a>.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0006",
+      title: "Lab 0006: Cache-Aside Engine with TTL Jitter & Single-Flight",
+      filename: "cache-aside-engine.js",
+      description:
+        "Complete <code>createCacheEngine(config)</code> where <code>config</code> provides <code>{ baseTtlMs, jitterMs, negativeTtlMs, now, rng, fetchFromDb }</code>. Rules: (1) On <code>get(key, onComplete)</code>, if <code>store</code> has <code>key</code> and <code>now() &lt; entry.expiresAt</code>, increment <code>hits</code> and call <code>onComplete(null, entry.value, { source: entry.isNull ? \"NEGATIVE_CACHE\" : \"CACHE\" })</code>. (2) Otherwise increment <code>misses</code>. If <code>inFlight.has(key)</code>, increment <code>coalesced</code>, push <code>onComplete</code> to its waiter list, and return. (3) Otherwise create waiter list <code>[onComplete]</code> in <code>inFlight</code>, increment <code>dbCalls</code>, and call <code>fetchFromDb(key, done)</code>. (4) When <code>done(err, value)</code> fires, grab waiters and immediately <code>inFlight.delete(key)</code>. On <code>err</code>, do not cache and notify waiters <code>(err, null, { source: \"DB_ERROR\", coalescedCount })</code>. On <code>value === null || value === undefined</code>, cache <code>null</code> for <code>negativeTtlMs</code> and notify <code>(null, null, { source: \"DB_NEGATIVE\", ttlMs: negativeTtlMs, coalescedCount })</code>. Otherwise compute <code>ttlMs = baseTtlMs + Math.round(rng() * jitterMs)</code>, cache <code>value</code>, and notify <code>(null, value, { source: \"DB\", ttlMs, coalescedCount })</code>.",
+      exports: ["createCacheEngine"],
+      starterCode: `function createCacheEngine(config) {
+  const { baseTtlMs, jitterMs, negativeTtlMs, now, rng, fetchFromDb } = config;
+  const store = new Map();
+  const inFlight = new Map();
+  const stats = { hits: 0, misses: 0, dbCalls: 0, coalesced: 0 };
+
+  function get(key, onComplete) {
+    const entry = store.get(key);
+
+    // TODO 1: If entry exists and now() < entry.expiresAt, increment stats.hits
+    // and call onComplete(null, entry.value, { source: entry.isNull ? "NEGATIVE_CACHE" : "CACHE" }).
+
+    stats.misses++;
+
+    // TODO 2: Single-flight check — if inFlight.has(key), increment stats.coalesced,
+    // push onComplete onto inFlight.get(key), and return.
+
+    // TODO 3: Start a new flight: set inFlight.set(key, [onComplete]), increment stats.dbCalls,
+    // and invoke fetchFromDb(key, (err, value) => { ... }) to delete inFlight, cache (or negative-cache),
+    // and notify every waiter.
+    onComplete(new Error("TODO: implement createCacheEngine"), null, { source: "UNIMPLEMENTED" });
+  }
+
+  function invalidate(key) {
+    store.delete(key);
+  }
+
+  function getStats() {
+    return { ...stats };
+  }
+
+  return { get, invalidate, getStats };
+}
+
+const sampleEngine = createCacheEngine({
+  baseTtlMs: 10000,
+  jitterMs: 2000,
+  negativeTtlMs: 3000,
+  now: () => 1000,
+  rng: () => 0.5,
+  fetchFromDb: (key, done) => done(null, { id: key, plan: "pro" })
+});
+
+sampleEngine.get("user:42", (err, val, meta) => {
+  console.log("Sample result:", { err: err ? err.message : null, val, meta, stats: sampleEngine.getStats() });
+});`,
+      hints: [
+        "For cache hits, check <code>if (entry && now() &lt; entry.expiresAt)</code>. Be sure to <code>return</code> immediately after calling <code>onComplete</code> so you don't fall through into the miss path.",
+        "Inside the <code>fetchFromDb(key, (err, value) =&gt; { ... })</code> callback, capture <code>const waiters = inFlight.get(key) || [];</code> and call <code>inFlight.delete(key);</code> <em>before</em> notifying waiters—that guarantees cleanup even if a callback throws or <code>err</code> is non-null."
+      ],
+      solutionExplanation:
+        "Checking now() < entry.expiresAt serves valid entries (including negative null sentinels) in O(1) time. On a miss, the first caller registers a waiter array in inFlight and fires one fetchFromDb call, while concurrent callers append themselves and increment coalesced. Deleting the inFlight key before notifying waiters prevents permanent stuck flights after DB errors.",
+      solutionCode: `function createCacheEngine(config) {
+  const { baseTtlMs, jitterMs, negativeTtlMs, now, rng, fetchFromDb } = config;
+  const store = new Map();
+  const inFlight = new Map();
+  const stats = { hits: 0, misses: 0, dbCalls: 0, coalesced: 0 };
+
+  function get(key, onComplete) {
+    const entry = store.get(key);
+    if (entry && now() < entry.expiresAt) {
+      stats.hits++;
+      onComplete(null, entry.value, {
+        source: entry.isNull ? "NEGATIVE_CACHE" : "CACHE"
+      });
+      return;
+    }
+
+    stats.misses++;
+
+    if (inFlight.has(key)) {
+      stats.coalesced++;
+      inFlight.get(key).push(onComplete);
+      return;
+    }
+
+    inFlight.set(key, [onComplete]);
+    stats.dbCalls++;
+
+    fetchFromDb(key, (err, value) => {
+      const waiters = inFlight.get(key) || [];
+      inFlight.delete(key);
+      const coalescedCount = waiters.length;
+
+      if (err) {
+        for (const cb of waiters) {
+          cb(err, null, { source: "DB_ERROR", coalescedCount });
+        }
+        return;
+      }
+
+      if (value === null || value === undefined) {
+        store.set(key, {
+          value: null,
+          isNull: true,
+          expiresAt: now() + negativeTtlMs
+        });
+        for (const cb of waiters) {
+          cb(null, null, {
+            source: "DB_NEGATIVE",
+            ttlMs: negativeTtlMs,
+            coalescedCount
+          });
+        }
+        return;
+      }
+
+      const ttlMs = baseTtlMs + Math.round(rng() * jitterMs);
+      store.set(key, {
+        value,
+        isNull: false,
+        expiresAt: now() + ttlMs
+      });
+      for (const cb of waiters) {
+        cb(null, value, { source: "DB", ttlMs, coalescedCount });
+      }
+    });
+  }
+
+  function invalidate(key) {
+    store.delete(key);
+  }
+
+  function getStats() {
+    return { ...stats };
+  }
+
+  return { get, invalidate, getStats };
+}`,
+      tests: [
+        {
+          name: "Cache-aside miss populates store, serves CACHE hit before TTL, and refetches at expiration",
+          run: (scope) => {
+            let clock = 1000;
+            let version = 0;
+            const engine = scope.createCacheEngine({
+              baseTtlMs: 5000,
+              jitterMs: 0,
+              negativeTtlMs: 1000,
+              now: () => clock,
+              rng: () => 0,
+              fetchFromDb: (key, done) => {
+                version++;
+                done(null, { key, version });
+              }
+            });
+
+            const results = [];
+            engine.get("item:1", (e, v, m) => results.push({ e, v, m }));
+            clock = 4000;
+            engine.get("item:1", (e, v, m) => results.push({ e, v, m }));
+            clock = 6000; // exact expiresAt (1000 + 5000) -> expired
+            engine.get("item:1", (e, v, m) => results.push({ e, v, m }));
+
+            const s = engine.getStats();
+            const pass =
+              results.length === 3 &&
+              results[0].m.source === "DB" &&
+              results[0].v.version === 1 &&
+              results[1].m.source === "CACHE" &&
+              results[1].v.version === 1 &&
+              results[2].m.source === "DB" &&
+              results[2].v.version === 2 &&
+              s.hits === 1 &&
+              s.misses === 2 &&
+              s.dbCalls === 2;
+            return { pass, message: `stats=${JSON.stringify(s)}` };
+          }
+        },
+        {
+          name: "Applies additive TTL jitter (baseTtlMs + Math.round(rng() * jitterMs)) across keys",
+          run: (scope) => {
+            let clock = 0;
+            const rolls = [0, 0.5, 1];
+            let rollIdx = 0;
+            const engine = scope.createCacheEngine({
+              baseTtlMs: 10000,
+              jitterMs: 2000,
+              negativeTtlMs: 1000,
+              now: () => clock,
+              rng: () => rolls[rollIdx++],
+              fetchFromDb: (key, done) => done(null, key)
+            });
+
+            const ttls = [];
+            engine.get("k1", (_, __, m) => ttls.push(m.ttlMs));
+            engine.get("k2", (_, __, m) => ttls.push(m.ttlMs));
+            engine.get("k3", (_, __, m) => ttls.push(m.ttlMs));
+
+            clock = 10500; // k1 (10000) expired, k2 (11000) and k3 (12000) still cached
+            const sourcesAt10500 = [];
+            engine.get("k1", (_, __, m) => sourcesAt10500.push(m.source));
+            engine.get("k2", (_, __, m) => sourcesAt10500.push(m.source));
+            engine.get("k3", (_, __, m) => sourcesAt10500.push(m.source));
+
+            const pass =
+              ttls[0] === 10000 &&
+              ttls[1] === 11000 &&
+              ttls[2] === 12000 &&
+              sourcesAt10500[0] === "DB" &&
+              sourcesAt10500[1] === "CACHE" &&
+              sourcesAt10500[2] === "CACHE";
+            return { pass, message: `ttls=${JSON.stringify(ttls)}, at10500=${JSON.stringify(sourcesAt10500)}` };
+          }
+        },
+        {
+          name: "Single-flight coalesces 5 concurrent misses for the same key into 1 DB fetch",
+          run: (scope) => {
+            const pending = [];
+            const engine = scope.createCacheEngine({
+              baseTtlMs: 10000,
+              jitterMs: 0,
+              negativeTtlMs: 2000,
+              now: () => 500,
+              rng: () => 0,
+              fetchFromDb: (key, done) => pending.push({ key, done })
+            });
+
+            const replies = [];
+            for (let i = 0; i < 5; i++) {
+              engine.get("product:999", (err, val, meta) => replies.push({ err, val, meta }));
+            }
+
+            const beforeResolveDbCalls = pending.length;
+            const beforeResolveReplies = replies.length;
+            pending[0].done(null, { id: 999, stock: 12 });
+
+            const s = engine.getStats();
+            const allMatch =
+              replies.length === 5 &&
+              replies.every((r) => !r.err && r.val.stock === 12 && r.meta.coalescedCount === 5);
+
+            const pass =
+              beforeResolveDbCalls === 1 &&
+              beforeResolveReplies === 0 &&
+              allMatch &&
+              s.misses === 5 &&
+              s.dbCalls === 1 &&
+              s.coalesced === 4;
+            return { pass, message: `dbCalls=${s.dbCalls}, coalesced=${s.coalesced}, replies=${replies.length}` };
+          }
+        },
+        {
+          name: "Negative caching stores null for negativeTtlMs and preserves falsy values like 0",
+          run: (scope) => {
+            let clock = 100;
+            const engine = scope.createCacheEngine({
+              baseTtlMs: 10000,
+              jitterMs: 0,
+              negativeTtlMs: 2000,
+              now: () => clock,
+              rng: () => 0,
+              fetchFromDb: (key, done) => done(null, key === "missing" ? null : 0)
+            });
+
+            const out = [];
+            engine.get("missing", (e, v, m) => out.push({ v, source: m.source }));
+            engine.get("zero", (e, v, m) => out.push({ v, source: m.source }));
+
+            clock = 1500; // within negativeTtlMs (100 + 2000 = 2100)
+            engine.get("missing", (e, v, m) => out.push({ v, source: m.source }));
+            engine.get("zero", (e, v, m) => out.push({ v, source: m.source }));
+
+            clock = 2500; // negative cache expired, zero (10100) still cached
+            engine.get("missing", (e, v, m) => out.push({ v, source: m.source }));
+            engine.get("zero", (e, v, m) => out.push({ v, source: m.source }));
+
+            const s = engine.getStats();
+            const pass =
+              out[0].source === "DB_NEGATIVE" &&
+              out[0].v === null &&
+              out[1].source === "DB" &&
+              out[1].v === 0 &&
+              out[2].source === "NEGATIVE_CACHE" &&
+              out[3].source === "CACHE" &&
+              out[3].v === 0 &&
+              out[4].source === "DB_NEGATIVE" &&
+              out[5].source === "CACHE" &&
+              s.dbCalls === 3;
+            return { pass, message: `out=${JSON.stringify(out)}, dbCalls=${s.dbCalls}` };
+          }
+        },
+        {
+          name: "DB errors clean up inFlight so subsequent retries can recover without caching failures",
+          run: (scope) => {
+            const pending = [];
+            let shouldFail = true;
+            const engine = scope.createCacheEngine({
+              baseTtlMs: 10000,
+              jitterMs: 0,
+              negativeTtlMs: 2000,
+              now: () => 1000,
+              rng: () => 0,
+              fetchFromDb: (key, done) => {
+                if (shouldFail) {
+                  pending.push(done);
+                } else {
+                  done(null, { recovered: true });
+                }
+              }
+            });
+
+            const errReplies = [];
+            engine.get("flaky", (err, val, meta) => errReplies.push({ err, val, meta }));
+            engine.get("flaky", (err, val, meta) => errReplies.push({ err, val, meta }));
+            pending[0](new Error("DB_TIMEOUT"));
+
+            shouldFail = false;
+            let recovery = null;
+            engine.get("flaky", (err, val, meta) => {
+              recovery = { err, val, meta };
+            });
+
+            const s = engine.getStats();
+            const pass =
+              errReplies.length === 2 &&
+              errReplies.every((r) => r.err && r.err.message === "DB_TIMEOUT" && r.meta.source === "DB_ERROR") &&
+              recovery &&
+              !recovery.err &&
+              recovery.val.recovered === true &&
+              recovery.meta.source === "DB" &&
+              s.dbCalls === 2;
+            return { pass, message: `dbCalls=${s.dbCalls}, recovery=${JSON.stringify(recovery)}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0006",
+      title: "Quiz 0006: Cache-Aside, Jitter & Stampede Defense",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Your team launches an Android feed backed by ElastiCache Redis (cache-aside, 15-minute fixed TTL) and RDS PostgreSQL. Every morning at 08:00 UTC, a batch job warms 200,000 user keys simultaneously. At 08:15 UTC, RDS CPU hits 100% and clients time out. What directly prevents this recurring 08:15 spike?",
+          options: [
+            "Move from cache-aside to write-through caching on every user profile update event",
+            "Add bounded random TTL jitter so warmed keys expire across staggered windows",
+            "Expand the OkHttp client disk cache quota inside the Android mobile app",
+            "Disable Redis key expiration completely and rely solely on random LRU eviction"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Write-through populates keys on user profile mutations, which does not stop a daily batch job from warming 200,000 keys with an identical fixed TTL.",
+            "Adding bounded random TTL jitter (e.g., 900s + random 0–180s) spreads the 200,000 expirations across a multi-minute window so RDS load stays smooth.",
+            "Each Android device caches only its own feed; 200,000 phones waking up at 08:15 UTC still hit the backend if Redis expires all keys simultaneously.",
+            "Disabling TTLs completely leaves stale feeds cached indefinitely for inactive users and can cause memory exhaustion if sessions share the cluster."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "A flash sale drops a single item (`product:999`) whose Redis key expires at 12:00:00. Within 50 ms, 4,000 Android clients concurrently call `GET /products/999`. Even with TTL jitter enabled, PostgreSQL collapses under 4,000 identical SELECTs. Why did TTL jitter fail here, and what fixes it?",
+          options: [
+            "Jitter causes premature eviction; switch Redis from allkeys-lru to volatile-lru policy instead",
+            "Jitter requires write-behind queues; batch all product reads into an SQS queue",
+            "Jitter only staggers multiple keys; add single-flight coalescing for one hot key",
+            "Jitter breaks OkHttp caching; configure Coil memory cache to intercept backend calls"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "Eviction policy governs what happens when Redis hits maxmemory, not what happens when 4,000 concurrent requests miss a single expired key.",
+            "Write-behind batches mutations asynchronously; read-path GET requests need immediate responses rather than async SQS queuing.",
+            "TTL jitter spreads expiration times across different keys, whereas single-flight coalescing collapses thousands of simultaneous misses on the same hot key into one DB query.",
+            "Server-side Redis TTL jitter has no effect on Android's OkHttp/Coil caches, and client caches cannot coalesce requests across 4,000 separate phones."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "Redis hit rate drops from 98% to 55% while RDS read IOPS triples. Traces show thousands of requests per second querying non-existent IDs like `user:-1`, returning `null` from PostgreSQL without writing anything to Redis. Which fix directly stops this cache penetration pattern?",
+          options: [
+            "Extend the base Redis key TTL from five minutes to twenty-four hours",
+            "Use write-through caching so user account mutations populate Redis keys synchronously",
+            "Change the ElastiCache eviction policy from volatile-lru to strict noeviction mode",
+            "Cache explicit null sentinel values with short TTLs and validate request IDs"
+          ],
+          correctIndex: 3,
+          explanations: [
+            "Increasing TTL for valid keys never helps non-existent keys because `null` misses are never stored in Redis in the first place.",
+            "Write-through only writes existing accounts when mutated; queries for fabricated or deleted IDs still miss Redis and hit PostgreSQL.",
+            "Switching to `noeviction` stops Redis from evicting old keys on memory pressure (causing write errors instead) and does not block penetration misses.",
+            "Validating malformed IDs at the edge and negative-caching explicit `null` sentinels with a short TTL (e.g., 30s) absorbs repeated misses in Redis before they reach RDS."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

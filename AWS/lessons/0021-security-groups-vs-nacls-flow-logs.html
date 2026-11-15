@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0021 — Stateful Security Groups vs Stateless NACLs &amp; VPC Flow Logs Debugging</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0021</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0021-security-groups-vs-nacls-flow-logs.html" class="active">Lesson 0021</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.2</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>Stateful Security Groups vs Stateless NACLs &amp; VPC Flow Logs Debugging</h1>
+    <p class="lead">
+      In production AWS VPCs, two firewall layers protect every workload: <strong>Security Groups (SGs)</strong> attached to elastic network interfaces and <strong>Network ACLs (NACLs)</strong> attached to subnets. Mixing up stateful connection tracking with stateless ephemeral return rules causes silent timeouts that only <strong>VPC Flow Logs</strong> expose.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, <code>res/xml/network_security_config.xml</code> declares an explicit trust boundary for outbound traffic—blocking cleartext HTTP by default and pinning trusted CAs per domain so individual <code>OkHttp</code> calls cannot bypass policy. In AWS, <strong>Security Groups</strong> enforce that same declarative allow-list mindset at the ENI boundary—except instead of pinning hostnames, you chain <strong>SG-to-SG references</strong> (<code>sg-alb &rarr; sg-ecs &rarr; sg-rds</code>), while <strong>NACLs</strong> act like a raw stateless packet filter at the subnet edge that forgets every connection the moment a packet leaves.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Two Firewalls on Every Packet Path (Stateful vs. Stateless)</h2>
+        <p>
+          Every packet entering or leaving an EC2 instance, ECS task ENI, RDS instance, or <a href="../reference/glossary.html#alb">Application Load Balancer</a> crosses <strong>two independent enforcement boundaries</strong> in strict order:
+        </p>
+        <ul>
+          <li><strong>Ingress path (into the workload):</strong> Subnet Route Table &rarr; <strong>NACL Inbound</strong> &rarr; <strong>Security Group Inbound</strong> &rarr; Target ENI.</li>
+          <li><strong>Egress path (out of the workload):</strong> Source ENI &rarr; <strong>Security Group Outbound</strong> &rarr; <strong>NACL Outbound</strong> &rarr; Subnet Route Table.</li>
+        </ul>
+
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 22%;">Dimension</th>
+              <th style="width: 39%;">Security Group (SG)</th>
+              <th style="width: 39%;">Network ACL (NACL)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Attachment Scope</strong></td>
+              <td>Elastic Network Interface (ENI) — per instance, ECS task, or RDS endpoint.</td>
+              <td>Subnet boundary — affects <em>every</em> ENI in associated subnets (1 NACL per subnet).</td>
+            </tr>
+            <tr>
+              <td><strong>Statefulness</strong></td>
+              <td><strong>Stateful:</strong> Return traffic for an allowed flow is automatically permitted regardless of opposite-direction rules.</td>
+              <td><strong>Stateless:</strong> Inbound and outbound are evaluated independently; return packets must match explicit ephemeral port rules.</td>
+            </tr>
+            <tr>
+              <td><strong>Rule Semantics</strong></td>
+              <td><strong>Allow-only</strong> (no explicit <code>DENY</code> rules). Implicit deny if no allow rule matches.</td>
+              <td><strong>Allow and Deny</strong> rules, evaluated in ascending rule number (<code>1&ndash;32766</code>); first match wins; default rule <code>*</code> denies.</td>
+            </tr>
+            <tr>
+              <td><strong>Source / Dest Targets</strong></td>
+              <td>CIDR blocks, prefix lists, or <strong>other Security Group IDs</strong> (including self-referencing).</td>
+              <td>IPv4/IPv6 CIDR blocks only — NACLs have no awareness of Security Group IDs.</td>
+            </tr>
+            <tr>
+              <td><strong>Default Quotas</strong></td>
+              <td>60 inbound + 60 outbound rules per SG; up to 5 SGs per ENI (adjustable).</td>
+              <td>20 rules per direction per NACL (hard limit up to 40; AWS recommends numbering by 100s).</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 265" width="100%" height="auto" role="img" aria-label="Ingress and return packet path across NACL, Security Group, ENI, and Flow Logs">
+            <rect x="0" y="0" width="680" height="265" fill="#fdfcf8" rx="6" />
+
+            <!-- Top Row: Inbound Request -->
+            <text x="16" y="26" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">1. Inbound Request (ALB 10.0.1.10:52100 &rarr; ECS ENI 10.0.10.25:443)</text>
+
+            <rect x="16" y="40" width="142" height="58" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="87" y="61" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#b45309">NACL Inbound</text>
+            <text x="87" y="78" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">#100 ALLOW 443</text>
+            <text x="87" y="91" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Stateless Check</text>
+
+            <line x1="158" y1="69" x2="186" y2="69" stroke="#575c66" stroke-width="1.5" />
+            <polygon points="186,65 194,69 186,73" fill="#575c66" />
+
+            <rect x="194" y="40" width="154" height="58" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="271" y="61" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#0f4c81">SG Inbound</text>
+            <text x="271" y="78" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">src: sg-alb, 443</text>
+            <text x="271" y="91" text-anchor="middle" font-family="monospace" font-size="10" fill="#0f4c81">Tracks Conntrack</text>
+
+            <line x1="348" y1="69" x2="376" y2="69" stroke="#575c66" stroke-width="1.5" />
+            <polygon points="376,65 384,69 376,73" fill="#575c66" />
+
+            <rect x="384" y="40" width="132" height="58" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="450" y="61" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#166534">ECS ENI</text>
+            <text x="450" y="78" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">10.0.10.25:443</text>
+            <text x="450" y="91" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Packet Delivered</text>
+
+            <line x1="516" y1="69" x2="544" y2="69" stroke="#575c66" stroke-width="1.5" stroke-dasharray="3 3" />
+
+            <rect x="544" y="40" width="120" height="58" rx="4" fill="#f5f2ea" stroke="#c2b9a7" />
+            <text x="604" y="61" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#1b1d21">Flow Log</text>
+            <text x="604" y="78" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">action=ACCEPT</text>
+            <text x="604" y="91" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">dstport=443</text>
+
+            <!-- Divider -->
+            <line x1="16" y1="126" x2="664" y2="126" stroke="#dfd9cc" stroke-dasharray="4 4" />
+
+            <!-- Bottom Row: Return Response -->
+            <text x="16" y="152" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">2. Return Response (ECS ENI 10.0.10.25:443 &rarr; ALB 10.0.1.10:52100)</text>
+
+            <rect x="16" y="166" width="132" height="62" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="82" y="187" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#166534">ECS ENI</text>
+            <text x="82" y="204" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Sends SYN-ACK</text>
+            <text x="82" y="217" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">dstport=52100</text>
+
+            <line x1="148" y1="197" x2="176" y2="197" stroke="#575c66" stroke-width="1.5" />
+            <polygon points="176,193 184,197 176,201" fill="#575c66" />
+
+            <rect x="184" y="166" width="154" height="62" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="261" y="187" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#0f4c81">SG Outbound</text>
+            <text x="261" y="204" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Stateful Match!</text>
+            <text x="261" y="217" text-anchor="middle" font-family="monospace" font-size="10" fill="#0f4c81">Auto-ALLOW Return</text>
+
+            <line x1="338" y1="197" x2="366" y2="197" stroke="#575c66" stroke-width="1.5" />
+            <polygon points="366,193 374,197 366,201" fill="#575c66" />
+
+            <rect x="374" y="166" width="156" height="62" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="452" y="187" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#991b1b">NACL Outbound</text>
+            <text x="452" y="204" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">Needs 1024-65535</text>
+            <text x="452" y="217" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">Else DROPPED (*)</text>
+
+            <line x1="530" y1="197" x2="554" y2="197" stroke="#575c66" stroke-width="1.5" stroke-dasharray="3 3" />
+
+            <rect x="554" y="166" width="110" height="62" rx="4" fill="#f5f2ea" stroke="#c2b9a7" />
+            <text x="609" y="187" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#1b1d21">Flow Log</text>
+            <text x="609" y="204" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">REJECT if</text>
+            <text x="609" y="217" text-anchor="middle" font-family="monospace" font-size="10" fill="#991b1b">port blocked</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Security Groups remember the inbound 5-tuple and automatically allow the return response, whereas stateless NACLs require explicit outbound ephemeral port rules (<code>1024&ndash;65535</code>) or the return <code>SYN-ACK</code> dies silently.
+          </div>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. SG-to-SG Chaining &amp; Self-Referencing Patterns</h2>
+        <p>
+          Junior engineers often copy subnet CIDRs into Security Group rules (for example, allowing <code>10.0.10.0/24</code> onto RDS port <code>5432</code>). In an autoscaling, multi-AZ architecture, CIDR-based SG rules create two operational hazards:
+        </p>
+        <ol>
+          <li><strong>Overly broad blast radius:</strong> Any compromised container or bastion that happens to land in <code>10.0.10.0/24</code> inherits database access even if its role does not need it.</li>
+          <li><strong>Brittle IP churn:</strong> When ECS tasks scale out or replace across multiple subnets, or when an ALB scales its node IPs dynamically, CIDR rules silently go stale.</li>
+        </ol>
+        <p>
+          Instead, reference the <strong>caller's Security Group ID</strong> directly. According to the <a href="https://docs.aws.amazon.com/vpc/latest/userguide/security-group-rules.html" target="_blank" rel="noopener">AWS Security Group Rules specification</a>, VPC resolves the membership of every ENI carrying that source SG ID dynamically in the control plane:
+        </p>
+        <ul>
+          <li><strong>Tier chaining:</strong> <code>sg-alb</code> allows <code>0.0.0.0/0:443</code> &rarr; <code>sg-api</code> allows <code>source: sg-alb</code> on <code>8080</code> &rarr; <code>sg-rds</code> allows <code>source: sg-api</code> on <code>5432</code>.</li>
+          <li><strong>Self-referencing SGs:</strong> Distributed caches (Redis clusters) or worker meshes attach <code>sg-cache</code> to every node and add an inbound rule with <code>source: sg-cache</code> so peers talk freely without hardcoding cluster IPs.</li>
+          <li><strong>Peered-VPC limitation:</strong> SG-to-SG referencing works across subnets and AZs in one VPC, and across same-region VPC Peering, but <em>not</em> across Transit Gateway or AWS PrivateLink endpoints—where you fall back to CIDR or prefix-list rules.</li>
+        </ul>
+
+        <!-- SECTION 3 -->
+        <h2>3. The Classic Stateless NACL Outage: Ephemeral Return Ports</h2>
+        <p>
+          Every VPC ships with a <strong>default NACL</strong> that allows all inbound and outbound traffic (<code>Rule #100 ALLOW ALL 0.0.0.0/0</code>). When teams create a <strong>custom NACL</strong> for compliance, AWS initializes it with <em>only</em> the catch-all deny rule (<code>* DENY ALL</code>) in both directions.
+        </p>
+        <p>
+          Consider what happens if you allow inbound HTTPS (<code>443</code>) and outbound PostgreSQL (<code>5432</code>) on a custom NACL, forgetting return traffic:
+        </p>
+        <ul>
+          <li>An <a href="../reference/glossary.html#alb">ALB</a> opens an ephemeral source port (AWS ELB/ALB, NAT Gateway, and IANA clients use <code>1024&ndash;65535</code>; Linux kernels typically allocate <code>32768&ndash;60999</code>) to connect to your backend on port <code>443</code>.</li>
+          <li>Your backend sends a TCP <code>SYN-ACK</code> back to <code>&lt;ALB_IP&gt;:52100</code>.</li>
+          <li>Because the NACL is stateless, it evaluates <strong>Outbound</strong> rules against destination port <code>52100</code>—finds no match—hits <code>* DENY</code>, and silently drops the packet.</li>
+        </ul>
+
+        <div class="callout warning">
+          <div class="callout-title">Two Production Traps with NACLs &amp; Connection Tracking</div>
+          <p style="margin: 0;">
+            <strong>1. Asymmetric Ephemeral Failure:</strong> Any custom NACL protecting TCP workloads must allow <code>1024&ndash;65535</code> on the return direction (outbound for servers accepting requests, inbound for clients initiating outbound HTTPS/DB calls).<br />
+            <strong>2. Untracked SG Connections:</strong> Per the <a href="https://docs.aws.amazon.com/vpc/latest/userguide/security-group-connection-tracking.html" target="_blank" rel="noopener">AWS Connection Tracking rules</a>, if a Security Group allows <code>0.0.0.0/0</code> on <em>all</em> protocols and ports in <strong>both</strong> directions (or matches an identical broad rule in both directions), AWS treats the flow as <strong>untracked</strong>. Never mix a wide-open SG rule with a narrower opposite-direction change without expecting connection tracking state to reset.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. Debugging Packet Drops with VPC Flow Logs</h2>
+        <p>
+          When a service times out, you cannot run <code>tcpdump</code> on a managed ALB, NAT Gateway, or RDS endpoint. <a href="https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html" target="_blank" rel="noopener">VPC Flow Logs</a> capture IP traffic metadata directly at the Nitro hypervisor boundary of a VPC, subnet, or individual ENI and publish records to CloudWatch Logs, S3, or Kinesis Data Firehose.
+        </p>
+        <p>
+          Each flow record aggregates packets over a <strong>1-minute</strong> or <strong>10-minute</strong> capture window (with roughly <strong>1&ndash;5 minutes</strong> of delivery delay to CloudWatch/S3). A default Version 2 record contains 14 space-delimited fields:
+        </p>
+<pre><code># Default VPC Flow Log v2 format:
+# version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status
+
+2 123456789012 eni-0a1b2c3d4e5f 10.0.1.10 10.0.10.25 52100 443 6 4 240 1731650400 1731650460 ACCEPT OK
+2 123456789012 eni-0a1b2c3d4e5f 10.0.10.25 10.0.1.10 443 52100 6 3 180 1731650400 1731650460 REJECT OK</code></pre>
+        <p>
+          Read those two lines like a senior incident responder:
+        </p>
+        <ul>
+          <li><code>protocol 6</code> = TCP (<code>17</code> = UDP, <code>1</code> = ICMP).</li>
+          <li>Line 1 shows <code>10.0.1.10:52100 &rarr; 10.0.10.25:443</code> marked <code>ACCEPT OK</code>: both the NACL inbound rule and the SG inbound rule allowed the request in.</li>
+          <li>Line 2 shows the return flow <code>10.0.10.25:443 &rarr; 10.0.1.10:52100</code> marked <code>REJECT OK</code>. Because the Security Group automatically tracks established inbound TCP flows, an outbound <code>REJECT</code> on an ephemeral destination port (<code>52100</code>) immediately proves a <strong>stateless NACL outbound rule</strong> dropped the return packet!</li>
+          <li>Note what Flow Logs <em>omit</em>: traffic to Amazon DNS (<code>+2</code>), instance metadata (<code>169.254.169.254</code>), DHCP, and VPC router ARP. And remember: Flow Logs record <code>REJECT</code> for both SG and NACL drops, without labeling which one—you infer the layer from direction, port, and rule state.</li>
+        </ul>
+
+        <!-- SECTION 5 -->
+        <h2>5. Production Code: Android Policy vs. AWS CDK SG Chain &amp; Custom NACL</h2>
+        <p>
+          Notice the architectural symmetry between Android's declarative network policy and an AWS CDK TypeScript stack enforcing SG-to-SG chaining, stateless NACL ephemeral ranges, and VPC Flow Logs:
+        </p>
+<pre><code>&lt;!-- 1. Android: res/xml/network_security_config.xml (declarative outbound trust boundary) --&gt;
+&lt;network-security-config&gt;
+  &lt;base-config cleartextTrafficPermitted="false" /&gt;
+  &lt;domain-config cleartextTrafficPermitted="false"&gt;
+    &lt;domain includeSubdomains="true"&gt;api.myapp.com&lt;/domain&gt;
+    &lt;pin-set expiration="2027-06-01"&gt;
+      &lt;pin digest="SHA-256"&gt;7HIpactkIAq2Y49orFOOQKurWxmmSFZhBCoQYcRhJ3Y=&lt;/pin&gt;
+    &lt;/pin-set&gt;
+  &lt;/domain-config&gt;
+&lt;/network-security-config&gt;</code></pre>
+
+<pre><code>// 2. AWS CDK (TypeScript): SG-to-SG chaining + Custom NACL + VPC Flow Logs
+const albSg = new ec2.SecurityGroup(this, "AlbSg", { vpc, allowAllOutbound: false });
+const apiSg = new ec2.SecurityGroup(this, "ApiSg", { vpc, allowAllOutbound: false });
+const rdsSg = new ec2.SecurityGroup(this, "RdsSg", { vpc, allowAllOutbound: false });
+
+albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), "HTTPS from Android clients");
+albSg.addEgressRule(apiSg, ec2.Port.tcp(8080), "Forward only to API SG");
+
+apiSg.addIngressRule(albSg, ec2.Port.tcp(8080), "Accept only from ALB SG");
+apiSg.addEgressRule(rdsSg, ec2.Port.tcp(5432), "Query only RDS SG");
+
+rdsSg.addIngressRule(apiSg, ec2.Port.tcp(5432), "Postgres only from API SG");
+
+// Stateless NACL for private API subnet — MUST include ephemeral ports 1024-65535
+const apiNacl = new ec2.NetworkAcl(this, "ApiNacl", {
+  vpc,
+  subnetSelection: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+});
+apiNacl.addEntry("AllowAlbInbound", {
+  ruleNumber: 100,
+  cidr: ec2.AclCidr.ipv4("10.0.0.0/16"),
+  traffic: ec2.AclTraffic.tcpPort(8080),
+  direction: ec2.TrafficDirection.INGRESS,
+  ruleAction: ec2.Action.ALLOW,
+});
+apiNacl.addEntry("AllowEphemeralOutbound", {
+  ruleNumber: 100,
+  cidr: ec2.AclCidr.ipv4("10.0.0.0/16"),
+  traffic: ec2.AclTraffic.tcpPortRange(1024, 65535),
+  direction: ec2.TrafficDirection.EGRESS,
+  ruleAction: ec2.Action.ALLOW,
+});
+
+// Enable 1-minute VPC Flow Logs for SG/NACL debugging
+vpc.addFlowLog("VpcFlowLogs", {
+  trafficType: ec2.FlowLogTrafficType.ALL,
+  maxAggregationInterval: ec2.FlowLogMaxAggregationInterval.ONE_MINUTE,
+});</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement <code>simulatePacketPath(packet, topology)</code> to simulate AWS VPC packet filtering across stateful Security Groups, stateless ordered NACLs, and VPC Flow Log verdicts.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Verify your intuition against realistic production networking incidents. Every question explains both why the right answer works and why each distractor fails.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCE & NEXT STEPS -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html" target="_blank" rel="noopener">Amazon VPC User Guide — Control traffic to your AWS resources using security groups</a> (Review stateful tracking and SG-to-SG referencing).
+          </li>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html" target="_blank" rel="noopener">Amazon VPC User Guide — Control traffic to subnets using network ACLs</a> (Review rule precedence and ephemeral ports).
+          </li>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html" target="_blank" rel="noopener">Amazon VPC User Guide — Log IP traffic using VPC Flow Logs</a> (Review Flow Log v2/v5 fields and <code>ACCEPT</code>/<code>REJECT</code> diagnostics).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0022 (PrivateLink, VPC Endpoints &amp; Peering)</strong>, ask me anything that feels fuzzy—for example: <em>"Why can't an NACL target a Security Group ID?"</em> or <em>"How do I debug an asymmetrical drop when an ALB sends traffic across AZs?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0020-vpc-design-subnets-igw-nat.html">&larr; Lesson 0020: Designing Production Multi-AZ VPCs: Subnets, Route Tables, IGW &amp; NAT Gateways</a>
+          <a href="./0022-privatelink-vpc-endpoints-peering.html">Lesson 0022: PrivateLink, Gateway vs Interface VPC Endpoints &amp; VPC Peering &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why Rule Numbers in Multiples of 100?</strong>
+          NACL rules evaluate from lowest number to highest. Leaving gaps (<code>100</code>, <code>200</code>, <code>300</code>) lets you insert an emergency <code>#50 DENY</code> block during an incident without renumbering existing rules.
+        </div>
+        <div class="sidenote">
+          <strong>Ephemeral Range Differences</strong>
+          AWS ELB/ALB, NAT Gateways, and IANA use ports <code>1024&ndash;65535</code>, whereas modern Linux kernels default to <code>32768&ndash;60999</code>. Always use <code>1024&ndash;65535</code> on NACL return rules unless every caller is strictly pinned.
+        </div>
+        <div class="sidenote">
+          <strong>Flow Logs Are Hypervisor-Side</strong>
+          VPC Flow Logs record traffic <em>as seen by the hypervisor</em> after SG/NACL evaluation, so you see <code>REJECT</code> without needing SSH access or agent installs on the instance.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0021",
+      title: "Lab 0021: SG vs. NACL Packet-Path & Flow Log Simulator",
+      filename: "packet-path-simulator.js",
+      description:
+        "Complete <code>evaluateNacl(rules, ip, dstPort, protocol)</code>, <code>evaluateSg(rules, ip, sgId, dstPort, protocol, isReturnTraffic)</code>, and <code>simulatePacketPath(packet, topology)</code>. Rules: (1) <code>evaluateNacl</code> sorts rules by ascending <code>ruleNumber</code>, finds the first matching rule (matching protocol or <code>\"ALL\"</code>, <code>dstPort</code> within <code>portRange</code>, and IP within <code>cidr</code> via the provided <code>ipInCidr</code>), and returns <code>{ allowed: rule.action === \"ALLOW\", ruleNumber: rule.ruleNumber }</code>; if none match, return <code>{ allowed: false, ruleNumber: \"*\" }</code>. (2) <code>evaluateSg</code> returns <code>{ allowed: true, reason: \"STATEFUL_TRACKED\" }</code> immediately when <code>isReturnTraffic</code> is true; otherwise checks if any rule matches protocol, <code>dstPort</code> in <code>portRange</code>, and either <code>rule.sgId === sgId</code> (when <code>rule.sgId</code> is set) or <code>ipInCidr(ip, rule.cidr)</code> (when <code>rule.cidr</code> is set), returning <code>{ allowed: true, reason: \"RULE_MATCH\" }</code> or <code>{ allowed: false, reason: \"IMPLICIT_DENY\" }</code>. (3) <code>simulatePacketPath</code> enforces order: for <code>\"INGRESS\"</code>, check <code>nacl.inboundRules</code> (using <code>packet.srcIp</code>) then <code>sg.inboundRules</code> (using <code>packet.srcIp, packet.srcSg</code>); for <code>\"EGRESS\"</code>, check <code>sg.outboundRules</code> (using <code>packet.dstIp, packet.dstSg</code>) then <code>nacl.outboundRules</code> (using <code>packet.dstIp</code>). Return <code>{ allowed, droppedAt, flowLogAction, naclRule, sgAllowed }</code> where <code>droppedAt</code> is <code>null | \"NACL\" | \"SG\"</code>, <code>flowLogAction</code> is <code>\"ACCEPT\" | \"REJECT\"</code>, and <code>sgAllowed</code> is <code>null</code> if dropped before SG.",
+      exports: ["evaluateNacl", "evaluateSg", "simulatePacketPath"],
+      starterCode: `function ipToInt(ip) {
+  const parts = ip.split(".").map(Number);
+  return (((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0;
+}
+
+function ipInCidr(ip, cidr) {
+  const [netIp, prefixStr] = cidr.split("/");
+  const prefix = Number(prefixStr);
+  const mask = prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0);
+  return ((ipToInt(ip) & mask) >>> 0) === ((ipToInt(netIp) & mask) >>> 0);
+}
+
+function evaluateNacl(rules, ip, dstPort, protocol) {
+  // rules: Array<{ ruleNumber: number, protocol: string, portRange: [number, number], cidr: string, action: "ALLOW" | "DENY" }>
+  // TODO 1: sort ascending by ruleNumber, return first match or { allowed: false, ruleNumber: "*" }
+  return { allowed: false, ruleNumber: "*" };
+}
+
+function evaluateSg(rules, ip, sgId, dstPort, protocol, isReturnTraffic) {
+  // rules: Array<{ protocol: string, portRange: [number, number], cidr?: string, sgId?: string }>
+  // TODO 2: handle stateful return traffic, then SG-ID or CIDR matching
+  return { allowed: false, reason: "IMPLICIT_DENY" };
+}
+
+function simulatePacketPath(packet, topology) {
+  // packet: { srcIp, dstIp, srcSg, dstSg, protocol, srcPort, dstPort, direction: "INGRESS" | "EGRESS", isReturnTraffic: boolean }
+  // topology: { nacl: { inboundRules, outboundRules }, sg: { inboundRules, outboundRules } }
+  // TODO 3: evaluate NACL -> SG for INGRESS, and SG -> NACL for EGRESS
+  return {
+    allowed: false,
+    droppedAt: "NACL",
+    flowLogAction: "REJECT",
+    naclRule: "*",
+    sgAllowed: null
+  };
+}
+
+console.log(
+  "Sample:",
+  simulatePacketPath(
+    {
+      srcIp: "10.0.10.25",
+      dstIp: "10.0.1.10",
+      srcSg: "sg-ecs",
+      dstSg: "sg-alb",
+      protocol: "TCP",
+      srcPort: 443,
+      dstPort: 52100,
+      direction: "EGRESS",
+      isReturnTraffic: true
+    },
+    {
+      nacl: { inboundRules: [], outboundRules: [] },
+      sg: { inboundRules: [], outboundRules: [] }
+    }
+  )
+);`,
+      hints: [
+        "Make a shallow copy with <code>[...rules].sort((a, b) => a.ruleNumber - b.ruleNumber)</code> inside <code>evaluateNacl</code> so you never mutate the caller's rule array. Check protocol with <code>r.protocol === \"ALL\" || r.protocol === protocol</code> and ports with <code>dstPort >= r.portRange[0] && dstPort <= r.portRange[1]</code>.",
+        "In <code>evaluateSg</code>, check <code>if (isReturnTraffic) return { allowed: true, reason: \"STATEFUL_TRACKED\" };</code> first. For SG rules, match <code>r.sgId ? r.sgId === sgId : ipInCidr(ip, r.cidr)</code>.",
+        "Remember the order difference! <code>INGRESS</code> hits <code>nacl.inboundRules</code> first (if denied, return <code>droppedAt: \"NACL\"</code>, <code>sgAllowed: null</code>), then <code>sg.inboundRules</code>. <code>EGRESS</code> hits <code>sg.outboundRules</code> first (if denied, return <code>droppedAt: \"SG\"</code>, <code>naclRule: null</code>), then <code>nacl.outboundRules</code>."
+      ],
+      solutionExplanation:
+        "NACLs are stateless, ordered (lowest rule number first), and sit at the subnet edge: first on INGRESS, last on EGRESS. Security Groups are stateful, allow-only, support SG-to-SG references, and sit directly on the ENI. Notice how return traffic passes SG outbound via stateful tracking yet still fails at NACL outbound unless ephemeral ports (1024-65535) are explicitly allowed.",
+      solutionCode: `function ipToInt(ip) {
+  const parts = ip.split(".").map(Number);
+  return (((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0;
+}
+
+function ipInCidr(ip, cidr) {
+  const [netIp, prefixStr] = cidr.split("/");
+  const prefix = Number(prefixStr);
+  const mask = prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0);
+  return ((ipToInt(ip) & mask) >>> 0) === ((ipToInt(netIp) & mask) >>> 0);
+}
+
+function matchesRuleBase(rule, dstPort, protocol) {
+  const protoMatch = rule.protocol === "ALL" || rule.protocol === protocol;
+  const portMatch = dstPort >= rule.portRange[0] && dstPort <= rule.portRange[1];
+  return protoMatch && portMatch;
+}
+
+function evaluateNacl(rules, ip, dstPort, protocol) {
+  const ordered = [...rules].sort((a, b) => a.ruleNumber - b.ruleNumber);
+  for (let i = 0; i < ordered.length; i++) {
+    const r = ordered[i];
+    if (matchesRuleBase(r, dstPort, protocol) && ipInCidr(ip, r.cidr)) {
+      return { allowed: r.action === "ALLOW", ruleNumber: r.ruleNumber };
+    }
+  }
+  return { allowed: false, ruleNumber: "*" };
+}
+
+function evaluateSg(rules, ip, sgId, dstPort, protocol, isReturnTraffic) {
+  if (isReturnTraffic) {
+    return { allowed: true, reason: "STATEFUL_TRACKED" };
+  }
+  for (let i = 0; i < rules.length; i++) {
+    const r = rules[i];
+    if (!matchesRuleBase(r, dstPort, protocol)) continue;
+    const targetMatch = r.sgId ? r.sgId === sgId : (r.cidr ? ipInCidr(ip, r.cidr) : false);
+    if (targetMatch) {
+      return { allowed: true, reason: "RULE_MATCH" };
+    }
+  }
+  return { allowed: false, reason: "IMPLICIT_DENY" };
+}
+
+function simulatePacketPath(packet, topology) {
+  if (packet.direction === "INGRESS") {
+    const naclRes = evaluateNacl(topology.nacl.inboundRules, packet.srcIp, packet.dstPort, packet.protocol);
+    if (!naclRes.allowed) {
+      return {
+        allowed: false,
+        droppedAt: "NACL",
+        flowLogAction: "REJECT",
+        naclRule: naclRes.ruleNumber,
+        sgAllowed: null
+      };
+    }
+    const sgRes = evaluateSg(
+      topology.sg.inboundRules,
+      packet.srcIp,
+      packet.srcSg,
+      packet.dstPort,
+      packet.protocol,
+      packet.isReturnTraffic
+    );
+    if (!sgRes.allowed) {
+      return {
+        allowed: false,
+        droppedAt: "SG",
+        flowLogAction: "REJECT",
+        naclRule: naclRes.ruleNumber,
+        sgAllowed: false
+      };
+    }
+    return {
+      allowed: true,
+      droppedAt: null,
+      flowLogAction: "ACCEPT",
+      naclRule: naclRes.ruleNumber,
+      sgAllowed: true
+    };
+  }
+
+  const sgRes = evaluateSg(
+    topology.sg.outboundRules,
+    packet.dstIp,
+    packet.dstSg,
+    packet.dstPort,
+    packet.protocol,
+    packet.isReturnTraffic
+  );
+  if (!sgRes.allowed) {
+    return {
+      allowed: false,
+      droppedAt: "SG",
+      flowLogAction: "REJECT",
+      naclRule: null,
+      sgAllowed: false
+    };
+  }
+  const naclRes = evaluateNacl(topology.nacl.outboundRules, packet.dstIp, packet.dstPort, packet.protocol);
+  if (!naclRes.allowed) {
+    return {
+      allowed: false,
+      droppedAt: "NACL",
+      flowLogAction: "REJECT",
+      naclRule: naclRes.ruleNumber,
+      sgAllowed: true
+    };
+  }
+  return {
+    allowed: true,
+    droppedAt: null,
+    flowLogAction: "ACCEPT",
+    naclRule: naclRes.ruleNumber,
+    sgAllowed: true
+  };
+}`,
+      tests: [
+        {
+          name: "Inbound SG-to-SG reference + NACL allow produces ACCEPT verdict",
+          run: (scope) => {
+            const topology = {
+              nacl: {
+                inboundRules: [
+                  { ruleNumber: 100, protocol: "TCP", portRange: [443, 443], cidr: "10.0.0.0/16", action: "ALLOW" }
+                ],
+                outboundRules: []
+              },
+              sg: {
+                inboundRules: [
+                  { protocol: "TCP", portRange: [443, 443], sgId: "sg-alb" }
+                ],
+                outboundRules: []
+              }
+            };
+            const out = scope.simulatePacketPath(
+              {
+                srcIp: "10.0.1.10",
+                dstIp: "10.0.10.25",
+                srcSg: "sg-alb",
+                dstSg: "sg-ecs",
+                protocol: "TCP",
+                srcPort: 52100,
+                dstPort: 443,
+                direction: "INGRESS",
+                isReturnTraffic: false
+              },
+              topology
+            );
+            const pass =
+              out.allowed === true &&
+              out.droppedAt === null &&
+              out.flowLogAction === "ACCEPT" &&
+              out.naclRule === 100 &&
+              out.sgAllowed === true;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "SG-to-SG rejects traffic from unauthorized SG even if IP is in allowed NACL CIDR",
+          run: (scope) => {
+            const topology = {
+              nacl: {
+                inboundRules: [
+                  { ruleNumber: 100, protocol: "TCP", portRange: [5432, 5432], cidr: "10.0.0.0/16", action: "ALLOW" }
+                ],
+                outboundRules: []
+              },
+              sg: {
+                inboundRules: [
+                  { protocol: "TCP", portRange: [5432, 5432], sgId: "sg-api" }
+                ],
+                outboundRules: []
+              }
+            };
+            const out = scope.simulatePacketPath(
+              {
+                srcIp: "10.0.10.99",
+                dstIp: "10.0.20.5",
+                srcSg: "sg-bastion",
+                dstSg: "sg-rds",
+                protocol: "TCP",
+                srcPort: 41000,
+                dstPort: 5432,
+                direction: "INGRESS",
+                isReturnTraffic: false
+              },
+              topology
+            );
+            const pass =
+              out.allowed === false &&
+              out.droppedAt === "SG" &&
+              out.flowLogAction === "REJECT" &&
+              out.naclRule === 100 &&
+              out.sgAllowed === false;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Stateless NACL drops stateful SG return traffic when ephemeral outbound port is missing",
+          run: (scope) => {
+            const topology = {
+              nacl: {
+                inboundRules: [
+                  { ruleNumber: 100, protocol: "TCP", portRange: [443, 443], cidr: "10.0.0.0/16", action: "ALLOW" }
+                ],
+                outboundRules: [
+                  { ruleNumber: 100, protocol: "TCP", portRange: [5432, 5432], cidr: "10.0.20.0/24", action: "ALLOW" }
+                ]
+              },
+              sg: {
+                inboundRules: [{ protocol: "TCP", portRange: [443, 443], sgId: "sg-alb" }],
+                outboundRules: []
+              }
+            };
+            const out = scope.simulatePacketPath(
+              {
+                srcIp: "10.0.10.25",
+                dstIp: "10.0.1.10",
+                srcSg: "sg-ecs",
+                dstSg: "sg-alb",
+                protocol: "TCP",
+                srcPort: 443,
+                dstPort: 52100,
+                direction: "EGRESS",
+                isReturnTraffic: true
+              },
+              topology
+            );
+            const pass =
+              out.allowed === false &&
+              out.droppedAt === "NACL" &&
+              out.flowLogAction === "REJECT" &&
+              out.naclRule === "*" &&
+              out.sgAllowed === true;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Return traffic succeeds when NACL allows ephemeral ports 1024-65535 even with empty SG outbound",
+          run: (scope) => {
+            const topology = {
+              nacl: {
+                inboundRules: [],
+                outboundRules: [
+                  { ruleNumber: 200, protocol: "TCP", portRange: [1024, 65535], cidr: "10.0.1.0/24", action: "ALLOW" }
+                ]
+              },
+              sg: { inboundRules: [], outboundRules: [] }
+            };
+            const out = scope.simulatePacketPath(
+              {
+                srcIp: "10.0.10.25",
+                dstIp: "10.0.1.10",
+                srcSg: "sg-ecs",
+                dstSg: "sg-alb",
+                protocol: "TCP",
+                srcPort: 443,
+                dstPort: 52100,
+                direction: "EGRESS",
+                isReturnTraffic: true
+              },
+              topology
+            );
+            const pass =
+              out.allowed === true &&
+              out.droppedAt === null &&
+              out.flowLogAction === "ACCEPT" &&
+              out.naclRule === 200 &&
+              out.sgAllowed === true;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "NACL evaluates lowest ruleNumber first regardless of input order and stops at first match",
+          run: (scope) => {
+            const topology = {
+              nacl: {
+                inboundRules: [
+                  { ruleNumber: 100, protocol: "TCP", portRange: [443, 443], cidr: "0.0.0.0/0", action: "ALLOW" },
+                  { ruleNumber: 50, protocol: "TCP", portRange: [443, 443], cidr: "203.0.113.0/24", action: "DENY" }
+                ],
+                outboundRules: []
+              },
+              sg: {
+                inboundRules: [{ protocol: "ALL", portRange: [0, 65535], cidr: "0.0.0.0/0" }],
+                outboundRules: []
+              }
+            };
+            const out = scope.simulatePacketPath(
+              {
+                srcIp: "203.0.113.42",
+                dstIp: "10.0.1.10",
+                srcSg: null,
+                dstSg: "sg-alb",
+                protocol: "TCP",
+                srcPort: 55000,
+                dstPort: 443,
+                direction: "INGRESS",
+                isReturnTraffic: false
+              },
+              topology
+            );
+            const pass =
+              out.allowed === false &&
+              out.droppedAt === "NACL" &&
+              out.flowLogAction === "REJECT" &&
+              out.naclRule === 50 &&
+              out.sgAllowed === null;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0021",
+      title: "Quiz 0021: Security Groups, NACLs & Flow Log Diagnostics",
+      questions: [
+        {
+          id: "q1",
+          prompt: "An ALB in a public subnet forwards HTTPS (<code>443</code>) traffic to ECS tasks in a private subnet. Incoming <code>SYN</code> packets reach the tasks and they reply, yet ALB health checks time out. VPC Flow Logs on the ECS ENI show <code>ACCEPT</code> for inbound port <code>443</code> and <code>REJECT</code> for outbound port <code>49152</code>. Which misconfiguration explains this?",
+          options: [
+            "The ECS subnet NACL lacks an outbound allow rule for ephemeral ports",
+            "The ECS security group lacks an outbound allow rule for ephemeral ports",
+            "The ALB security group lacks an inbound allow rule for port 443",
+            "The private route table lacks a default route to the NAT Gateway"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "NACLs are stateless, so even when inbound TCP 443 is permitted, return packets destined to the ALB's ephemeral source port (1024-65535) are dropped at the subnet NACL unless explicitly allowed outbound.",
+            "Security groups are stateful; once inbound port 443 is allowed, return packets on that established connection are automatically permitted outbound without an explicit SG outbound rule.",
+            "If the ALB security group blocked inbound 443, client requests would fail before reaching the ALB and would not produce an outbound REJECT on the ECS ENI.",
+            "ALB-to-ECS traffic stays inside the VPC via the local route and never traverses a NAT Gateway; furthermore, Flow Logs clearly recorded a filter REJECT on outbound port 49152."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "You deploy an Auto Scaling group of API containers that call an RDS PostgreSQL database (<code>5432</code>) in an isolated subnet. Instead of adding the API subnet's <code>/24</code> CIDR to the RDS security group, you reference the API security group ID (<code>sg-api</code>) as the source. What is the main operational advantage of SG-to-SG referencing?",
+          options: [
+            "New API instances gain database access immediately regardless of their assigned IP",
+            "Traffic between referenced security groups bypasses every subnet network ACL rule check",
+            "Database traffic between referenced security groups skips all TLS handshakes and encryption",
+            "Referenced security groups automatically peer VPCs across regions without route table edits"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "AWS dynamically tracks ENI membership for sg-api, so newly scaled tasks across any subnet or AZ immediately gain port 5432 access without updating CIDR rules or widening access to unrelated hosts.",
+            "NACLs always evaluate packets crossing subnet boundaries statelessly regardless of whether Security Groups use CIDR blocks or SG-to-SG references.",
+            "Security Groups operate at Layer 3/4 packet filtering and never disable or alter application-layer TLS encryption or TCP connection handshakes.",
+            "SG-to-SG referencing requires existing local routing or same-region VPC peering; it never creates peering links or modifies route tables."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "During a security incident, your team adds NACL inbound rule <code>#50 DENY TCP 443</code> from <code>203.0.113.0/24</code> above existing rule <code>#100 ALLOW TCP 443</code> from <code>0.0.0.0/0</code>. Later, legitimate partner traffic from <code>203.0.113.42</code> fails, and VPC Flow Logs show <code>action=REJECT</code>. Which statement accurately explains the Flow Log behavior?",
+          options: [
+            "NACLs evaluate rules by ascending number and stop at the first match",
+            "NACLs merge overlapping rules and apply the broadest deny across the VPC",
+            "Security groups automatically mirror NACL deny rules and log duplicate drop entries",
+            "Flow Logs report REJECT only when both NACL and security group deny"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "NACL rules execute strictly in ascending rule-number order; rule #50 matches 203.0.113.42 first and drops the packet before rule #100 is ever evaluated, producing REJECT in Flow Logs.",
+            "NACLs do not merge rules or propagate across the entire VPC; they evaluate sequentially on a first-match basis only for subnets associated with that NACL.",
+            "Security groups have no deny rules and operate completely independently from NACLs, never mirroring NACL rules.",
+            "VPC Flow Logs emit REJECT whenever either layer drops a packet (an NACL drop alone or an SG drop alone produces REJECT)."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

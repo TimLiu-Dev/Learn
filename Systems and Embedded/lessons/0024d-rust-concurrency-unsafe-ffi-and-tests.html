@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0024d: Send/Sync Concurrency, Unsafe/FFI &amp; Testing | Systems &amp; Embedded</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js"></script>
+</head>
+<body>
+
+  <header class="course-nav">
+    <div class="nav-left">
+      <a href="../index.html" class="nav-btn">&larr; Master Plan</a>
+      <a href="0024c-rust-traits-generics-lifetimes-and-pin.html" class="nav-btn">&larr; Lesson 0024c</a>
+      <a href="../reference/0005-rust-for-systems-devs-cheat-sheet.html" class="nav-btn">📄 Ref #5 (Rust Bridge)</a>
+      <div class="nav-breadcrumb">Track 06 &bull; <span>Lesson 0024d</span></div>
+    </div>
+    <div class="nav-status-pills">
+      <div id="status-read" class="status-pill completed"><span>📖 Theory Read</span></div>
+      <div id="status-practice" class="status-pill"><span>⚡ Practice Passed</span></div>
+      <div id="status-quiz" class="status-pill"><span>🎯 Quizzes Passed</span></div>
+    </div>
+  </header>
+
+  <main class="container">
+    <header class="lesson-header">
+      <span class="track-badge">Track 06: Systems Rust &amp; AOSP &bull; Lesson 0024d</span>
+      <h1>Fearless Concurrency &amp; FFI:<br><code>Send</code>/<code>Sync</code>, Smart Pointers, <code>unsafe</code> &amp; Cargo Tests</h1>
+      <p class="lesson-lead">
+        Systems Rust never executes in isolation: bare-metal drivers write hardware MMIO pointers, Linux drivers wrap C kernel structs, and AOSP Binder HALs dispatch concurrent RPCs across threads. Master <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>, <code>Send</code>/<code>Sync</code>, the exact boundaries of <code>unsafe</code> FFI, and Cargo <code>#[test]</code> suites.
+      </p>
+
+      <div class="callout callout-bridge">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+          Mental Model Shift: Runtime Locks vs Compile-Time <code>Send</code> &amp; <code>Sync</code>
+        </div>
+        <p style="margin-bottom:0.5rem; font-size:0.95rem;">
+          In Java/Kotlin or C++, passing a non-thread-safe object into a background thread pool compiles cleanly and crashes weeks later in production under race load.
+        </p>
+        <p style="margin-bottom:0; font-size:0.95rem;">
+          In <strong>Rust</strong>, types implement marker traits <strong><code>Send</code></strong> (safe to move across thread boundaries) and <strong><code>Sync</code></strong> (safe to share <code>&amp;T</code> concurrently from multiple threads). Because AOSP's <code>Binder</code> pool invokes your HAL from worker threads simultaneously, your service struct <em>must</em> be <code>Send + Sync</code>—using <code>Atomic*</code> or <code>Mutex&lt;T&gt;</code> instead of plain unprotected fields!
+        </p>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. Smart Pointers &amp; Data-Inside-The-Lock (<code>Mutex&lt;T&gt;</code>)</h2>
+      <ul>
+        <li><strong><code>Box&lt;T&gt;</code>:</strong> Unique heap allocation (analogous to C++ <code>std::unique_ptr&lt;T&gt;</code>; unused on heapless MCUs, common on Linux/AOSP).</li>
+        <li><strong><code>Rc&lt;T&gt;</code> vs <code>Arc&lt;T&gt;</code>:</strong> Reference-counted shared ownership (like C++ <code>shared_ptr</code>). <code>Rc&lt;T&gt;</code> is non-atomic (<code>!Send</code> — single-thread only). <code>Arc&lt;T&gt;</code> uses atomic counts (thread-safe).</li>
+        <li><strong><code>Mutex&lt;T&gt;</code> / <code>RwLock&lt;T&gt;</code> / <code>mpsc::channel</code>:</strong> Unlike C/Kotlin where mutexes sit <em>beside</em> fields, Rust's <code>Mutex&lt;T&gt;</code> physically wraps <code>T</code>. You literally cannot read or write <code>T</code> without locking first! Always drop the returned guard before making blocking IPC calls.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>2. The 5 Rules of <code>unsafe</code>, <code>#[repr(C)]</code> FFI &amp; Safe Abstractions</h2>
+      <p>
+        An <code>unsafe { ... }</code> block does not turn off the borrow checker; it unlocks strictly <strong>five operations</strong> where the programmer must verify safety invariants (documented with <code>// SAFETY:</code> comments) and wrap them behind a safe public API:
+      </p>
+      <ol>
+        <li>Dereferencing a raw pointer (<code>*const T</code> / <code>*mut T</code>).</li>
+        <li>Calling an <code>unsafe fn</code> or C FFI function (<code>extern "C"</code>).</li>
+        <li>Accessing or modifying a mutable <code>static</code> variable.</li>
+        <li>Implementing an <code>unsafe trait</code> (e.g., manual <code>Send</code>/<code>Sync</code> on FFI wrappers).</li>
+        <li>Reading fields of a bare C <code>union</code>.</li>
+      </ol>
+      <div class="code-window">
+        <div class="code-header">
+          <span>ffi_bridge.rs (#[repr(C)] ABI Alignment + Safe Wrapper + Unit Test)</span>
+          <div class="window-dots"><span class="dot dot-red"></span><span class="dot dot-yellow"></span><span class="dot dot-green"></span></div>
+        </div>
+        <pre><code>#[repr(C)] // Guarantee C struct field layout (Rust default layout can reorder!)
+pub struct RawCanMsg {
+    pub can_id: u32,
+    pub dlc: u8,
+    pub data: [u8; 8],
+}
+
+pub fn decode_c_frame(ptr: *const RawCanMsg) -&gt; Option&lt;u32&gt; {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Null pointer already checked above; caller guarantees ptr points
+    // to a valid, aligned, immutable RawCanMsg for the duration of this call.
+    let msg: &amp;RawCanMsg = unsafe { &amp;*ptr };
+    Some(msg.can_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn null_pointer_returns_none() {
+        assert_eq!(decode_c_frame(core::ptr::null()), None);
+    }
+}</code></pre>
+      </div>
+    </section>
+
+    <!-- PRACTICE WORKBENCH -->
+    <section class="practice-section" id="practice-lab">
+      <div class="practice-badge">Hands-On Practice Lab</div>
+      <h2 class="practice-title" style="margin:0 0 0.5rem; letter-spacing:0;">Interactive Practice: Safe Wrapper Around C FFI Frame &amp; Atomic Counter</h2>
+      <p style="color:var(--text-muted); font-size:0.95rem; margin-bottom:1.5rem;">
+        Implement <code>ingest_c_packet()</code>: add <code>#[repr(C)]</code> to <code>CWireHeader</code>, reject null <code>ptr</code> safely, read <code>(*ptr).msg_id</code> inside an <code>unsafe</code> block, and increment the thread-safe counter using <code>RX_COUNT.fetch_add(1, Ordering::Relaxed)</code>.
+      </p>
+
+      <div class="workbench-editor-container">
+        <div class="editor-toolbar">
+          <div class="editor-tab">ffi_ingest.rs</div>
+          <div class="toolbar-actions">
+            <button class="btn btn-hint" onclick="toggleHint()">💡 Need a Hint?</button>
+            <button class="btn btn-secondary" onclick="toggleSolution()">👁️ View Solution</button>
+            <button class="btn btn-primary" onclick="runPracticeTest()">▶ Run &amp; Verify Code</button>
+          </div>
+        </div>
+
+        <textarea id="code-editor" class="code-textarea" spellcheck="false">
+use core::sync::atomic::{AtomicU32, Ordering};
+
+static RX_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// TODO 1: Ensure C ABI layout by adding #[repr(C)] above CWireHeader
+pub struct CWireHeader {
+    pub msg_id: u16,
+    pub flags: u8,
+}
+
+pub fn ingest_c_packet(ptr: *const CWireHeader) -&gt; Option&lt;u16&gt; {
+    // TODO 2: Return None if ptr.is_null()
+    // TODO 3: Read msg_id inside unsafe { &amp;*ptr } and increment RX_COUNT via fetch_add
+    let _ = (&amp;RX_COUNT, Ordering::Relaxed, ptr);
+    None
+}
+</textarea>
+
+        <div id="hints-box" class="hints-drawer">
+          <div style="font-weight:700; color:var(--accent-amber); margin-bottom:0.5rem;">💡 Progressive Guidance Hints:</div>
+          <div class="hint-step"><strong>Hint 1:</strong> Place <code>#[repr(C)]</code> directly above <code>pub struct CWireHeader</code> so Rust preserves C field offsets.</div>
+          <div class="hint-step"><strong>Hint 2:</strong> Check <code>if ptr.is_null() { return None; }</code>, then <code>let hdr = unsafe { &amp;*ptr };</code>, increment <code>RX_COUNT.fetch_add(1, Ordering::Relaxed);</code>, and return <code>Some(hdr.msg_id)</code>.</div>
+        </div>
+
+        <div id="solution-box" class="solution-drawer">
+          <div style="font-weight:700; color:var(--accent-emerald); margin-bottom:0.5rem;">✅ Reference Production Solution:</div>
+          <pre style="margin:0; background:transparent; padding:0.5rem 0;"><code>#[repr(C)]
+pub struct CWireHeader {
+    pub msg_id: u16,
+    pub flags: u8,
+}
+
+pub fn ingest_c_packet(ptr: *const CWireHeader) -&gt; Option&lt;u16&gt; {
+    if ptr.is_null() {
+        return None;
+    }
+    let hdr = unsafe { &amp;*ptr };
+    RX_COUNT.fetch_add(1, Ordering::Relaxed);
+    Some(hdr.msg_id)
+}</code></pre>
+        </div>
+
+        <div class="console-panel">
+          <div class="console-header">
+            <span>Rust FFI Safety &amp; Atomic Concurrency Check</span>
+            <span id="test-summary">Status: Idle</span>
+          </div>
+          <div id="console-logs" class="console-logs">[System Ready] Click 'Run &amp; Verify Code' to check #[repr(C)], null guard, unsafe boundary, and AtomicU32...</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- QUIZZES -->
+    <section>
+      <h2>Knowledge Check</h2>
+
+      <div class="quiz-card" id="quiz-1">
+        <div class="quiz-number">Question 1 &bull; Mastery Verification</div>
+        <div class="quiz-question">
+          Why does Rust reject sharing an <code>Rc&lt;RefCell&lt;State&gt;&gt;</code> across an AOSP Binder thread pool while accepting <code>Arc&lt;Mutex&lt;State&gt;&gt;</code>?
+        </div>
+        <div class="quiz-options">
+          <div class="quiz-option" onclick="SystemsQuiz.handleAnswer(1, true, this)">
+            <div class="option-radio"></div>
+            <span>Non atomic reference counts lack Sync and Send trait guarantees</span>
+          </div>
+          <div class="quiz-option" onclick="SystemsQuiz.handleAnswer(1, false, this)">
+            <div class="option-radio"></div>
+            <span>Reference counted pointers cannot live inside heap allocations safely anywhere</span>
+          </div>
+          <div class="quiz-option" onclick="SystemsQuiz.handleAnswer(1, false, this)">
+            <div class="option-radio"></div>
+            <span>Binder frameworks forbid mutex synchronization across concurrent vendor kernel services</span>
+          </div>
+          <div class="quiz-option" onclick="SystemsQuiz.handleAnswer(1, false, this)">
+            <div class="option-radio"></div>
+            <span>Interior mutability automatically allocates garbage collection threads on every write</span>
+          </div>
+        </div>
+        <div class="quiz-explanation" id="quiz-1-exp">
+          <div class="why-correct"><strong>✓ Correct! (Option A: Missing Send + Sync guarantees)</strong><br>
+            <code>Rc</code> updates its refcount with non-atomic increments and <code>RefCell</code> performs non-atomic borrow checking, so neither implements <code>Send</code> or <code>Sync</code>. <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> provides atomic refcounts and mutual exclusion, allowing safe multi-thread sharing.
+          </div>
+          <div class="why-wrong">
+            <strong>Analysis of Distractors:</strong><br>
+            &bull; <em>Option B:</em> Both <code>Rc</code> and <code>Arc</code> allocate on the heap.<br>
+            &bull; <em>Option C:</em> Binder threads specifically require synchronization primitives like <code>Mutex</code> or atomics.<br>
+            &bull; <em>Option D:</em> Rust never creates GC threads.
+          </div>
+        </div>
+      </div>
+
+      <div class="quiz-card" id="quiz-2">
+        <div class="quiz-number">Question 2 &bull; Mastery Verification</div>
+        <div class="quiz-question">
+          Why must a Rust struct passed across an <code>extern "C"</code> FFI boundary be annotated with <code>#[repr(C)]</code>?
+        </div>
+        <div class="quiz-options">
+          <div class="quiz-option" onclick="SystemsQuiz.handleAnswer(2, false, this)">
+            <div class="option-radio"></div>
+            <span>Annotation injects automatic null checks before every foreign function invocation</span>
+          </div>
+          <div class="quiz-option" onclick="SystemsQuiz.handleAnswer(2, false, this)">
+            <div class="option-radio"></div>
+            <span>Annotation enables exception unwinding across Linux kernel C driver boundaries</span>
+          </div>
+          <div class="quiz-option" onclick="SystemsQuiz.handleAnswer(2, true, this)">
+            <div class="option-radio"></div>
+            <span>Default Rust representation may reorder fields breaking C binary compatibility</span>
+          </div>
+          <div class="quiz-option" onclick="SystemsQuiz.handleAnswer(2, false, this)">
+            <div class="option-radio"></div>
+            <span>Annotation strips borrow checker validation inside safe code modules completely</span>
+          </div>
+        </div>
+        <div class="quiz-explanation" id="quiz-2-exp">
+          <div class="why-correct"><strong>✓ Correct! (Option C: Preserves C ABI field order &amp; alignment)</strong><br>
+            By default (<code>#[repr(Rust)]</code>), <code>rustc</code> has no stable ABI and can freely reorder fields to minimize struct padding. Marking a struct <code>#[repr(C)]</code> forces exact C compiler field ordering and alignment rules.
+          </div>
+          <div class="why-wrong">
+            <strong>Analysis of Distractors:</strong><br>
+            &bull; <em>Option A, B, D:</em> <code>#[repr(C)]</code> strictly controls memory layout, not runtime checks, unwinding, or borrow rules.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="callout callout-primary-source">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+          Recommended Primary Source to Read
+        </div>
+        <p style="font-size:0.95rem; margin-bottom:0.5rem;">
+          <strong>The Rust Book Chapters 11, 15, 16 &amp; 19 ("Testing, Smart Pointers, Concurrency &amp; Unsafe Rust")</strong> and <strong>The Rustonomicon ("FFI &amp; Safety Invariants")</strong>.
+        </p>
+      </div>
+
+      <div class="callout callout-ask-agent">
+        <div class="callout-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Ask Follow-Up Questions Anytime
+        </div>
+        <p style="font-size:0.95rem; margin-bottom:0;">
+          Ready to take your first bare-metal step into <code>#![no_std]</code> MMIO registers in Lesson 0025? Ask anything first!
+        </p>
+      </div>
+    </section>
+
+    <footer class="lesson-footer-nav">
+      <a href="0024c-rust-traits-generics-lifetimes-and-pin.html" class="nav-btn">&larr; Lesson 0024c</a>
+      <a href="0025-bare-metal-rust-no-std.html" style="color:var(--accent-cyan); font-weight:700; text-decoration:none;">
+        Lesson 0025: Bare-Metal Rust (no_std) &rarr;
+      </a>
+    </footer>
+  </main>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      SystemsQuiz.init('lesson_0024d', 2);
+      if (localStorage.getItem('lesson_0024d_practice') === 'done') {
+        document.getElementById('status-practice').classList.add('completed');
+      }
+    });
+
+    function toggleHint() { document.getElementById('hints-box').classList.toggle('show'); }
+    function toggleSolution() { document.getElementById('solution-box').classList.toggle('show'); }
+
+    function runPracticeTest() {
+      const rawCode = document.getElementById('code-editor').value;
+      const code = rawCode.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+      const logs = document.getElementById('console-logs');
+      const summary = document.getElementById('test-summary');
+
+      let passed = true;
+      let logBuffer = "Checking #[repr(C)], null guard, unsafe dereference, and AtomicU32...\n";
+
+      if (/\#\[repr\(C\)\][\s\S]*struct\s+CWireHeader/.test(code) && code.includes('ptr.is_null()')) {
+        logBuffer += "✔ TEST 1: #[repr(C)] ABI attribute and null-pointer guard verified.\n";
+      } else {
+        passed = false;
+        logBuffer += "✖ TEST 1: Add #[repr(C)] to CWireHeader and guard with if ptr.is_null() { return None; }.\n";
+      }
+
+      if (code.includes('unsafe') && code.includes('RX_COUNT.fetch_add') && /Some\(\s*\w+\.msg_id\s*\)/.test(code)) {
+        logBuffer += "✔ TEST 2: Safe wrapper over unsafe dereference, atomic fetch_add, and Some(msg_id) verified.\n";
+      } else {
+        passed = false;
+        logBuffer += "✖ TEST 2: Dereference inside unsafe, increment RX_COUNT.fetch_add(1, ...), and return Some(hdr.msg_id).\n";
+      }
+
+      if (passed) {
+        logBuffer += "\n🎉 RUST CONCURRENCY, FFI & TESTING BRIDGE VERIFIED!";
+        summary.innerHTML = '<span style="color:var(--accent-emerald); font-weight:700;">SUCCESS: 2/2 Passed</span>';
+        document.getElementById('status-practice').classList.add('completed');
+        localStorage.setItem('lesson_0024d_practice', 'done');
+      } else {
+        summary.innerHTML = '<span style="color:var(--accent-rose); font-weight:700;">FAILED: Review Code</span>';
+      }
+
+      logs.innerHTML = logBuffer;
+    }
+  </script>
+</body>
+</html>

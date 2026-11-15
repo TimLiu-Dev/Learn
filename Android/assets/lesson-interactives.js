@@ -32,8 +32,8 @@ function initRunnableExamples() {
           runBtn.disabled = false;
           runBtn.innerHTML = '▶ Run Again';
 
-          // Format simulated terminal output lines
-          const lines = expectedOutput.split('\\n');
+          // Format simulated terminal output lines (supports both real newlines and escaped \n)
+          const lines = expectedOutput.split(/\r?\n|\\n/);
           let formattedHtml = '<div style="color:#71717a; margin-bottom:0.4rem;">$ kotlinc -script snippet.kts</div>';
           lines.forEach(line => {
             let color = '#e4e4e7';
@@ -208,6 +208,18 @@ function initQuizzes() {
 
     const quizData = JSON.parse(widget.getAttribute('data-quiz') || '{}');
     const optionsData = quizData.options || [];
+
+    // Ensure code snippet is rendered if provided in data-quiz JSON
+    const card = widget.querySelector('.quiz-card');
+    const questionEl = widget.querySelector('.quiz-question');
+    if (quizData.code && card && questionEl && !card.querySelector('.quiz-code-block')) {
+      const pre = document.createElement('pre');
+      pre.className = 'quiz-code-block';
+      const codeEl = document.createElement('code');
+      codeEl.textContent = quizData.code;
+      pre.appendChild(codeEl);
+      questionEl.insertAdjacentElement('afterend', pre);
+    }
 
     function resetQuiz() {
       answered = false;

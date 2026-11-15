@@ -253,6 +253,8 @@ for __i, __t in enumerate(__tests):
             __actual = list_to_array(__actual)
         elif isinstance(__actual, TreeNode):
             __actual = tree_to_array(__actual)
+        elif __actual is None and __expected == [] and ("build_list" in __call or "build_tree" in __call):
+            __actual = []
 
         __is_pass = False
         if __comp == "set_or_equal":

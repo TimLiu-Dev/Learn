@@ -37,6 +37,12 @@
   Best practices for versioned SQL migrations, checksums, and expand-and-contract schema evolution.
 - [OpenTelemetry Java & Micrometer Tracing Docs](https://docs.micrometer.io/tracing/reference/)
   W3C `traceparent` propagation, `ObservationRegistry`, SLF4J 2 + Logback, and MDC log correlation.
+- [Spring Modulith & ArchUnit Reference Guides](https://docs.spring.io/spring-modulith/reference/)
+  Domain-driven modular monolith boundaries, transactional `EventPublicationRegistry`, and bytecode architecture tests with [ArchUnit](https://www.archunit.org/).
+- [Spring AI & LangChain4j Reference Documentation](https://docs.spring.io/spring-ai/reference/)
+  Enterprise LLM `ChatClient`, structured `BeanOutputConverter` Java `record` outputs, `PgVectorStore` RAG, and `@Tool` function calling ([LangChain4j](https://docs.langchain4j.dev/)).
+- [Spring gRPC & Spring for GraphQL Reference](https://docs.spring.io/spring-graphql/reference/)
+  Protocol Buffers HTTP/2 RPC (`spring-grpc`) and batched GraphQL DataLoader resolvers (`@BatchMapping`).
 
 ### Optional Tracks: DSA Coding Interviews & Distributed Streaming (Kafka, Spark, Flink)
 - [NeetCode 150 / Roadmap (Java)](https://neetcode.io/roadmap)

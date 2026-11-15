@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kotlin Contracts, @PublishedApi &amp; R8 · Idiomatic Kotlin</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/answers.js"></script>
+<script src="../assets/lesson.js"></script>
+</head>
+<body>
+<main>
+
+<nav class="top">
+  <a href="../index.html">← Course index</a>
+  <a href="../reference/modern-kotlin-tooling.html">Reference: Modern Kotlin &amp; Tooling</a>
+  <a href="../reference/generics.html">Reference: Generics &amp; Reified</a>
+</nav>
+
+<p class="kicker">Section 13 · 2027 Modern Kotlin Track · Lesson 13.4</p>
+<h1>Staff Internals: Kotlin Contracts, <code>@PublishedApi</code> &amp; R8</h1>
+<p class="subtitle">Teaching the compiler smart casts and definite assignment with <code>contract { ... }</code>, exposing <code>inline reified</code> backing fields via <code>@PublishedApi internal</code>, and surviving Android R8 shrinking.</p>
+
+<h2>Warm-up: Rapid Recall</h2>
+<ol class="recall">
+  <li>Why does a standard <code>inline fun &lt;reified T&gt;</code> preserve generic type <code>T</code> at runtime when normal JVM generics erase it?
+    <details><summary>Check</summary>The compiler copies the <code>inline</code> function's bytecode directly into every call site and substitutes the concrete type argument for <code>T</code>.</details></li>
+  <li>Why does <code>kotlinx.serialization</code> survive Android release minification better than reflection-based Gson?
+    <details><summary>Check</summary><code>kotlinx.serialization</code> generates explicit compile-time serializer classes rather than looking up obfuscated field names via runtime reflection.</details></li>
+</ol>
+
+<h2>The Concept: Staff-Level Compiler &amp; Release Mechanics</h2>
+
+<h3>1. Kotlin Contracts: Teaching the Compiler Smart Casts &amp; Definite Assignment</h3>
+<p><span class="sidenote">Ever wondered how Kotlin lets you initialize a <code>val x: Int</code> inside <code>run { x = 42 }</code> or <code>mutex.withLock { x = 42 }</code>? Their stdlib declarations include a <code>callsInPlace(..., EXACTLY_ONCE)</code> contract!</span>Normally, the Kotlin compiler does not inspect the body of functions you call to deduce nullability or how many times a lambda runs. With <code>kotlin.contracts.contract</code>, you give the compiler a verified guarantee:</p>
+<ul>
+  <li><strong><code>callsInPlace(block, InvocationKind.EXACTLY_ONCE)</code></strong>: Tells the compiler that an <code>inline</code> lambda executes exactly once before returning, allowing callers to initialize local <code>val</code> variables inside your lambda!</li>
+  <li><strong><code>returns(true) implies (value != null)</code></strong> (or <code>value is Subtype</code>): Tells the compiler that whenever your validation helper returns <code>true</code>, the argument is guaranteed non-null (or of a specific subtype), unlocking automatic smart casts in the caller's <code>if (...)</code> block!</li>
+</ul>
+
+<code class="kt-run">@file:OptIn(kotlin.contracts.ExperimentalContracts::class)
+import kotlin.contracts.*
+
+inline fun &lt;R&gt; executeOnceInTransaction(block: () -&gt; R): R {
+    contract {
+        callsInPlace(block, InvocationKind.EXACTLY_ONCE)
+    }
+    return block()
+}
+
+fun isValidBearer(header: String?): Boolean {
+    contract {
+        returns(true) implies (header != null)
+    }
+    return !header.isNullOrBlank() &amp;&amp; header.startsWith("Bearer ")
+}
+
+fun main() {
+    // Definite assignment of an uninitialized val inside our custom lambda!
+    val tokenLength: Int
+    executeOnceInTransaction {
+        tokenLength = 17
+    }
+
+    val rawHeader: String? = "Bearer secret_jwt"
+    if (isValidBearer(rawHeader)) {
+        // Smart-cast to non-null String automatically thanks to our contract!
+        println("tx=$tokenLength, bearer=${rawHeader.removePrefix("Bearer ")}")
+    }
+}</code>
+
+<h3>2. <code>@PublishedApi internal</code> &amp; SDK Binary Compatibility</h3>
+<p>When you write a public <code>inline fun &lt;reified T&gt;</code>, its body is copied directly into external caller modules at compile time. Because of this, a public <code>inline</code> function <strong>cannot access <code>private</code> or plain <code>internal</code> properties</strong> of its class. Marking the backing property <code>@PublishedApi internal</code> makes it visible to inlined bytecode while keeping it hidden from normal Kotlin autocomplete:</p>
+
+<code class="kt-run">class TypeSafeStore {
+    @PublishedApi
+    internal val storage = mutableMapOf&lt;String, Any&gt;()
+
+    inline fun &lt;reified T : Any&gt; put(value: T) {
+        storage[T::class.qualifiedName ?: error("Anonymous type")] = value
+    }
+
+    inline fun &lt;reified T : Any&gt; getOrNull(): T? =
+        storage[T::class.qualifiedName] as? T
+}
+
+fun main() {
+    val store = TypeSafeStore()
+    store.put("Android 2027")
+    store.put(2027)
+    println("String=${store.getOrNull&lt;String&gt;()}, Int=${store.getOrNull&lt;Int&gt;()}")
+}</code>
+
+<div class="callout why">
+  <span class="tag">Public API Binary Compatibility Trap</span>
+  <p>Avoid exposing <code>data class</code> in public library APIs that evolve frequently: adding a new property changes the generated <code>copy(...)</code> and <code>componentN()</code> bytecode signatures, breaking compiled binary callers with <code>NoSuchMethodError</code>.</p>
+</div>
+
+<h3>3. Android R8 / ProGuard Shrinking, Obfuscation &amp; Reflection Rules</h3>
+<p>When building an Android release APK/AAB (<code>isMinifyEnabled = true</code>), the <strong>R8</strong> compiler performs three passes:</p>
+<ol>
+  <li><strong>Shrinking (Tree Shaking)</strong>: Removes unreachable classes, methods, and fields.</li>
+  <li><strong>Obfuscation</strong>: Renames classes and fields to short names (<code>UserDto.displayName</code> → <code>a.b</code>) to shrink DEX size.</li>
+  <li><strong>Optimization</strong>: Inlines methods, merges classes, and folds constants.</li>
+</ol>
+<p><strong>Why Reflection Breaks in Release Builds</strong>: If code uses reflection (e.g., <code>Class.forName(...)</code>, JNI native callbacks, or unannotated Gson DTOs matching JSON keys against <code>field.name</code>), R8 either strips the "unused" constructor or renames <code>displayName</code> to <code>a</code>, causing silent <code>null</code> fields or <code>ClassNotFoundException</code> in production! Fix this by:</p>
+<ul>
+  <li>Using compile-time codegen (<code>@Serializable</code> in <code>kotlinx.serialization</code>, Room/Hilt KSP) instead of runtime reflection.</li>
+  <li>Annotating reflection/JNI entry points with <code>@androidx.annotation.Keep</code> (or <code>@SerialName</code> / <code>@SerializedName</code> on wire fields) and shipping library rules in <code>consumer-rules.pro</code>.</li>
+</ul>
+
+<h2>Quick Check</h2>
+<p class="quiz-score"></p>
+
+<div class="quiz" data-answer="b">
+  <p class="q">1. Why does initializing a local <code>val status: String</code> inside a custom higher-order function <code>withTrace { status = "OK" }</code> fail to compile unless <code>withTrace</code> declares a Kotlin Contract?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="Inline lambdas can capture and mutate vars freely; the issue is proving a val is assigned exactly once.">Because <code>inline</code> functions are forbidden from capturing local variables on the stack</button></li>
+    <li><button data-key="b" data-why="Correct: Without callsInPlace(block, InvocationKind.EXACTLY_ONCE), the compiler cannot prove whether the lambda runs zero times (leaving val unassigned) or multiple times (reassigning val).">Because without <code>callsInPlace(..., EXACTLY_ONCE)</code>, the compiler cannot prove the lambda runs once</button></li>
+    <li><button data-key="c" data-why="Contracts are a compile-time static analysis feature and never allocate locks or mutexes.">Because <code>contract</code> automatically wraps the lambda inside a runtime thread lock</button></li>
+    <li><button data-key="d" data-why="Kotlin contracts work on JVM, Android, Native, JS, and Wasm targets alike.">Because definite assignment inside lambdas requires JVM runtime reflection</button></li>
+  </ul>
+  <p class="explain"><code>callsInPlace(block, InvocationKind.EXACTLY_ONCE)</code> proves to the compiler's control-flow graph that the lambda runs synchronously once, making <code>val</code> initialization safe.</p>
+</div>
+
+<div class="quiz" data-answer="d">
+  <p class="q">2. An Android app using reflection-based JSON parsing works in <code>debug</code> builds, but returns <code>null</code> for every field in <code>release</code> builds (<code>isMinifyEnabled = true</code>). What caused this?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="Release builds use the exact same networking permissions declared in AndroidManifest.xml.">Release builds disable internet permissions unless configured in <code>build.gradle.kts</code></button></li>
+    <li><button data-key="b" data-why="Dispatchers.IO behaves identically in debug and release builds.">R8 automatically replaces <code>Dispatchers.IO</code> with main-thread execution</button></li>
+    <li><button data-key="c" data-why="Kotlin data classes generate identical equals/hashCode logic in debug and release builds.">Kotlin strips <code>data class</code> primary constructors when compiling release builds</button></li>
+    <li><button data-key="d" data-why="Correct: R8 obfuscates property names (e.g. userName -&gt; a) and strips unreferenced constructors unless protected by @Serializable, explicit field annotations, or @Keep.">R8 renamed the DTO fields during obfuscation so reflection could no longer match JSON keys</button></li>
+  </ul>
+  <p class="explain">Reflection looks up fields by their runtime bytecode name. When R8 renames <code>userName</code> to <code>a</code>, reflection misses every JSON key unless you use compile-time <code>@Serializable</code> or explicit keep/serial annotations.</p>
+</div>
+
+<div class="quiz" data-answer="a">
+  <p class="q">3. Why does a <code>public inline fun &lt;reified T&gt; resolve(): T</code> fail to compile when it reads a <code>private val registry</code> inside the same class, and what is the idiomatic fix?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="Correct: Because inline copies the function body into external call sites where private members are inaccessible; marking the member @PublishedApi internal exposes it to inlined bytecode safely.">Inlined bytecode runs at external call sites; mark the backing property <code>@PublishedApi internal</code></button></li>
+    <li><button data-key="b" data-why="Removing inline makes reified T illegal to compile.">Remove the <code>inline</code> keyword so <code>reified T</code> can read private fields</button></li>
+    <li><button data-key="c" data-why="@JvmOverloads only generates default-argument method overloads.">Annotate the <code>private val</code> with <code>@JvmOverloads</code> to generate synthetic accessors</button></li>
+    <li><button data-key="d" data-why="@DslMarker restricts implicit outer receivers in lambdas and has no effect on visibility.">Annotate the enclosing class with <code>@DslMarker</code> to open private fields</button></li>
+  </ul>
+  <p class="explain"><code>@PublishedApi internal</code> allows public <code>inline</code> functions to reference internal implementation details without exposing them as part of the public source autocomplete API.</p>
+</div>
+
+<h2>Practice: Hands-On Exercises</h2>
+
+<section class="exercise">
+  <span class="type">Exercise 1 · Write from blank</span>
+  <h3>Contract-Powered Guard, Single-Init Scope &amp; <code>@PublishedApi</code> Registry</h3>
+  <p>Implement three Staff-level utilities above <code>main</code> so that <code>main</code> compiles and passes all checks:</p>
+  <ol>
+    <li><code>fun isValidApiKey(raw: String?): Boolean</code> with <code>contract { returns(true) implies (raw != null) }</code> that returns <code>true</code> when <code>!raw.isNullOrBlank() &amp;&amp; raw.startsWith("ak_")</code>.</li>
+    <li><code>inline fun &lt;R&gt; runCriticalStep(block: () -&gt; R): R</code> with <code>contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }</code> that invokes and returns <code>block()</code>.</li>
+    <li><code>class ServiceRegistry</code> holding <code>@PublishedApi internal val services = mutableMapOf&lt;String, Any&gt;()</code> with <code>inline fun &lt;reified T : Any&gt; register(instance: T)</code> and <code>inline fun &lt;reified T : Any&gt; resolve(): T</code> (storing and retrieving by <code>T::class.qualifiedName!!</code>).</li>
+  </ol>
+  <code class="kt-run">@file:OptIn(kotlin.contracts.ExperimentalContracts::class)
+import kotlin.contracts.*
+
+// Write isValidApiKey, runCriticalStep, and ServiceRegistry above main:
+
+fun main() {
+    val initializedOnce: String
+    runCriticalStep {
+        initializedOnce = "bootstrapped"
+    }
+    check(initializedOnce == "bootstrapped")
+
+    val candidate: String? = "ak_live_900"
+    val suffix = if (isValidApiKey(candidate)) {
+        // Smart cast to non-null String works ONLY when contract is present!
+        candidate.removePrefix("ak_")
+    } else {
+        "invalid"
+    }
+    check(suffix == "live_900")
+    check(!isValidApiKey(null))
+    check(!isValidApiKey("bad_key"))
+
+    val registry = ServiceRegistry()
+    registry.register("AuthModule")
+    registry.register(42)
+    check(registry.resolve&lt;String&gt;() == "AuthModule")
+    check(registry.resolve&lt;Int&gt;() == 42)
+    println("Contracts &amp; @PublishedApi verified: $initializedOnce/$suffix")
+}</code>
+  <ul class="checklist">
+    <li><label><input type="checkbox"><span>Added <code>returns(true) implies (raw != null)</code> contract to <code>isValidApiKey</code></span></label></li>
+    <li><label><input type="checkbox"><span>Added <code>callsInPlace(block, InvocationKind.EXACTLY_ONCE)</code> contract to <code>runCriticalStep</code></span></label></li>
+    <li><label><input type="checkbox"><span>Used <code>@PublishedApi internal</code> on <code>services</code> inside <code>ServiceRegistry</code></span></label></li>
+  </ul>
+  <details class="hint"><summary>Hint 1: Writing both contracts</summary>Place <code>contract { ... }</code> as the very first statement inside <code>isValidApiKey</code> and <code>runCriticalStep</code>.</details>
+  <details class="hint"><summary>Hint 2: Reified ServiceRegistry</summary>Use <code>val key = T::class.qualifiedName ?: error("Unnamed")</code> inside both <code>register</code> and <code>resolve</code>, casting with <code>services[key] as T</code>.</details>
+</section>
+
+<section class="exercise">
+  <span class="type">Exercise 2 · Refactor</span>
+  <h3>Replace <code>var</code> / <code>!!</code> Workarounds with Contracts &amp; <code>reified</code></h3>
+  <p>This utility file forces callers to use mutable <code>var</code> placeholders, unsafe <code>!!</code> assertions, and verbose <code>Class&lt;T&gt;</code> arguments. Refactor <code>traceSection</code> and <code>hasValidPrefix</code> to declare Kotlin Contracts, and refactor <code>CodecBox.find</code> into an <code>inline fun &lt;reified T : Any&gt; find(): T?</code> backed by <code>@PublishedApi internal val map</code>.</p>
+  <code class="kt-run">@file:OptIn(kotlin.contracts.ExperimentalContracts::class)
+import kotlin.contracts.*
+
+// REFACTOR 1: Add callsInPlace(block, InvocationKind.EXACTLY_ONCE) contract
+inline fun &lt;R&gt; traceSection(label: String, block: () -&gt; R): R {
+    return block()
+}
+
+// REFACTOR 2: Add returns(true) implies (input != null) contract
+fun hasValidPrefix(input: String?): Boolean {
+    return input != null &amp;&amp; input.startsWith("kt:")
+}
+
+// REFACTOR 3: Expose @PublishedApi internal val map and inline fun &lt;reified T : Any&gt; find(): T?
+class CodecBox {
+    @PublishedApi
+    internal val map = mutableMapOf&lt;String, Any&gt;("kotlin.String" to "KotlinCodec", "kotlin.Int" to 99)
+
+    fun &lt;T : Any&gt; find(clazz: Class&lt;T&gt;): T? = map[clazz.canonicalName] as? T
+}
+
+fun main() {
+    val outcome: String
+    traceSection("init") {
+        outcome = "traced"
+    }
+
+    val raw: String? = "kt:2027"
+    val extracted = if (hasValidPrefix(raw)) raw.substringAfter("kt:") else "none"
+
+    val box = CodecBox()
+    val strCodec: String? = box.find&lt;String&gt;()
+    val intCodec: Int? = box.find&lt;Int&gt;()
+    check(outcome == "traced" &amp;&amp; extracted == "2027" &amp;&amp; strCodec == "KotlinCodec" &amp;&amp; intCodec == 99)
+    println("Refactored contracts &amp; reified lookup: $outcome $extracted $strCodec")
+}</code>
+  <ul class="checklist">
+    <li><label><input type="checkbox"><span>Added <code>callsInPlace(block, InvocationKind.EXACTLY_ONCE)</code> to <code>traceSection</code> so <code>val outcome: String</code> compiles</span></label></li>
+    <li><label><input type="checkbox"><span>Added <code>returns(true) implies (input != null)</code> to <code>hasValidPrefix</code> so <code>raw.substringAfter</code> smart-casts cleanly</span></label></li>
+    <li><label><input type="checkbox"><span>Replaced <code>find(clazz: Class&lt;T&gt;)</code> with <code>inline fun &lt;reified T : Any&gt; find(): T? = map[T::class.qualifiedName] as? T</code></span></label></li>
+  </ul>
+  <details class="hint"><summary>Hint</summary>In <code>traceSection</code>, add <code>contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }</code>. In <code>hasValidPrefix</code>, add <code>contract { returns(true) implies (input != null) }</code>. In <code>CodecBox</code>, change <code>find</code> to <code>inline fun &lt;reified T : Any&gt; find(): T? = map[T::class.qualifiedName] as? T</code>.</details>
+</section>
+
+<div class="source">
+  <span class="tag">Primary source</span>
+  <p><a href="https://kotlinlang.org/docs/whatsnew13.html#contracts">Kotlin Docs: Contracts</a>, <a href="https://kotlinlang.org/api/core/kotlin-stdlib/kotlin/-published-api/">@PublishedApi</a>, and <a href="https://developer.android.com/build/shrink-code">Android Developers: Shrink, obfuscate, and optimize your app with R8</a>.</p>
+</div>
+
+<div class="ask">
+  <span class="tag">Stuck or curious?</span>
+  <p>Ask your teacher in the workspace: “Why can't Kotlin Contracts currently validate arbitrary arithmetic expressions, and what happens if a library author writes a lying contract?”</p>
+</div>
+
+<nav class="lesson-nav">
+  <a href="0068-gradle-kts-serialization-interop.html">← 13.3 Gradle Kotlin DSL, Serialization &amp; Interop</a>
+  <a href="0070-review-2027-android-mastery.html">13.R 2027 Android Mastery Review →</a>
+</nav>
+
+</main>
+</body>
+</html>

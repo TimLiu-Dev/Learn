@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0046 — CloudWatch Logs Insights, Alarms, X-Ray/ADOT Tracing &amp; Operational Runbooks</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0046</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0046-cloudwatch-xray-synthetics-runbooks.html" class="active">Lesson 0046</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.8</span>
+      <span class="pill">Observability &amp; Ops</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>CloudWatch Logs Insights, Alarms, X-Ray/ADOT Tracing &amp; Operational Runbooks</h1>
+    <p class="lead">
+      When an incident hits production at 2:00 AM, senior engineers do not SSH into containers to tail text files. They query structured JSON logs with CloudWatch Logs Insights, trust composite alarms tuned against missing-data false positives, isolate tail latency using distributed X-Ray/ADOT flame graphs, and execute pre-written runbooks.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android Studio, you filter one device's <strong>Logcat</strong> stream by tag and inspect CPU/network flame charts in <strong>Android Profiler</strong> or Perfetto. In AWS, millions of concurrent requests interleave across API Gateway, Lambda/ECS, DynamoDB, and SQS. <strong>CloudWatch Logs Insights</strong> is your distributed, SQL-like Logcat; <strong>Composite Alarms</strong> replace noisy single-threshold alerts; <strong>AWS X-Ray / ADOT</strong> is your cross-service Profiler tied together by trace headers; and <strong>Runbooks + Synthetics Canaries</strong> ensure the on-call engineer mitigates failures in minutes rather than guessing under pressure.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Structured Logging, EMF &amp; CloudWatch Logs Insights</h2>
+        <p>
+          Plain-text <code>console.log</code> strings (<code>"Order 991 failed in 420ms"</code>) break down at cloud scale because regex parsing is slow and fragile. Senior AWS services emit <strong>single-line JSON</strong> containing stable correlation fields: <code>timestamp</code>, <code>level</code>, <code>service</code>, <code>route</code>, <code>statusCode</code>, <code>durationMs</code>, <code>requestId</code>, and <code>traceId</code>.
+        </p>
+        <p>
+          According to the <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html" target="_blank" rel="noopener">CloudWatch Logs Insights query syntax</a>, CloudWatch automatically discovers JSON fields in log events, letting you run interactive aggregations in seconds:
+        </p>
+        <ul>
+          <li><strong><code>fields</code> &amp; <code>filter</code>:</strong> Project only needed columns and prune early (e.g., <code>filter statusCode &gt;= 500</code>).</li>
+          <li><strong><code>stats pct(durationMs, 99) as p99</code>:</strong> Compute p50/p95/p99 latency per route instead of misleading averages.</li>
+          <li><strong><code>bin(1m)</code>:</strong> Bucket counts and percentiles into time series to pinpoint the exact deployment minute a regression started.</li>
+          <li><strong>Cost &amp; Speed Trap:</strong> Logs Insights bills per <strong>GB of log data scanned</strong>. Always narrow your time window, query specific log groups (never wildcard every service), and avoid dumping multi-kilobyte request/response bodies into standard logs.</li>
+        </ul>
+
+        <div class="callout warning">
+          <div class="callout-title">Embedded Metric Format (EMF) vs. Synchronous PutMetricData</div>
+          <p style="margin: 0;">
+            Never call the CloudWatch <code>PutMetricData</code> API synchronously inside an API request path—it adds network latency and hits API throttling quotas during traffic spikes. Instead, print <strong>CloudWatch Embedded Metric Format (EMF)</strong> JSON to <code>stdout</code>. The Lambda runtime or CloudWatch Agent extracts custom metrics asynchronously with zero request latency, while retaining full-resolution JSON logs. Also keep metric dimensions low-cardinality (e.g., <code>route</code> and <code>tenantTier</code>, never <code>userId</code> or <code>orderId</code>), because each unique dimension combination creates a separate billable custom metric.
+          </p>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. CloudWatch Alarms, M-of-N Evaluation &amp; Composite Alarms</h2>
+        <p>
+          Naive alarms trigger false pages whenever one container restarts or traffic drops overnight. Production alarming relies on four tuning levers documented in the <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html" target="_blank" rel="noopener">CloudWatch Alarms configuration guide</a>:
+        </p>
+        <ol>
+          <li><strong>Percentile Statistics (<code>p99</code> / <code>p95</code>) over <code>Average</code>:</strong> An endpoint serving 99% of requests in 40 ms and 1% in 8,000 ms reports an <code>Average</code> of ~120 ms—hiding a severe tail-latency outage.</li>
+          <li><strong>M-of-N Evaluation (<code>DatapointsToAlarm</code> / <code>EvaluationPeriods</code>):</strong> Requiring <code>3 out of 5</code> consecutive 1-minute periods absorbs transient 60-second blips (such as rolling ECS task replacements) while still paging within 3 minutes of a sustained outage.</li>
+          <li><strong><code>TreatMissingData</code> Semantics:</strong> Sparse metrics (like <code>Lambda Errors</code> or <code>ALB HTTPCode_Target_5XX_Count</code>) emit <em>nothing</em> when zero errors occur. Setting <code>notBreaching</code> treats silent minutes as <code>0</code> errors; leaving <code>missing</code> can stall in <code>INSUFFICIENT_DATA</code>, while <code>breaching</code> will page you at 3:00 AM simply because traffic stopped. Conversely, use <code>breaching</code> for <strong>heartbeat / Synthetics canary</strong> metrics where silence means the probe died.</li>
+          <li><strong>Composite Alarms:</strong> Combine multiple underlying metric alarms using boolean expressions (<code>ALARM(High5xxRate) AND ALARM(HighRequestVolume)</code>) via <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Create_Composite_Alarm.html" target="_blank" rel="noopener">CloudWatch Composite Alarms</a>. That stops an isolated single-user retry loop (100% error rate on 2 requests/min) from waking the primary on-call engineer.</li>
+        </ol>
+
+        <!-- SECTION 3 -->
+        <h2>3. Distributed Tracing: X-Ray, ADOT &amp; Context Propagation</h2>
+        <p>
+          When an Android request takes 1,450 ms across five microservices, logs alone only show isolated timestamps. Distributed tracing links every hop into a single causal tree using a trace header—either AWS X-Ray's <code>X-Amzn-Trace-Id</code> (e.g., <code>Root=1-6736a1b2-...;Parent=53995c3f...;Sampled=1</code>) or the W3C standard <code>traceparent</code> supported by <strong>AWS Distro for OpenTelemetry (ADOT)</strong>.
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 250" width="100%" height="auto" role="img" aria-label="X-Ray and ADOT Distributed Trace Waterfall">
+            <rect x="0" y="0" width="680" height="250" fill="#fdfcf8" rx="6" />
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">X-Ray / ADOT Trace Waterfall (Total Trace = 1,420 ms &middot; TraceId: 1-6736a1b2-9f0c...)</text>
+
+            <!-- Header timeline -->
+            <line x1="180" y1="44" x2="655" y2="44" stroke="#c2b9a7" stroke-width="1" />
+            <text x="180" y="40" font-family="monospace" font-size="10" fill="#575c66">0ms</text>
+            <text x="340" y="40" font-family="monospace" font-size="10" fill="#575c66">500ms</text>
+            <text x="500" y="40" font-family="monospace" font-size="10" fill="#575c66">1,000ms</text>
+            <text x="625" y="40" font-family="monospace" font-size="10" fill="#575c66">1,420ms</text>
+
+            <!-- Row 1: Android -> API GW -->
+            <text x="16" y="72" font-family="monospace" font-size="11" fill="#1b1d21">1. API Gateway</text>
+            <rect x="180" y="56" width="470" height="22" rx="3" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="188" y="71" font-family="monospace" font-size="10" fill="#0f4c81">Segment: 1,420 ms (self: 40 ms)</text>
+
+            <!-- Row 2: Lambda Checkout -->
+            <text x="16" y="106" font-family="monospace" font-size="11" fill="#1b1d21">2. Lambda: Checkout</text>
+            <rect x="195" y="90" width="440" height="22" rx="3" fill="#dcfce7" stroke="#166534" />
+            <text x="203" y="105" font-family="monospace" font-size="10" fill="#166534">Segment: 1,350 ms (self: 120 ms)</text>
+
+            <!-- Row 3: DynamoDB Subsegment (Bottleneck) -->
+            <text x="16" y="140" font-family="monospace" font-size="11" fill="#991b1b">3. Sub: DynamoDB Scan</text>
+            <rect x="215" y="124" width="335" height="22" rx="3" fill="#fee2e2" stroke="#991b1b" />
+            <text x="223" y="139" font-family="monospace" font-size="10" fill="#991b1b">Subsegment: 1,030 ms (BOTTLENECK: 72.5% exclusive)</text>
+
+            <!-- Row 4: Stripe HTTP Subsegment -->
+            <text x="16" y="174" font-family="monospace" font-size="11" fill="#b45309">4. Sub: Payment API</text>
+            <rect x="554" y="158" width="66" height="22" rx="3" fill="#fef3c7" stroke="#b45309" />
+            <text x="560" y="173" font-family="monospace" font-size="10" fill="#b45309">200 ms</text>
+
+            <!-- Row 5: SQS Async -->
+            <text x="16" y="208" font-family="monospace" font-size="11" fill="#575c66">5. SQS -&gt; ReceiptFn</text>
+            <rect x="622" y="192" width="36" height="22" rx="3" fill="#f5f2ea" stroke="#575c66" stroke-dasharray="3 2" />
+            <text x="200" y="232" font-family="sans-serif" font-size="11" fill="#575c66">Propagate traceparent/X-Amzn-Trace-Id across SQS attributes so ReceiptFn links here instead of starting an orphan trace.</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Inclusive vs. exclusive time in an <a href="https://docs.aws.amazon.com/xray/latest/devguide/xray-concepts.html" target="_blank" rel="noopener">AWS X-Ray trace</a>. Even though Lambda Checkout reports 1,350 ms total duration, 1,230 ms belongs to child subsegments; DynamoDB's 1,030 ms exclusive self-time is the true bottleneck.
+          </div>
+        </div>
+
+        <p>
+          Two architectural rules govern distributed tracing in production:
+        </p>
+        <ul>
+          <li><strong>Inclusive vs. Exclusive (Self) Time:</strong> A parent segment's duration includes its own CPU work <em>plus</em> every synchronous child subsegment. Always rank bottlenecks by <strong>exclusive time</strong> (<code>segment.durationMs - sum(directChild.durationMs)</code>) so you fix the slow DynamoDB query rather than blindly bumping Lambda memory.</li>
+          <li><strong>Sampling &amp; Async Propagation:</strong> X-Ray's default sampling rule records <strong>1 request per second plus 5%</strong> of additional requests to control cost. Use ADOT Collector tail-sampling (or explicit error/slow-path rules) to capture 100% of 5xx errors, and propagate trace headers into SQS message attributes or EventBridge metadata so asynchronous consumers attach as linked spans.</li>
+        </ul>
+
+        <!-- SECTION 4 -->
+        <h2>4. Production Examples: Logs Insights, CDK Composite Alarm &amp; ADOT</h2>
+        <p>
+          Below is a real operational pair: (1) a CloudWatch Logs Insights query that surfaces slow p99 endpoints alongside sample <code>traceId</code>s for immediate X-Ray lookup, and (2) an AWS CDK TypeScript definition combining an error-rate alarm and a minimum-traffic gate into one composite pager alarm with a direct runbook link.
+        </p>
+<pre><code># 1. CloudWatch Logs Insights — Find slow p99 routes &amp; grab a sample traceId for X-Ray
+fields @timestamp, route, statusCode, durationMs, traceId
+| filter service = "checkout-api" and statusCode &gt;= 200
+| stats count() as reqs,
+        pct(durationMs, 95) as p95Ms,
+        pct(durationMs, 99) as p99Ms,
+        earliest(traceId) as sampleTrace
+  by route, bin(5m)
+| filter p99Ms &gt; 800
+| sort p99Ms desc
+| limit 20</code></pre>
+
+<pre><code>// 2. AWS CDK (TypeScript) — Composite Alarm eliminating 3 AM low-traffic false pages
+import * as cw from "aws-cdk-lib/aws-cloudwatch";
+import * as actions from "aws-cdk-lib/aws-cloudwatch-actions";
+import { Duration } from "aws-cdk-lib";
+
+const high5xxAlarm = new cw.Alarm(this, "CheckoutHigh5xx", {
+  metric: apiErrorRateMetric, // 5xx / TotalRequests * 100
+  threshold: 2.0,
+  comparisonOperator: cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
+  evaluationPeriods: 5,
+  datapointsToAlarm: 3, // 3-of-5 M-of-N dampens single-minute spikes
+  treatMissingData: cw.TreatMissingData.NOT_BREACHING,
+});
+
+const meaningfulTrafficAlarm = new cw.Alarm(this, "CheckoutActiveTraffic", {
+  metric: apiRequestCountMetric.with({ statistic: "Sum", period: Duration.minutes(1) }),
+  threshold: 50,
+  comparisonOperator: cw.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+  evaluationPeriods: 5,
+  datapointsToAlarm: 3,
+  treatMissingData: cw.TreatMissingData.NOT_BREACHING,
+});
+
+const pagerComposite = new cw.CompositeAlarm(this, "CheckoutUserImpactPager", {
+  compositeAlarmName: "PROD-Checkout-UserImpact-Sev2",
+  alarmDescription: "Runbook: https://internal.example.com/runbooks/checkout-5xx-sev2",
+  alarmRule: cw.AlarmRule.allOf(
+    cw.AlarmRule.fromAlarm(high5xxAlarm, cw.AlarmState.ALARM),
+    cw.AlarmRule.fromAlarm(meaningfulTrafficAlarm, cw.AlarmState.ALARM)
+  ),
+});
+pagerComposite.addAlarmAction(new actions.SnsAction(onCallPagerTopic));</code></pre>
+
+        <!-- SECTION 5 -->
+        <h2>5. Actionable On-Call Runbooks &amp; CloudWatch Synthetics</h2>
+        <p>
+          An alarm without a runbook is just noise. Following the <a href="https://aws.amazon.com/builders-library/instrumenting-distributed-systems-for-operational-visibility/" target="_blank" rel="noopener">Amazon Builders' Library guidance on operational visibility</a>, every paging composite alarm must embed a direct URL to a version-controlled runbook containing four sections:
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 24%;">Runbook Section</th>
+              <th style="width: 44%;">Required Operational Content</th>
+              <th style="width: 32%;">Anti-Pattern to Avoid</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1. Impact &amp; Severity</strong></td>
+              <td>User-facing symptom (e.g., Android checkout fails with 503), SLO burn rate, and customer communication threshold.</td>
+              <td>Vague CPU/memory metrics with no explanation of user impact.</td>
+            </tr>
+            <tr>
+              <td><strong>2. Triage Queries</strong></td>
+              <td>Copy-paste Logs Insights query, CloudWatch dashboard deep-link, and X-Ray service map filter.</td>
+              <td>Forcing a sleepy engineer to recall log group names and JSON field keys.</td>
+            </tr>
+            <tr>
+              <td><strong>3. Safe Mitigations</strong></td>
+              <td>Pre-approved levers: CodeDeploy rollback, AppConfig feature flag off, Route 53 weight shift, or ASG scale-out.</td>
+              <td>Ad-hoc database edits or unreviewed manual EC2/container mutations.</td>
+            </tr>
+            <tr>
+              <td><strong>4. Verify &amp; Escalate</strong></td>
+              <td>Exact recovery criteria (e.g., canary passes 3 consecutive runs + p99 &lt; 400 ms) and secondary escalation path.</td>
+              <td>Closing an incident before synthetic probes and error budgets stabilize.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          Pair real-user metrics with <strong>CloudWatch Synthetics Canaries</strong> (scheduled Node.js/Python scripts hitting critical login and checkout paths every 1–5 minutes). Because canaries run even at 4:00 AM with zero organic mobile users, set their alarm <code>TreatMissingData</code> to <code>breaching</code> so a broken deployment or expired TLS cert is caught <em>before</em> morning commuters open the app.
+        </p>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement three core observability engine functions: <code>evaluateAlarmState(alarm)</code> (M-of-N + <code>treatMissingData</code> semantics), <code>evaluateCompositeAlarm(alarms, operator)</code> (<code>AND</code>/<code>OR</code> boolean logic), and <code>findTraceBottleneck(segments)</code> (computing exclusive self-time across an X-Ray/ADOT segment tree).
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Apply these production observability rules to realistic AWS incident scenarios. Every option is followed by immediate feedback explaining why the correct choice works and why each alternative fails.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCES -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Logs Insights:</strong> <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html" target="_blank" rel="noopener">Amazon CloudWatch Logs Insights Query Syntax</a> &amp; <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html" target="_blank" rel="noopener">Embedded Metric Format (EMF) Specification</a>.
+          </li>
+          <li>
+            <strong>Alarms &amp; Composites:</strong> <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html" target="_blank" rel="noopener">Using Amazon CloudWatch Alarms (Missing Data &amp; M-of-N)</a> &amp; <a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Create_Composite_Alarm.html" target="_blank" rel="noopener">Creating a Composite Alarm</a>.
+          </li>
+          <li>
+            <strong>Tracing &amp; OpenTelemetry:</strong> <a href="https://docs.aws.amazon.com/xray/latest/devguide/xray-concepts.html" target="_blank" rel="noopener">AWS X-Ray Concepts (Segments, Subsegments &amp; Sampling)</a> &amp; <a href="https://aws-otel.github.io/docs/introduction" target="_blank" rel="noopener">AWS Distro for OpenTelemetry (ADOT) Documentation</a>.
+          </li>
+          <li>
+            <strong>Builders' Library:</strong> <a href="https://aws.amazon.com/builders-library/instrumenting-distributed-systems-for-operational-visibility/" target="_blank" rel="noopener">Instrumenting Distributed Systems for Operational Visibility</a> — David Yanacek.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0047 (Senior FinOps &amp; Disaster Recovery)</strong>, test your intuition—for example: <em>"How does multi-window SLO error-budget burn-rate alarming improve on static threshold alarms?"</em> or <em>"When should my Android OkHttp interceptor generate vs. strip W3C traceparent headers?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0045-waf-shield-guardduty-cloudtrail.html">&larr; Lesson 0045: Edge & Account Defense: AWS WAF, Shield, GuardDuty, CloudTrail & Security Hub</a>
+          <a href="./0047-finops-dr-rpo-rto-fis-wafr.html">Lesson 0047: Senior FinOps & Disaster Recovery: Cost Guardrails, RPO/RTO Tiers & Chaos Engineering &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>High-Cardinality Log Trap</strong>
+          Put high-cardinality IDs like <code>userId</code> or <code>orderId</code> in JSON <em>log fields</em> (for Logs Insights queries), never in CloudWatch Metric <em>dimensions</em>—otherwise custom metric billing explodes exponentially.
+        </div>
+        <div class="sidenote">
+          <strong>X-Ray vs. ADOT in 2027</strong>
+          Legacy X-Ray SDKs are in maintenance mode in favor of <strong>OpenTelemetry (ADOT)</strong>, which instruments your Kotlin/Node/Go code once using W3C <code>traceparent</code> and exports directly to CloudWatch Application Signals &amp; X-Ray.
+        </div>
+        <div class="sidenote">
+          <strong>Page on Symptoms, Ticket on Causes</strong>
+          Page humans only on user-visible symptoms (elevated 5xx rate, p99 SLO breach, failing Synthetics canary). Route single-instance CPU or queue-depth warnings to tickets or dashboards.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0046",
+      title: "Lab 0046: CloudWatch Composite Alarm & X-Ray Bottleneck Analyzer",
+      filename: "observability-analyzer.js",
+      description:
+        "Implement three functions:<br>(1) <code>evaluateAlarmState(alarm)</code>: Slice the last <code>alarm.evaluationPeriods</code> points from <code>alarm.datapoints</code> (<code>Array&lt;number|null&gt;</code>). If all points in the window are <code>null</code>: return <code>\"ALARM\"</code> if <code>treatMissingData === \"breaching\"</code>, <code>\"OK\"</code> if <code>\"notBreaching\"</code>, else <code>\"INSUFFICIENT_DATA\"</code>. Otherwise count breaching points: numeric values breach via <code>comparison === \"GT\" ? v &gt; threshold : v &gt;= threshold</code>; <code>null</code> points breach only when <code>treatMissingData === \"breaching\"</code>. Return <code>breaches &gt;= datapointsToAlarm ? \"ALARM\" : \"OK\"</code>.<br>(2) <code>evaluateCompositeAlarm(alarms, operator)</code>: Evaluate each alarm by name into <code>alarmStates</code> and collect <code>firingAlarms</code> (those in <code>\"ALARM\"</code>). For <code>\"AND\"</code>: <code>\"ALARM\"</code> if all are <code>\"ALARM\"</code>, <code>\"OK\"</code> if any is <code>\"OK\"</code>, else <code>\"INSUFFICIENT_DATA\"</code>. For <code>\"OR\"</code>: <code>\"ALARM\"</code> if any is <code>\"ALARM\"</code>, <code>\"INSUFFICIENT_DATA\"</code> if any is <code>\"INSUFFICIENT_DATA\"</code>, else <code>\"OK\"</code>.<br>(3) <code>findTraceBottleneck(segments)</code>: Given nodes <code>{ id, service, operation, durationMs, parentId, fault }</code>, compute each node's <code>exclusiveMs = Math.max(0, durationMs - sum(directChildren.durationMs))</code>. Find <code>totalTraceMs</code> (max <code>durationMs</code> of nodes with <code>parentId === null</code>), pick the node with highest <code>exclusiveMs</code> (tie-break: <code>fault === true</code> first, then earliest), compute <code>bottleneckSharePct</code> rounded to 1 decimal, and collect unique <code>faultServices</code>.",
+      exports: ["evaluateAlarmState", "evaluateCompositeAlarm", "findTraceBottleneck"],
+      starterCode: `function evaluateAlarmState(alarm) {
+  // alarm: { name, datapoints, threshold, comparison: "GT"|"GTE", evaluationPeriods, datapointsToAlarm, treatMissingData }
+  const windowPoints = alarm.datapoints.slice(-alarm.evaluationPeriods);
+  // TODO 1: handle all-null window based on alarm.treatMissingData ("breaching", "notBreaching", "missing", "ignore")
+
+  // TODO 2: count breaching points (numeric comparisons + null when treatMissingData === "breaching")
+  return "OK";
+}
+
+function evaluateCompositeAlarm(alarms, operator) {
+  // operator: "AND" | "OR"
+  const alarmStates = {};
+  const firingAlarms = [];
+  // TODO 3: evaluate every alarm, populate alarmStates & firingAlarms, then compute composite state ("ALARM" | "OK" | "INSUFFICIENT_DATA")
+
+  return { state: "OK", alarmStates, firingAlarms };
+}
+
+function findTraceBottleneck(segments) {
+  // segments: [{ id, service, operation, durationMs, parentId, fault }]
+  // TODO 4: sum direct children per parentId, compute exclusiveMs = max(0, durationMs - childSum)
+  // TODO 5: find totalTraceMs (max durationMs among parentId === null), pick max exclusiveMs bottleneck,
+  //         compute bottleneckSharePct (1 decimal), and list unique faultServices
+  return {
+    totalTraceMs: 0,
+    bottleneckId: "",
+    bottleneckService: "",
+    bottleneckOperation: "",
+    exclusiveMs: 0,
+    bottleneckSharePct: 0,
+    faultServices: []
+  };
+}
+
+console.log(
+  "Sample composite:",
+  evaluateCompositeAlarm(
+    [
+      { name: "High5xx", datapoints: [0.5, 3.1, 4.0, 2.8], threshold: 2.0, comparison: "GT", evaluationPeriods: 4, datapointsToAlarm: 3, treatMissingData: "notBreaching" },
+      { name: "HighTraffic", datapoints: [null, null, null], threshold: 50, comparison: "GTE", evaluationPeriods: 3, datapointsToAlarm: 2, treatMissingData: "notBreaching" }
+    ],
+    "AND"
+  )
+);`,
+      hints: [
+        "In <code>evaluateAlarmState</code>, check <code>windowPoints.length === 0 || windowPoints.every((v) =&gt; v === null || v === undefined)</code> first. For mixed windows, treat each <code>null</code> as breaching only when <code>alarm.treatMissingData === \"breaching\"</code>.",
+        "In <code>evaluateCompositeAlarm</code>, notice short-circuiting: in <code>AND</code> logic, a single <code>\"OK\"</code> makes the whole expression <code>\"OK\"</code> even if another alarm is <code>\"INSUFFICIENT_DATA\"</code>. In <code>OR</code> logic, a single <code>\"ALARM\"</code> makes the whole expression <code>\"ALARM\"</code>.",
+        "In <code>findTraceBottleneck</code>, build a <code>childrenSumById</code> map by iterating over all segments where <code>seg.parentId !== null</code> and adding <code>seg.durationMs</code> to <code>childrenSumById[seg.parentId]</code>. Then <code>exclusiveMs = Math.max(0, seg.durationMs - (childrenSumById[seg.id] || 0))</code>."
+      ],
+      solutionExplanation:
+        "CloudWatch evaluates the most recent N periods, applies treatMissingData rules before comparing against DatapointsToAlarm, and propagates boolean short-circuits in composite rules. In distributed X-Ray/ADOT traces, subtracting direct child durations reveals exclusive self-time so parent orchestration wrappers do not mask the real downstream bottleneck.",
+      solutionCode: `function evaluateAlarmState(alarm) {
+  const windowPoints = alarm.datapoints.slice(-alarm.evaluationPeriods);
+  const allMissing =
+    windowPoints.length === 0 ||
+    windowPoints.every((v) => v === null || v === undefined);
+
+  if (allMissing) {
+    if (alarm.treatMissingData === "breaching") return "ALARM";
+    if (alarm.treatMissingData === "notBreaching") return "OK";
+    return "INSUFFICIENT_DATA";
+  }
+
+  let breaches = 0;
+  for (const point of windowPoints) {
+    if (point === null || point === undefined) {
+      if (alarm.treatMissingData === "breaching") {
+        breaches += 1;
+      }
+      continue;
+    }
+    const isBreach =
+      alarm.comparison === "GT"
+        ? point > alarm.threshold
+        : point >= alarm.threshold;
+    if (isBreach) {
+      breaches += 1;
+    }
+  }
+
+  return breaches >= alarm.datapointsToAlarm ? "ALARM" : "OK";
+}
+
+function evaluateCompositeAlarm(alarms, operator) {
+  const alarmStates = {};
+  const firingAlarms = [];
+  let hasOk = false;
+  let hasAlarm = false;
+  let hasInsufficient = false;
+
+  for (const alarm of alarms) {
+    const st = evaluateAlarmState(alarm);
+    alarmStates[alarm.name] = st;
+    if (st === "ALARM") {
+      hasAlarm = true;
+      firingAlarms.push(alarm.name);
+    } else if (st === "OK") {
+      hasOk = true;
+    } else {
+      hasInsufficient = true;
+    }
+  }
+
+  let state = "OK";
+  if (operator === "AND") {
+    if (alarms.length > 0 && !hasOk && !hasInsufficient) {
+      state = "ALARM";
+    } else if (hasOk) {
+      state = "OK";
+    } else {
+      state = "INSUFFICIENT_DATA";
+    }
+  } else if (operator === "OR") {
+    if (hasAlarm) {
+      state = "ALARM";
+    } else if (hasInsufficient) {
+      state = "INSUFFICIENT_DATA";
+    } else {
+      state = "OK";
+    }
+  }
+
+  return { state, alarmStates, firingAlarms };
+}
+
+function findTraceBottleneck(segments) {
+  const childSumById = {};
+  for (const seg of segments) {
+    if (seg.parentId !== null && seg.parentId !== undefined) {
+      childSumById[seg.parentId] = (childSumById[seg.parentId] || 0) + seg.durationMs;
+    }
+  }
+
+  let totalTraceMs = 0;
+  for (const seg of segments) {
+    if (seg.parentId === null || seg.parentId === undefined) {
+      if (seg.durationMs > totalTraceMs) {
+        totalTraceMs = seg.durationMs;
+      }
+    }
+  }
+
+  const faultServices = [];
+  const seenFault = new Set();
+  let best = null;
+  let bestExclusive = -1;
+
+  for (const seg of segments) {
+    if (seg.fault && !seenFault.has(seg.service)) {
+      seenFault.add(seg.service);
+      faultServices.push(seg.service);
+    }
+
+    const exclusiveMs = Math.max(0, seg.durationMs - (childSumById[seg.id] || 0));
+    const isBetter =
+      best === null ||
+      exclusiveMs > bestExclusive ||
+      (exclusiveMs === bestExclusive && Boolean(seg.fault) && !Boolean(best.fault));
+
+    if (isBetter) {
+      best = seg;
+      bestExclusive = exclusiveMs;
+    }
+  }
+
+  const bottleneckSharePct =
+    totalTraceMs > 0 ? Math.round((bestExclusive / totalTraceMs) * 1000) / 10 : 0;
+
+  return {
+    totalTraceMs,
+    bottleneckId: best ? best.id : "",
+    bottleneckService: best ? best.service : "",
+    bottleneckOperation: best ? best.operation : "",
+    exclusiveMs: best ? bestExclusive : 0,
+    bottleneckSharePct,
+    faultServices
+  };
+}`,
+      tests: [
+        {
+          name: "M-of-N evaluation triggers ALARM on 3-of-5 GT breaches and ignores older points",
+          run: (scope) => {
+            const st = scope.evaluateAlarmState({
+              name: "LatencyP99",
+              datapoints: [900, 950, 200, 850, 810, 300, 920],
+              threshold: 800,
+              comparison: "GT",
+              evaluationPeriods: 5,
+              datapointsToAlarm: 3,
+              treatMissingData: "notBreaching"
+            });
+            const pass = st === "ALARM";
+            return { pass, message: `expected ALARM, got ${st}` };
+          }
+        },
+        {
+          name: "Missing data semantics: all-null window respects notBreaching, breaching, and missing",
+          run: (scope) => {
+            const s1 = scope.evaluateAlarmState({
+              name: "SparseErrors",
+              datapoints: [null, null, null],
+              threshold: 1,
+              comparison: "GTE",
+              evaluationPeriods: 3,
+              datapointsToAlarm: 2,
+              treatMissingData: "notBreaching"
+            });
+            const s2 = scope.evaluateAlarmState({
+              name: "CanaryHeartbeat",
+              datapoints: [null, null, null],
+              threshold: 1,
+              comparison: "GTE",
+              evaluationPeriods: 3,
+              datapointsToAlarm: 2,
+              treatMissingData: "breaching"
+            });
+            const s3 = scope.evaluateAlarmState({
+              name: "RawMetric",
+              datapoints: [null, null],
+              threshold: 1,
+              comparison: "GTE",
+              evaluationPeriods: 2,
+              datapointsToAlarm: 1,
+              treatMissingData: "missing"
+            });
+            const pass = s1 === "OK" && s2 === "ALARM" && s3 === "INSUFFICIENT_DATA";
+            return { pass, message: `got notBreaching=${s1}, breaching=${s2}, missing=${s3}` };
+          }
+        },
+        {
+          name: "Composite AND suppresses 3 AM false page when traffic alarm is OK (notBreaching)",
+          run: (scope) => {
+            const res = scope.evaluateCompositeAlarm(
+              [
+                { name: "High5xx", datapoints: [5, 8, 6], threshold: 2, comparison: "GT", evaluationPeriods: 3, datapointsToAlarm: 2, treatMissingData: "notBreaching" },
+                { name: "ActiveTraffic", datapoints: [null, null, null], threshold: 50, comparison: "GTE", evaluationPeriods: 3, datapointsToAlarm: 2, treatMissingData: "notBreaching" }
+              ],
+              "AND"
+            );
+            const pass =
+              res.state === "OK" &&
+              res.alarmStates.High5xx === "ALARM" &&
+              res.alarmStates.ActiveTraffic === "OK" &&
+              res.firingAlarms.length === 1 &&
+              res.firingAlarms[0] === "High5xx";
+            return { pass, message: `got state=${res.state}, firing=${JSON.stringify(res.firingAlarms)}` };
+          }
+        },
+        {
+          name: "Composite AND & OR handle INSUFFICIENT_DATA short-circuiting correctly",
+          run: (scope) => {
+            const andWithOk = scope.evaluateCompositeAlarm(
+              [
+                { name: "A", datapoints: [null, null], threshold: 1, comparison: "GTE", evaluationPeriods: 2, datapointsToAlarm: 1, treatMissingData: "missing" },
+                { name: "B", datapoints: [0, 0], threshold: 1, comparison: "GTE", evaluationPeriods: 2, datapointsToAlarm: 1, treatMissingData: "missing" }
+              ],
+              "AND"
+            );
+            const orWithInsufficient = scope.evaluateCompositeAlarm(
+              [
+                { name: "A", datapoints: [null, null], threshold: 1, comparison: "GTE", evaluationPeriods: 2, datapointsToAlarm: 1, treatMissingData: "missing" },
+                { name: "B", datapoints: [0, 0], threshold: 1, comparison: "GTE", evaluationPeriods: 2, datapointsToAlarm: 1, treatMissingData: "missing" }
+              ],
+              "OR"
+            );
+            const orWithAlarm = scope.evaluateCompositeAlarm(
+              [
+                { name: "A", datapoints: [null, null], threshold: 1, comparison: "GTE", evaluationPeriods: 2, datapointsToAlarm: 1, treatMissingData: "missing" },
+                { name: "B", datapoints: [3, 4], threshold: 1, comparison: "GTE", evaluationPeriods: 2, datapointsToAlarm: 1, treatMissingData: "missing" }
+              ],
+              "OR"
+            );
+            const pass =
+              andWithOk.state === "OK" &&
+              orWithInsufficient.state === "INSUFFICIENT_DATA" &&
+              orWithAlarm.state === "ALARM";
+            return {
+              pass,
+              message: `got andWithOk=${andWithOk.state}, orInsuff=${orWithInsufficient.state}, orAlarm=${orWithAlarm.state}`
+            };
+          }
+        },
+        {
+          name: "X-Ray bottleneck finder uses exclusive self-time instead of inclusive parent duration",
+          run: (scope) => {
+            const res = scope.findTraceBottleneck([
+              { id: "gw", service: "api-gateway", operation: "POST /checkout", durationMs: 1420, parentId: null, fault: false },
+              { id: "fn", service: "checkout-lambda", operation: "handler", durationMs: 1350, parentId: "gw", fault: true },
+              { id: "ddb", service: "dynamodb", operation: "ScanOrders", durationMs: 1030, parentId: "fn", fault: true },
+              { id: "pay", service: "stripe-http", operation: "POST /charges", durationMs: 200, parentId: "fn", fault: false }
+            ]);
+            const pass =
+              res.totalTraceMs === 1420 &&
+              res.bottleneckId === "ddb" &&
+              res.bottleneckService === "dynamodb" &&
+              res.exclusiveMs === 1030 &&
+              res.bottleneckSharePct === 72.5 &&
+              res.faultServices.length === 2 &&
+              res.faultServices[0] === "checkout-lambda" &&
+              res.faultServices[1] === "dynamodb";
+            return { pass, message: `got ${JSON.stringify(res)}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0046",
+      title: "Quiz 0046: Logs Insights, Composite Alarms & Trace Propagation",
+      questions: [
+        {
+          id: "q1",
+          prompt: "An ECS checkout service currently calls the CloudWatch PutMetricData API synchronously on every request to record latency per orderId. During a flash sale, checkout p99 spikes by 90 ms and CloudWatch returns ThrottlingException. Which change fixes both problems cleanly?",
+          options: [
+            "Increase the AWS SDK retry count on PutMetricData inside every request handler",
+            "Emit Embedded Metric Format logs to stdout and drop unique orderId dimensions",
+            "Query raw unstructured text strings hourly using CloudWatch Logs Insights regex filters",
+            "Create one dedicated CloudWatch custom metric namespace for each active customer order"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Adding more SDK retries around synchronous PutMetricData worsens request latency during traffic spikes and amplifies throttling against the CloudWatch control/data plane.",
+            "Writing Embedded Metric Format (EMF) JSON to stdout lets the CloudWatch Agent extract metrics asynchronously with zero request-path latency, and dropping unique orderId dimensions prevents high-cardinality metric billing explosion and throttling.",
+            "Running hourly regex queries over unstructured text does not fix synchronous PutMetricData throttling and turns real-time metric alarming into delayed batch jobs.",
+            "Creating a separate custom metric namespace per customer order explodes metric cardinality infinitely and still requires PutMetricData API calls."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "Your on-call team gets paged every Sunday at 3:00 AM when a low-traffic Lambda error-rate alarm enters ALARM with zero invocations, and also gets paged when a single noisy ALB target returns three 500s during deployment. How should you reconfigure alerting?",
+          options: [
+            "Treat missing data as breaching and shrink evaluation windows down to one single minute",
+            "Switch the metric statistic from sum to average across all Lambda execution log groups",
+            "Treat missing data as notBreaching and gate pages with M of N composite alarms",
+            "Disable CloudWatch Synthetics canaries during Sunday overnight hours and silence all SNS pager topics"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "Treating missing data as breaching causes immediate false alarms whenever traffic drops to zero, and 1-minute single-period evaluation maximizes noise during deployments.",
+            "Averaging error counts does not solve missing-data behavior at zero traffic or combine error rate with traffic volume.",
+            "Setting treatMissingData to notBreaching prevents silent 3 AM windows from firing false alarms, and gating with an M-of-N composite alarm (e.g., high error rate AND meaningful traffic over 3-of-5 periods) filters out brief deployment blips.",
+            "Disabling Synthetics canaries and silencing SNS topics blinds the team to real overnight outages instead of fixing alarm signal quality."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "An Android checkout request takes 1,420 ms end-to-end. In X-Ray, the API Gateway and first Lambda segments are linked, the downstream SQS consumer Lambda appears in an unrelated separate trace, and the first Lambda shows 1,350 ms total duration with a 1,030 ms DynamoDB subsegment. Which diagnosis is accurate?",
+          options: [
+            "SQS lost trace headers while DynamoDB dominates exclusive time inside the first Lambda call",
+            "First Lambda CPU starvation dominates exclusive time while tracing sampling hid child queue spans",
+            "API Gateway TLS handshakes consume most exclusive time because ADOT strips incoming trace headers",
+            "CloudWatch merges SQS traces automatically once DynamoDB subsegment durations drop below one full second"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Subtracting the 1,030 ms DynamoDB subsegment (and any other child spans) from the 1,350 ms Lambda segment reveals DynamoDB dominates exclusive time, while failing to propagate traceparent / X-Amzn-Trace-Id across SQS attributes creates a disconnected orphan trace.",
+            "The first Lambda's self-time is at most 320 ms (1,350 - 1,030), so DynamoDB—not Lambda CPU—is the primary bottleneck, and sampling drops entire traces or children rather than splitting an SQS consumer into a brand-new linked root trace.",
+            "API Gateway's inclusive duration is 1,420 ms only because it waits for the 1,350 ms Lambda downstream; its own exclusive time is tiny, and ADOT forwards rather than strips trace headers.",
+            "CloudWatch and X-Ray never retroactively merge unrelated traces based on DynamoDB latency; trace linkage depends strictly on propagating the same Trace ID across SQS message attributes."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

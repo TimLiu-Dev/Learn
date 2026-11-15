@@ -35,7 +35,7 @@ Course root: `/Users/tl/Documents/Learns/CS Fundamentals` (always use absolute p
   - Check at least one practice end to end. Click `.pg-run`, wait for `.pg-status` to show ✗ or ✓, paste the solution with `document.querySelector('.practice .CodeMirror').CodeMirror.setValue(...)`, run again and expect ✓.
   - Also confirm the page has no errors and no horizontal scroll at 420px wide.
 - Local toolchain: JDK 26 (`java File.java` runs one file), kotlinc 2.4.20 in `.build/tools/kotlinc/bin/kotlinc`, sqlite3, and libraries in `.build/libs`.
-- Write scratch files in your own folder under `/private/tmp/claude-501/-Users-tl-Documents-Learns-CS-Fundamentals/81019dbd-af17-411d-8f17-c86ac7cdd7e3/scratchpad/` (e.g. `…/scratchpad/l12/`), never in the course.
+- Write scratch files in your own folder under `/private/tmp/claude-501/-Users-tl-Documents-Learns-CS-Fundamentals/81019dbd-af17-411d-8f17-c86ac7cdd7e3/scratchpad/` (e.g. `…/scratchpad/l12/`), never in the course. macOS may clear that folder during long pauses, so keep nothing there you can't regenerate.
 
 ## 1. Explain every option of every quiz (`whyopts`)
 
@@ -90,6 +90,7 @@ After each quiz's `<p class="why">…</p>`, add one `<li>` per button, in button
   - Write 3–6 tests that check behaviour, including edge cases.
   - Give a message wherever a bare value would confuse.
   - Tests may define helper classes (L8 p3 defines a `Duck`).
+- **What the page shows** for a failing test: the full assertion message, plus anything the test printed (`println`), e.g. "· printed: …". `playground.js` fixes the Playground's escaping. An error shows as `ExceptionType: message`. So `assertEquals` on strings is safe, and hints may suggest `println` tracing.
 - `Solution.kt`: the model answer, passing every test. Idiomatic, commented only where it teaches.
 - `Starter.java` and `Solution.java`: `public class Practice` with static nested classes or methods.
   - The block between `// CHECKS` and `// END CHECKS` must be identical in both files. It holds `main` plus the `check(name, expected, () -> actual)` helper; copy it from L8.
@@ -109,6 +110,7 @@ After each quiz's `<p class="why">…</p>`, add one `<li>` per button, in button
 - **Playground limits:**
   - Single file, Java 17 APIs, kotlinx.coroutines and kotlinx.serialization available.
   - No file system, no stdin, 10 s limit, output cap.
+  - Versions on the Playground: kotlinx-coroutines-core 1.7.3, kotlinx-coroutines-test 1.6.4, JUnit 4.13.2 (so `assertThrows` exists). It has 2 CPU cores. In tests, coroutine thread names get a ` @coroutine#N` suffix.
   - Java 17 means no `ExecutorService.close()`, so Kotlin's `executor.use { }` fails with "Cannot infer type for type parameter 'R'". Also no virtual threads, no `HttpClient` close, and no JDBC drivers.
   - Threads and sockets work. Keep concurrency tests deterministic: join, use latches, no sleeps for timing.
 - **Where Kotlin can't express the skill** (pure shell, a design discussion), use the closest honest Kotlin exercise, e.g. reimplement a pipeline stage in Kotlin. Don't skip the practice.

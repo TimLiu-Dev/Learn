@@ -170,7 +170,7 @@
         });
       }
 
-      const practices = [...document.querySelectorAll(".practice")];
+      const practices = [...document.querySelectorAll("div.practice[data-id]")];
       if (practices.length) {
         let solved = {};
         try { solved = JSON.parse(localStorage.getItem(KEY + ":practice")) || {}; } catch (e) { /* ignore */ }

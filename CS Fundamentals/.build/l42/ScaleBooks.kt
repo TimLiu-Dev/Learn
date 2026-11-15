@@ -97,11 +97,13 @@ fun main() {
     var errors = 0
     var leaderReads = 0
     var staleReads = 0
+    var reads = 0                               // books created, so reads made by each client
     repeat(20) { i ->
         if (i == 10) { backends[1].server.stop(0); lb.log("b2 crashed") }
         val post = send(HttpRequest.newBuilder(lb.uri.resolve("/books")).header("Token", token)
             .POST(HttpRequest.BodyPublishers.ofString("Book $i")))
         if (post.statusCode() != 201) { errors++; lb.log("POST Book $i -> ${post.statusCode()} ${post.body()}"); return@repeat }
+        reads++
         val id = post.body()
         val version = post.headers().firstValue("X-Version").orElseThrow()
         // the writer reads its own write: it sends the version it saw
@@ -117,8 +119,8 @@ fun main() {
 
     println("per-backend requests: " + targets.joinToString(" ") { "${it.name}=${it.served}" })
     println("errors seen by the client: $errors")
-    println("own reads routed to the leader (replica behind): $leaderReads of 20")
-    println("other client's reads that got 404 (replica behind): $staleReads of 20")
+    println("own reads routed to the leader (replica behind): $leaderReads of $reads")
+    println("other client's reads that got 404 (replica behind): $staleReads of $reads")
     println("thumbnail jobs: ${thumbnails.size} distinct, made ${made.get()} times, duplicates skipped: ${skipped.get()}")
 
     lb.close(); jobs.close(); db.close()

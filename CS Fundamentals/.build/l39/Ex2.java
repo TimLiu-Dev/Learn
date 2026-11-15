@@ -30,8 +30,8 @@ public class Ex2 {
             Builder cc(String address) { cc.add(address); return this; }   // repeatable: builders handle lists well
             Builder html(boolean v) { html = v; return this; }
             Email build() {
-                if (!to.contains("@")) throw new IllegalStateException("bad address: " + to);
-                if (subject.isBlank()) throw new IllegalStateException("subject is required");
+                if (!to.contains("@")) throw new IllegalArgumentException("bad address: " + to);
+                if (subject.isBlank()) throw new IllegalArgumentException("subject is required");
                 return new Email(this);
             }
         }
@@ -40,6 +40,6 @@ public class Ex2 {
     public static void main(String[] args) {
         System.out.println(Email.to("ada@uni.test").subject("Hello").cc("desk@library.test").cc("boss@library.test").build());
         System.out.println(Email.reminder("ada@uni.test", "Dune", 3));
-        try { Email.to("ada").subject("Hi").build(); } catch (IllegalStateException e) { System.out.println("rejected: " + e.getMessage()); }
+        try { Email.to("ada").subject("Hi").build(); } catch (IllegalArgumentException e) { System.out.println("rejected: " + e.getMessage()); }
     }
 }

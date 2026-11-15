@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0029 — S3 Deep Dive: Strong Consistency, Block Public Access, Pre-Signed URLs &amp; Lifecycle</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0029</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0029-s3-consistency-presigned-urls-lifecycle.html" class="active">Lesson 0029</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part2">Part 2 &middot; Module 2.4</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>S3 Deep Dive: Strong Consistency, Block Public Access, Pre-Signed URLs &amp; Lifecycle</h1>
+    <p class="lead">
+      Proxying user photos and videos through your API servers wastes compute, trips Lambda 6 MB and API Gateway 10 MB payload limits, and doubles egress costs. A senior cloud engineer keeps S3 buckets locked behind Block Public Access, issues constrained SigV4 pre-signed URLs so Android clients stream straight to S3, relies on strong read-after-write consistency for immediate post-upload processing, and avoids 128 KB and early-deletion traps in storage lifecycle policies.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android, uploading a 40 MB video via Retrofit <code>@Multipart</code> to your REST backend ties up an OkHttp socket and forces your ECS/Lambda server to buffer or stream the file twice (Mobile &rarr; Backend &rarr; S3). Instead, your app calls a tiny JSON endpoint (<code>POST /uploads/presign</code>) to obtain a short-lived <strong>S3 pre-signed <code>PUT</code> URL</strong>, then uses a custom streaming <code>OkHttp</code> <code>RequestBody</code> backed by <code>ContentResolver.openInputStream(uri)</code> to upload bytes <strong>directly to S3</strong> without loading the file into the JVM heap—while the bucket itself stays 100% private.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Strong Read-After-Write Consistency &amp; Partition Scaling</h2>
+        <p>
+          Before December 2020, Amazon S3 had eventual consistency for overwrite <code>PUT</code>s and <code>DELETE</code>s, forcing mobile backends into awkward DynamoDB metadata hacks or retry loops. Today, per the <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel" target="_blank" rel="noopener">Amazon S3 Data Consistency Model</a>, S3 delivers <strong>strong read-after-write consistency</strong> automatically across all Regions at zero extra cost or latency penalty:
+        </p>
+        <ul>
+          <li><strong>Immediate Visibility After <code>200 OK</code>:</strong> Once a <code>PUT</code> (new key or overwrite), <code>POST</code> (multipart complete), or <code>DELETE</code> returns <code>200 OK</code>, every subsequent <code>GET</code>, <code>HEAD</code>, or <code>LIST</code> sees the new object version or deletion immediately. When Android finishes uploading <code>uploads/u42/avatar.jpg</code> and calls <code>POST /profile/confirm</code>, your Lambda thumbnailer never hits a stale <code>404 NoSuchKey</code> race.</li>
+          <li><strong>No Partial Reads, Last-Writer-Wins on Races:</strong> In-flight uploads are atomic—concurrent readers see either the previous committed object or the new one, never half-written bytes. If two devices overwrite the exact same key simultaneously, the write with the later S3 commit timestamp wins unless you enforce optimistic locking with <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html" target="_blank" rel="noopener">S3 conditional writes</a> (<code>If-None-Match: *</code> to fail if the key exists, or <code>If-Match: &lt;ETag&gt;</code> for compare-and-swap).</li>
+          <li><strong>Automatic Partition Throughput:</strong> S3 scales horizontally to at least <strong>3,500 <code>PUT</code>/<code>COPY</code>/<code>POST</code>/<code>DELETE</code></strong> and <strong>5,500 <code>GET</code>/<code>HEAD</code></strong> requests per second <strong>per partitioned prefix</strong>. You no longer need random hex prefixes for normal workloads.</li>
+          <li><strong>Single <code>PUT</code> vs. Multipart Upload Limits:</strong> A single <code>PUT Object</code> supports up to <strong>5 GiB</strong>. Any upload above <strong>5 GiB</strong> (max object size <strong>5 TiB</strong>) requires Multipart Upload (up to <strong>10,000 parts</strong>, minimum <strong>5 MiB</strong> per part except the final part). AWS recommends switching to Multipart Upload at <strong>100 MiB+</strong> so mobile network drops only retry a 5–10 MiB chunk instead of restarting from byte zero.</li>
+        </ul>
+
+        <!-- SECTION 2 -->
+        <h2>2. Block Public Access &amp; Bucket Owner Enforced</h2>
+        <p>
+          Historical S3 data leaks rarely came from broken cryptography; they came from a stray bucket policy or legacy object ACL granting anonymous <code>s3:GetObject</code> to <code>*</code>. Since April 2023, every newly created S3 bucket enables two defaults that should never be weakened for user-upload buckets:
+        </p>
+        <ol>
+          <li><strong>S3 Block Public Access (4 Guardrails):</strong> <code>BlockPublicAcls</code>, <code>IgnorePublicAcls</code>, <code>BlockPublicPolicy</code>, and <code>RestrictPublicBuckets</code>. Enable all four at both the <strong>Bucket level</strong> and the <strong>AWS Account level</strong> (enforced org-wide via SCPs).</li>
+          <li><strong><code>ObjectOwnership: BucketOwnerEnforced</code> (ACLs Disabled):</strong> Disables legacy S3 ACLs completely. Access is governed strictly by IAM policies, Bucket policies, and VPC Endpoint policies, guaranteeing the bucket owner always owns every uploaded object.</li>
+        </ol>
+
+        <div class="callout">
+          <div class="callout-title">Key Distinction: Private Bucket &ne; Broken Pre-Signed URLs</div>
+          <p style="margin: 0;">
+            Turning on all four <strong>Block Public Access</strong> settings does <em>not</em> break pre-signed URLs. Block Public Access only blocks <strong>anonymous</strong> (unauthenticated) policies and ACLs. A pre-signed URL carries your backend IAM role's SigV4 signature (<code>X-Amz-Credential</code> + <code>X-Amz-Signature</code>), so S3 evaluates it as an authenticated IAM request—while direct unauthenticated requests to <code>https://bucket.s3.amazonaws.com/key</code> still fail with <code>403 AccessDenied</code>.
+          </p>
+        </div>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 700 245" width="100%" height="auto" role="img" aria-label="Direct-to-S3 Pre-Signed Upload Architecture">
+            <rect x="0" y="0" width="700" height="245" fill="#fdfcf8" rx="6" />
+
+            <!-- Android Box -->
+            <rect x="18" y="68" width="145" height="96" rx="6" fill="#e9f1f8" stroke="#0f4c81" stroke-width="1.5" />
+            <text x="90" y="96" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f4c81">Android App</text>
+            <text x="90" y="114" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">OkHttp +</text>
+            <text x="90" y="130" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">ContentResolver</text>
+            <text x="90" y="146" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">Streaming PUT</text>
+
+            <!-- Backend Box -->
+            <rect x="265" y="24" width="180" height="72" rx="6" fill="#fef3c7" stroke="#b45309" stroke-width="1.5" />
+            <text x="355" y="47" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#b45309">API Gateway + Lambda</text>
+            <text x="355" y="64" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">1. Validate JWT &amp; Quota</text>
+            <text x="355" y="79" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">2. Sign PUT (300s TTL)</text>
+
+            <!-- S3 Box -->
+            <rect x="505" y="68" width="177" height="114" rx="6" fill="#dcfce7" stroke="#166534" stroke-width="1.5" />
+            <text x="593" y="92" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#166534">Private S3 Bucket</text>
+            <text x="593" y="112" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Block Public Access: ON</text>
+            <text x="593" y="128" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">ACLs: Disabled</text>
+            <text x="593" y="144" text-anchor="middle" font-family="monospace" font-size="10" fill="#1b1d21">Strong Consistency</text>
+            <text x="593" y="160" text-anchor="middle" font-family="monospace" font-size="10" fill="#166534">Lifecycle &rarr; GIR (90d)</text>
+
+            <!-- Arrows -->
+            <line x1="163" y1="84" x2="263" y2="56" stroke="#0f4c81" stroke-width="1.6" />
+            <polygon points="265,55 255,54 258,62" fill="#0f4c81" />
+            <text x="210" y="54" text-anchor="middle" font-family="monospace" font-size="10" fill="#0f4c81">1. POST /presign</text>
+
+            <line x1="265" y1="78" x2="165" y2="104" stroke="#b45309" stroke-width="1.4" stroke-dasharray="4 3" />
+            <polygon points="163,105 173,106 170,98" fill="#b45309" />
+            <text x="220" y="112" text-anchor="middle" font-family="monospace" font-size="10" fill="#b45309">2. URL + Headers</text>
+
+            <line x1="163" y1="142" x2="503" y2="142" stroke="#166534" stroke-width="2" />
+            <polygon points="505,142 496,137 496,147" fill="#166534" />
+            <text x="334" y="135" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="#166534">3. Direct PUT binary (Content-Type + Content-Length signed)</text>
+
+            <!-- S3 Event Notification -->
+            <rect x="265" y="182" width="180" height="44" rx="6" fill="#f3f4f6" stroke="#575c66" stroke-width="1.2" />
+            <text x="355" y="201" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#1b1d21">Worker Lambda / MediaConvert</text>
+            <text x="355" y="216" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">GetObject (strongly consistent)</text>
+
+            <line x1="530" y1="182" x2="447" y2="204" stroke="#575c66" stroke-width="1.4" stroke-dasharray="4 3" />
+            <polygon points="445,205 455,206 452,198" fill="#575c66" />
+            <text x="530" y="216" text-anchor="middle" font-family="monospace" font-size="10" fill="#575c66">4. EventBridge PutObject</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Direct-to-S3 upload flow. Binary bytes bypass API Gateway and Lambda entirely while Block Public Access prevents anonymous bucket exposure.
+          </div>
+        </div>
+
+        <!-- SECTION 3 -->
+        <h2>3. Pre-Signed URLs: SigV4 Mechanics &amp; Three Production Traps</h2>
+        <p>
+          A <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html" target="_blank" rel="noopener">SigV4 pre-signed URL</a> computes an HMAC-SHA256 signature over the HTTP method, object key, query parameters, and exact headers listed in <code>X-Amz-SignedHeaders</code>. Note that signing happens <strong>100% locally in your backend CPU</strong>—your Lambda does not make a network round-trip to S3 to generate the URL.
+        </p>
+        <p>
+          Watch out for three classic senior-level production failures:
+        </p>
+        <ol>
+          <li><strong>The STS Credential Expiration Trap:</strong> While SigV4 allows <code>X-Amz-Expires</code> up to <strong>604,800 seconds (7 days)</strong> for long-lived IAM user access keys, production backends run on <strong>IAM Roles</strong> (Lambda, ECS, EC2 IMDSv2) backed by temporary STS credentials. Per AWS docs, a pre-signed URL expires when <em>either</em> <code>X-Amz-Expires</code> elapses <em>or</em> the underlying STS token expires—<strong>whichever comes first</strong>. If an assumed role session lasts 1 hour (<code>3600s</code>) and you set <code>ExpiresIn = 86400</code>, S3 rejects uploads with <code>403 ExpiredToken</code> after 1 hour.</li>
+          <li><strong>Unconstrained Signed Headers (Abuse Vector):</strong> If your backend only signs <code>host</code> and omits <code>ContentType</code> and <code>ContentLength</code>, any authenticated user who requests a pre-signed URL for a 2 MB avatar can use <code>curl</code> to upload a <strong>5 GiB</strong> archive or an executable <code>text/html</code> phishing page into your bucket. Always bind <code>ContentType</code>, exact <code>ContentLength</code> (or use a <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPOST.html" target="_blank" rel="noopener">Pre-Signed POST Policy</a> with <code>["content-length-range", 1, 10485760]</code> when exact byte length isn't known upfront), and prefix-scope the IAM role to <code>uploads/${userId}/*</code>.</li>
+          <li><strong><code>403 SignatureDoesNotMatch</code> on Android:</strong> If your backend signs <code>content-type: image/jpeg</code>, OkHttp must transmit <code>Content-Type: image/jpeg</code> verbatim—not <code>image/jpg</code> and not <code>application/octet-stream</code>. Even an auto-appended <code>; charset=utf-8</code> breaks the HMAC signature.</li>
+        </ol>
+
+        <div class="callout warning">
+          <div class="callout-title">Security Rule: Never Trust Client-Supplied Object Keys</div>
+          <p style="margin: 0;">
+            Never let the Android client choose the S3 object key directly (<code>key = req.body.key</code>), or a user could overwrite <code>uploads/victim-id/avatar.jpg</code>. Generate a server-side UUID key scoped to the verified JWT subject: <code>uploads/${jwtSub}/${uuid}.jpg</code>.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. Storage Classes &amp; Lifecycle Cost Traps</h2>
+        <p>
+          Mobile user-generated media is read heavily in the first days and rarely touched after 90 days. Keeping everything in <code>S3 Standard</code> (<strong>$0.023/GB-month</strong> in <code>us-east-1</code>) wastes up to 80% of storage spend—yet naive <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html" target="_blank" rel="noopener">S3 Lifecycle</a> rules can actually <em>increase</em> your bill if you ignore minimums and request fees:
+        </p>
+        <ul>
+          <li><strong>S3 Standard ($0.023/GB-mo):</strong> 0-day minimum duration, 0 minimum billable size, $0 retrieval fee. Best for active media (&lt;30 days) or tiny objects (&lt;128 KB).</li>
+          <li><strong>S3 Standard-IA ($0.0125/GB-mo):</strong> <strong>30-day minimum storage duration</strong>, <strong>128 KB minimum billable object size</strong>, <strong>$0.01/GB retrieval fee</strong>. A 16 KB thumbnail is still billed as 128 KB (8&times; storage inflation!).</li>
+          <li><strong>S3 Glacier Instant Retrieval ($0.004/GB-mo):</strong> Millisecond latency via normal <code>GET</code>, <strong>90-day minimum duration</strong>, <strong>128 KB minimum billable size</strong>, <strong>$0.03/GB retrieval fee</strong>. Ideal for archived user photos and videos that must still open instantly in-app.</li>
+          <li><strong>S3 Glacier Flexible Retrieval ($0.0036/GB-mo) &amp; Deep Archive ($0.00099/GB-mo):</strong> Asynchronous restore (minutes to 48 hours via <code>RestoreObject</code>), 90-day / 180-day minimums, plus <strong>40 KB per-object metadata overhead</strong>. Do not use for interactive mobile reads.</li>
+          <li><strong>S3 Intelligent-Tiering:</strong> Automatically moves objects &ge;128 KB across tiers with zero retrieval fees, charging <strong>$0.0025 per 1,000 objects/month</strong> for monitoring. Objects &lt;128 KB never tier down and pay monitoring fees for nothing.</li>
+          <li><strong>Abort Incomplete Multipart Uploads:</strong> Always include <code>AbortIncompleteMultipartUpload</code> (e.g., <strong>7 days</strong>). When an Android phone loses LTE halfway through a 500 MB multipart upload, orphaned parts sit in S3 Standard accruing silent monthly charges until aborted.</li>
+        </ul>
+
+        <!-- SECTION 5 -->
+        <h2>5. Production Code: Backend Presigner + Android OkHttp Streamer</h2>
+        <p>
+          Notice how the backend constrains <code>ContentType</code>, <code>ContentLength</code>, and encryption in the signature, while the Android client streams straight from a <code>ContentResolver</code> descriptor with zero byte-array buffering:
+        </p>
+<pre><code>// 1. Backend (TypeScript / AWS SDK v3) — Generate constrained 5-minute pre-signed PUT
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+const s3 = new S3Client({ region: "us-east-1" });
+
+export async function createPhotoUploadUrl(userId: string, bytes: number, mime: string) {
+  if (!["image/jpeg", "image/webp", "video/mp4"].includes(mime)) throw new Error("Unsupported MIME");
+  if (bytes <= 0 || bytes > 50 * 1024 * 1024) throw new Error("Exceeds 50 MiB limit");
+
+  const key = `uploads/${userId}/${crypto.randomUUID()}`;
+  const cmd = new PutObjectCommand({
+    Bucket: process.env.MEDIA_BUCKET!,
+    Key: key,
+    ContentType: mime,       // Included in X-Amz-SignedHeaders -> locked by SigV4
+    ContentLength: bytes,    // Prevents client from uploading larger payload
+    ServerSideEncryption: "AES256"
+  });
+
+  const url = await getSignedUrl(s3, cmd, { expiresIn: 300 }); // 5 min (< STS role expiry)
+  return { url, key, requiredHeaders: { "Content-Type": mime, "Content-Length": String(bytes), "x-amz-server-side-encryption": "AES256" } };
+}
+
+// 2. Android Client (Kotlin / OkHttp) — Stream Uri directly without loading into RAM
+class UriStreamingRequestBody(
+  private val resolver: ContentResolver,
+  private val uri: Uri,
+  private val mimeType: String,
+  private val exactBytes: Long
+) : RequestBody() {
+  // Exact match required: OkHttp must NOT append "; charset=utf-8"
+  override fun contentType(): MediaType = mimeType.toMediaType()
+  override fun contentLength(): Long = exactBytes
+  override fun writeTo(sink: BufferedSink) {
+    resolver.openInputStream(uri)?.source()?.use { source -> sink.writeAll(source) }
+      ?: error("Unable to open upload stream for $uri")
+  }
+}</code></pre>
+
+        <!-- SECTION 6: INTERACTIVE CODE PRACTICE -->
+        <h2>6. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement <code>validatePresignedUpload(policy, request)</code> to enforce STS truncation, signed headers, MIME allowlists, and size limits, and <code>estimate12MonthStorageCost(workload, lifecycle)</code> to model 12 months of storage, 128 KB minimum billable sizes, retrieval fees, and transition fees.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 7: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>7. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your S3 architecture judgment under realistic mobile and cost edge cases. Every answer explains why the right choice works and why each distractor fails.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 8: PRIMARY SOURCES & TEACHER CHECK-IN -->
+        <h2>8. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html" target="_blank" rel="noopener">Amazon S3 — Sharing Objects with Presigned URLs</a> (Includes IAM Role STS token expiration rules).
+          </li>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html" target="_blank" rel="noopener">Blocking Public Access to Your Amazon S3 Storage</a> &amp; <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel" target="_blank" rel="noopener">S3 Strong Consistency Model</a>.
+          </li>
+          <li>
+            <strong>Primary Doc:</strong> <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html" target="_blank" rel="noopener">S3 Lifecycle Transitions — General Considerations &amp; Minimum Object Sizes</a>.
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before advancing to <strong>Lesson 0030 (CloudFront CDN: OAC, Cache Keys &amp; Edge Functions)</strong>, ask anything that feels unclear—for example: <em>"How do we handle 2 GB Android video uploads with Multipart Pre-Signed URLs?"</em> or <em>"How does EventBridge + S3 Event Notifications verify MIME magic bytes asynchronously after upload?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0028-lambda-firecracker-cold-starts-vpc.html">&larr; Lesson 0028: AWS Lambda Internals: Firecracker MicroVMs, Cold Starts, Concurrency &amp; Power Tuning</a>
+          <a href="./0030-cloudfront-oac-cache-policies-edge.html">Lesson 0030: CloudFront CDN: Origin Access Control (OAC), Cache Keys &amp; Edge Functions &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why Checksum Headers Matter</strong>
+          Adding <code>x-amz-checksum-sha256</code> when signing a <code>PUT</code> lets S3 reject corrupted cellular packets at the edge before committing the object—saving your Lambda worker from decoding truncated JPEGs.
+        </div>
+        <div class="sidenote">
+          <strong>STS Token Ceiling</strong>
+          A Lambda execution role typically receives STS credentials valid for 6–12 hours, while an explicitly assumed role defaults to 1 hour (<code>3600s</code>). Never issue pre-signed URLs longer than your guaranteed STS lifetime.
+        </div>
+        <div class="sidenote">
+          <strong>Don't Forget Multipart Cleanup</strong>
+          A single <code>AbortIncompleteMultipartUpload</code> rule after 7 days routinely saves 10–30% on mobile video buckets by purging abandoned cellular upload chunks. Check <a href="../reference/glossary.html">Glossary</a> for core terms.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0029",
+      title: "Lab 0029: S3 Pre-Signed Upload Validator & 12-Month Lifecycle Cost Calculator",
+      filename: "s3-upload-and-lifecycle.js",
+      description:
+        "Implement two functions: (1) <code>validatePresignedUpload(policy, request)</code> computes <code>effectiveTtlSeconds = Math.min(policy.expiresSeconds, policy.stsRemainingSeconds)</code>. Check in order: (a) if <code>policy.signedHeaders</code> (lowercased) is missing <code>\"content-type\"</code> or <code>\"content-length\"</code>, return <code>{ valid: false, statusCode: 400, reason: \"UNCONSTRAINED_POLICY\", effectiveTtlSeconds }</code>; (b) if <code>request.elapsedSeconds >= effectiveTtlSeconds</code>, return <code>statusCode: 403, reason: \"EXPIRED_TOKEN\"</code>; (c) if any header in <code>policy.signedHeaders</code> is missing from <code>request.sentHeaders</code> (case-insensitive), return <code>statusCode: 403, reason: \"SIGNATURE_MISMATCH\"</code>; (d) if <code>!policy.allowedContentTypes.includes(request.contentType)</code>, return <code>statusCode: 403, reason: \"INVALID_CONTENT_TYPE\"</code>; (e) if <code>request.contentLengthBytes <= 0 || request.contentLengthBytes > policy.maxAllowedBytes</code>, return <code>statusCode: 403, reason: \"SIZE_LIMIT_EXCEEDED\"</code>; otherwise return <code>{ valid: true, statusCode: 200, reason: \"ALLOWED\", effectiveTtlSeconds }</code>. (2) <code>estimate12MonthStorageCost(workload, lifecycle)</code> models 12 months (<code>m = 1..12</code>, <code>dayStart = (m - 1) * 30</code>) for <code>workload.objectCount</code> objects of <code>workload.avgObjectSizeKb</code> KB (<code>KB_PER_GB = 1024 * 1024</code>). Use <code>rawGb = (objectCount * avgObjectSizeKb) / KB_PER_GB</code> and <code>billableIaOrGirGb = (objectCount * Math.max(avgObjectSizeKb, 128)) / KB_PER_GB</code>. Each month picks <code>GIR</code> if <code>transitionToGirDay !== null && dayStart >= transitionToGirDay</code>, else <code>STANDARD_IA</code> if <code>transitionToIaDay !== null && dayStart >= transitionToIaDay</code>, else <code>STANDARD</code>. Rates: Standard = <code>$0.023/GB</code> ($0 retrieval); Standard-IA = <code>$0.0125/GB</code> + <code>$0.01/GB</code> retrieval; GIR = <code>$0.004/GB</code> + <code>$0.03/GB</code> retrieval. Add one-time transition fees: <code>$0.01</code> per 1,000 objects if any month uses <code>STANDARD_IA</code>, plus <code>$0.02</code> per 1,000 objects if any month uses <code>GIR</code>. Return <code>{ standardOnlyCost, lifecycleCost, savings, worthTransitioning }</code> rounded to 2 decimal places.",
+      exports: ["validatePresignedUpload", "estimate12MonthStorageCost"],
+      starterCode: `const KB_PER_GB = 1024 * 1024;
+
+function validatePresignedUpload(policy, request) {
+  // policy:  { expiresSeconds, stsRemainingSeconds, signedHeaders, maxAllowedBytes, allowedContentTypes }
+  // request: { elapsedSeconds, contentType, contentLengthBytes, sentHeaders }
+  const effectiveTtlSeconds = Math.min(policy.expiresSeconds, policy.stsRemainingSeconds);
+
+  // TODO 1: normalize signedHeaders & sentHeaders to lowercase
+  // TODO 2: enforce signedHeaders includes "content-type" and "content-length" (400 UNCONSTRAINED_POLICY)
+  // TODO 3: enforce elapsedSeconds < effectiveTtlSeconds (403 EXPIRED_TOKEN)
+  // TODO 4: enforce all signedHeaders are present in sentHeaders (403 SIGNATURE_MISMATCH)
+  // TODO 5: enforce allowedContentTypes (403 INVALID_CONTENT_TYPE) & size bounds (403 SIZE_LIMIT_EXCEEDED)
+
+  return { valid: false, statusCode: 500, reason: "NOT_IMPLEMENTED", effectiveTtlSeconds };
+}
+
+function estimate12MonthStorageCost(workload, lifecycle) {
+  // workload:  { objectCount, avgObjectSizeKb, monthlyRetrievalGb }
+  // lifecycle: { transitionToIaDay, transitionToGirDay }
+  const round2 = (n) => Math.round(n * 100) / 100;
+
+  // TODO: compute standardOnlyCost, 12-month lifecycle storage + retrieval + transition fees,
+  // savings, and worthTransitioning (lifecycleCost < standardOnlyCost)
+  return { standardOnlyCost: 0, lifecycleCost: 0, savings: 0, worthTransitioning: false };
+}
+
+console.log(
+  "Presigned check:",
+  validatePresignedUpload(
+    {
+      expiresSeconds: 86400,
+      stsRemainingSeconds: 3600,
+      signedHeaders: ["host", "Content-Type", "Content-Length"],
+      maxAllowedBytes: 10 * 1024 * 1024,
+      allowedContentTypes: ["image/jpeg", "image/webp"]
+    },
+    {
+      elapsedSeconds: 4000,
+      contentType: "image/jpeg",
+      contentLengthBytes: 2048000,
+      sentHeaders: ["host", "content-type", "content-length"]
+    }
+  )
+);`,
+      hints: [
+        "In <code>validatePresignedUpload</code>, build lowercase <code>Set</code>s for <code>signedHeaders</code> and <code>sentHeaders</code>, and check policy constraints (<code>UNCONSTRAINED_POLICY</code>) before evaluating request-level checks (<code>EXPIRED_TOKEN</code>, <code>SIGNATURE_MISMATCH</code>, <code>INVALID_CONTENT_TYPE</code>, <code>SIZE_LIMIT_EXCEEDED</code>).",
+        "In <code>estimate12MonthStorageCost</code>, track booleans <code>usedIa</code> and <code>usedGir</code> while looping <code>m = 1..12</code> so transition fees are added once per tier actually entered, and remember to round <code>standardOnlyCost</code> and <code>lifecycleCost</code> to 2 decimal places before computing <code>savings = round2(standardOnlyCost - lifecycleCost)</code>."
+      ],
+      solutionExplanation:
+        "validatePresignedUpload models S3's real STS credential ceiling (min of URL expiry and STS token remaining life) and verifies that Content-Type and Content-Length are locked in X-Amz-SignedHeaders. estimate12MonthStorageCost demonstrates why large objects (>128 KB) save heavily via Glacier Instant Retrieval while tiny objects (<128 KB) lose money due to the 128 KB minimum billable object size and per-1,000-object transition fees.",
+      solutionCode: `const KB_PER_GB = 1024 * 1024;
+
+function validatePresignedUpload(policy, request) {
+  const effectiveTtlSeconds = Math.min(policy.expiresSeconds, policy.stsRemainingSeconds);
+  const signedSet = new Set((policy.signedHeaders || []).map((h) => String(h).toLowerCase()));
+  const sentSet = new Set((request.sentHeaders || []).map((h) => String(h).toLowerCase()));
+
+  if (!signedSet.has("content-type") || !signedSet.has("content-length")) {
+    return { valid: false, statusCode: 400, reason: "UNCONSTRAINED_POLICY", effectiveTtlSeconds };
+  }
+
+  if (request.elapsedSeconds >= effectiveTtlSeconds) {
+    return { valid: false, statusCode: 403, reason: "EXPIRED_TOKEN", effectiveTtlSeconds };
+  }
+
+  for (const h of signedSet) {
+    if (!sentSet.has(h)) {
+      return { valid: false, statusCode: 403, reason: "SIGNATURE_MISMATCH", effectiveTtlSeconds };
+    }
+  }
+
+  if (!policy.allowedContentTypes.includes(request.contentType)) {
+    return { valid: false, statusCode: 403, reason: "INVALID_CONTENT_TYPE", effectiveTtlSeconds };
+  }
+
+  if (request.contentLengthBytes <= 0 || request.contentLengthBytes > policy.maxAllowedBytes) {
+    return { valid: false, statusCode: 403, reason: "SIZE_LIMIT_EXCEEDED", effectiveTtlSeconds };
+  }
+
+  return { valid: true, statusCode: 200, reason: "ALLOWED", effectiveTtlSeconds };
+}
+
+function estimate12MonthStorageCost(workload, lifecycle) {
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const rawGb = (workload.objectCount * workload.avgObjectSizeKb) / KB_PER_GB;
+  const billableIaOrGirGb = (workload.objectCount * Math.max(workload.avgObjectSizeKb, 128)) / KB_PER_GB;
+
+  const standardOnlyCost = round2(12 * rawGb * 0.023);
+  let totalLifecycle = 0;
+  let usedIa = false;
+  let usedGir = false;
+
+  for (let m = 1; m <= 12; m++) {
+    const dayStart = (m - 1) * 30;
+    if (lifecycle.transitionToGirDay !== null && dayStart >= lifecycle.transitionToGirDay) {
+      usedGir = true;
+      totalLifecycle += billableIaOrGirGb * 0.004 + workload.monthlyRetrievalGb * 0.03;
+    } else if (lifecycle.transitionToIaDay !== null && dayStart >= lifecycle.transitionToIaDay) {
+      usedIa = true;
+      totalLifecycle += billableIaOrGirGb * 0.0125 + workload.monthlyRetrievalGb * 0.01;
+    } else {
+      totalLifecycle += rawGb * 0.023;
+    }
+  }
+
+  if (usedIa) totalLifecycle += (workload.objectCount / 1000) * 0.01;
+  if (usedGir) totalLifecycle += (workload.objectCount / 1000) * 0.02;
+
+  const lifecycleCost = round2(totalLifecycle);
+  const savings = round2(standardOnlyCost - lifecycleCost);
+  return {
+    standardOnlyCost,
+    lifecycleCost,
+    savings,
+    worthTransitioning: lifecycleCost < standardOnlyCost
+  };
+}`,
+      tests: [
+        {
+          name: "Validates compliant Android JPEG upload within effective STS TTL",
+          run: (scope) => {
+            const out = scope.validatePresignedUpload(
+              {
+                expiresSeconds: 3600,
+                stsRemainingSeconds: 7200,
+                signedHeaders: ["host", "Content-Type", "Content-Length"],
+                maxAllowedBytes: 10485760,
+                allowedContentTypes: ["image/jpeg", "image/webp"]
+              },
+              {
+                elapsedSeconds: 120,
+                contentType: "image/jpeg",
+                contentLengthBytes: 2500000,
+                sentHeaders: ["Host", "content-type", "content-length"]
+              }
+            );
+            const pass = out.valid === true && out.statusCode === 200 && out.reason === "ALLOWED" && out.effectiveTtlSeconds === 3600;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Flags EXPIRED_TOKEN when STS token expires before requested URL expiry",
+          run: (scope) => {
+            const out = scope.validatePresignedUpload(
+              {
+                expiresSeconds: 86400,
+                stsRemainingSeconds: 3600,
+                signedHeaders: ["host", "content-type", "content-length"],
+                maxAllowedBytes: 10485760,
+                allowedContentTypes: ["video/mp4"]
+              },
+              {
+                elapsedSeconds: 3600,
+                contentType: "video/mp4",
+                contentLengthBytes: 5000000,
+                sentHeaders: ["host", "content-type", "content-length"]
+              }
+            );
+            const pass = out.valid === false && out.statusCode === 403 && out.reason === "EXPIRED_TOKEN" && out.effectiveTtlSeconds === 3600;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Flags UNCONSTRAINED_POLICY (400) if content-length or content-type is omitted from signedHeaders",
+          run: (scope) => {
+            const out = scope.validatePresignedUpload(
+              {
+                expiresSeconds: 300,
+                stsRemainingSeconds: 3600,
+                signedHeaders: ["host", "content-type"],
+                maxAllowedBytes: 10485760,
+                allowedContentTypes: ["image/jpeg"]
+              },
+              {
+                elapsedSeconds: 10,
+                contentType: "image/jpeg",
+                contentLengthBytes: 1024,
+                sentHeaders: ["host", "content-type"]
+              }
+            );
+            const pass = out.valid === false && out.statusCode === 400 && out.reason === "UNCONSTRAINED_POLICY";
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Flags SIGNATURE_MISMATCH and SIZE_LIMIT_EXCEEDED appropriately",
+          run: (scope) => {
+            const basePolicy = {
+              expiresSeconds: 300,
+              stsRemainingSeconds: 3600,
+              signedHeaders: ["host", "content-type", "content-length"],
+              maxAllowedBytes: 5000000,
+              allowedContentTypes: ["image/jpeg"]
+            };
+            const missingHeader = scope.validatePresignedUpload(basePolicy, {
+              elapsedSeconds: 20,
+              contentType: "image/jpeg",
+              contentLengthBytes: 1000,
+              sentHeaders: ["host", "content-length"]
+            });
+            const oversized = scope.validatePresignedUpload(basePolicy, {
+              elapsedSeconds: 20,
+              contentType: "image/jpeg",
+              contentLengthBytes: 9000000,
+              sentHeaders: ["host", "content-type", "content-length"]
+            });
+            const pass = missingHeader.reason === "SIGNATURE_MISMATCH" && oversized.reason === "SIZE_LIMIT_EXCEEDED";
+            return { pass, message: `missing=${missingHeader.reason}, oversized=${oversized.reason}` };
+          }
+        },
+        {
+          name: "Large 2 MB photo cohort saves strongly via Standard -> IA (30d) -> GIR (90d)",
+          run: (scope) => {
+            const out = scope.estimate12MonthStorageCost(
+              { objectCount: 1000000, avgObjectSizeKb: 2048, monthlyRetrievalGb: 50 },
+              { transitionToIaDay: 30, transitionToGirDay: 90 }
+            );
+            const pass =
+              out.standardOnlyCost === 539.06 &&
+              out.lifecycleCost === 208.56 &&
+              out.savings === 330.5 &&
+              out.worthTransitioning === true;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        },
+        {
+          name: "Tiny 16 KB thumbnail cohort loses money from 128 KB minimum + transition fees",
+          run: (scope) => {
+            const out = scope.estimate12MonthStorageCost(
+              { objectCount: 1000000, avgObjectSizeKb: 16, monthlyRetrievalGb: 10 },
+              { transitionToIaDay: 30, transitionToGirDay: 90 }
+            );
+            const pass =
+              out.standardOnlyCost === 4.21 &&
+              out.lifecycleCost > out.standardOnlyCost &&
+              out.savings < 0 &&
+              out.worthTransitioning === false;
+            return { pass, message: `got ${JSON.stringify(out)}` };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0029",
+      title: "Quiz 0029: S3 Pre-Signed URLs, Consistency & Lifecycle Traps",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Your backend Lambda function (default execution role) generates an S3 pre-signed PUT URL with ExpiresIn = 86400 (24 hours) for a background Android WorkManager upload. Six hours later, the phone regains Wi-Fi and uploads the file, but S3 rejects it with 403 ExpiredToken. What caused the early failure?",
+          options: [
+            "S3 caps all signature lifetimes at one hour whenever bucket versioning is active",
+            "Underlying Lambda STS role credentials expired before the requested URL expiration window ended",
+            "S3 Block Public Access revokes anonymous signature tokens after six idle hours pass",
+            "Android WorkManager rewrote the query string signature when switching from cellular to WiFi"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Bucket versioning does not restrict pre-signed URL TTLs; IAM users can sign up to 7 days regardless of versioning.",
+            "When signing with an IAM Role, the pre-signed URL becomes invalid as soon as EITHER X-Amz-Expires elapses OR the temporary STS credentials expire—whichever occurs first.",
+            "Block Public Access does not expire or revoke authenticated SigV4 pre-signed URLs on an idle timer.",
+            "Network handoffs drop sockets, not URL strings; a rewritten query string would return 403 SignatureDoesNotMatch rather than ExpiredToken."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "An Android app stores 20 million 32 KB profile thumbnails in S3 Standard. To cut storage costs, a teammate adds a Lifecycle rule transitioning all objects to S3 Glacier Instant Retrieval after 30 days. After the transition completes, the monthly S3 bill goes UP instead of down. Why?",
+          options: [
+            "Glacier Instant Retrieval bills a 128 KB minimum per object plus transition fees",
+            "Glacier Instant Retrieval stores two extra backup copies across three distinct AWS Regions",
+            "Lifecycle transitions force S3 to rewrite every thumbnail using expensive KMS data keys",
+            "S3 Standard charges an early deletion penalty whenever objects leave within ninety days"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Glacier Instant Retrieval enforces a 128 KB minimum billable size per object (4x inflation for 32 KB thumbnails) plus per-1,000-object transition request charges.",
+            "Glacier Instant Retrieval is single-Region multi-AZ storage just like S3 Standard; cross-Region replication only happens if you explicitly configure CRR.",
+            "Lifecycle storage-class transitions change the storage tier metadata without forcing KMS re-encryption charges per object.",
+            "S3 Standard has zero minimum storage duration and zero early-deletion penalties; minimum durations apply only after objects move into IA or Glacier classes."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "You enable all four S3 Block Public Access settings on your media bucket and set ObjectOwnership to BucketOwnerEnforced. Afterward, your Android client uploads a photo via a backend pre-signed PUT URL, then calls POST /posts so a Lambda worker reads the photo via GetObject. What happens?",
+          options: [
+            "The Android upload fails with 403 because Block Public Access rejects signed URLs",
+            "The upload succeeds and Lambda immediately reads the latest bytes via strong consistency",
+            "The upload succeeds but Lambda sees 404 until eventual consistency propagates object metadata",
+            "The Lambda worker fails with 403 because BucketOwnerEnforced removes IAM role read permissions"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "Block Public Access only blocks anonymous public policies and ACLs; pre-signed URLs carry an authenticated IAM SigV4 signature and continue working normally.",
+            "S3 executes the authenticated pre-signed PUT and guarantees strong read-after-write consistency immediately after 200 OK, so Lambda reads the exact bytes on the first try.",
+            "S3 has provided strong read-after-write consistency for all PUT, DELETE, and LIST operations since December 2020, eliminating 404 eventual-consistency races.",
+            "BucketOwnerEnforced disables legacy ACLs and consolidates access control under IAM and bucket policies; it does not strip your Lambda IAM role's s3:GetObject permissions."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

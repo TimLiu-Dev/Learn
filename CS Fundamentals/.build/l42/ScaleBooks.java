@@ -128,12 +128,13 @@ public class ScaleBooks {
         })).toList();
 
         String token = send(HttpRequest.newBuilder(lb.uri().resolve("/login?user=ada"))).body();
-        int errors = 0, leaderReads = 0, staleReads = 0;
+        int errors = 0, leaderReads = 0, staleReads = 0, reads = 0;
         for (int i = 0; i < 20; i++) {
             if (i == 10) { backends.get(1).server.stop(0); lb.log("b2 crashed"); }
             var post = send(HttpRequest.newBuilder(lb.uri().resolve("/books")).header("Token", token)
                 .POST(HttpRequest.BodyPublishers.ofString("Book " + i)));
             if (post.statusCode() != 201) { errors++; lb.log("POST Book " + i + " -> " + post.statusCode() + " " + post.body()); continue; }
+            reads++;                                                   // books created, so reads made by each client
             String id = post.body();
             String version = post.headers().firstValue("X-Version").orElseThrow();
             // the writer reads its own write: it sends the version it saw
@@ -149,8 +150,8 @@ public class ScaleBooks {
 
         System.out.println("per-backend requests: " + targets.stream().map(Object::toString).collect(Collectors.joining(" ")));
         System.out.println("errors seen by the client: " + errors);
-        System.out.println("own reads routed to the leader (replica behind): " + leaderReads + " of 20");
-        System.out.println("other client's reads that got 404 (replica behind): " + staleReads + " of 20");
+        System.out.println("own reads routed to the leader (replica behind): " + leaderReads + " of " + reads);
+        System.out.println("other client's reads that got 404 (replica behind): " + staleReads + " of " + reads);
         System.out.println("thumbnail jobs: " + thumbnails.size() + " distinct, made " + made.get() + " times, duplicates skipped: " + skipped.get());
 
         lb.close(); jobs.close(); db.close();

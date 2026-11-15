@@ -1,0 +1,47 @@
+# Unfixed findings from v6 builders (input for check #2)
+- L1: Apple Gatekeeper route (Open Anyway) not tested on a quarantined .command; gradle init output not re-run.
+- L2: the Java regex listing (~line 780) is captioned RegexDemo.java, but the file is Regex.java. Text.kt/.java show the emoji as an escape while the files use the literal emoji (same output). The recall card has no Unicode-part-two item; add one. The lesson is now ~145–165 min.
+- L3: w-2 (~line 56) says "the safe way", but a.equals(b) throws if a is null; whyopts explains it, the question is unchanged. p2-3 (~line 855): the correct option "Return values can be tested, reused" reads awkwardly. .build/l3/Collections.java is an unused old copy.
+- L4: VIZ highlight convention differs: `frames` highlights the line about to run, while alias/pass/boxes highlight the line just run. Warm-up w-1 uses `contacts` without saying it's L3's map.
+- L5: line ~167 NPE capture shows "<local6>" (no debug info under java File.java; IntelliJ says "missing"). cq p1-6 NoHash.java relies on distinct identity hashes (near-certain; explanation says "almost certainly").
+- L6: the meta total (~130–140) is lower than the toc sum (147); this was already off before v6. Spelling: options say "initializer" (~151, ~284) where the prose says "initialiser". The p1-2 option "Usable only in initializers, init" reads awkwardly.
+- L7: p2-1 (~295) is the only question without a closing "…" or "?".
+- ALL: lessons built before the build.py wording fix say "fill in the TODOs" in the Java details. At the end, replace it with "do the same task in Java" in every built lesson.
+- L13: e-4 (tpl ~64) asks about `xs.get(0) == xs.get(1)` without println (minor). p2-5 "Nothing at all" can be added vs Java allows null (explained). External links not curl-checked.
+- L15: Part 3 says "Sixteen forwarding methods" while the Trimmed note says Set is "a 15-method one" (both defensible; consider aligning).
+- L11: p3-3 option word counts are 6/6/5/6 (QA does not flag them because the options contain code); consider evening them out.
+- L9: p1-1 (tpl ~191) options are lowercase "prints Circle" vs the house "Prints X". The meta total (~130–140) is lower than the toc sum (139+). The Homebrew stdlib path (~159) is unverified.
+- ALL: several builders note the meta totals were rounded down vs toc sums before v6; check #2 should make the lesson-meta total equal the toc sum ± range.
+- L18: toc parts sum to 154 min vs meta ~130–145 (pre-existing mismatch).
+- L16: p1-1 (~195) and p3-1 (~579) have loose-bound ambiguity (O(n)/O(n log n)/O(n²) are technically valid upper bounds); reword to "tightest". Line ~242 "measureTimeMillis compiles without warnings" is uncompiled.
+- L14: p1-4 (tpl ~255) offers "Prints true/false" for a question with no program (explained in whyopts).
+- SHARED (fixed 2026-11-14): the Playground rendered JUnit failure messages as raw HTML, so `expected:<vehicle…>` lost its text. It also hid printed output. playground.js now intercepts the test XHR: it escapes messages, names the exception type, appends "printed: …", and keeps responseType text. L12's practices use an error() helper as a workaround; that's fine to keep.
+- L17: e-4 (~758) distractors name SOLID principles taught later (L38). p1-4 (~217) "Prints null" is an odd distractor for a compiles-or-not question. p4-2 (~595) the option "Gives empty" is vague. The final's Gradle tests and the ListTiming numbers were not re-run.
+- L20: the p1 practice sits before the Check rather than right after the exercise, because isBalanced builds on the "stick" section (intentional).
+- L19: the Kotlin collections-overview quote is unverified (the page is JS-rendered).
+- L48: the recall card and reference/maths-and-theory.html lack Bayes and variance. The meta total was below the toc sum before v6.
+- SHEETS (end task): add the new v6 sections to the reference sheets: L2 Unicode part 2, L48 Bayes and variance, L25 licences/SemVer/BOM/multi-module, L28 Amdahl/Little, L33 personal data and security principles, L40 branching/releases, L45 coverage/property tests, L47 ethics. Recall cards too, where missing.
+- L52: e-3 (~618) "Halting is undecidable" — on a finite 256-byte machine halting is decidable in principle by spotting a repeated state; the explanation could mention this.
+- L50: e-2 (~649) "the JDK docs recommend" overstates the quote ("likely to be faster"). The p2 Java check has no timeout, so an unpruned learner solution hangs in IntelliJ (the Kotlin test has timeout=2000).
+- L49 (lines in .build/l49/tpl_src.html; tpl/0049.html is generated from it): ~358 "plain quick-union is also quadratic on random input" rests on measured ratios only, uncited. ~203 says "The widget below draws it" but the widget comes after the listing and output.
+- L53 (.build/l53/tpl_src.html:596): p4-4 says "ssh refused", but the replay shows ssh-keygen -y refusing ("bad permissions"). Glossary terms not checked.
+- L23: e-4 (~1124) option "At the function's first instruction" is loose (aload_0/ldc come before checkNotNullParameter).
+- L51: the pasted timings at tpl ~235/298/548 have no raw files in out/. The JDK 9 vs 8u Pattern claim (~237) is unchecked.
+- L54 (.build/l54/tpl_src.html:673): the recall card loosely paraphrases the real failing program `…(2 ^ -1)… + c`.
+- L26: the meta (~125–140) is 4 min below the toc sum (144). The final-exercise figures were not re-run.
+- L30 (tpl ~277): "the OS hands them out in sequence" describes this run on macOS, not a guarantee. ~499: a distractor is only wrong at the default DNS cache setting (fine).
+- L24: the toc sums to 149 vs meta 124–139 (pre-existing gap). Oracle docs link to JDK 25 while the course runs JDK 26 (fine).
+- L29: the Playground has coroutines 1.7.3/test 1.6.4 vs the lesson 1.11.0, 2 cores (Dispatch.kt prints different numbers; "yours will differ" covers it), and test thread names get "@coroutine#N".
+- L27: L26 (built line ~1273) promises "You will meet Conditions with blocking queues in L27", but L27 text never shows Condition (only practice p3 does). Add a short Part 3 paragraph on Condition (await/signal, while-loop).
+- L31: the meta total is below the toc sum (pre-existing). The e-2 claim that the JDK HttpServer speaks only HTTP/1.1 is unconfirmed against the docs.
+- L28: reference/concurrency.html lacks Amdahl/Little (add to the SHEETS task). The Part 1 .auto box recommends `use` on a pool without noting the Playground (Java 17) cannot compile it. The claim about Amdahl's paper being prose-only is from memory (403).
+- L32 (tpl ~690): TimeTypes prints the local tzdb (2026a), but the Playground has tzdb 2026e, so running it in the page differs. Consider "(your JDK's tzdb version)" wording. L32 is now ~157–177 min (long).
+- L55: Part 1 Set-Cookie uses Max-Age=1800 (tpl ~79/93) while the final Auth.kt uses 28800; explain the difference or align them. Only RFC 6265bis was link-checked.
+- L34: practice id p2b breaks the pK convention (Part 2 has two practices; intentional). Shared fix done: an empty SQL result now says "returned no rows".
+- L36: toc parts sum to 154 min vs meta ~135–145 (pre-existing gap: 130 vs 110–120). p2-5 why (tpl ~514) says "about 200 ms" while the run shows 259 ms. e-3 why (~tpl e-3) assumes "the code keeps it reachable". SHARED: pg_check's SQL runners use Python sqlite3's legacy implicit transactions, so a BEGIN after any DML errors in pg_check but works in sql.js/CLI, and a ROLLBACK after bare DML undoes it in pg_check but errors in sql.js; connecting with isolation_level=None would match the browser. L36 files avoid both patterns.
+- L36: the toc sums to 154 vs meta ~135–145 (pre-existing). p2-5 says "about 200 ms" but the run shows 259 ms. e-3 explanation assumes "the code keeps it reachable". Shared fix done: pg_check SQL now runs in autocommit (isolation_level=None), matching sql.js; L34 and L36 re-verified (0 problems).
+- L25: Part 3 is now 63 min; check #2 should split it (e.g. licences + SemVer/BOM/multi-module as its own part with a new id that keeps the final id). Missing: exercise steps, recall items, primary-box links and RESOURCES entries for licences/SemVer/BOM (the sheet entries are in the SHEETS task). The licensee plugin was not run (labelled in the lesson).
+- L35: toc 159 vs meta 130–145 (pre-existing gap). Doc quote wording not re-checked. Note: sql.js 1.15.1 bundles SQLite 3.54.0.
+- L33: GDPR Art. 4(1), 5(1)(e) and Recital 26 are quoted from memory (EUR-Lex blocks fetches). Verify via gdpr-info.eu or an official mirror. The final part id moved p4→p5 (check anchors and links). toc 185 vs meta 160–175.
+- L37 (.build/l37/lesson.src.html): line ~460 auto box still lists take among "error-free" functions; ~341 p2-2 option "The code, to pass test" awkward. Chapter titles/IntelliJ shortcuts from memory.
+- L38 (tpl): ~332 p1-3 explanation calls List.of().add "an LSP violation built into the JDK" (debatable: add is documented optional). ~507 the Dummy table row says MemberStore is a dummy, but in the final it is the shared FakeMemberStore (a fake).

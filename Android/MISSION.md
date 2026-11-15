@@ -9,6 +9,7 @@ Transition from a junior Android developer into a high-impact, senior-ready Mode
 - Implement production-grade networking (Ktor/Retrofit + kotlinx.serialization), local persistence (Room + DataStore), and background synchronization (WorkManager).
 - Satisfy 2027 platform mandates and production trust requirements: 16 KB page alignment, Android 17 adaptive/resizable layouts, Predictive Back, Credential Manager (Passkeys), Play Integrity, screenshot regression tests, and `ApplicationExitInfo` observability.
 - Architect Kotlin Multiplatform (KMP) shared domain/data modules (Ktor, Room KMP, Koin) and evaluate Compose Multiplatform & On-Device AI (Gemini Nano) tradeoffs.
+- Lead brownfield View-to-Compose migrations (`ComposeView`/`AndroidView`), architect Media3 (`ExoPlayer`) & `CameraX` pipelines, build Jetpack Glance widgets & Android 16/17 Live Updates, and design multi-module feature flag & analytics systems.
 - Ship an end-to-end, resume-worthy capstone app ("Aether Portfolio") featuring real-time data, offline caching, biometrics, 85%+ automated test coverage, Baseline Profiles, and CI/CD.
 - Confidently tackle Android System Design and technical interviews at top-tier product companies.
 

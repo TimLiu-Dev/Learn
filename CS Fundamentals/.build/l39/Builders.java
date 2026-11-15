@@ -30,8 +30,8 @@ public class Builders {
             Builder page(int limit, int offset) { this.limit = limit; this.offset = offset; return this; }
 
             BookSearch build() {                                         // validate the whole object, once
-                if (yearFrom > yearTo) throw new IllegalStateException("yearFrom " + yearFrom + " > yearTo " + yearTo);
-                if (limit < 1 || limit > 100) throw new IllegalStateException("limit must be 1..100, was " + limit);
+                if (yearFrom > yearTo) throw new IllegalArgumentException("yearFrom " + yearFrom + " > yearTo " + yearTo);
+                if (limit < 1 || limit > 100) throw new IllegalArgumentException("limit must be 1..100, was " + limit);
                 return new BookSearch(this);
             }
         }
@@ -41,7 +41,7 @@ public class Builders {
         BookSearch q = BookSearch.builder().title("dune").years(1960, 1970).sort("year").build();
         System.out.println(q);
         try { BookSearch.builder().years(2000, 1990).build(); }
-        catch (IllegalStateException e) { System.out.println("rejected: " + e.getMessage()); }
+        catch (IllegalArgumentException e) { System.out.println("rejected: " + e.getMessage()); }
 
         // Builders in the JDK: HttpRequest (L31) and StringBuilder
         HttpRequest req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:8080/books?q=dune"))

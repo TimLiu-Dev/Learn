@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 0007 — PostgreSQL Internals: B-Tree Indexes, EXPLAIN Plans &amp; Connection Pooling</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <nav class="site-nav">
+    <div class="site-nav-inner">
+      <a class="site-brand" href="../master-plan.html">
+        <span>Android &rarr; Senior AWS 2027</span>
+        <span class="badge">Lesson 0007</span>
+      </a>
+      <div class="nav-links">
+        <a href="../master-plan.html">Master Plan Legend</a>
+        <a href="./0007-postgresql-indexes-explain-pooling.html" class="active">Lesson 0007</a>
+        <a href="../reference/glossary.html">Glossary</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="page-wrap">
+    <div class="meta-strip">
+      <span class="pill part1">Part 1 &middot; Module 1.3</span>
+      <span class="pill">Est. Time: 25 mins</span>
+    </div>
+
+    <h1>PostgreSQL Internals: B-Tree Indexes, <code>EXPLAIN</code> Plans &amp; Connection Pooling</h1>
+    <p class="lead">
+      Adding an index in SQLite on Android masks slow queries on 5,000 local rows. On multi-tenant Amazon RDS PostgreSQL with 50 million rows and autoscaling ECS/Lambda callers, misunderstanding composite B-tree ordering, Visibility Map heap fetches, or process-per-connection memory turns a 4 ms lookup into an outage.
+    </p>
+
+    <div class="lesson-layout with-sidenote-rail">
+      <article>
+        <div class="callout android-bridge">
+          <div class="callout-title">Your Android Bridge</div>
+          <p style="margin: 0;">
+            In Android Room, you annotate <code>@Entity(indices = [Index(value = ["userId", "createdAt"])])</code> on a local SQLite file opened by a single app process with zero network hops. In production AWS backends, <strong>Amazon RDS / Aurora PostgreSQL</strong> stores table rows (<strong>heap</strong>) and <a href="../reference/glossary.html#b-tree-index">B-tree indexes</a> in <strong>8 KB pages</strong> across network-attached EBS volumes, verifies <a href="../reference/glossary.html#mvcc">MVCC</a> row visibility on every tuple, and forks an OS process (~5–10 MB RAM) for every open client connection.
+          </p>
+        </div>
+
+        <!-- SECTION 1 -->
+        <h2>1. Composite B-Tree Indexes &amp; the Leftmost Prefix Rule</h2>
+        <p>
+          A PostgreSQL B-tree index stores sorted keys in a balanced tree of <strong>8 KB pages</strong> (typically 3–4 levels deep even for 50 million rows). Leaf pages hold the indexed column values plus a physical tuple pointer called a <code>ctid</code> (<code>(page_number, slot_index)</code>) pointing to the row in the table heap.
+        </p>
+        <p>
+          When you create a composite index <code>ON orders (tenant_id, status, created_at)</code>, entries are sorted <strong>lexicographically</strong>: first by <code>tenant_id</code>, ties broken by <code>status</code>, and ties broken by <code>created_at</code>. That sort order creates the <a href="../reference/glossary.html#leftmost-prefix">leftmost prefix rule</a>:
+        </p>
+        <ol>
+          <li><strong>Equality prefixes stay contiguous:</strong> <code>WHERE tenant_id = 42 AND status = 'PAID'</code> narrows directly to one contiguous slice of leaf pages, keeping <code>created_at</code> sorted inside that slice.</li>
+          <li><strong>The first range predicate stops prefix narrowing:</strong> In <code>WHERE tenant_id = 42 AND created_at &gt;= '2026-11-01'</code> on <code>(tenant_id, created_at, status)</code>, <code>tenant_id = 42</code> and <code>created_at &gt;= ...</code> use the tree, but any trailing column (<code>status</code>) is <em>no longer sorted globally</em> across the matched range—it can only be filtered row-by-row after scanning the range.</li>
+          <li><strong>Skipping a leading column breaks the tree lookup:</strong> <code>WHERE status = 'PAID'</code> (without <code>tenant_id</code>) cannot jump to one subtree because <code>'PAID'</code> rows live inside every <code>tenant_id</code> subtree, forcing PostgreSQL toward a <code>Seq Scan</code>.</li>
+        </ol>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 250" width="100%" height="auto" role="img" aria-label="Composite B-Tree Leftmost Prefix and Heap Fetch Diagram">
+            <rect x="0" y="0" width="680" height="250" fill="#fdfcf8" rx="6" />
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Composite B-Tree: INDEX (tenant_id, status, created_at)</text>
+
+            <!-- Root -->
+            <rect x="235" y="42" width="210" height="32" rx="4" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="340" y="62" text-anchor="middle" font-family="monospace" font-size="11" fill="#0f4c81">Root Page (tenant_id split)</text>
+
+            <!-- Arrows Root -> Branch -->
+            <line x1="290" y1="74" x2="170" y2="100" stroke="#575c66" stroke-width="1.5" />
+            <line x1="390" y1="74" x2="510" y2="100" stroke="#575c66" stroke-width="1.5" />
+
+            <!-- Branch Left (matched) -->
+            <rect x="40" y="100" width="260" height="34" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="170" y="121" text-anchor="middle" font-family="monospace" font-size="11" fill="#166534">Leaf Slice: (42, 'PAID', 2026-11..)</text>
+
+            <!-- Branch Right -->
+            <rect x="380" y="100" width="260" height="34" rx="4" fill="#fef3c7" stroke="#b45309" />
+            <text x="510" y="121" text-anchor="middle" font-family="monospace" font-size="11" fill="#b45309">Leaf Slice: (99, 'OPEN'/'PAID', ..)</text>
+
+            <!-- Query Outcomes -->
+            <rect x="40" y="158" width="290" height="74" rx="4" fill="#dcfce7" stroke="#166534" />
+            <text x="52" y="178" font-family="sans-serif" font-size="11" font-weight="700" fill="#166534">PREFIX HIT (3–4 page reads)</text>
+            <text x="52" y="196" font-family="monospace" font-size="10.5" fill="#1b1d21">WHERE tenant_id = 42 AND status = 'PAID'</text>
+            <text x="52" y="216" font-family="sans-serif" font-size="11" fill="#166534">&rarr; Index Scan (or Index Only if clean VM)</text>
+
+            <rect x="350" y="158" width="290" height="74" rx="4" fill="#fee2e2" stroke="#991b1b" />
+            <text x="362" y="178" font-family="sans-serif" font-size="11" font-weight="700" fill="#991b1b">PREFIX MISS (Full table scan)</text>
+            <text x="362" y="196" font-family="monospace" font-size="10.5" fill="#1b1d21">WHERE status = 'PAID' (skips tenant_id)</text>
+            <text x="362" y="216" font-family="sans-serif" font-size="11" fill="#991b1b">&rarr; Seq Scan reads all 8 KB heap pages</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 1: Put high-selectivity equality columns (<code>tenant_id</code>, <code>status</code>) first and range/sort columns (<code>created_at</code>) last in a composite B-tree index.
+          </div>
+        </div>
+
+        <!-- SECTION 2 -->
+        <h2>2. Reading <code>EXPLAIN (ANALYZE, BUFFERS)</code>: Seq Scan vs. Index-Only Scan</h2>
+        <p>
+          Never optimize a PostgreSQL query from <code>EXPLAIN</code> alone—<code>EXPLAIN</code> only prints the planner's <em>estimates</em>, which drift badly if table statistics from <code>ANALYZE</code> are stale. Always run <a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener"><code>EXPLAIN (ANALYZE, BUFFERS)</code></a> in staging or read replicas to see real execution times, actual row counts, and 8 KB page hits/reads:
+        </p>
+        <ul>
+          <li><strong><code>Seq Scan</code> (Sequential Scan):</strong> Reads every heap page in physical order (<code>seq_page_cost = 1.0</code>). Counterintuitively, a <code>Seq Scan</code> is <em>faster</em> than an <code>Index Scan</code> on tiny tables (&lt;~50 pages) or when a query matches more than <strong>~15%–20%</strong> of the table (low selectivity), because sequential I/O avoids bouncing across random heap pages (<code>random_page_cost = 4.0</code> by default, often tuned to <code>1.1</code> on AWS GP3/io2 NVMe EBS).</li>
+          <li><strong><code>Index Scan</code>:</strong> Traverses the B-tree and follows each <code>ctid</code> to the table heap to check MVCC visibility (<code>xmin</code>/<code>xmax</code>) and fetch non-indexed columns. At 1%–10% selectivity, PostgreSQL often switches to <code>Bitmap Index Scan</code> + <code>Bitmap Heap Scan</code> to sort <code>ctid</code>s and read each heap page once.</li>
+          <li><strong><code>Index Only Scan</code> &amp; the <a href="../reference/glossary.html#visibility-map">Visibility Map</a>:</strong> Using <code>INCLUDE (total_cents)</code> stores extra payload columns inside leaf pages so queries never need heap data. However, PostgreSQL B-tree leaves contain <em>no MVCC visibility info</em>. It skips the heap fetch <strong>only</strong> if the page's bit in the Visibility Map is marked all-visible (maintained by <code>VACUUM</code> / autovacuum). Watch <code>Heap Fetches: 0</code> vs <code>Heap Fetches: 184200</code> in your plan!</li>
+        </ul>
+
+        <!-- SECTION 3 -->
+        <h2>3. Connection Pooling Math: Process-Per-Connection vs. RDS Proxy</h2>
+        <p>
+          In Android, a single app uses one SQLite handle. In PostgreSQL, every client connection forks a dedicated OS backend process consuming roughly <strong>5–10 MB of base RAM</strong> (plus per-query <code>work_mem</code> allocations for sorts/hashes). Accepting 2,000 direct connections from ECS tasks or AWS Lambda functions triggers two distinct failure modes:
+        </p>
+        <ol>
+          <li><strong><code>max_connections</code> exhaustion &amp; OOM:</strong> Connections fail with <code>FATAL: remaining connection slots are reserved</code> or exhaust instance memory before CPU even hits 100%.</li>
+          <li><strong>CPU &amp; lock thrashing:</strong> Even if RAM holds out, having far more <em>actively executing</em> queries than roughly <code>2x</code> to <code>4x</code> the instance's vCPUs causes heavy context switching and kernel/lightweight lock contention (such as <code>ProcArrayLock</code>).</li>
+        </ol>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 680 185" width="100%" height="auto" role="img" aria-label="Transaction Pooling with Amazon RDS Proxy or PgBouncer">
+            <rect x="0" y="0" width="680" height="185" fill="#fdfcf8" rx="6" />
+            <text x="16" y="28" font-family="sans-serif" font-size="13" font-weight="700" fill="#1b1d21">Transaction-Mode Multiplexing (Amazon RDS Proxy / PgBouncer)</text>
+
+            <rect x="16" y="48" width="185" height="90" rx="5" fill="#e9f1f8" stroke="#0f4c81" />
+            <text x="108" y="72" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f4c81">1,500 App Connections</text>
+            <text x="108" y="92" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#1b1d21">50 ECS tasks x 30 pool</text>
+            <text x="108" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#575c66">95% idle between queries</text>
+
+            <line x1="201" y1="93" x2="245" y2="93" stroke="#0f4c81" stroke-width="2" />
+            <polygon points="245,88 255,93 245,98" fill="#0f4c81" />
+
+            <rect x="255" y="48" width="185" height="90" rx="5" fill="#fef3c7" stroke="#b45309" />
+            <text x="347" y="72" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#b45309">RDS Proxy / PgBouncer</text>
+            <text x="347" y="92" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#1b1d21">Transaction Pooling</text>
+            <text x="347" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#575c66">Pins backend only per TX</text>
+
+            <line x1="440" y1="93" x2="484" y2="93" stroke="#166534" stroke-width="2" />
+            <polygon points="484,88 494,93 484,98" fill="#166534" />
+
+            <rect x="494" y="48" width="170" height="90" rx="5" fill="#dcfce7" stroke="#166534" />
+            <text x="579" y="72" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#166534">32–64 PG Backends</text>
+            <text x="579" y="92" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#1b1d21">8 vCPU RDS Postgres</text>
+            <text x="579" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#166534">~320 MB connection RAM</text>
+
+            <text x="16" y="166" font-family="sans-serif" font-size="11.5" fill="#575c66">Note: Transaction pooling limits session-level state (SET without LOCAL, LISTEN/NOTIFY, temp tables).</text>
+          </svg>
+          <div class="diagram-caption">
+            Figure 2: A <a href="../reference/glossary.html#connection-pooler">transaction pooler</a> shields PostgreSQL from thousands of idle app sockets, but cannot fix CPU saturation if too many queries run concurrently.
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-title">Golden Rule for Pool Sizing &amp; Proxy Limits</div>
+          <p style="margin: 0;">
+            Never set application pool size blindly to 100 per container. Calculate <code>instances &times; pool_per_instance</code> before deploying: if it exceeds ~80% of <code>max_connections</code>, insert <strong>Amazon RDS Proxy</strong> or <strong>PgBouncer (transaction mode)</strong>, and cap active concurrent queries near <code>2&ndash;4 &times; db_vcpus</code> with queue timeouts.
+          </p>
+        </div>
+
+        <!-- SECTION 4 -->
+        <h2>4. Code Example: Production Index DDL &amp; Pool Sizing</h2>
+        <p>
+          Compare the Android Room index you write locally with the zero-blocking DDL, query diagnostic, and pool sizing required in production on AWS:
+        </p>
+<pre><code>-- 1. Production PostgreSQL: build covering composite index WITHOUT locking writes
+CREATE INDEX CONCURRENTLY idx_orders_tenant_status_created_cov
+  ON orders (tenant_id, status, created_at DESC)
+  INCLUDE (total_cents);
+
+-- 2. Verify Index-Only Scan + zero heap fetches + shared buffer cache hits
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT tenant_id, created_at, total_cents
+FROM orders
+WHERE tenant_id = 42 AND status = 'PAID' AND created_at &gt;= NOW() - INTERVAL '7 days'
+ORDER BY created_at DESC
+LIMIT 50;
+
+// 3. Backend Pool Sizing (Node.js pg / ECS behind RDS Proxy on 8-vCPU RDS)
+// 40 ECS tasks * max 5 = 200 client sockets -&gt; multiplexed by RDS Proxy to ~32 PG backends
+const pool = new Pool({
+  host: process.env.RDS_PROXY_ENDPOINT,
+  max: 5,                       // Keep per-task pool small; avoid connection storms
+  connectionTimeoutMillis: 2000 // Fail fast instead of piling up blocked requests
+});</code></pre>
+
+        <!-- SECTION 5: INTERACTIVE CODE PRACTICE -->
+        <h2>5. Interactive Code Practice (Runs Live &amp; Checks)</h2>
+        <p>
+          Implement <code>analyzePostgresWorkload(query, indexColumns, tableStats, poolConfig)</code> to evaluate leftmost-prefix index coverage, choose the realistic PostgreSQL scan strategy, and detect connection-limit or CPU saturation.
+        </p>
+        <div id="practice-1"></div>
+
+        <!-- SECTION 6: MULTIPLE-CHOICE DIAGNOSTIC QUIZ -->
+        <h2>6. Diagnostic Quiz (Retrieval Practice)</h2>
+        <p>
+          Test your PostgreSQL mental model on real production failure scenarios. Every choice includes immediate reasoning for both the winning answer and every distractor.
+        </p>
+        <div id="quiz-1"></div>
+
+        <!-- SECTION 7: PRIMARY SOURCE & NEXT STEPS -->
+        <h2>7. Primary Sources &amp; Teacher Check-In</h2>
+        <ul>
+          <li>
+            <strong>PostgreSQL Official Docs:</strong> <a href="https://www.postgresql.org/docs/current/indexes-multicolumn.html" target="_blank" rel="noopener">Multicolumn Indexes</a> and <a href="https://www.postgresql.org/docs/current/indexes-index-only-scans.html" target="_blank" rel="noopener">Index-Only Scans and Covering Indexes</a>.
+          </li>
+          <li>
+            <strong>PostgreSQL Official Docs:</strong> <a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener">Using EXPLAIN</a> (Planner costs, actual loops, and buffer statistics).
+          </li>
+          <li>
+            <strong>AWS Documentation:</strong> <a href="https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html" target="_blank" rel="noopener">Managing connections with Amazon RDS Proxy</a> (Multiplexing, pinning conditions, and max connections).
+          </li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Ask Your Teacher Follow-Up Questions</div>
+          <p style="margin: 0;">
+            Before moving to <strong>Lesson 0008 (ACID Transactions, Isolation Levels &amp; Zero-Downtime Migrations)</strong>, ask me anything that feels fuzzy—for example: <em>"Why do prepared statements or session variables cause RDS Proxy to pin a connection?"</em> or <em>"When does a Bitmap Heap Scan beat a plain Index Scan?"</em>
+          </p>
+        </div>
+
+        <footer class="lesson-footer">
+          <a href="./0006-caching-patterns-ttl-jitter-stampede.html">&larr; Lesson 0006: Caching Patterns: Cache-Aside, Write-Through, TTL Jitter &amp; Stampedes</a>
+          <a href="./0008-acid-transactions-isolation-migrations.html">Lesson 0008: ACID Transactions, Isolation Levels, Optimistic Locking &amp; Zero-Downtime Migrations &rarr;</a>
+        </footer>
+      </article>
+
+      <!-- Sidenote Rail (Tufte Margin Notes) -->
+      <aside class="sidenote-rail" aria-label="Margin notes">
+        <div class="sidenote">
+          <strong>Why <code>CONCURRENTLY</code> Matters</strong>
+          A plain <code>CREATE INDEX</code> holds a <code>SHARE</code> lock that blocks all <code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code> writes until finished. <code>CREATE INDEX CONCURRENTLY</code> takes two passes without blocking writes.
+        </div>
+        <div class="sidenote">
+          <strong>Pinning in RDS Proxy</strong>
+          If your ORM runs session-level <code>SET search_path</code> or creates temporary tables, RDS Proxy <em>pins</em> that client to one backend process for the session—defeating multiplexing!
+        </div>
+        <div class="sidenote">
+          <strong>Tune <code>random_page_cost</code></strong>
+          PostgreSQL's default <code>random_page_cost = 4.0</code> assumes spinning HDDs. On AWS GP3/io2 SSDs, lowering it toward <code>1.1&ndash;1.5</code> helps the planner pick indexes accurately.
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script src="../assets/lesson-widgets.js"></script>
+  <script>
+    LessonWidgets.initCodePractice("practice-1", {
+      lessonId: "0007",
+      title: "Lab 0007: Index-Match, Query-Plan & Pool Saturation Analyzer",
+      filename: "pg-analyzer.js",
+      description:
+        "Complete <code>analyzePostgresWorkload(query, indexColumns, tableStats, poolConfig)</code>. Rules:<br>(1) Walk <code>indexColumns</code> left-to-right: find matching filter in <code>query.filters</code> (<code>{ column, op }</code> where <code>op</code> is <code>\"=\"</code> or <code>\"RANGE\"</code>). Stop if a column has no filter; increment <code>matchedPrefixCols</code> for each matched column, and stop immediately after matching a <code>\"RANGE\"</code> filter.<br>(2) Compute <code>selectivity = tableStats.totalRows > 0 ? tableStats.matchedRows / tableStats.totalRows : 1</code>. If <code>matchedPrefixCols === 0 || selectivity > 0.2</code>, <code>scanType = \"SEQ_SCAN\"</code> and <code>estimatedPageReads = Math.ceil(tableStats.totalRows / 100)</code>. Otherwise check if every column in <code>query.selectColumns</code> exists in <code>indexColumns</code>: if yes and <code>tableStats.visibilityMapClean</code> is true, <code>scanType = \"INDEX_ONLY_SCAN\"</code> (<code>estimatedPageReads = 4</code>); else <code>scanType = \"INDEX_SCAN\"</code> (<code>estimatedPageReads = 4 + tableStats.matchedRows</code>).<br>(3) Compute <code>totalClientConnections = poolConfig.appInstances * poolConfig.poolPerInstance</code>. Set <code>poolStatus</code>: if <code>!poolConfig.rdsProxyEnabled && totalClientConnections > poolConfig.dbMaxConnections</code> return <code>\"CONNECTION_LIMIT_EXCEEDED\"</code>; else if <code>poolConfig.activeQueries > poolConfig.dbVcpus * 4</code> return <code>\"CPU_THRASHING\"</code>; else return <code>\"HEALTHY\"</code>.",
+      exports: ["analyzePostgresWorkload"],
+      starterCode: `function analyzePostgresWorkload(query, indexColumns, tableStats, poolConfig) {
+  // query:       { filters: [{ column, op }], selectColumns: string[] }
+  // indexColumns: string[] e.g. ["tenant_id", "status", "created_at"]
+  // tableStats:  { totalRows, matchedRows, visibilityMapClean }
+  // poolConfig:  { appInstances, poolPerInstance, activeQueries, dbVcpus, dbMaxConnections, rdsProxyEnabled }
+
+  let matchedPrefixCols = 0;
+  // TODO 1: walk indexColumns left-to-right using leftmost-prefix & range-stop rules
+
+  const selectivity = tableStats.totalRows > 0
+    ? tableStats.matchedRows / tableStats.totalRows
+    : 1;
+
+  let scanType = "SEQ_SCAN";
+  let estimatedPageReads = 0;
+  // TODO 2: determine scanType ("SEQ_SCAN", "INDEX_ONLY_SCAN", "INDEX_SCAN") & estimatedPageReads
+
+  const totalClientConnections = poolConfig.appInstances * poolConfig.poolPerInstance;
+  let poolStatus = "HEALTHY";
+  // TODO 3: evaluate CONNECTION_LIMIT_EXCEEDED, CPU_THRASHING, or HEALTHY
+
+  return { matchedPrefixCols, scanType, estimatedPageReads, totalClientConnections, poolStatus };
+}
+
+console.log(
+  "Sample analysis:",
+  analyzePostgresWorkload(
+    {
+      filters: [{ column: "tenant_id", op: "=" }, { column: "status", op: "=" }],
+      selectColumns: ["tenant_id", "status"]
+    },
+    ["tenant_id", "status", "created_at"],
+    { totalRows: 1000000, matchedRows: 200, visibilityMapClean: true },
+    { appInstances: 10, poolPerInstance: 5, activeQueries: 12, dbVcpus: 8, dbMaxConnections: 200, rdsProxyEnabled: false }
+  )
+);`,
+      hints: [
+        "Build a lookup object or <code>Map</code> from <code>query.filters</code> mapping <code>column -> op</code>. Loop over <code>indexColumns</code>: if missing, <code>break</code>; increment <code>matchedPrefixCols</code>; if <code>op !== \"=\"</code>, <code>break</code>.",
+        "Use <code>query.selectColumns.every((col) => indexColumns.includes(col))</code> to check covering-index eligibility before checking <code>tableStats.visibilityMapClean</code>.",
+        "Check <code>!poolConfig.rdsProxyEnabled && totalClientConnections > poolConfig.dbMaxConnections</code> before checking <code>poolConfig.activeQueries > poolConfig.dbVcpus * 4</code>."
+      ],
+      solutionExplanation:
+        "PostgreSQL B-tree traversal stops narrowing the index prefix after any skipped leading column or after the first range operator. Even when an index matches, low selectivity (>20% of rows) pushes the planner toward Seq Scan, and stale Visibility Map pages force Index Scan heap fetches. Meanwhile, transaction-mode proxies absorb idle client connection limits, but CPU thrashing still occurs if active concurrent queries outnumber available vCPUs.",
+      solutionCode: `function analyzePostgresWorkload(query, indexColumns, tableStats, poolConfig) {
+  const filterByCol = new Map();
+  for (const f of query.filters) {
+    filterByCol.set(f.column, f.op);
+  }
+
+  let matchedPrefixCols = 0;
+  for (const col of indexColumns) {
+    if (!filterByCol.has(col)) {
+      break;
+    }
+    matchedPrefixCols++;
+    if (filterByCol.get(col) !== "=") {
+      break;
+    }
+  }
+
+  const selectivity = tableStats.totalRows > 0
+    ? tableStats.matchedRows / tableStats.totalRows
+    : 1;
+
+  let scanType;
+  let estimatedPageReads;
+  const isCovering = query.selectColumns.every((col) => indexColumns.includes(col));
+
+  if (matchedPrefixCols === 0 || selectivity > 0.2) {
+    scanType = "SEQ_SCAN";
+    estimatedPageReads = Math.ceil(tableStats.totalRows / 100);
+  } else if (isCovering && tableStats.visibilityMapClean) {
+    scanType = "INDEX_ONLY_SCAN";
+    estimatedPageReads = 4;
+  } else {
+    scanType = "INDEX_SCAN";
+    estimatedPageReads = 4 + tableStats.matchedRows;
+  }
+
+  const totalClientConnections = poolConfig.appInstances * poolConfig.poolPerInstance;
+  let poolStatus = "HEALTHY";
+
+  if (!poolConfig.rdsProxyEnabled && totalClientConnections > poolConfig.dbMaxConnections) {
+    poolStatus = "CONNECTION_LIMIT_EXCEEDED";
+  } else if (poolConfig.activeQueries > poolConfig.dbVcpus * 4) {
+    poolStatus = "CPU_THRASHING";
+  }
+
+  return { matchedPrefixCols, scanType, estimatedPageReads, totalClientConnections, poolStatus };
+}`,
+      tests: [
+        {
+          name: "Covering prefix equality + clean Visibility Map selects INDEX_ONLY_SCAN with 4 page reads",
+          run: (scope) => {
+            const out = scope.analyzePostgresWorkload(
+              {
+                filters: [{ column: "tenant_id", op: "=" }, { column: "status", op: "=" }],
+                selectColumns: ["tenant_id", "status"]
+              },
+              ["tenant_id", "status", "created_at"],
+              { totalRows: 1000000, matchedRows: 200, visibilityMapClean: true },
+              { appInstances: 10, poolPerInstance: 5, activeQueries: 12, dbVcpus: 8, dbMaxConnections: 200, rdsProxyEnabled: false }
+            );
+            const pass =
+              out.matchedPrefixCols === 2 &&
+              out.scanType === "INDEX_ONLY_SCAN" &&
+              out.estimatedPageReads === 4 &&
+              out.poolStatus === "HEALTHY";
+            return { pass, message: `got matched=${out.matchedPrefixCols}, scan=${out.scanType}, reads=${out.estimatedPageReads}, pool=${out.poolStatus}` };
+          }
+        },
+        {
+          name: "Dirty Visibility Map falls back from INDEX_ONLY_SCAN to INDEX_SCAN with heap fetches",
+          run: (scope) => {
+            const out = scope.analyzePostgresWorkload(
+              {
+                filters: [{ column: "tenant_id", op: "=" }],
+                selectColumns: ["tenant_id", "status"]
+              },
+              ["tenant_id", "status", "created_at"],
+              { totalRows: 500000, matchedRows: 50, visibilityMapClean: false },
+              { appInstances: 8, poolPerInstance: 5, activeQueries: 10, dbVcpus: 4, dbMaxConnections: 100, rdsProxyEnabled: false }
+            );
+            const pass = out.matchedPrefixCols === 1 && out.scanType === "INDEX_SCAN" && out.estimatedPageReads === 54;
+            return { pass, message: `got scan=${out.scanType}, reads=${out.estimatedPageReads}` };
+          }
+        },
+        {
+          name: "Range predicate on middle column stops prefix matching for trailing columns",
+          run: (scope) => {
+            const out = scope.analyzePostgresWorkload(
+              {
+                filters: [
+                  { column: "tenant_id", op: "=" },
+                  { column: "created_at", op: "RANGE" },
+                  { column: "status", op: "=" }
+                ],
+                selectColumns: ["tenant_id", "total_cents"]
+              },
+              ["tenant_id", "created_at", "status"],
+              { totalRows: 100000, matchedRows: 100, visibilityMapClean: true },
+              { appInstances: 4, poolPerInstance: 5, activeQueries: 8, dbVcpus: 4, dbMaxConnections: 100, rdsProxyEnabled: false }
+            );
+            const pass = out.matchedPrefixCols === 2 && out.scanType === "INDEX_SCAN" && out.estimatedPageReads === 104;
+            return { pass, message: `got matchedPrefixCols=${out.matchedPrefixCols}, scan=${out.scanType}` };
+          }
+        },
+        {
+          name: "Skipping leading column or low selectivity (>20%) triggers SEQ_SCAN",
+          run: (scope) => {
+            const skipped = scope.analyzePostgresWorkload(
+              { filters: [{ column: "status", op: "=" }], selectColumns: ["status"] },
+              ["tenant_id", "status", "created_at"],
+              { totalRows: 100000, matchedRows: 10, visibilityMapClean: true },
+              { appInstances: 2, poolPerInstance: 5, activeQueries: 4, dbVcpus: 4, dbMaxConnections: 100, rdsProxyEnabled: false }
+            );
+            const lowSel = scope.analyzePostgresWorkload(
+              { filters: [{ column: "tenant_id", op: "=" }], selectColumns: ["tenant_id"] },
+              ["tenant_id", "status", "created_at"],
+              { totalRows: 100000, matchedRows: 25000, visibilityMapClean: true },
+              { appInstances: 2, poolPerInstance: 5, activeQueries: 4, dbVcpus: 4, dbMaxConnections: 100, rdsProxyEnabled: false }
+            );
+            const pass =
+              skipped.matchedPrefixCols === 0 &&
+              skipped.scanType === "SEQ_SCAN" &&
+              skipped.estimatedPageReads === 1000 &&
+              lowSel.scanType === "SEQ_SCAN";
+            return { pass, message: `skipped=${skipped.scanType}(${skipped.estimatedPageReads}), lowSel=${lowSel.scanType}` };
+          }
+        },
+        {
+          name: "Detects CONNECTION_LIMIT_EXCEEDED without RDS Proxy and CPU_THRASHING when activeQueries > 4*vCPU with proxy",
+          run: (scope) => {
+            const directOverload = scope.analyzePostgresWorkload(
+              { filters: [{ column: "tenant_id", op: "=" }], selectColumns: ["tenant_id"] },
+              ["tenant_id"],
+              { totalRows: 10000, matchedRows: 5, visibilityMapClean: true },
+              { appInstances: 50, poolPerInstance: 10, activeQueries: 12, dbVcpus: 8, dbMaxConnections: 200, rdsProxyEnabled: false }
+            );
+            const proxiedHealthy = scope.analyzePostgresWorkload(
+              { filters: [{ column: "tenant_id", op: "=" }], selectColumns: ["tenant_id"] },
+              ["tenant_id"],
+              { totalRows: 10000, matchedRows: 5, visibilityMapClean: true },
+              { appInstances: 50, poolPerInstance: 10, activeQueries: 12, dbVcpus: 8, dbMaxConnections: 200, rdsProxyEnabled: true }
+            );
+            const proxiedCpuThrash = scope.analyzePostgresWorkload(
+              { filters: [{ column: "tenant_id", op: "=" }], selectColumns: ["tenant_id"] },
+              ["tenant_id"],
+              { totalRows: 10000, matchedRows: 5, visibilityMapClean: true },
+              { appInstances: 50, poolPerInstance: 10, activeQueries: 60, dbVcpus: 8, dbMaxConnections: 200, rdsProxyEnabled: true }
+            );
+            const pass =
+              directOverload.totalClientConnections === 500 &&
+              directOverload.poolStatus === "CONNECTION_LIMIT_EXCEEDED" &&
+              proxiedHealthy.poolStatus === "HEALTHY" &&
+              proxiedCpuThrash.poolStatus === "CPU_THRASHING";
+            return {
+              pass,
+              message: `direct=${directOverload.poolStatus}, proxyOk=${proxiedHealthy.poolStatus}, proxyThrash=${proxiedCpuThrash.poolStatus}`
+            };
+          }
+        }
+      ]
+    });
+
+    LessonWidgets.initQuiz("quiz-1", {
+      lessonId: "0007",
+      title: "Quiz 0007: B-Tree Indexes, EXPLAIN & Connection Pools",
+      questions: [
+        {
+          id: "q1",
+          prompt: "A 20-million-row `orders` table has a composite B-tree index on `(tenant_id, status, created_at)`. A query runs `SELECT tenant_id, created_at FROM orders WHERE status = 'PAID' AND created_at >= NOW() - INTERVAL '7 days'`, and `EXPLAIN ANALYZE` chooses a slow `Seq Scan`. Why did PostgreSQL skip the composite index?",
+          options: [
+            "The visibility map is stale, forcing the planner to reject index scans",
+            "The query omits the leading tenant_id column, preventing B-tree subtree range pruning",
+            "The range predicate on created_at disables B-tree lookups across eight-kilobyte index pages",
+            "The selected columns exclude primary keys, preventing PostgreSQL from reading index leaves"
+          ],
+          correctIndex: 1,
+          explanations: [
+            "A stale visibility map turns an Index Only Scan into an Index Scan with heap fetches; it does not prevent using a matching index.",
+            "Because the composite B-tree is sorted first by tenant_id, omitting tenant_id scatters 'PAID' rows across every tenant subtree, forcing a Seq Scan.",
+            "Range predicates on trailing columns are fully supported by B-trees once the leading prefix columns are constrained.",
+            "PostgreSQL B-tree leaf pages store ctid tuple pointers directly; primary keys do not need to appear in the SELECT list."
+          ]
+        },
+        {
+          id: "q2",
+          prompt: "You create a covering index `CREATE INDEX idx_orders_cov ON orders (tenant_id, status) INCLUDE (total_cents)` so a hot reporting query uses `Index Only Scan`. Under heavy update traffic, `EXPLAIN (ANALYZE, BUFFERS)` reports `Index Only Scan` with `Heap Fetches: 184200` and tail latency spikes. What explains the heap fetches?",
+          options: [
+            "INCLUDE columns sit outside B-tree leaf pages, forcing extra random heap lookups",
+            "The planner ignores INCLUDE columns whenever random_page_cost exceeds the default sequential cost",
+            "Frequent updates dirty heap pages faster than autovacuum updates the visibility map",
+            "PostgreSQL stores MVCC transaction timestamps exclusively inside WAL segments rather than indexes"
+          ],
+          correctIndex: 2,
+          explanations: [
+            "INCLUDE columns are stored directly inside the B-tree leaf pages specifically to avoid visiting the table heap for payload values.",
+            "Once the planner selects Index Only Scan, INCLUDE columns are already part of the plan; random_page_cost only influences plan choice.",
+            "B-tree leaves lack MVCC visibility metadata, so PostgreSQL must visit the heap whenever pages are not marked all-visible in the Visibility Map by vacuum.",
+            "MVCC xmin/xmax metadata lives in each heap tuple header, not exclusively in WAL segments."
+          ]
+        },
+        {
+          id: "q3",
+          prompt: "An AWS Lambda API surges to 1,500 concurrent invocations against an 8-vCPU RDS PostgreSQL instance (`max_connections = 800`), failing with `remaining connection slots are reserved`. Adding Amazon RDS Proxy in transaction-pooling mode eliminates the slot errors, yet p99 latency collapses whenever 300 heavy analytical queries run simultaneously. Why?",
+          options: [
+            "Multiplexing caps idle backend sockets, not CPU contention from concurrent active queries",
+            "Transaction pooling forces RDS Proxy to re-run TLS handshakes on every statement",
+            "RDS Proxy disables PostgreSQL shared buffers, forcing analytical scans onto instance storage",
+            "Analytical queries bypass proxy connection pools and open direct superuser TCP sockets"
+          ],
+          correctIndex: 0,
+          explanations: [
+            "Transaction pooling solves memory and slot exhaustion from idle connections, but 300 simultaneously active heavy queries still saturate 8 vCPUs and locks.",
+            "RDS Proxy maintains warm backend connections and pools TLS sessions; it does not renegotiate TLS per SQL statement.",
+            "Shared buffers belong to the PostgreSQL server instance itself and remain fully active behind RDS Proxy.",
+            "All client traffic pointed at the RDS Proxy endpoint goes through the proxy unless the caller explicitly connects to the direct RDS hostname."
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>

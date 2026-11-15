@@ -26,6 +26,12 @@
   Official KMP documentation and Android Jetpack KMP library guides (Room KMP, DataStore, Ktor, Koin). Use for: Sharing business logic and UI natively across Android and iOS.
 - [Android Developers: Gemini Nano & On-Device AI](https://developer.android.com/ai/gemini-nano)
   Official AICore and ML Kit GenAI documentation for local inference. Use for: Privacy-first, offline-capable AI features.
+- [Android Developers: Compose & View Interoperability](https://developer.android.com/develop/ui/compose/migrate/interoperability-apis)
+  Official migration guide for `ComposeView`, `AndroidView`, and `ViewCompositionStrategy`. Use for: Brownfield app migrations and wrapping native Views.
+- [Android Developers: Jetpack Media3 (ExoPlayer) & CameraX](https://developer.android.com/media/media3)
+  Official media playback, caching, background `MediaSessionService`, and `CameraX` pipeline guides. Use for: Video feeds, audio players, and camera capture.
+- [Android Developers: Jetpack Glance & Live Update Notifications](https://developer.android.com/develop/ui/compose/glance)
+  Official documentation for declarative App Widgets (`GlanceAppWidget`) and Android 16/17 Promoted Ongoing Notifications (`ProgressStyle`). Use for: Home-screen and lock-screen system surfaces.
 
 ## Wisdom (Communities)
 

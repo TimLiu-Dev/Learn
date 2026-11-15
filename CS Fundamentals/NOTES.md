@@ -186,3 +186,4 @@
     - L45: coverage and property tests.
   - **Batches** (one builder per lesson): A = L1–L7; then L9–L15; L48, L16–L21; L49–L52, L22, L53, L23; L54, L24–L29; L30–L33, L55, L34–L36; L56, L37–L43; L57, L44–L47.
   - **Then:** an independent second review of every lesson (check #2), and automated QA, manifest, chrome and nav (check #3).
+  - **Progress tracking:** `.build/v6/queue.md` (done, running, queued) and `.build/v6/findings.md` (builder findings left for check #2). These live in the course because macOS cleared the scratchpad during the weekly-limit pause (2026-11-07 → 11-14). By 2026-11-14, L1–L8 were done; the L9–L21 and L48 builders were resumed after the pause.
