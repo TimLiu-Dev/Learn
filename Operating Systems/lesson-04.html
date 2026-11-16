@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 04: Hardware Atomics, Memory Ordering &amp; Futex Internals — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <style>
+    .mode-tabs { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.85rem; }
+    .mode-tab {
+      padding: 0.36rem 0.78rem;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-card);
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .mode-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .mesi-badge {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 0.14rem 0.44rem;
+      border-radius: 5px;
+    }
+    .mesi-M { background: var(--amber-soft); color: var(--amber); border: 1px solid var(--amber); }
+    .mesi-S { background: var(--green-soft); color: var(--green); border: 1px solid var(--green); }
+    .mesi-I { background: var(--red-soft); color: var(--red); border: 1px solid var(--red); }
+    .mesi-E { background: var(--cyan-soft); color: var(--cyan); border: 1px solid var(--cyan); }
+    .futex-state-box {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: 999px;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+    .fs-0 { background: var(--green-soft); color: var(--green); border: 1px solid var(--green); }
+    .fs-1 { background: var(--amber-soft); color: var(--amber); border: 1px solid var(--amber); }
+    .fs-2 { background: var(--red-soft); color: var(--red); border: 1px solid var(--red); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 04</span>
+        <span>Hardware Atomics, Memory Ordering &amp; Futex Internals</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-03.html">&larr; Prev Lesson</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C &amp; Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">Code Labs (3)</a>
+        <a href="#quiz">Quiz (6)</a>
+        <a href="lesson-05.html">Next Lesson &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- HERO -->
+    <section class="hero">
+      <span class="badge b-concept">PHASE 2 // CACHE COHERENCE, MEMORY BARRIERS &amp; FUTEX</span>
+      <h1>Lesson 04: Hardware Atomics, Memory Ordering &amp; Futex Internals</h1>
+      <p>
+        Multi-core synchronization starts in silicon, not in <code>pthread_mutex_lock()</code>. Modern ARM64 CPUs
+        buffer writes in per-core store buffers, reorder loads past stores, and shuttle 64-byte cache lines across cores
+        via MESI coherence. Understanding hardware memory ordering and the Linux <code>futex()</code> 3-state protocol
+        explains why uncontended locks cost ~10ns while contended locks sleep cleanly in the kernel.
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button id="markLessonComplete" class="btn btn-green btn-sm" type="button">Mark Lesson 04 Complete</button>
+      </div>
+    </section>
+
+    <!-- MODULE 1: MENTAL MODEL + SIMULATOR -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>Store Buffers, MESI Cache Lines &amp; The 3-State Futex</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. Cache Lines, MESI &amp; Store Buffers</h3>
+          <p><strong>Cache Coherency (MESI):</strong> CPU cores do not read/write individual bytes to RAM—they move <strong>64-byte cache lines</strong> in states <code>Modified</code>, <code>Exclusive</code>, <code>Shared</code>, or <code>Invalid</code>. Writing a byte invalidates every other core's copy of that 64-byte line (causing <em>false sharing</em> if unrelated hot variables sit in the same 64 bytes).</p>
+          <p><strong>Store Buffers &amp; Weak Ordering:</strong> Waiting for remote invalidations on every store would stall the core. So cores enqueue writes in a private <strong>Store Buffer</strong> and continue executing subsequent reads! On weakly ordered ARM64, another core can observe stores out of program order unless you emit a barrier (<code>DMB ISH</code>) or acquire/release instructions (<code>LDAR</code> / <code>STLR</code>).</p>
+        </div>
+
+        <div class="card">
+          <h3>2. Why <code>futex</code> Beats Pure Spinlocks &amp; Pure Kernel Locks</h3>
+          <p><strong>Spinlocks:</strong> Great inside the kernel for nanosecond critical sections with preemption disabled, but disastrous in user space if the lock holder gets preempted—waiters burn 100% CPU spinning.</p>
+          <p><strong>Linux <code>futex(uaddr, op, val)</code> (Fast User-Space Mutex):</strong> Keeps an atomic 32-bit integer in user memory with 3 states: <code>0 = unlocked</code>, <code>1 = locked (uncontended)</code>, <code>2 = locked (contended / waiters sleeping)</code>. Uncontended <code>0 &harr; 1</code> uses a single atomic CAS in EL0 with <strong>zero syscalls</strong>; only state <code>2</code> traps into <code>EL1</code> to sleep or wake via a kernel hash-bucket waitqueue.</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <strong>Acquire / Release Contract:</strong> A <code>memory_order_release</code> store guarantees all prior writes by this thread become visible <em>before</em> the flag/lock is published. A <code>memory_order_acquire</code> load guarantees subsequent reads by the consumer occur <em>after</em> observing the flag—forming a cross-core happens-before edge without full <code>seq_cst</code> overhead.
+      </div>
+
+      <h3 style="margin:1.25rem 0 0.4rem;">Interactive Simulator: Store Buffer / MESI Coherence &amp; 3-State Futex</h3>
+      <p style="margin:0; font-size:0.89rem; color:var(--text-muted);">
+        Switch between the two hardware/kernel visualizers below to watch store-buffer reordering vs. <code>DMB ISH</code> barriers and trace uncontended vs. contended <code>futex</code> syscalls.
+      </p>
+
+      <div class="sim-box">
+        <div class="mode-tabs">
+          <button class="mode-tab active" id="tabMesi" type="button">Mode A: Store Buffer &amp; MESI Coherence</button>
+          <button class="mode-tab" id="tabFutex" type="button">Mode B: 3-State Futex (0 / 1 / 2)</button>
+        </div>
+
+        <!-- MODE A: MESI / STORE BUFFER -->
+        <div id="panelMesi">
+          <div class="sim-controls">
+            <button class="btn btn-primary btn-sm" id="mesiStepBtn" type="button">Next Cycle &rarr;</button>
+            <button class="btn btn-amber btn-sm" id="mesiBarrierBtn" type="button">Toggle Barrier: OFF (Weak ARM64)</button>
+            <button class="btn btn-sm" id="mesiResetBtn" type="button">Reset</button>
+            <span class="pill" id="mesiCyclePill">Cycle 0 / 4</span>
+          </div>
+
+          <div class="sim-grid">
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">CORE 0: <code>x = 1; [DMB?] r1 = y;</code></div>
+              <div class="reg-row"><span>Store Buffer</span><span id="c0Buf" class="reg-val">Empty</span></div>
+              <div class="reg-row"><span>L1 Line [x]</span><span id="c0LineX" class="reg-val"><span class="mesi-badge mesi-S">S: x=0</span></span></div>
+              <div class="reg-row"><span>L1 Line [y]</span><span id="c0LineY" class="reg-val"><span class="mesi-badge mesi-S">S: y=0</span></span></div>
+              <div class="reg-row"><span>Observed r1</span><span id="c0Reg" class="reg-val">-</span></div>
+            </div>
+
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">CORE 1: <code>y = 1; [DMB?] r2 = x;</code></div>
+              <div class="reg-row"><span>Store Buffer</span><span id="c1Buf" class="reg-val">Empty</span></div>
+              <div class="reg-row"><span>L1 Line [x]</span><span id="c1LineX" class="reg-val"><span class="mesi-badge mesi-S">S: x=0</span></span></div>
+              <div class="reg-row"><span>L1 Line [y]</span><span id="c1LineY" class="reg-val"><span class="mesi-badge mesi-S">S: y=0</span></span></div>
+              <div class="reg-row"><span>Observed r2</span><span id="c1Reg" class="reg-val">-</span></div>
+            </div>
+
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">COHERENCY BUS &amp; OUTCOME</div>
+              <div class="reg-row"><span>Bus Traffic</span><span id="busMsg" class="reg-val">Quiet</span></div>
+              <div class="reg-row"><span>Result (r1, r2)</span><span id="mesiOutcome" class="reg-val">Pending</span></div>
+            </div>
+          </div>
+
+          <div class="callout" id="mesiExplain" style="margin:0.9rem 0 0; font-size:0.86rem;">
+            Both cores start with cache lines <code>x=0</code> and <code>y=0</code> in MESI <strong>Shared (S)</strong> state. Click <strong>Next Cycle</strong> to see why Store Buffers cause <code>(r1=0, r2=0)</code> without a barrier.
+          </div>
+        </div>
+
+        <!-- MODE B: FUTEX -->
+        <div id="panelFutex" style="display:none;">
+          <div class="sim-controls">
+            <button class="btn btn-primary btn-sm" id="fxFastBtn" type="button">T1 Lock + Unlock (Uncontended)</button>
+            <button class="btn btn-sm" id="fxT1LockBtn" type="button">T1: lock()</button>
+            <button class="btn btn-amber btn-sm" id="fxT2LockBtn" type="button">T2: lock() [Contended!]</button>
+            <button class="btn btn-green btn-sm" id="fxT1UnlockBtn" type="button">T1: unlock()</button>
+            <button class="btn btn-sm" id="fxResetBtn" type="button">Reset</button>
+            <span id="fxStateBadge" class="futex-state-box fs-0">uaddr = 0 (UNLOCKED)</span>
+          </div>
+
+          <div class="sim-grid">
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">USER-SPACE ATOMIC WORD</div>
+              <div class="reg-row"><span>*uaddr State</span><span id="fxVal" class="reg-val">0</span></div>
+              <div class="reg-row"><span>Current Owner</span><span id="fxOwner" class="reg-val">None</span></div>
+              <div class="reg-row"><span>EL0 CAS Ops</span><span id="fxCasCount" class="reg-val">0</span></div>
+            </div>
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">KERNEL FUTEX WAITQUEUE (EL1)</div>
+              <div class="reg-row"><span>Sleeping Threads</span><span id="fxWaitQ" class="reg-val">[]</span></div>
+              <div class="reg-row"><span>FUTEX_WAIT Traps</span><span id="fxWaits" class="reg-val">0</span></div>
+              <div class="reg-row"><span>FUTEX_WAKE Traps</span><span id="fxWakes" class="reg-val">0</span></div>
+            </div>
+          </div>
+
+          <div class="callout" id="fxExplain" style="margin:0.9rem 0 0; font-size:0.86rem;">
+            Notice that uncontended <code>0 &rarr; 1 &rarr; 0</code> executes <strong>0 kernel syscalls</strong>. Try <code>T1: lock()</code> then <code>T2: lock()</code> to trigger the <code>1 &rarr; 2</code> transition and <code>FUTEX_WAIT</code>.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 2: REAL C, ARM64 ATOMICS & FUTEX -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C11 ATOMICS, ARM64 LSE/LL-SC &amp; FUTEX</span>
+          <h2>Acquire/Release Publication, ARM64 CAS &amp; 3-State Futex Mutex</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>C11 &lt;stdatomic.h&gt; — Lock-Free Producer/Consumer</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code4-1">Copy</button>
+          </div>
+          <pre class="code" id="code4-1">#include &lt;stdatomic.h&gt;
+
+struct Packet { int payload; };
+struct Packet data;
+_Atomic int ready = 0;
+
+void producer(int val) {
+    data.payload = val; /* Non-atomic write */
+    /* STLR on ARM64: all prior stores visible BEFORE ready=1 */
+    atomic_store_explicit(&amp;ready, 1, memory_order_release);
+}
+
+int consumer(int *out) {
+    /* LDAR on ARM64: no later read can speculate BEFORE ready==1 */
+    if (atomic_load_explicit(&amp;ready, memory_order_acquire) == 1) {
+        *out = data.payload; /* Guaranteed to see val! */
+        return 1;
+    }
+    return 0;
+}</pre>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>ARM64 Assembly — LL/SC (LDXR/STXR) vs ARMv8.1 LSE (CASAL)</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code4-2">Copy</button>
+          </div>
+          <pre class="code" id="code4-2">/* Classic ARMv8.0 LL/SC loop: prone to livelock under high contention */
+retry:
+    ldaxr   w2, [x0]         // Load-Acquire Exclusive *uaddr
+    cmp     w2, w1           // Compare with expected
+    b.ne    fail
+    stlxr   w3, w4, [x0]     // Store-Release Exclusive newval
+    cbnz    w3, retry        // Retry if exclusive monitor cleared!
+
+/* ARMv8.1 LSE (Large System Extensions) single-instruction atomic:
+ * Scales dramatically better on 8+ core mobile &amp; 64+ core servers */
+    mov     w2, w1
+    casal   w2, w4, [x0]     // Atomic CAS with Acquire-Release semantics</pre>
+        </div>
+      </div>
+
+      <div class="code-wrap">
+        <div class="code-header">
+          <span>Linux User-Space C — 3-State Futex Mutex (Ulrich Drepper Pattern)</span>
+          <button class="btn btn-sm copy-btn" type="button" data-copy="code4-3">Copy</button>
+        </div>
+        <pre class="code" id="code4-3">#include &lt;linux/futex.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;stdatomic.h&gt;
+#include &lt;unistd.h&gt;
+
+/* state: 0 = unlocked, 1 = locked (no waiters), 2 = locked (waiters exist) */
+void futex_lock(_Atomic int *uaddr) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(
+            uaddr, &amp;expected, 1, memory_order_acquire, memory_order_relaxed)) {
+        return; /* FAST PATH: 0 syscalls! */
+    }
+    do {
+        /* If state==2 OR we successfully upgrade 1-&gt;2, sleep in kernel if still 2 */
+        if (expected == 2 ||
+            atomic_compare_exchange_strong_explicit(
+                uaddr, &amp;expected, 2, memory_order_relaxed, memory_order_relaxed)) {
+            syscall(SYS_futex, uaddr, FUTEX_WAIT_PRIVATE, 2, NULL, NULL, 0);
+        }
+        expected = 0;
+    } while (!atomic_compare_exchange_strong_explicit(
+                 uaddr, &amp;expected, 2, memory_order_acquire, memory_order_relaxed));
+}
+
+void futex_unlock(_Atomic int *uaddr) {
+    /* Only wake kernel waiters if prior state was 2 (contended) */
+    if (atomic_exchange_explicit(uaddr, 0, memory_order_release) == 2) {
+        syscall(SYS_futex, uaddr, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    }
+}</pre>
+      </div>
+
+      <div class="callout amber">
+        <strong>Senior Insight — Why <code>FUTEX_WAIT</code> Checks Expected Value Atomically in Kernel:</strong> Without passing <code>val = 2</code> to <code>futex(FUTEX_WAIT, 2)</code>, Thread B could observe the lock held, get preempted, Thread A could unlock and call <code>FUTEX_WAKE</code> (waking nobody!), and then Thread B would enter <code>FUTEX_WAIT</code> and sleep forever ("lost wakeup"). The kernel checks <code>*uaddr == 2</code> under its bucket spinlock and immediately returns <code>-EAGAIN</code> if Thread A already unlocked!
+      </div>
+    </section>
+
+    <!-- MODULE 3: ANDROID INTERNALS BRIDGE -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2>ART <code>synchronized</code> Thin-Locks, <code>pthread_mutex</code> &amp; False Sharing</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. ART <code>synchronized</code> Thin-Lock &rarr; Monitor &rarr; <code>futex</code></h3>
+          <p>Every Kotlin/Java object in ART begins with a 32-bit <strong>LockWord</strong> inside its object header:</p>
+          <p><strong>Thin-Lock (Fast Path):</strong> On uncontended <code>synchronized(obj)</code>, ART uses an atomic CAS to write the current thread's thin-lock ID and recursion count directly into the LockWord—no heap allocation and no syscall.</p>
+          <p><strong>Fat Monitor (Contended Path):</strong> If a second thread contends (or calls <code>Object.wait()</code>), ART inflates the LockWord into a <code>Monitor</code> structure backed by a Linux <code>futex</code> waitqueue. Similarly, Android <code>bionic</code>'s <code>pthread_mutex</code> uses CAS + optional adaptive spinning before falling back to <code>FUTEX_WAIT_PRIVATE</code>.</p>
+        </div>
+
+        <div class="card">
+          <h3>2. False Sharing in Native C++ Audio &amp; Render Threads</h3>
+          <p>In real-time Android native pipelines (<code>AAudio</code> / <code>Oboe</code> audio callbacks on Core 6 Big, UI/RenderThread on Core 7 Big, or metrics counters on LITTLE cores), placing two per-thread <code>std::atomic&lt;uint64_t&gt;</code> counters adjacent in a struct puts them inside the <strong>same 64-byte cache line</strong>.</p>
+          <p>Even though the threads touch <em>disjoint</em> variables, every atomic increment steals exclusive ownership (<code>M</code> state) and invalidates the peer core's L1 cache (<code>I</code> state)—degrading throughput by 5–15x! Fix it with <code>alignas(64)</code> (or <code>std::hardware_destructive_interference_size</code>) between independently written hot fields.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: 3 RUNNABLE CODING LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // HANDS-ON CONCURRENCY LABS (3 RUNNABLE CHALLENGES)</span>
+          <h2>Implement Ticket Spinlock, 3-State Futex &amp; False Sharing Analyzer</h2>
+        </div>
+      </div>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // FAIR SPINLOCK</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>ticketSpinlockStep(lock, ops)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Build a strict FIFO ticket spinlock (<code>nextTicket</code>, <code>nowServing</code>) that prevents thread starvation.
+            </p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given initial <code>lock = { nextTicket: 0, nowServing: 0 }</code> (do not mutate caller's input; clone it or track locally) and <code>ops = [{ threadId, action: "tryAcquire" | "unlock" }]</code>:<br/>
+          &bull; Maintain <code>owner = null</code>, <code>waiting = {}</code> (map of <code>threadId -&gt; ticket</code>), and <code>acquiredOrder = []</code>.<br/>
+          &bull; On <code>"tryAcquire"</code>: if <code>owner === threadId</code>, ignore. Otherwise, if <code>waiting[threadId] === undefined</code>, assign <code>waiting[threadId] = nextTicket++</code>. Next, if <code>owner === null &amp;&amp; waiting[threadId] === nowServing</code>, grant lock: <code>owner = threadId</code>, <code>delete waiting[threadId]</code>, push <code>threadId</code> to <code>acquiredOrder</code>.<br/>
+          &bull; On <code>"unlock"</code>: ONLY if <code>owner === threadId</code>, release <code>owner = null</code> and increment <code>nowServing += 1</code>.<br/>
+          &bull; Return <code>{ nextTicket, nowServing, owner, acquiredOrder, waiting }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // LINUX FUTEX PROTOCOL</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>futexMutexSim(ops)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Simulate the 3-state futex mutex (<code>0=unlocked, 1=locked, 2=contended</code>) and count <code>FUTEX_WAIT</code> / <code>FUTEX_WAKE</code> traps.
+            </p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>ops = [{ threadId, action: "lock" | "unlock" }]</code>:<br/>
+          &bull; Start with <code>state = 0</code>, <code>owner = null</code>, <code>waitQueue = []</code>, <code>syscalls = { wait: 0, wake: 0 }</code>, <code>acquiredOrder = []</code>.<br/>
+          &bull; On <code>"lock"</code>: if <code>state === 0</code>, fast-path CAS sets <code>state = 1</code>, <code>owner = threadId</code>, pushes <code>threadId</code> to <code>acquiredOrder</code> (0 syscalls!). Otherwise, set <code>state = 2</code>, increment <code>syscalls.wait += 1</code>, and push <code>threadId</code> to <code>waitQueue</code>.<br/>
+          &bull; On <code>"unlock"</code> (only if <code>owner === threadId</code>): clear <code>owner = null</code>. If <code>state === 1</code>, set <code>state = 0</code> (0 syscalls!). If <code>state === 2</code>, set <code>state = 0</code>, increment <code>syscalls.wake += 1</code>; if <code>waitQueue.length &gt; 0</code>, shift the next waiter <code>w</code>, grant lock to <code>w</code> (<code>owner = w</code>, push <code>w</code> to <code>acquiredOrder</code>, and set <code>state = waitQueue.length &gt; 0 ? 2 : 1</code>!).<br/>
+          &bull; Return <code>{ state, owner, waitQueue, syscalls, acquiredOrder }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // CACHE LINE COHERENCE</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>analyzeFalseSharing(fields, cacheLineSize)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Detect cross-core cache-line sharing in struct layouts and compute a padded layout eliminating false sharing.
+            </p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>fields = [{ name, size, align?, writerCore }]</code> and <code>cacheLineSize = 64</code>:<br/>
+          &bull; Helper <code>roundUp(n, a) = Math.ceil(n / a) * a</code>. Default <code>align = field.align ?? Math.min(field.size, 8)</code> (min 1).<br/>
+          &bull; <strong>Natural Layout:</strong> Place fields sequentially: <code>offset = roundUp(cursor, align)</code>, <code>startLine = Math.floor(offset / cacheLineSize)</code>, <code>endLine = Math.floor((offset + size - 1) / cacheLineSize)</code>, <code>cursor = offset + size</code>. Any cache line touched by <code>&ge; 2</code> distinct <code>writerCore</code>s belongs in sorted <code>sharedLines</code>.<br/>
+          &bull; <strong>Padded Layout:</strong> Place fields sequentially; before placing a field, check the cache line <code>curLine = Math.floor(pCursor / cacheLineSize)</code>. If any already-placed field on <code>curLine</code> has a <em>different</em> <code>writerCore</code>, bump <code>pCursor = (curLine + 1) * cacheLineSize</code> first, then align to <code>align</code> and place.<br/>
+          &bull; Return <code>{ naturalSize, layout, sharedLines, hasFalseSharing: sharedLines.length &gt; 0, paddedLayout, paddedSize }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: DIAGNOSTIC QUIZZES -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (6 Questions)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Profiling Lock Contention, Futex Sleeps &amp; Cache Misses on Linux / Android</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>Real Linux / Android Shell Forensics</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code4-cli">Copy</button>
+          </div>
+          <pre class="code" id="code4-cli"># 1. Trace futex(FUTEX_WAIT) contention hotspots in a live process
+strace -f -e trace=futex -p &lt;pid&gt;
+
+# 2. Measure hardware cache-line invalidations &amp; misses with perf / simpleperf
+simpleperf stat -e cache-misses,L1-dcache-load-misses -p &lt;pid&gt; --duration 5
+
+# 3. Inspect a thread blocked inside futex_wait_queue in kernel stack
+cat /proc/&lt;pid&gt;/task/&lt;tid&gt;/wchan
+cat /proc/&lt;pid&gt;/task/&lt;tid&gt;/stack
+
+# 4. Check ARM64 CPU LSE atomic support (atomics flag in /proc/cpuinfo)
+grep -E "Features|atomics" /proc/cpuinfo | head -n 4</pre>
+        </div>
+
+        <div class="card">
+          <h3>Senior Engineer Mastery Checklist</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can explain how store buffers cause <code>(r1=0, r2=0)</code> reordering and how <code>DMB ISH</code> / <code>acquire-release</code> prevents it.</span></li>
+            <li><input type="checkbox" /> <span>I understand why ARMv8.1 LSE <code>CASAL</code> scales better under contention than LL/SC <code>LDXR/STXR</code> loops.</span></li>
+            <li><input type="checkbox" /> <span>I can trace every transition of the <code>0 / 1 / 2</code> <code>futex</code> mutex and explain why <code>FUTEX_WAIT</code> checks <code>*uaddr == 2</code> in the kernel.</span></li>
+            <li><input type="checkbox" /> <span>I can spot false sharing in C++ / Rust structs and fix it using <code>alignas(64)</code> cache-line padding.</span></li>
+          </ul>
+          <div class="callout green" style="margin-top:0.85rem; margin-bottom:0; font-size:0.84rem;">
+            <strong>Next Up:</strong> Ready to build lock-free SPSC ring buffers, avoid ABA, and learn kernel RCU? Continue to <a href="lesson-05.html">Lesson 05: Deadlocks, Lock-Free Ring Buffers &amp; RCU &rarr;</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a class="btn" href="lesson-03.html">&larr; Lesson 03: EEVDF &amp; EAS</a>
+      <a class="btn" href="master-plan.html">Master Plan</a>
+      <a class="btn btn-primary" href="lesson-05.html">Lesson 05: Lock-Free &amp; RCU &rarr;</a>
+    </div>
+  </main>
+
+  <script src="assets/os-course.js"></script>
+  <script>
+    /* ============================================================
+       SIMULATOR MODE SWITCHING
+       ============================================================ */
+    const tabMesi = document.getElementById("tabMesi");
+    const tabFutex = document.getElementById("tabFutex");
+    const panelMesi = document.getElementById("panelMesi");
+    const panelFutex = document.getElementById("panelFutex");
+
+    tabMesi.addEventListener("click", () => {
+      tabMesi.classList.add("active");
+      tabFutex.classList.remove("active");
+      panelMesi.style.display = "";
+      panelFutex.style.display = "none";
+    });
+    tabFutex.addEventListener("click", () => {
+      tabFutex.classList.add("active");
+      tabMesi.classList.remove("active");
+      panelFutex.style.display = "";
+      panelMesi.style.display = "none";
+    });
+
+    /* ============================================================
+       MODE A: STORE BUFFER & MESI COHERENCE SIMULATOR
+       ============================================================ */
+    let mesiCycle = 0;
+    let mesiBarrier = false;
+
+    const MESI_SEQ = {
+      weak: [
+        {
+          c0Buf: "Empty", c0X: "S: x=0", c0Y: "S: y=0", r1: "-",
+          c1Buf: "Empty", c1X: "S: x=0", c1Y: "S: y=0", r2: "-",
+          bus: "Quiet", outcome: "Pending",
+          explain: 'Initial state: both cores hold <code>x=0</code> and <code>y=0</code> in MESI <strong>Shared (S)</strong>.'
+        },
+        {
+          c0Buf: "Pending [x=1]", c0X: "S: x=0", c0Y: "S: y=0", r1: "-",
+          c1Buf: "Pending [y=1]", c1X: "S: x=0", c1Y: "S: y=0", r2: "-",
+          bus: "RFO queued", outcome: "Pending",
+          explain: '<strong>Cycle 1:</strong> Core 0 writes <code>x=1</code> into its <em>Store Buffer</em>; Core 1 writes <code>y=1</code> into its <em>Store Buffer</em>. Neither write has drained to L1 cache or invalidated the peer yet!'
+        },
+        {
+          c0Buf: "Pending [x=1]", c0X: "S: x=0", c0Y: "S: y=0", r1: "0 (stale L1!)",
+          c1Buf: "Pending [y=1]", c1X: "S: x=0", c1Y: "S: y=0", r2: "0 (stale L1!)",
+          bus: "Bypassed!", outcome: "(r1=0, r2=0) REORDERED!",
+          explain: '<strong>Cycle 2 (Memory Reordering Bug!):</strong> Without <code>DMB ISH</code>, Core 0 speculatively reads <code>y</code> from its local L1 (<code>S: y=0</code>) before its own store buffer drains; Core 1 reads <code>x=0</code>. Both read <strong>0</strong>!'
+        },
+        {
+          c0Buf: "Empty (drained)", c0X: "M: x=1", c0Y: "I (invalidated)", r1: "0",
+          c1Buf: "Empty (drained)", c1X: "I (invalidated)", c1Y: "M: y=1", r2: "0",
+          bus: "MESI Invalidate x & y", outcome: "(r1=0, r2=0) OBSERVED",
+          explain: '<strong>Cycle 3:</strong> Store buffers finally drain: Core 0 acquires <code>x</code> in <strong>Modified (M)</strong> and invalidates Core 1\'s line; Core 1 acquires <code>y</code> in <strong>M</strong>. Too late—<code>r1=0, r2=0</code> is already latched!'
+        },
+        {
+          c0Buf: "Empty", c0X: "M: x=1", c0Y: "I", r1: "0",
+          c1Buf: "Empty", c1X: "I", c1Y: "M: y=1", r2: "0",
+          bus: "Coherent (too late)", outcome: "Broken without DMB ISH",
+          explain: '<strong>Conclusion:</strong> Cache coherence (MESI) is intact, yet weak memory ordering broke Peterson-style mutual exclusion! Toggle <strong>Barrier: ON</strong> to fix it.'
+        }
+      ],
+      strong: [
+        {
+          c0Buf: "Empty", c0X: "S: x=0", c0Y: "S: y=0", r1: "-",
+          c1Buf: "Empty", c1X: "S: x=0", c1Y: "S: y=0", r2: "-",
+          bus: "Quiet", outcome: "Pending",
+          explain: 'Initial state with <code>DMB ISH</code> placed between store and load on both cores.'
+        },
+        {
+          c0Buf: "Pending [x=1]", c0X: "S: x=0", c0Y: "S: y=0", r1: "-",
+          c1Buf: "Pending [y=1]", c1X: "S: x=0", c1Y: "S: y=0", r2: "-",
+          bus: "DMB ISH stalls loads", outcome: "Pending",
+          explain: '<strong>Cycle 1:</strong> Core 0 buffers <code>x=1</code> and hits <code>DMB ISH</code>; Core 1 buffers <code>y=1</code> and hits <code>DMB ISH</code>. Both loads are <strong>halted</strong> until store buffers drain and invalidations ack!'
+        },
+        {
+          c0Buf: "Empty (drained)", c0X: "M: x=1", c0Y: "I (invalidated)", r1: "-",
+          c1Buf: "Empty (drained)", c1X: "I (invalidated)", c1Y: "M: y=1", r2: "-",
+          bus: "MESI Invalidate Acked", outcome: "Loads unblocked",
+          explain: '<strong>Cycle 2:</strong> Both store buffers drain to L1 (<code>M</code> state) and MESI invalidations clear peer stale lines (<code>S &rarr; I</code>) <em>before</em> either load executes.'
+        },
+        {
+          c0Buf: "Empty", c0X: "S: x=1", c0Y: "S: y=1", r1: "1 (bus miss)",
+          c1Buf: "Empty", c1X: "S: x=1", c1Y: "S: y=1", r2: "1 (bus miss)",
+          bus: "Read Share x & y", outcome: "(r1=1, r2=1) SAFE!",
+          explain: '<strong>Cycle 3:</strong> Core 0 misses on invalidated <code>y</code> and fetches <code>y=1</code>; Core 1 fetches <code>x=1</code>. Both see the fresh values!'
+        },
+        {
+          c0Buf: "Empty", c0X: "S: x=1", c0Y: "S: y=1", r1: "1",
+          c1Buf: "Empty", c1X: "S: x=1", c1Y: "S: y=1", r2: "1",
+          bus: "Quiet", outcome: "(0,0) IMPOSSIBLE!",
+          explain: '<strong>Invariant Guaranteed:</strong> With <code>DMB ISH</code> (or C11 <code>seq_cst</code> / <code>acq_rel</code> fencing), <code>(r1=0, r2=0)</code> can never occur.'
+        }
+      ]
+    };
+
+    function mesiTag(str) {
+      const ch = str[0];
+      const cls = ch === "M" ? "mesi-M" : ch === "S" ? "mesi-S" : ch === "I" ? "mesi-I" : "mesi-E";
+      return `<span class="mesi-badge ${cls}">${str}</span>`;
+    }
+
+    function renderMesi() {
+      const seq = mesiBarrier ? MESI_SEQ.strong : MESI_SEQ.weak;
+      const st = seq[mesiCycle];
+      document.getElementById("mesiCyclePill").textContent = `Cycle ${mesiCycle} / 4`;
+      document.getElementById("c0Buf").textContent = st.c0Buf;
+      document.getElementById("c0LineX").innerHTML = mesiTag(st.c0X);
+      document.getElementById("c0LineY").innerHTML = mesiTag(st.c0Y);
+      document.getElementById("c0Reg").textContent = st.r1;
+      document.getElementById("c1Buf").textContent = st.c1Buf;
+      document.getElementById("c1LineX").innerHTML = mesiTag(st.c1X);
+      document.getElementById("c1LineY").innerHTML = mesiTag(st.c1Y);
+      document.getElementById("c1Reg").textContent = st.r2;
+      document.getElementById("busMsg").textContent = st.bus;
+      document.getElementById("mesiOutcome").textContent = st.outcome;
+      document.getElementById("mesiExplain").innerHTML = st.explain;
+    }
+
+    document.getElementById("mesiStepBtn").addEventListener("click", () => {
+      mesiCycle = (mesiCycle + 1) % 5;
+      renderMesi();
+    });
+    document.getElementById("mesiBarrierBtn").addEventListener("click", (e) => {
+      mesiBarrier = !mesiBarrier;
+      mesiCycle = 0;
+      e.target.textContent = mesiBarrier ? "Toggle Barrier: ON (DMB ISH)" : "Toggle Barrier: OFF (Weak ARM64)";
+      renderMesi();
+    });
+    document.getElementById("mesiResetBtn").addEventListener("click", () => {
+      mesiCycle = 0;
+      renderMesi();
+    });
+    renderMesi();
+
+    /* ============================================================
+       MODE B: 3-STATE FUTEX VISUALIZER
+       ============================================================ */
+    let fx = { state: 0, owner: null, waitQ: [], cas: 0, waits: 0, wakes: 0, explain: 'Ready. Click <strong>T1 Lock + Unlock</strong> for the 0-syscall fast path, or simulate contention with T1 + T2.' };
+
+    function renderFutex() {
+      const badge = document.getElementById("fxStateBadge");
+      if (fx.state === 0) { badge.textContent = "uaddr = 0 (UNLOCKED)"; badge.className = "futex-state-box fs-0"; }
+      else if (fx.state === 1) { badge.textContent = "uaddr = 1 (LOCKED)"; badge.className = "futex-state-box fs-1"; }
+      else { badge.textContent = "uaddr = 2 (CONTENDED)"; badge.className = "futex-state-box fs-2"; }
+
+      document.getElementById("fxVal").textContent = String(fx.state);
+      document.getElementById("fxOwner").textContent = fx.owner || "None";
+      document.getElementById("fxCasCount").textContent = String(fx.cas);
+      document.getElementById("fxWaitQ").textContent = fx.waitQ.length ? `[${fx.waitQ.join(", ")}]` : "[]";
+      document.getElementById("fxWaits").textContent = String(fx.waits);
+      document.getElementById("fxWakes").textContent = String(fx.wakes);
+      document.getElementById("fxExplain").innerHTML = fx.explain;
+    }
+
+    document.getElementById("fxFastBtn").addEventListener("click", () => {
+      if (fx.state !== 0) {
+        fx.explain = "Lock is already held! Unlock first or reset to demonstrate the uncontended fast path.";
+        renderFutex();
+        return;
+      }
+      fx.cas += 2;
+      fx.explain = '<strong>Uncontended Fast Path (<code>0 &rarr; 1 &rarr; 0</code>):</strong> T1 executed atomic CAS(0&rarr;1) and atomic XCHG(1&rarr;0) entirely in user space. <strong>0 kernel syscalls!</strong>';
+      renderFutex();
+    });
+
+    document.getElementById("fxT1LockBtn").addEventListener("click", () => {
+      if (fx.owner === "T1") return;
+      fx.cas += 1;
+      if (fx.state === 0) {
+        fx.state = 1;
+        fx.owner = "T1";
+        fx.explain = '<strong>T1 Fast Lock:</strong> CAS(0&rarr;1) succeeded in EL0. State is now <code>1</code> (uncontended). Zero syscalls.';
+      } else {
+        fx.state = 2;
+        fx.waits += 1;
+        fx.waitQ.push("T1");
+        fx.explain = '<strong>T1 Contended:</strong> CAS(0&rarr;1) failed, upgraded state to <code>2</code>, and trapped via <code>futex(FUTEX_WAIT, 2)</code>.';
+      }
+      renderFutex();
+    });
+
+    document.getElementById("fxT2LockBtn").addEventListener("click", () => {
+      if (fx.owner === "T2" || fx.waitQ.includes("T2")) return;
+      fx.cas += 1;
+      if (fx.state === 0) {
+        fx.state = 1;
+        fx.owner = "T2";
+        fx.explain = '<strong>T2 Fast Lock:</strong> CAS(0&rarr;1) succeeded in EL0. State is now <code>1</code>.';
+      } else {
+        fx.state = 2;
+        fx.waits += 1;
+        fx.waitQ.push("T2");
+        fx.explain = '<strong>T2 Slow Path!</strong> CAS(0&rarr;1) failed. T2 upgraded state <code>1 &rarr; 2</code> and called <code>futex(uaddr, FUTEX_WAIT, 2)</code> to sleep in kernel waitqueue without spinning!';
+      }
+      renderFutex();
+    });
+
+    document.getElementById("fxT1UnlockBtn").addEventListener("click", () => {
+      if (!fx.owner) {
+        fx.explain = "Mutex is already unlocked (`uaddr = 0`).";
+        renderFutex();
+        return;
+      }
+      const prevOwner = fx.owner;
+      const wasState = fx.state;
+      fx.cas += 1;
+      fx.owner = null;
+      if (wasState === 1) {
+        fx.state = 0;
+        fx.explain = `<strong>${prevOwner} Fast Unlock:</strong> Atomic exchange <code>1 &rarr; 0</code> saw no waiters. <strong>0 syscalls!</strong>`;
+      } else {
+        fx.state = 0;
+        fx.wakes += 1;
+        const woken = fx.waitQ.shift();
+        if (woken) {
+          fx.owner = woken;
+          fx.state = fx.waitQ.length > 0 ? 2 : 1;
+          fx.explain = `<strong>${prevOwner} Contended Unlock:</strong> Prior state was <code>2</code>, so ${prevOwner} called <code>futex(FUTEX_WAKE, 1)</code>! Kernel woke <strong>${woken}</strong>, which re-acquired the lock (state=<code>${fx.state}</code>).`;
+        } else {
+          fx.explain = `<strong>${prevOwner} Unlock:</strong> Prior state was <code>2</code>; called <code>FUTEX_WAKE</code>, state=0.`;
+        }
+      }
+      renderFutex();
+    });
+
+    document.getElementById("fxResetBtn").addEventListener("click", () => {
+      fx = { state: 0, owner: null, waitQ: [], cas: 0, waits: 0, wakes: 0, explain: 'Reset complete. <code>*uaddr = 0</code>.' };
+      renderFutex();
+    });
+    renderFutex();
+
+    /* ============================================================
+       LESSON CONFIG: 3 LABS + 6 DIAGNOSTIC QUIZZES
+       ============================================================ */
+    window.LESSON_CONFIG = {
+      num: "04",
+      labs: {
+        1: {
+          fnName: "ticketSpinlockStep",
+          starter: `function ticketSpinlockStep(lock, ops) {
+  // 1. Copy lock.nextTicket & lock.nowServing; track owner = null, waiting = {}, acquiredOrder = []
+  // 2. "tryAcquire": assign ticket = nextTicket++ only on first wait; acquire iff owner===null && ticket===nowServing
+  // 3. "unlock": only if owner === threadId, set owner = null & nowServing += 1
+  // 4. Return { nextTicket, nowServing, owner, acquiredOrder, waiting }
+}`,
+          hints: [
+            "Hint 1: Initialize `let nextTicket = lock.nextTicket ?? 0; let nowServing = lock.nowServing ?? 0; let owner = null; const waiting = {}; const acquiredOrder = [];`.",
+            "Hint 2: On `tryAcquire`, if `owner === op.threadId` do nothing. Else if `waiting[op.threadId] === undefined`, set `waiting[op.threadId] = nextTicket++`.",
+            "Hint 3: After ensuring the thread has a ticket, check `if (owner === null && waiting[op.threadId] === nowServing)` -> `owner = op.threadId; delete waiting[op.threadId]; acquiredOrder.push(op.threadId);`."
+          ],
+          solution: `function ticketSpinlockStep(lock, ops) {
+  let nextTicket = lock.nextTicket ?? 0;
+  let nowServing = lock.nowServing ?? 0;
+  let owner = null;
+  const waiting = {};
+  const acquiredOrder = [];
+
+  for (const op of ops) {
+    if (op.action === "tryAcquire") {
+      if (owner === op.threadId) continue;
+      if (waiting[op.threadId] === undefined) {
+        waiting[op.threadId] = nextTicket++;
+      }
+      if (owner === null && waiting[op.threadId] === nowServing) {
+        owner = op.threadId;
+        delete waiting[op.threadId];
+        acquiredOrder.push(op.threadId);
+      }
+    } else if (op.action === "unlock") {
+      if (owner === op.threadId) {
+        owner = null;
+        nowServing += 1;
+      }
+    }
+  }
+
+  return { nextTicket, nowServing, owner, acquiredOrder, waiting };
+}`,
+          solutionExplain: "Ticket spinlocks replace unfair test-and-set racing with strict FIFO ordering: `fetch_add(&nextTicket, 1)` hands each thread a unique number, and spinning on `nowServing == myTicket` prevents any latecomer from barging ahead.",
+          tests: (fn) => {
+            const r1 = fn({ nextTicket: 0, nowServing: 0 }, [
+              { threadId: "T1", action: "tryAcquire" },
+              { threadId: "T1", action: "unlock" },
+              { threadId: "T2", action: "tryAcquire" }
+            ]);
+            const p1 = r1.owner === "T2" && r1.nowServing === 1 && JSON.stringify(r1.acquiredOrder) === '["T1","T2"]';
+
+            const r2 = fn({ nextTicket: 0, nowServing: 0 }, [
+              { threadId: "T1", action: "tryAcquire" }, // ticket 0 -> acquires
+              { threadId: "T3", action: "tryAcquire" }, // ticket 1 -> waits
+              { threadId: "T2", action: "tryAcquire" }, // ticket 2 -> waits
+              { threadId: "T1", action: "unlock" },     // nowServing=1
+              { threadId: "T2", action: "tryAcquire" }, // ticket 2 != 1 -> still waits!
+              { threadId: "T3", action: "tryAcquire" }, // ticket 1 === 1 -> acquires!
+              { threadId: "T3", action: "unlock" },     // nowServing=2
+              { threadId: "T2", action: "tryAcquire" }  // ticket 2 === 2 -> acquires!
+            ]);
+            const p2 = JSON.stringify(r2.acquiredOrder) === '["T1","T3","T2"]' && r2.nextTicket === 3 && r2.owner === "T2";
+
+            const r3 = fn({ nextTicket: 0, nowServing: 0 }, [
+              { threadId: "T1", action: "tryAcquire" },
+              { threadId: "T2", action: "tryAcquire" },
+              { threadId: "T2", action: "tryAcquire" },
+              { threadId: "T2", action: "tryAcquire" }
+            ]);
+            const p3 = r3.nextTicket === 2 && r3.waiting.T2 === 1;
+
+            const r4 = fn({ nextTicket: 0, nowServing: 0 }, [
+              { threadId: "T1", action: "tryAcquire" },
+              { threadId: "T2", action: "unlock" }
+            ]);
+            const p4 = r4.owner === "T1" && r4.nowServing === 0;
+
+            return [
+              { name: "Uncontended sequential acquire/unlock", pass: p1, detail: p1 ? "T1 then T2" : JSON.stringify(r1) },
+              { name: "Contended FIFO fairness prevents T2 from jumping T3", pass: p2, detail: p2 ? "order=[T1,T3,T2]" : JSON.stringify(r2) },
+              { name: "Repeated spin polls reuse existing ticket", pass: p3, detail: p3 ? "nextTicket=2, T2 ticket=1" : JSON.stringify(r3) },
+              { name: "Non-owner unlock is safely ignored", pass: p4, detail: p4 ? "owner stays T1" : JSON.stringify(r4) }
+            ];
+          }
+        },
+        2: {
+          fnName: "futexMutexSim",
+          starter: `function futexMutexSim(ops) {
+  // 1. Track state (0/1/2), owner, waitQueue, syscalls { wait, wake }, acquiredOrder
+  // 2. "lock": 0->1 fast path (0 syscalls); else state=2, waitQueue.push, syscalls.wait++
+  // 3. "unlock": if state===1 -> state=0; if state===2 -> wake first waiter & set state = waitQueue.length>0 ? 2 : 1
+  // 4. Return { state, owner, waitQueue, syscalls, acquiredOrder }
+}`,
+          hints: [
+            "Hint 1: On `\"lock\"`: if `state === 0`, set `state = 1`, `owner = op.threadId`, `acquiredOrder.push(op.threadId)`. Else set `state = 2`, `syscalls.wait += 1`, `waitQueue.push(op.threadId)`.",
+            "Hint 2: On `\"unlock\"`: ignore if `owner !== op.threadId`. Clear `owner = null`. If `state === 1`, simply set `state = 0`.",
+            "Hint 3: When `state === 2` on unlock, set `state = 0`, `syscalls.wake += 1`. If `waitQueue.length > 0`, `const w = waitQueue.shift(); owner = w; acquiredOrder.push(w); state = waitQueue.length > 0 ? 2 : 1;`."
+          ],
+          solution: `function futexMutexSim(ops) {
+  let state = 0;
+  let owner = null;
+  const waitQueue = [];
+  const syscalls = { wait: 0, wake: 0 };
+  const acquiredOrder = [];
+
+  for (const op of ops) {
+    if (op.action === "lock") {
+      if (state === 0) {
+        state = 1;
+        owner = op.threadId;
+        acquiredOrder.push(op.threadId);
+      } else {
+        state = 2;
+        syscalls.wait += 1;
+        waitQueue.push(op.threadId);
+      }
+    } else if (op.action === "unlock") {
+      if (owner !== op.threadId) continue;
+      owner = null;
+      if (state === 1) {
+        state = 0;
+      } else if (state === 2) {
+        state = 0;
+        syscalls.wake += 1;
+        if (waitQueue.length > 0) {
+          const next = waitQueue.shift();
+          owner = next;
+          acquiredOrder.push(next);
+          state = waitQueue.length > 0 ? 2 : 1;
+        }
+      }
+    }
+  }
+
+  return { state, owner, waitQueue, syscalls, acquiredOrder };
+}`,
+          solutionExplain: "Notice the subtle 3-state invariant when a woken thread re-acquires: if other waiters remain in `waitQueue`, the woken thread MUST leave `state = 2` so its own subsequent `unlock()` still triggers `FUTEX_WAKE` for the next sleeper!",
+          tests: (fn) => {
+            const r1 = fn([
+              { threadId: "T1", action: "lock" },
+              { threadId: "T1", action: "unlock" }
+            ]);
+            const p1 = r1.state === 0 && r1.syscalls.wait === 0 && r1.syscalls.wake === 0;
+
+            const r2 = fn([
+              { threadId: "T1", action: "lock" },
+              { threadId: "T2", action: "lock" },
+              { threadId: "T1", action: "unlock" },
+              { threadId: "T2", action: "unlock" }
+            ]);
+            const p2 = r2.state === 0 && r2.syscalls.wait === 1 && r2.syscalls.wake === 1 &&
+              JSON.stringify(r2.acquiredOrder) === '["T1","T2"]';
+
+            const r3 = fn([
+              { threadId: "T1", action: "lock" },
+              { threadId: "T2", action: "lock" },
+              { threadId: "T3", action: "lock" },
+              { threadId: "T1", action: "unlock" },
+              { threadId: "T2", action: "unlock" },
+              { threadId: "T3", action: "unlock" }
+            ]);
+            const p3 = r3.state === 0 && r3.syscalls.wait === 2 && r3.syscalls.wake === 2 &&
+              JSON.stringify(r3.acquiredOrder) === '["T1","T2","T3"]';
+
+            const r4 = fn([
+              { threadId: "T1", action: "lock" },
+              { threadId: "T2", action: "unlock" }
+            ]);
+            const p4 = r4.owner === "T1" && r4.state === 1 && r4.syscalls.wake === 0;
+
+            return [
+              { name: "Uncontended lock/unlock performs 0 syscalls", pass: p1, detail: p1 ? "wait=0, wake=0" : JSON.stringify(r1) },
+              { name: "2-thread contention uses 1 FUTEX_WAIT + 1 FUTEX_WAKE", pass: p2, detail: p2 ? "wait=1, wake=1" : JSON.stringify(r2) },
+              { name: "3-thread contention preserves state=2 until queue drains", pass: p3, detail: p3 ? "all 3 acquired, wake=2" : JSON.stringify(r3) },
+              { name: "Non-owner unlock ignored without corrupting state", pass: p4, detail: p4 ? "owner=T1, state=1" : JSON.stringify(r4) }
+            ];
+          }
+        },
+        3: {
+          fnName: "analyzeFalseSharing",
+          starter: `function analyzeFalseSharing(fields, cacheLineSize = 64) {
+  // 1. Compute natural C struct offsets & line ranges [startLine..endLine]
+  // 2. Find sharedLines touched by >= 2 distinct writerCore values
+  // 3. Compute paddedLayout pushing conflicting writerCores to a fresh cache line
+  // 4. Return { naturalSize, layout, sharedLines, hasFalseSharing, paddedLayout, paddedSize }
+}`,
+          hints: [
+            "Hint 1: `const roundUp = (n, a) => (a <= 1 ? n : Math.ceil(n / a) * a);` and `align = Math.max(1, f.align ?? Math.min(f.size, 8))`.",
+            "Hint 2: Track `lineWriters = new Map()` (`lineIdx -> Set of writerCore`). For each line from `startLine` to `endLine`, add `f.writerCore`. Any line with `set.size >= 2` goes into `sharedLines` sorted ascending.",
+            "Hint 3: For `paddedLayout`, track `paddedLineWriters` (`lineIdx -> Set`). Before placing `f`, compute candidate `pOff = roundUp(pCursor, align)`, `pStart = Math.floor(pOff / cacheLineSize)`; if `paddedLineWriters.get(pStart)` contains a core `!== f.writerCore`, bump `pCursor = (pStart + 1) * cacheLineSize` and recompute `pOff = roundUp(pCursor, align)`."
+          ],
+          solution: `function analyzeFalseSharing(fields, cacheLineSize = 64) {
+  const roundUp = (n, a) => (a <= 1 ? n : Math.ceil(n / a) * a);
+
+  let cursor = 0;
+  const layout = [];
+  const lineWriters = new Map();
+
+  for (const f of fields) {
+    const align = Math.max(1, f.align ?? Math.min(f.size, 8));
+    const offset = roundUp(cursor, align);
+    const startLine = Math.floor(offset / cacheLineSize);
+    const endLine = f.size > 0 ? Math.floor((offset + f.size - 1) / cacheLineSize) : startLine;
+    cursor = offset + f.size;
+
+    layout.push({ name: f.name, offset, size: f.size, startLine, endLine, writerCore: f.writerCore });
+    for (let l = startLine; l <= endLine; l++) {
+      if (!lineWriters.has(l)) lineWriters.set(l, new Set());
+      lineWriters.get(l).add(f.writerCore);
+    }
+  }
+
+  const sharedLines = Array.from(lineWriters.entries())
+    .filter(([, cores]) => cores.size >= 2)
+    .map(([line]) => line)
+    .sort((a, b) => a - b);
+
+  let pCursor = 0;
+  const paddedLayout = [];
+  const pLineWriters = new Map();
+
+  for (const f of fields) {
+    const align = Math.max(1, f.align ?? Math.min(f.size, 8));
+    let pOff = roundUp(pCursor, align);
+    let pStart = Math.floor(pOff / cacheLineSize);
+    const existing = pLineWriters.get(pStart);
+    if (existing && Array.from(existing).some((c) => c !== f.writerCore)) {
+      pCursor = (pStart + 1) * cacheLineSize;
+      pOff = roundUp(pCursor, align);
+      pStart = Math.floor(pOff / cacheLineSize);
+    }
+    const pEnd = f.size > 0 ? Math.floor((pOff + f.size - 1) / cacheLineSize) : pStart;
+    pCursor = pOff + f.size;
+
+    paddedLayout.push({ name: f.name, offset: pOff, startLine: pStart, endLine: pEnd });
+    for (let l = pStart; l <= pEnd; l++) {
+      if (!pLineWriters.has(l)) pLineWriters.set(l, new Set());
+      pLineWriters.get(l).add(f.writerCore);
+    }
+  }
+
+  return {
+    naturalSize: cursor,
+    layout,
+    sharedLines,
+    hasFalseSharing: sharedLines.length > 0,
+    paddedLayout,
+    paddedSize: pCursor
+  };
+}`,
+          solutionExplain: "False sharing occurs whenever two cores write to distinct fields mapped onto the same 64-byte cache line. Aligning conflicting writers onto separate cache-line boundaries eliminates MESI ping-pong while still packing same-core fields densely.",
+          tests: (fn) => {
+            const r1 = fn([
+              { name: "audioFrames", size: 8, writerCore: 6 },
+              { name: "renderFrames", size: 8, writerCore: 7 }
+            ], 64);
+            const p1 = r1.hasFalseSharing === true && JSON.stringify(r1.sharedLines) === "[0]" &&
+              r1.paddedLayout[0].offset === 0 && r1.paddedLayout[1].offset === 64;
+
+            const r2 = fn([
+              { name: "c0_a", size: 8, writerCore: 0 },
+              { name: "c0_b", size: 8, writerCore: 0 },
+              { name: "c1_a", size: 8, writerCore: 1 }
+            ], 64);
+            const p2 = r2.hasFalseSharing === true && r2.paddedLayout[1].offset === 8 && r2.paddedLayout[2].offset === 64;
+
+            const r3 = fn([
+              { name: "a", size: 8, align: 64, writerCore: 0 },
+              { name: "b", size: 8, align: 64, writerCore: 1 }
+            ], 64);
+            const p3 = r3.hasFalseSharing === false && r3.sharedLines.length === 0;
+
+            const r4 = fn([
+              { name: "pad", size: 48, align: 8, writerCore: 0 },
+              { name: "span", size: 32, align: 8, writerCore: 0 },
+              { name: "peer", size: 8, align: 8, writerCore: 1 }
+            ], 64);
+            const p4 = r4.hasFalseSharing === true && JSON.stringify(r4.sharedLines) === "[1]" &&
+              r4.paddedLayout[2].offset === 128;
+
+            return [
+              { name: "Detects adjacent cross-core atomics & pads to offset 64", pass: p1, detail: p1 ? "shared=[0], padded=[0, 64]" : JSON.stringify(r1) },
+              { name: "Packs same-core fields tightly before padding next core", pass: p2, detail: p2 ? "c0_a=0, c0_b=8, c1_a=64" : JSON.stringify(r2) },
+              { name: "Already alignas(64) struct reports zero false sharing", pass: p3, detail: p3 ? "hasFalseSharing=false" : JSON.stringify(r3) },
+              { name: "Detects multi-line field crossing into line 1", pass: p4, detail: p4 ? "shared=[1], peer padded to 128" : JSON.stringify(r4) }
+            ];
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "1. On a weakly ordered ARM64 CPU, Core 0 executes `x = 1; r1 = y;` while Core 1 executes `y = 1; r2 = x;` (initially `x = y = 0`) with NO barriers. How can both cores read `(r1 = 0, r2 = 0)`?",
+          options: [
+            "A. Cache coherence is disabled in ARM64 user mode.",
+            "B. Each core's store sits in its local Store Buffer while its subsequent load reads stale `Shared` values from its L1 cache.",
+            "C. The Linux scheduler swapped the two threads mid-instruction.",
+            "D. `x` and `y` must be uninitialized stack variables."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): ARM64 hardware maintains full MESI/MOESI cache coherency across all cores at all EL levels.",
+            "Correct (B): Store buffers hide write-invalidation latency by buffering stores locally while allowing later independent loads to bypass the store buffer and hit local L1 cache—yielding `(0, 0)` unless fenced with `DMB ISH`.",
+            "Wrong (C): Context switching isn't needed for `(0, 0)`—it happens purely in hardware pipelines on two cores running simultaneously.",
+            "Wrong (D): Both variables are explicitly initialized to `0`."
+          ]
+        },
+        {
+          q: "2. What does pairing `atomic_store_explicit(&ready, 1, memory_order_release)` on Core 0 with `atomic_load_explicit(&ready, memory_order_acquire)` on Core 1 guarantee?",
+          options: [
+            "A. It forces all cores in the SoC to flush their entire L1/L2 caches to DRAM.",
+            "B. Every write made by Core 0 before the release store is guaranteed to be visible to Core 1 after Core 1's acquire load observes `1`.",
+            "C. It automatically locks a kernel `futex` around `ready`.",
+            "D. It prevents Core 0 from ever writing to `ready` again."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Acquire/release uses targeted barrier ordering (`STLR`/`LDAR`), never full cache flushes to DRAM.",
+            "Correct (B): Release-acquire creates a *synchronizes-with* happens-before relationship: prior writes cannot sink past the release store, and subsequent reads cannot hoist above the acquire load.",
+            "Wrong (C): Atomics are pure CPU instructions with no kernel `futex` involvement.",
+            "Wrong (D): `ready` remains an ordinary atomic variable that can be written again later."
+          ]
+        },
+        {
+          q: "3. Why do modern ARMv8.1+ Android SoCs prefer LSE instructions (`CASAL`, `LDADDAL`) over ARMv8.0 LL/SC (`LDXR`/`STXR`) under contention?",
+          options: [
+            "A. `LDXR`/`STXR` cannot operate on 32-bit integers.",
+            "B. Under high multi-core contention, `STXR` frequently fails its exclusive monitor reservation when another core touches the same cache line, causing retry livelock, whereas LSE performs the read-modify-write atomically in hardware.",
+            "C. `CASAL` bypasses CPU caches entirely.",
+            "D. `LDXR`/`STXR` requires `EL1` kernel privileges."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `LDXR`/`STXR` support 8, 16, 32, and 64-bit accesses.",
+            "Correct (B): When 8 cores run LL/SC loops on the same cache line, every store or monitor eviction forces peers to fail `STXR` and retry. LSE executes `CASAL` as a single hardware atomic (even near-cache/interconnect), eliminating retry storms.",
+            "Wrong (C): LSE operates coherently through the CPU cache hierarchy.",
+            "Wrong (D): Both LL/SC and LSE are unprivileged EL0 instructions."
+          ]
+        },
+        {
+          q: "4. In the 3-state `futex` mutex (`0=unlocked, 1=locked, 2=contended`), why does `unlock()` ONLY call `futex(FUTEX_WAKE)` when the old value was `2`?",
+          options: [
+            "A. Because `FUTEX_WAKE` returns `-EINVAL` if `*uaddr == 1`.",
+            "B. State `1` guarantees zero threads are sleeping in the kernel waitqueue, so `1 -> 0` can complete completely in EL0 with zero syscall overhead.",
+            "C. State `2` means two threads own the mutex simultaneously.",
+            "D. State `1` automatically wakes sleeping threads in hardware without a syscall."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `FUTEX_WAKE` doesn't fail based on `*uaddr` value, but calling it unconditionally would waste a costly EL0->EL1 trap on every uncontended unlock.",
+            "Correct (B): Any contender that fails `0->1` must upgrade the state to `2` before sleeping. Thus, observing old state `1` proves nobody is waiting, making uncontended lock+unlock 100% user-space.",
+            "Wrong (C): A mutex only ever has one owner; `2` means locked *with potential sleepers*.",
+            "Wrong (D): Hardware cannot wake kernel `task_struct`s; only `FUTEX_WAKE` wakes sleepers."
+          ]
+        },
+        {
+          q: "5. Why does `futex(uaddr, FUTEX_WAIT, 2)` pass the expected value `2` into the kernel syscall?",
+          options: [
+            "A. To specify that the thread wants to sleep for 2 milliseconds.",
+            "B. So the kernel atomically verifies `*uaddr == 2` under its waitqueue bucket lock before sleeping—preventing a lost wakeup if the owner unlocked right before `FUTEX_WAIT` ran.",
+            "C. To tell the kernel which CPU core to wake next.",
+            "D. Because `futex` only supports 2-byte integers."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Timeout is a separate `struct timespec *` argument, not `val`.",
+            "Correct (B): If the lock holder unlocked (`*uaddr = 0`) and called `FUTEX_WAKE` between the contender's CAS and its `FUTEX_WAIT` trap, the kernel sees `*uaddr != 2`, returns `-EAGAIN` immediately, and avoids a permanent lost wakeup.",
+            "Wrong (C): `val` is purely the expected 32-bit user-space futex value.",
+            "Wrong (D): `futex` operates strictly on 32-bit (4-byte) aligned integers."
+          ]
+        },
+        {
+          q: "6. Two native C++ threads on different cores increment completely separate `std::atomic<uint64_t>` counters (`audioCount` and `videoCount`) yet throughput collapses by 10x. What is the most likely culprit and fix?",
+          options: [
+            "A. Priority inversion; fix by calling `sched_yield()`.",
+            "B. False sharing: both 8-byte atomics sit on the same 64-byte cache line, causing MESI `M <-> I` cache-line ping-pong; fix with `alignas(64)` padding.",
+            "C. Zombie processes; fix with `waitpid()`.",
+            "D. Stack overflow; fix with `-fstack-protector`."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Incrementing disjoint atomics does not block on locks or cause priority inversion.",
+            "Correct (B): MESI coherency operates at 64-byte cache-line granularity. Two hot writers on separate cores in the same 64 bytes fight for exclusive `Modified` ownership on every write. Separating them with `alignas(64)` restores linear scaling.",
+            "Wrong (C): Zombie processes only affect exited child descriptors, not active thread atomic throughput.",
+            "Wrong (D): Stack corruption crashes or traps; it doesn't silently slow down adjacent heap/struct atomics."
+          ]
+        }
+      ]
+    };
+
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0087: SQL Profiling (EXPLAIN ANALYZE), Index Internals, Read Replicas, Sharding &amp; CAP</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0063-spring-data-jpa-repositories-transactions.html">&larr; Prev: Lesson 0063</a></div>
+      <div class="lesson-nav-center">
+        <a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a>
+        &nbsp;|&nbsp;
+        <a href="../reference/0087-database-profiling-scaling-and-cap.html">&#128214; Cheat Sheet 0087</a>
+      </div>
+      <div><a href="0064-restclient-resilience4j-and-idempotency.html">Next: Lesson 0064 &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Main Track 3 &bull; Database Performance &amp; Scaling &bull; Lesson 0087</div>
+      <h1>SQL Profiling (<code>EXPLAIN ANALYZE</code>), Index Internals, Read Replicas, Sharding &amp; CAP</h1>
+      <p class="lesson-subtitle">
+        Stop guessing inside Hibernate: read PostgreSQL execution plans, design left-prefix &amp; partial B-Tree indexes, route <code>@Transactional(readOnly = true)</code> traffic to replicas safely, and choose between PostgreSQL, OpenSearch, and NoSQL using CAP/PACELC.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. Reading <code>EXPLAIN (ANALYZE, BUFFERS)</code> &amp; Why Queries Turn into <code>Seq Scan</code></h2>
+      <p>
+        Even with <code>OSIV=false</code> and keyset pagination (<a href="0063-spring-data-jpa-repositories-transactions.html">Lesson 0063</a>), a single unindexed JPA query scanning 20 million rows stalls PostgreSQL CPU and saturates HikariCP. Never guess index usage—run <code>EXPLAIN (ANALYZE, BUFFERS)</code> directly on the SQL emitted by Hibernate:
+      </p>
+      <pre><code>-- ANTI-PATTERN: Non-sargable predicate + missing left-prefix column forces Seq Scan!
+CREATE INDEX idx_orders_tenant_status_created ON orders (tenant_id, status, created_at DESC);
+
+-- 1. Skips leading column tenant_id -> cannot seek B-Tree efficiently!
+-- 2. LOWER(customer_email) wraps the column in a function -> bypasses B-Tree on customer_email!
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, total_cents FROM orders
+WHERE status = 'PAID' AND LOWER(customer_email) = 'alice@acme.io'
+ORDER BY created_at DESC LIMIT 20;
+-- Plan output: Seq Scan on orders (actual time=0.04..412.80 rows=20 loops=1)
+--              Buffers: shared hit=1200 read=48920  &lt;-- 380 MB scanned for 20 rows!</code></pre>
+      <p>
+        In a composite B-Tree index <code>(A, B, C)</code>, PostgreSQL sorts tuples lexicographically by <code>A</code>, then <code>B</code>, then <code>C</code>. Equality predicates must match from the <strong>leftmost prefix</strong> (<code>A</code>, then <code>B</code>), with at most one trailing range/sort column (<code>C</code>). For rare hot states like <code>status = 'PENDING'</code>, a <strong>partial index</strong> shrinks index RAM by 95%:
+      </p>
+      <pre><code>-- IDIOMATIC POSTGRESQL: Sargable left-prefix + partial index + covering INCLUDE
+CREATE INDEX idx_orders_pending_tenant
+    ON orders (tenant_id, created_at DESC)
+    INCLUDE (total_cents)
+    WHERE status = 'PENDING'; -- Tiny partial index!
+
+-- Store normalized email (or index LOWER(customer_email) explicitly) so equality is sargable:
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, total_cents FROM orders
+WHERE tenant_id = 'T-42' AND status = 'PENDING'
+ORDER BY created_at DESC LIMIT 20;
+-- Plan output: Index Only Scan using idx_orders_pending_tenant (actual time=0.03..0.09 rows=20)
+--              Heap Fetches: 0   Buffers: shared hit=4</code></pre>
+    </section>
+
+    <section>
+      <h2>2. Scaling Relational DBs: Read Replicas, Partitioning vs. Sharding &amp; CAP/PACELC</h2>
+      <p>
+        When a single PostgreSQL primary node saturates on read traffic or table size, senior engineers scale along three distinct steps before jumping to NoSQL:
+      </p>
+      <table>
+        <thead>
+          <tr><th>Scaling Mechanism</th><th>How It Works</th><th>Fatal Production Trap</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Read Replicas (<code>AbstractRoutingDataSource</code>)</strong></td><td>Routes <code>@Transactional(readOnly = true)</code> queries to streaming async replicas.</td><td><strong>Replication Lag (Read-Your-Own-Writes):</strong> User saves an order on Primary, redirects immediately, and Replica returns <code>404</code> 50ms later!</td></tr>
+          <tr><td><strong>Table Partitioning (Declarative)</strong></td><td>Splits one logical table (e.g., <code>events_2027_01</code>) by time or tenant inside one PostgreSQL instance.</td><td>Queries missing the partition key scan <em>every</em> child partition (partition pruning fails).</td></tr>
+          <tr><td><strong>Horizontal Sharding</strong></td><td>Distributes rows across independent database clusters by shard key (e.g., <code>tenant_id</code>).</td><td>Cross-shard <code>JOIN</code>s and distributed ACID transactions become slow or impossible; resharding is painful.</td></tr>
+        </tbody>
+      </table>
+      <pre><code>// IDIOMATIC SPRING: LazyConnectionDataSourceProxy + ReadOnly Replica Routing
+// CRITICAL: Wrap routing DataSource in LazyConnectionDataSourceProxy so Spring evaluates
+// TransactionSynchronizationManager.isCurrentTransactionReadOnly() BEFORE borrowing a JDBC connection!
+public final class ReplicaRoutingDataSource extends AbstractRoutingDataSource {
+    public enum Role { PRIMARY, REPLICA }
+
+    @Override
+    protected Object determineCurrentLookupKey() {
+        boolean isReadOnly = TransactionSynchronizationManager.isCurrentTransactionReadOnly();
+        boolean pinnedToPrimary = WritePinContext.isPinnedPrimary(); // e.g., post-mutation flag in same request!
+        return (isReadOnly &amp;&amp; !pinnedToPrimary) ? Role.REPLICA : Role.PRIMARY;
+    }
+}</code></pre>
+      <div class="callout tip">
+        <div class="callout-title">&#9889; CAP &amp; PACELC + Polyglot Storage Decision Rule in 2027</div>
+        Under a network partition (<strong>CAP</strong>), distributed stores choose <strong>CP</strong> (PostgreSQL synchronous commit, Kafka <code>acks=all</code> + <code>min.insync.replicas</code>) or <strong>AP</strong> (Redis async replicas, DynamoDB eventual reads). In normal operation without partitions (<strong>PACELC</strong>), they trade <strong>Latency vs. Consistency</strong>. Reach for <strong>Elasticsearch/OpenSearch</strong> for multi-field fuzzy full-text search &amp; facets, <strong>Redis</strong> for sub-millisecond TTL/rate-limit counters, and keep source-of-truth business state in <strong>PostgreSQL</strong> (including <code>JSONB</code> and <code>pgvector</code>) until scale genuinely demands sharding or MongoDB.
+      </div>
+    </section>
+
+    <section>
+      <h2>3. Hands-On Practice Workbenches</h2>
+      <div id="ex-1" class="workbench-container"></div>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>4. Senior Concept &amp; Code Quiz</h2>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <ul>
+        <li><a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener"><strong>PostgreSQL Official Docs &mdash; Using <code>EXPLAIN</code> &amp; Index Types</strong></a></li>
+        <li><a href="https://vladmihalcea.com/read-write-read-only-transaction-routing-spring/" target="_blank" rel="noopener"><strong>Vlad Mihalcea &mdash; Spring Read-Write / Read-Only Transaction Routing</strong></a></li>
+      </ul>
+
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> Why does <code>AbstractRoutingDataSource</code> silently route <code>@Transactional(readOnly = true)</code> queries to the <code>PRIMARY</code> database unless wrapped in <code>LazyConnectionDataSourceProxy</code>?
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0063-spring-data-jpa-repositories-transactions.html">&larr; Prev: Lesson 0063</a></div>
+      <div><a href="../reference/0087-database-profiling-scaling-and-cap.html">&#128196; Reference Sheet 0087</a> &bull; <a href="0001-master-plan-and-curriculum.html">Course Hub</a></div>
+      <div><a href="0064-restclient-resilience4j-and-idempotency.html">Next: Lesson 0064 &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+  {
+    "exercises": [
+      {
+        "id": "ex-1",
+        "filename": "ReplicaRoutingPolicy.java",
+        "badge": "Implementation Drill",
+        "instructions": "<p>Implement read-replica routing with read-your-own-writes protection in <code>selectDataSource(boolean readOnlyTx, boolean writePinnedInSession)</code>:</p><ol><li>Return <code>DataSourceRole.REPLICA</code> only when <code>readOnlyTx</code> is <code>true</code> <strong>and</strong> <code>writePinnedInSession</code> is <code>false</code>.</li><li>Otherwise return <code>DataSourceRole.PRIMARY</code> so recent writers never read stale replication lag.</li></ol>",
+        "initialCode": "public class ReplicaRoutingPolicy {\n    public enum DataSourceRole { PRIMARY, REPLICA }\n\n    public static DataSourceRole selectDataSource(boolean readOnlyTx, boolean writePinnedInSession) {\n        // TODO: Route readOnly transactions to REPLICA unless writePinnedInSession is true\n        return null;\n    }\n\n    public static void main(String[] args) {\n        System.out.println(\"Read-only normal: \" + selectDataSource(true, false));\n        System.out.println(\"Read-only post-write: \" + selectDataSource(true, true));\n        System.out.println(\"Write tx: \" + selectDataSource(false, false));\n    }\n}\n",
+        "solution": "public class ReplicaRoutingPolicy {\n    public enum DataSourceRole { PRIMARY, REPLICA }\n\n    public static DataSourceRole selectDataSource(boolean readOnlyTx, boolean writePinnedInSession) {\n        if (readOnlyTx && !writePinnedInSession) {\n            return DataSourceRole.REPLICA;\n        }\n        return DataSourceRole.PRIMARY;\n    }\n\n    public static void main(String[] args) {\n        System.out.println(\"Read-only normal: \" + selectDataSource(true, false));\n        System.out.println(\"Read-only post-write: \" + selectDataSource(true, true));\n        System.out.println(\"Write tx: \" + selectDataSource(false, false));\n    }\n}\n",
+        "solutionExplanation": "Async PostgreSQL replicas always lag behind the primary by milliseconds (or seconds under load). Pinning a user or request to PRIMARY briefly after a write guarantees read-your-own-writes consistency while offloading general read traffic to replicas.",
+        "hints": [
+          "Check both conditions together: <code>if (readOnlyTx &amp;&amp; !writePinnedInSession)</code>.",
+          "Return <code>DataSourceRole.REPLICA</code> inside the branch, and <code>DataSourceRole.PRIMARY</code> as the fallback."
+        ],
+        "tests": [
+          {
+            "name": "Checks readOnlyTx and !writePinnedInSession",
+            "regex": "readOnlyTx\\s*&&\\s*!writePinnedInSession",
+            "flags": "m",
+            "passMessage": "Gates replica routing on read-only status and absence of write pinning.",
+            "failMessage": "Require both readOnlyTx and !writePinnedInSession before returning REPLICA."
+          },
+          {
+            "name": "Returns REPLICA for safe reads",
+            "regex": "return\\s+DataSourceRole\\.REPLICA;",
+            "flags": "m",
+            "passMessage": "Routes eligible read-only transactions to REPLICA.",
+            "failMessage": "Return DataSourceRole.REPLICA when eligible."
+          },
+          {
+            "name": "Falls back to PRIMARY",
+            "regex": "return\\s+DataSourceRole\\.PRIMARY;",
+            "flags": "m",
+            "passMessage": "Falls back to PRIMARY for writes and read-your-own-writes.",
+            "failMessage": "Return DataSourceRole.PRIMARY for writes or pinned sessions."
+          }
+        ],
+        "simulatedOutput": "Read-only normal: REPLICA\nRead-only post-write: PRIMARY\nWrite tx: PRIMARY\nProcess finished with exit code 0"
+      },
+      {
+        "id": "ex-2",
+        "filename": "SargableQueryFix.java",
+        "badge": "Bug-Fix Challenge",
+        "instructions": "<p><code>buildCustomerOrderQuery</code> currently emits two <code>Seq Scan</code> killers: it wraps <code>email</code> in <code>LOWER(email)</code> (non-sargable) and puts <code>status</code> before the composite index's leading key <code>tenant_id</code>.</p><ol><li>Fix the SQL predicate to filter on <code>tenant_id = ?</code> first, then <code>email_normalized = ?</code> (using <code>email.toLowerCase(Locale.ROOT)</code> in Java).</li><li>Order by <code>created_at DESC LIMIT 20</code> cleanly.</li></ol>",
+        "initialCode": "import java.util.Locale;\n\npublic class SargableQueryFix {\n    public record QueryPlan(String sql, String normalizedEmail) {}\n\n    public static QueryPlan buildCustomerOrderQuery(String rawEmail) {\n        // BUG 1: LOWER(email) disables standard B-Tree index seek\n        // BUG 2: status before tenant_id violates composite index (tenant_id, email_normalized, created_at)\n        String sql = \"SELECT id, total_cents FROM orders WHERE LOWER(email) = ? AND status = 'PAID' ORDER BY created_at DESC LIMIT 20\";\n        return new QueryPlan(sql, rawEmail);\n    }\n\n    public static void main(String[] args) {\n        QueryPlan plan = buildCustomerOrderQuery(\"Alice@Acme.IO\");\n        System.out.println(plan.sql());\n        System.out.println(\"Param: \" + plan.normalizedEmail());\n    }\n}\n",
+        "solution": "import java.util.Locale;\n\npublic class SargableQueryFix {\n    public record QueryPlan(String sql, String normalizedEmail) {}\n\n    public static QueryPlan buildCustomerOrderQuery(String rawEmail) {\n        String normalized = rawEmail.toLowerCase(Locale.ROOT);\n        String sql = \"SELECT id, total_cents FROM orders WHERE tenant_id = ? AND email_normalized = ? ORDER BY created_at DESC LIMIT 20\";\n        return new QueryPlan(sql, normalized);\n    }\n\n    public static void main(String[] args) {\n        QueryPlan plan = buildCustomerOrderQuery(\"Alice@Acme.IO\");\n        System.out.println(plan.sql());\n        System.out.println(\"Param: \" + plan.normalizedEmail());\n    }\n}\n",
+        "solutionExplanation": "Normalizing case at write/query time in Java against an indexed email_normalized column keeps the SQL predicate sargable, and placing tenant_id first satisfies the B-Tree leftmost prefix.",
+        "hints": [
+          "Normalize in Java with <code>rawEmail.toLowerCase(Locale.ROOT)</code> instead of SQL <code>LOWER(...)</code>.",
+          "Start the <code>WHERE</code> clause with <code>WHERE tenant_id = ? AND email_normalized = ?</code>."
+        ],
+        "tests": [
+          {
+            "name": "Removes non-sargable LOWER(email) SQL function",
+            "regex": "^(?!.*LOWER\\s*\\().*email_normalized\\s*=\\s*\\?",
+            "flags": "m",
+            "passMessage": "Replaced LOWER(email) with sargable email_normalized = ?.",
+            "failMessage": "Remove LOWER(...) from SQL and filter on email_normalized = ?."
+          },
+          {
+            "name": "Leads WHERE clause with tenant_id",
+            "regex": "WHERE\\s+tenant_id\\s*=\\s*\\?\\s+AND\\s+email_normalized\\s*=\\s*\\?",
+            "flags": "m",
+            "passMessage": "Matches leftmost composite B-Tree index prefix (tenant_id, email_normalized).",
+            "failMessage": "Order WHERE predicates as 'WHERE tenant_id = ? AND email_normalized = ?'."
+          },
+          {
+            "name": "Normalizes email with Locale.ROOT",
+            "regex": "rawEmail\\.toLowerCase\\s*\\(\\s*Locale\\.ROOT\\s*\\)",
+            "flags": "m",
+            "passMessage": "Normalizes email deterministically in Java using Locale.ROOT.",
+            "failMessage": "Normalize parameter using rawEmail.toLowerCase(Locale.ROOT)."
+          }
+        ],
+        "simulatedOutput": "SELECT id, total_cents FROM orders WHERE tenant_id = ? AND email_normalized = ? ORDER BY created_at DESC LIMIT 20\nParam: alice@acme.io\nProcess finished with exit code 0"
+      }
+    ],
+    "quiz": {
+      "id": "quiz-main",
+      "questions": [
+        {
+          "question": "1. Given composite index `idx (tenant_id, status, created_at DESC)`, which query fails to use the index efficiently?",
+          "correctIndex": 1,
+          "options": [
+            {
+              "text": "Query filtering by `tenant_id` and `status`, sorted by `created_at DESC`.",
+              "explanation": "Filtering equality on the leading columns `tenant_id` and `status` allows a direct B-Tree seek already pre-sorted by `created_at DESC`."
+            },
+            {
+              "text": "Query filtering only by `status` and `created_at` without specifying `tenant_id`.",
+              "explanation": "Skipping the leftmost column `tenant_id` breaks the lexicographical B-Tree prefix, forcing a full index scan or sequential table scan."
+            },
+            {
+              "text": "Query filtering only by `tenant_id` equality with `LIMIT 20`.",
+              "explanation": "Matching the leftmost prefix `tenant_id` lets PostgreSQL perform an efficient B-Tree index range scan immediately."
+            },
+            {
+              "text": "Query filtering by `tenant_id`, `status`, and a `created_at` range.",
+              "explanation": "Leading equalities on `tenant_id` and `status` followed by a range predicate on `created_at` match the ideal B-Tree access pattern."
+            }
+          ]
+        },
+        {
+          "question": "2. Why do `@Transactional(readOnly = true)` queries still hit the primary DB with plain `AbstractRoutingDataSource`?",
+          "correctIndex": 2,
+          "options": [
+            {
+              "text": "Spring Boot forbids read-only transactions from running over pooled HikariCP connections.",
+              "explanation": "HikariCP handles read-only transactions normally; it simply returns connections from whichever `DataSource` Spring resolves."
+            },
+            {
+              "text": "PostgreSQL JDBC drivers refuse all `SELECT` statements routed to standby replicas.",
+              "explanation": "PostgreSQL hot standby replicas natively execute `SELECT` queries and read-only transactions without special driver hacks."
+            },
+            {
+              "text": "Spring acquires the JDBC connection before setting the `readOnly` synchronization flag.",
+              "explanation": "Without `LazyConnectionDataSourceProxy`, `PlatformTransactionManager` obtains a connection eagerly before `TransactionSynchronizationManager` sets `readOnly=true`."
+            },
+            {
+              "text": "Hibernate 7 disables connection routing whenever `OSIV` is set to false.",
+              "explanation": "Disabling OSIV scopes connections to the transaction boundary and has nothing to do with eager vs. lazy connection lookup."
+            }
+          ]
+        },
+        {
+          "question": "3. When should a Spring Boot 4 backend add Elasticsearch/OpenSearch alongside PostgreSQL?",
+          "correctIndex": 0,
+          "options": [
+            {
+              "text": "When product needs ranked fuzzy full-text search and multi-facet aggregations.",
+              "explanation": "Inverted indexes in OpenSearch/Elasticsearch excel at typo-tolerant scoring, synonyms, and high-cardinality facets beyond basic B-Tree or `tsvector` queries."
+            },
+            {
+              "text": "Whenever a service stores user balances that require strict ACID serializability.",
+              "explanation": "OpenSearch is an eventually consistent search engine without multi-document ACID transactions; financial balances belong in PostgreSQL."
+            },
+            {
+              "text": "Every time a JPA entity adds more than three foreign-key columns.",
+              "explanation": "Relational foreign keys and joins are PostgreSQL's core strength; search engines do not replace normalized relational schemas."
+            },
+            {
+              "text": "To replace Flyway schema migrations and database connection pooling completely.",
+              "explanation": "Flyway and HikariCP manage relational schema evolution and JDBC pooling; search engines serve read-optimized search indexes."
+            }
+          ]
+        }
+      ]
+    }
+  }
+  </script>
+  <script src="../assets/workbench.js"></script>
+  <script src="../assets/quiz.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const data = JSON.parse(document.getElementById('lesson-data').textContent);
+      data.exercises.forEach(ex => new JavaExercise(ex));
+      new JavaQuiz(data.quiz);
+    });
+  </script>
+</body>
+</html>

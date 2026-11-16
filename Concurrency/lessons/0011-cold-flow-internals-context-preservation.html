@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 11 — Cold Flow Internals, Operators &amp; Context Preservation</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 11 · Cold Flow &amp; Context</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 4 · Lesson 11 · Cold Streams &amp; Operators</div>
+      <h1>Cold Flow Internals, Operators &amp; Context Preservation</h1>
+      <p class="hero-sub">
+        Under the hood, a Kotlin <code>Flow&lt;T&gt;</code> is neither a thread pool nor a background queue—it is just sequential
+        <code>suspend</code> lambdas passing a <code>FlowCollector&lt;T&gt;</code> callback up and down the call stack.
+        Master why <code>flowOn</code> only affects upstream stages, how <code>buffer</code>, <code>conflate</code>, and
+        <code>flatMapLatest</code> vs. <code>flatMapMerge</code> shape backpressure and cancellation, and why exception transparency forbids <code>try/catch</code> around <code>emit()</code>.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. Interactive Pipeline Visualizer</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Kotlin &amp; Android Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>Why Cold Flow Is Just Sequential <code>suspend</code> Lambdas</h2>
+      <p class="section-lead">
+        Most developers imagine a <code>Flow</code> as an active pipeline pushing values through background queues.
+        In reality, an unbuffered cold <code>Flow</code> has zero concurrency of its own: it is a lazy, unicast CPS callback chain
+        (<a href="https://kotlinlang.org/docs/flow.html" target="_blank" rel="noopener">Kotlin Asynchronous Flow Guide</a>).
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">1. Two Interfaces, Zero Threads</h3>
+          <p style="color:var(--text-muted); margin-bottom:10px;">
+            The entire cold stream abstraction compiles down to two tiny interfaces:
+          </p>
+<pre>interface Flow&lt;out T&gt; {
+    suspend fun collect(collector: FlowCollector&lt;T&gt;)
+}
+
+fun interface FlowCollector&lt;in T&gt; {
+    suspend fun emit(value: T)
+}</pre>
+          <p style="color:var(--text-muted); margin-bottom:0; margin-top:10px;">
+            When you write <code>flow { emit(1); emit(2) }.map { it * 10 }.collect { render(it) }</code>, nothing runs until <code>collect</code> is invoked.
+            Every <code>emit(1)</code> directly suspends and invokes <code>map</code>'s lambda, which directly invokes <code>render(10)</code> before <code>emit(1)</code> returns to produce <code>2</code>.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">2. Context Preservation &amp; <code>flowOn</code></h3>
+          <p style="color:var(--text-muted); margin-bottom:10px;">
+            Because <code>emit()</code> directly calls the downstream <code>FlowCollector</code>, Kotlin enforces <strong>Context Preservation</strong>:
+            <code>emit()</code> must be called from the same <code>CoroutineContext</code> as <code>collect()</code>.
+          </p>
+<pre>// Upstream runs in channel coroutine on IO;
+// Downstream stays on collector's Main context!
+flow { emit(queryDb()) }    // runs on Dispatchers.IO
+    .map { toDomain(it) }   // runs on Dispatchers.IO
+    .flowOn(Dispatchers.IO) // &lt;-- Channel boundary
+    .map { toUiModel(it) }  // runs on Main
+    .collect { render(it) } // runs on Main</pre>
+          <p style="color:var(--text-muted); margin-bottom:0; margin-top:10px;">
+            <code>flowOn</code> inserts a coroutine + buffered channel boundary so upstream runs on its own dispatcher while downstream stays untouched
+            (<a href="https://kotlinlang.org/docs/flow.html#flowon-operator" target="_blank" rel="noopener">Flow Context &amp; flowOn</a>).
+          </p>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 18px;">
+        <h3 style="margin-top:0;">Operator Architecture Diagram: Sequential Fusion vs. Channel Boundary</h3>
+<pre>COLD SEQUENTIAL (default — 1 coroutine, 0 channels, sequential CPS calls):
+  [Collector Coroutine]
+     └─ collect() ─▶ map.collect() ─▶ flow.collect()
+                         ▲                 │
+                         └─── emit(v) ◀────┘   (must stay on same CoroutineContext!)
+
+WITH flowOn / buffer / conflate (2 coroutines decoupled by Channel):
+  [Upstream Coroutine (e.g. IO)] ──emit──▶ [ Channel / Buffer ] ──receive──▶ [Collector Coroutine (Main)]
+     ▲ flowOn(IO) affects ONLY stages left of the channel!                      ▲ downstream stays on Main
+
+EARLY TERMINATION (take(n) / first()):
+  Collector throws internal AbortFlowException(owner) inside emit() ──▶ unwinds upstream immediately!</pre>
+      </div>
+
+      <h3 style="margin-top: 24px;">Backpressure &amp; Flattening Operators Compared</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Operator</th>
+              <th>Coroutines</th>
+              <th>When Collector Is Slower Than Producer</th>
+              <th>Production Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Default (Sequential)</strong></td>
+              <td>1 coroutine</td>
+              <td>Producer suspends inside <code>emit()</code> until collector finishes item.</td>
+              <td>Deterministic step-by-step transforms with natural backpressure.</td>
+            </tr>
+            <tr>
+              <td><strong><code>buffer(capacity)</code></strong></td>
+              <td>2 coroutines + Channel</td>
+              <td>Producer runs ahead up to <code>capacity</code> items; total time shrinks from sum to overlap.</td>
+              <td>Decoupling fast I/O/DB reads from moderately slow UI/disk writes.</td>
+            </tr>
+            <tr>
+              <td><strong><code>conflate()</code></strong></td>
+              <td>2 coroutines + 1-slot <code>DROP_OLDEST</code></td>
+              <td>Producer never waits; intermediate uncollected items are overwritten by newest value.</td>
+              <td>UI state ticks, download progress %, sensor frames where only latest matters.</td>
+            </tr>
+            <tr>
+              <td><strong><code>collectLatest</code> / <code>flatMapLatest</code></strong></td>
+              <td>Cancels previous inner job</td>
+              <td>Immediately cancels in-flight collector/inner flow and starts fresh on latest emission.</td>
+              <td>Search-as-you-type autocomplete, filter switches, reactive reload triggers.</td>
+            </tr>
+            <tr>
+              <td><strong><code>flatMapConcat</code></strong></td>
+              <td>Sequential inner flows</td>
+              <td>Waits for inner flow <em>N</em> to complete completely before collecting inner flow <em>N+1</em>.</td>
+              <td>Strict ordered multi-step uploads or paginated fetches.</td>
+            </tr>
+            <tr>
+              <td><strong><code>flatMapMerge(concurrency)</code></strong></td>
+              <td>Bounded concurrent inner flows</td>
+              <td>Collects up to <code>concurrency</code> (default 16) inner flows concurrently, interleaving results.</td>
+              <td>Parallel enrichment of independent IDs when output order does not matter.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Exception Transparency Invariant:</strong> A downstream collector must always be able to catch exceptions thrown by upstream or by itself.
+        Wrapping <code>emit()</code> inside a <code>try { emit(v) } catch (e: Throwable) { ... }</code> inside <code>flow { ... }</code> accidentally swallows <em>downstream</em> collector errors (and breaks <code>CancellationException</code>!).
+        Always use the declarative <code>.catch { ... }</code> operator, which inspects the thrower and catches <strong>upstream errors only</strong>
+        (<a href="https://kotlinlang.org/docs/flow.html#exception-transparency" target="_blank" rel="noopener">Exception Transparency</a>).
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive Cold Flow Pipeline Visualizer</div>
+      <h2>Compare Sequential, <code>buffer()</code>, <code>conflate()</code> &amp; <code>collectLatest</code></h2>
+      <p class="section-lead">
+        Suppose Producer emits 4 frames (<code>V1..V4</code>, 1 tick each) while Consumer takes <strong>3 ticks</strong> to render each frame.
+        Step through each mode to see how coroutines, channel slots, and cancellation behave tick by tick.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="sequential">Sequential (Default)</button>
+            <button class="btn" data-mode="buffer">buffer(2)</button>
+            <button class="btn" data-mode="conflate">conflate()</button>
+            <button class="btn" data-mode="collectLatest">collectLatest</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span>Producer Coroutine (1 tick / emit)</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-producer"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Channel / Operator Boundary</span><span id="sim-boundary-label">None (Direct CPS Call)</span></div>
+              <div class="timeline-track" id="lane-channel"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Collector Coroutine (3 ticks / item)</span><span>Downstream</span></div>
+              <div class="timeline-track" id="lane-consumer"></div>
+            </div>
+
+            <div class="registers-grid">
+              <div class="reg-card"><div class="reg-name">Buffer / Active</div><div class="reg-val" id="reg-buffer" style="color:var(--accent);">[]</div></div>
+              <div class="reg-card"><div class="reg-name">Delivered</div><div class="reg-val" id="reg-delivered" style="color:var(--green);">—</div></div>
+              <div class="reg-card"><div class="reg-name">Skipped / Cancelled</div><div class="reg-val" id="reg-dropped" style="color:var(--amber);">0</div></div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Select a Flow operator mode and click <strong>Step →</strong> or <strong>▶ Play</strong> to trace producer/consumer scheduling.
+            </div>
+          </div>
+
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">PIPELINE EXECUTION TRACE</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; Android</div>
+      <h2>Junior Traps vs. Senior Patterns in Kotlin Flow</h2>
+      <p class="section-lead">
+        Apply <a href="https://developer.android.com/kotlin/coroutines/coroutines-best-practices" target="_blank" rel="noopener">Android Coroutines Best Practices</a>
+        and <a href="https://kotlinlang.org/docs/flow.html" target="_blank" rel="noopener">Kotlin Flow Context &amp; Exception Rules</a> to avoid silent bugs and crashes.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Context Preservation — Why <code>withContext</code> Inside <code>flow {}</code> Throws</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: withContext Around emit()</span></div>
+<pre>fun fetchReadings(): Flow&lt;Reading&gt; = flow {
+    // CRASH: IllegalStateException!
+    // Flow invariant is violated: collected on Main,
+    // but emit() called from Dispatchers.IO!
+    withContext(Dispatchers.IO) {
+        val row = db.queryLatest()
+        emit(row)
+    }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: flowOn(Dispatchers.IO)</span></div>
+<pre>fun fetchReadings(): Flow&lt;Reading&gt; = flow {
+    val row = db.queryLatest() // runs on IO
+    emit(row)
+}
+    .map { mapToDomain(it) }   // also runs on IO
+    .flowOn(Dispatchers.IO)    // affects UPSTREAM only
+// Collector in ViewModel/UI stays safely on Main!</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: Search-as-You-Type with <code>debounce</code> + <code>flatMapLatest</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: flatMapMerge Out-of-Order Race</span></div>
+<pre>queryFlow
+    .debounce(300)
+    // Stale "ko" (500ms) can finish AFTER "kot" (80ms)
+    // and overwrite newer search results on screen!
+    .flatMapMerge { q -&gt; repo.searchUsers(q) }
+    .collect { render(it) }</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: distinctUntilChanged + flatMapLatest</span></div>
+<pre>queryFlow
+    .debounce(300)
+    .map { it.trim() }
+    .distinctUntilChanged()
+    .flatMapLatest { q -&gt;
+        if (q.isEmpty()) flowOf(emptyList())
+        else repo.searchUsers(q).flowOn(Dispatchers.IO)
+    } // Cancels obsolete "ko" HTTP request immediately!
+    .collect { render(it) }</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: <code>catch {}</code> Scope &amp; <code>onCompletion</code> Ordering</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: try/catch in flow{} + Wrong Order</span></div>
+<pre>flow {
+    try { emit(api.load()) }
+    catch (e: Exception) { emit(Fallback) }
+    // Trap 1: Catches collector crashes AND CancellationException!
+}
+    .onCompletion { cause -&gt; log(cause) } // Trap 2: Sees cause == null
+    .catch { emit(Fallback) }             // if catch runs AFTER onCompletion!</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Declarative catch Before Downstream</span></div>
+<pre>flow { emit(api.load()) }
+    .catch { cause -&gt;
+        // Upstream errors ONLY; CancellationException is never caught.
+        emit(cachedFallback())
+    }
+    .onCompletion { cause -&gt;
+        // Runs on normal finish, upstream failure, or cancellation.
+        // Positioned AFTER catch: cause == null if catch handled it.
+        hideLoadingSpinner(failed = cause != null)
+    }
+    .collect { render(it) } // Downstream crashes still propagate!</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">
+        Implement the core mechanics of Cold Flows in JS. Click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>).
+        Each starter intentionally breaks an invariant you must fix.
+      </p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 11.1 · COLD STREAM INTERNALS</span>
+            <h3 style="margin:8px 0 4px;">Build a Lazy, Unicast <code>ColdFlow</code> with <code>map</code>, <code>filter</code> &amp; <code>take</code></h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>class ColdFlow</code> so producers execute lazily per <code>collect()</code> and <code>take(n)</code> aborts upstream early.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>new ColdFlow(producer)</code> receives <code>producer = async (emit) =&gt; { ... }</code>; it must <strong>not</strong> run until <code>collect(collector)</code> is called.<br/>
+          • Every <code>collect(collector)</code> call re-runs the producer lazily from scratch.<br/>
+          • <code>map(fn)</code>, <code>filter(pred)</code>, and <code>take(n)</code> each return a new <code>ColdFlow</code>. When <code>take(n)</code> receives <code>n</code> items (or <code>n &lt;= 0</code>), stop upstream immediately so no extra items are produced!
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_11_1_cold_flow.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 11.2 · LATEST-WINS CANCELLATION</span>
+            <h3 style="margin:8px 0 4px;">Implement <code>collectLatest(itemsStream, handler)</code> via <code>AbortSignal</code></h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Cancel the previous in-flight <code>handler(item, signal)</code> whenever a newer upstream item arrives.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Iterate <code>for await (const item of itemsStream)</code> without waiting for slow handlers to finish before pulling the next item.<br/>
+          • On each new item: call <code>activeController.abort()</code> on any previous handler's <code>AbortController</code>, create a new <code>AbortController</code>, and invoke <code>handler(item, controller.signal)</code>.<br/>
+          • Await completion of launched handlers before <code>collectLatest</code> resolves; swallow expected <code>AbortError</code> when <code>signal.aborted</code> is true, but rethrow genuine non-abort errors!
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_11_2_collect_latest.js</span><span>AbortController / AbortSignal</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 11.3 · CONTEXT PRESERVATION &amp; EXCEPTION TRANSPARENCY</span>
+            <h3 style="margin:8px 0 4px;">Implement <code>flowContextAndCatch(pipeline)</code></h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Enforce <code>flowOn</code> upstream-only context assignment, reject direct <code>withContext</code> emissions, and restrict <code>catch</code> to upstream errors.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          Input: <code>{ source, ops = [], collector, collectorContext = 'Main' }</code>.<br/>
+          • <code>ops</code> contains <code>{ type: 'map', fn }</code>, <code>{ type: 'flowOn', context }</code>, and <code>{ type: 'catch', handler }</code>.<br/>
+          • <code>flowOn</code> assigns context to stages <strong>upstream</strong> of itself only; downstream stages and <code>collector(val, collectorContext)</code> retain downstream context.<br/>
+          • <code>source({ emit, withContext, context })</code>: if <code>emit()</code> is called while <code>withContext(otherCtx, ...)</code> changed the active context away from <code>context</code>, throw <code>new Error('Flow invariant is violated...')</code>.<br/>
+          • <code>catch</code> invokes <code>await op.handler(err, emit, stageCtx)</code> <strong>only</strong> for upstream errors—never catch errors thrown by downstream stages or <code>collector</code>!
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_11_3_context_catch.js</span><span>Kotlin flowOn + catchImpl semantics</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in length so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Read the
+          <a href="https://kotlinlang.org/docs/flow.html" target="_blank" rel="noopener">Kotlin Asynchronous Flow Guide</a>
+          and review the <a href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference Sheet</a>.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime
+          (e.g., <em>"How does Kotlin's ChannelFlow fuse consecutive flowOn operators?"</em> or <em>"Walk me through why catchImpl tracks fromDownstream"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0010-channels-fanout-actors-shared-state.html">← Lesson 10 (Channels &amp; Actors)</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0012-hot-streams-stateflow-sharedflow-lifecycle.html">Lesson 12 (Hot Streams: StateFlow &amp; SharedFlow) →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_SCENARIOS = {
+      sequential: {
+        boundaryLabel: 'None (Direct CPS Suspend Call)',
+        steps: [
+          { p: { cls: 'ta', txt: 'EMIT V1' }, c: { cls: 'idle', txt: 'DIRECT' }, s: { cls: 'sw', txt: 'WAIT' }, buf: '—', del: '—', drop: 0, type: '', msg: 'Tick 1: Producer emits V1 and suspends inside emit() awaiting Collector.' },
+          { p: { cls: 'idle', txt: 'SUSP' }, c: { cls: 'idle', txt: 'IN CPS' }, s: { cls: 'tb', txt: 'V1 (1/3)' }, buf: '—', del: '—', drop: 0, type: '', msg: 'Tick 2: Collector runs step 1/3 on V1; Producer cannot produce V2 yet.' },
+          { p: { cls: 'idle', txt: 'SUSP' }, c: { cls: 'idle', txt: 'IN CPS' }, s: { cls: 'tb', txt: 'V1 (2/3)' }, buf: '—', del: '—', drop: 0, type: '', msg: 'Tick 3: Collector runs step 2/3 on V1.' },
+          { p: { cls: 'idle', txt: 'SUSP' }, c: { cls: 'idle', txt: 'DONE V1' }, s: { cls: 'tb', txt: 'V1 (3/3)' }, buf: '—', del: 'V1', drop: 0, type: 'good', msg: 'Tick 4: Collector finishes V1; emit(V1) finally returns to Producer.' },
+          { p: { cls: 'ta', txt: 'EMIT V2' }, c: { cls: 'idle', txt: 'DIRECT' }, s: { cls: 'sw', txt: 'WAIT' }, buf: '—', del: 'V1', drop: 0, type: '', msg: 'Tick 5: Producer emits V2 and suspends again.' },
+          { p: { cls: 'idle', txt: 'SUSP' }, c: { cls: 'idle', txt: 'IN CPS' }, s: { cls: 'tb', txt: 'V2 (1/3)' }, buf: '—', del: 'V1', drop: 0, type: '', msg: 'Tick 6: Collector processes V2 (1/3).' },
+          { p: { cls: 'idle', txt: 'SUSP' }, c: { cls: 'idle', txt: 'IN CPS' }, s: { cls: 'tb', txt: 'V2 (2/3)' }, buf: '—', del: 'V1', drop: 0, type: '', msg: 'Tick 7: Collector processes V2 (2/3).' },
+          { p: { cls: 'idle', txt: 'SUSP' }, c: { cls: 'idle', txt: 'DONE V2' }, s: { cls: 'tb', txt: 'V2 (3/3)' }, buf: '—', del: 'V1, V2', drop: 0, type: 'good', msg: 'Tick 8: V2 complete. All 4 items would take 4 * (1 + 3) = 16 ticks!' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Sequential Baseline (4 items = 16 ticks):</strong> Single coroutine, zero channels. Producer and Collector never overlap.' }
+      },
+      buffer: {
+        boundaryLabel: 'Channel(capacity = 2) · 2 Coroutines',
+        steps: [
+          { p: { cls: 'ta', txt: 'EMIT V1' }, c: { cls: 'io', txt: 'SEND V1' }, s: { cls: 'sw', txt: 'RECV' }, buf: '[V1]', del: '—', drop: 0, type: '', msg: 'Tick 1: Producer sends V1 to channel and immediately returns!' },
+          { p: { cls: 'ta', txt: 'EMIT V2' }, c: { cls: 'io', txt: 'Q:[V2]' }, s: { cls: 'tb', txt: 'V1 (1/3)' }, buf: '[V2]', del: '—', drop: 0, type: 'good', msg: 'Tick 2: Overlapped! Collector starts V1 while Producer buffers V2.' },
+          { p: { cls: 'ta', txt: 'EMIT V3' }, c: { cls: 'io', txt: 'Q:[V2,V3]' }, s: { cls: 'tb', txt: 'V1 (2/3)' }, buf: '[V2, V3]', del: '—', drop: 0, type: 'good', msg: 'Tick 3: Producer fills buffer slot 2 with V3 while Collector continues V1.' },
+          { p: { cls: 'ta', txt: 'EMIT V4' }, c: { cls: 'sw', txt: 'FULL Q' }, s: { cls: 'tb', txt: 'V1 (3/3)' }, buf: '[V2, V3]', del: 'V1', drop: 0, type: 'warn', msg: 'Tick 4: V1 finishes! V4 suspends briefly on full buffer until V2 is dequeued.' },
+          { p: { cls: 'idle', txt: 'PROD DONE' }, c: { cls: 'io', txt: 'Q:[V3,V4]' }, s: { cls: 'tb', txt: 'V2 (1/3)' }, buf: '[V3, V4]', del: 'V1', drop: 0, type: 'good', msg: 'Tick 5: V2 dequeued, V4 enters buffer; Producer finishes all work early.' },
+          { p: { cls: 'idle', txt: 'IDLE' }, c: { cls: 'io', txt: 'Q:[V3,V4]' }, s: { cls: 'tb', txt: 'V2 (2/3)' }, buf: '[V3, V4]', del: 'V1', drop: 0, type: '', msg: 'Tick 6: Collector drains V2 (2/3).' },
+          { p: { cls: 'idle', txt: 'IDLE' }, c: { cls: 'io', txt: 'Q:[V4]' }, s: { cls: 'tb', txt: 'V2 (3/3)' }, buf: '[V1..V2]', del: 'V1, V2', drop: 0, type: 'good', msg: 'Tick 7: V2 complete; V3 and V4 remain in channel (total 13 ticks for all 4).' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Buffered Overlap:</strong> All 4 items delivered in exact order (<code>V1, V2, V3, V4</code>) in 13 ticks instead of 16.' }
+      },
+      conflate: {
+        boundaryLabel: 'Channel(CONFLATED · 1-slot DROP_OLDEST)',
+        steps: [
+          { p: { cls: 'ta', txt: 'EMIT V1' }, c: { cls: 'io', txt: 'SLOT:V1' }, s: { cls: 'sw', txt: 'RECV' }, buf: '[V1]', del: '—', drop: 0, type: '', msg: 'Tick 1: Producer drops V1 into conflated slot.' },
+          { p: { cls: 'ta', txt: 'EMIT V2' }, c: { cls: 'io', txt: 'SLOT:V2' }, s: { cls: 'tb', txt: 'V1 (1/3)' }, buf: '[V2]', del: '—', drop: 0, type: '', msg: 'Tick 2: Collector picks up V1; Producer writes V2 into slot without waiting.' },
+          { p: { cls: 'ta', txt: 'EMIT V3' }, c: { cls: 'sw', txt: 'DROP V2' }, s: { cls: 'tb', txt: 'V1 (2/3)' }, buf: '[V3]', del: '—', drop: 1, type: 'warn', msg: 'Tick 3: Producer emits V3, overwriting unread V2 (1 skipped frame).' },
+          { p: { cls: 'ta', txt: 'EMIT V4' }, c: { cls: 'sw', txt: 'DROP V3' }, s: { cls: 'tb', txt: 'V1 (3/3)' }, buf: '[V4]', del: 'V1', drop: 2, type: 'warn', msg: 'Tick 4: Producer finishes with V4 (V3 overwritten). Collector finishes V1.' },
+          { p: { cls: 'idle', txt: 'PROD DONE' }, c: { cls: 'io', txt: 'EMPTY' }, s: { cls: 'tb', txt: 'V4 (1/3)' }, buf: '[]', del: 'V1', drop: 2, type: 'good', msg: 'Tick 5: Collector jumps straight from V1 to latest snapshot V4!' },
+          { p: { cls: 'idle', txt: 'IDLE' }, c: { cls: 'io', txt: 'EMPTY' }, s: { cls: 'tb', txt: 'V4 (2/3)' }, buf: '[]', del: 'V1', drop: 2, type: '', msg: 'Tick 6: Collector renders V4 (2/3).' },
+          { p: { cls: 'idle', txt: 'IDLE' }, c: { cls: 'io', txt: 'CLOSED' }, s: { cls: 'tb', txt: 'V4 (3/3)' }, buf: '[]', del: 'V1, V4', drop: 2, type: 'good', msg: 'Tick 7: Complete! Stale V2 and V3 skipped cleanly; V4 delivered in 7 ticks.' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Conflation:</strong> Fast producer never blocks; slow collector processed only <code>V1</code> and <code>V4</code> (7 ticks total).' }
+      },
+      collectLatest: {
+        boundaryLabel: 'Channel + Cancel Previous Collector Job',
+        steps: [
+          { p: { cls: 'ta', txt: 'EMIT V1' }, c: { cls: 'io', txt: 'START V1' }, s: { cls: 'tb', txt: 'V1 (1/3)' }, buf: 'Job(V1)', del: '—', drop: 0, type: '', msg: 'Tick 1: V1 arrives; Collector starts Job(V1).' },
+          { p: { cls: 'ta', txt: 'EMIT V2' }, c: { cls: 'bad', txt: 'CANCEL V1' }, s: { cls: 'bad', txt: 'X V1' }, buf: 'Job(V2)', del: '—', drop: 1, type: 'bad', msg: 'Tick 2: V2 arrives! Job(V1) is immediately cancelled before finishing; Job(V2) starts.' },
+          { p: { cls: 'ta', txt: 'EMIT V3' }, c: { cls: 'bad', txt: 'CANCEL V2' }, s: { cls: 'bad', txt: 'X V2' }, buf: 'Job(V3)', del: '—', drop: 2, type: 'bad', msg: 'Tick 3: V3 arrives! Job(V2) is cancelled; Job(V3) starts.' },
+          { p: { cls: 'ta', txt: 'EMIT V4' }, c: { cls: 'bad', txt: 'CANCEL V3' }, s: { cls: 'bad', txt: 'X V3' }, buf: 'Job(V4)', del: '—', drop: 3, type: 'bad', msg: 'Tick 4: V4 arrives! Job(V3) is cancelled; Job(V4) starts.' },
+          { p: { cls: 'idle', txt: 'PROD DONE' }, c: { cls: 'io', txt: 'RUN V4' }, s: { cls: 'tb', txt: 'V4 (1/3)' }, buf: 'Job(V4)', del: '—', drop: 3, type: '', msg: 'Tick 5: No newer items; Job(V4) runs uninterrupted (1/3).' },
+          { p: { cls: 'idle', txt: 'IDLE' }, c: { cls: 'io', txt: 'RUN V4' }, s: { cls: 'tb', txt: 'V4 (2/3)' }, buf: 'Job(V4)', del: '—', drop: 3, type: '', msg: 'Tick 6: Job(V4) runs (2/3).' },
+          { p: { cls: 'idle', txt: 'IDLE' }, c: { cls: 'io', txt: 'DONE V4' }, s: { cls: 'tb', txt: 'V4 (3/3)' }, buf: 'None', del: 'V4', drop: 3, type: 'good', msg: 'Tick 7: Only V4 completes! All 3 obsolete in-flight jobs were aborted.' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>collectLatest:</strong> Cancelled 3 obsolete handlers mid-flight; only the newest emission (<code>V4</code>) completed.' }
+      }
+    };
+
+    let currentSimMode = 'sequential';
+    let simStepIdx = 0;
+    let simTimer = null;
+
+    function resetSim() {
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        document.getElementById('sim-play').textContent = '▶ Play';
+      }
+      simStepIdx = 0;
+      const sc = SIM_SCENARIOS[currentSimMode];
+      document.getElementById('lane-producer').innerHTML = '';
+      document.getElementById('lane-channel').innerHTML = '';
+      document.getElementById('lane-consumer').innerHTML = '';
+      document.getElementById('sim-boundary-label').textContent = sc.boundaryLabel;
+      document.getElementById('reg-buffer').textContent = '[]';
+      document.getElementById('reg-delivered').textContent = '—';
+      document.getElementById('reg-dropped').textContent = '0';
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${sc.steps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step → or ▶ Play.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through this timeline to compare coroutine overlap, conflation, and cancellation.';
+    }
+
+    function stepSim() {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById('sim-play').textContent = '▶ Play';
+        }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      const appendSlot = (id, slot) => {
+        if (!slot) return;
+        const d = document.createElement('div');
+        d.className = `slot ${slot.cls}`;
+        d.textContent = slot.txt;
+        document.getElementById(id).appendChild(d);
+      };
+      appendSlot('lane-producer', s.p);
+      appendSlot('lane-channel', s.c);
+      appendSlot('lane-consumer', s.s);
+
+      document.getElementById('reg-buffer').textContent = s.buf;
+      document.getElementById('reg-delivered').textContent = s.del;
+      document.getElementById('reg-dropped').textContent = String(s.drop);
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${sc.steps.length}`;
+
+      const logEl = document.getElementById('sim-log');
+      if (simStepIdx === 1) logEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.className = `trace-line ${s.type}`;
+      line.textContent = `[${simStepIdx}] ${s.msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+      }
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        btn.textContent = '▶ Play';
+      } else {
+        if (simStepIdx >= SIM_SCENARIOS[currentSimMode].steps.length) resetSim();
+        btn.textContent = '⏸ Pause';
+        simTimer = setInterval(stepSim, 750);
+      }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'ColdFlow',
+        starter: `class ColdFlow {\n  constructor(producer) {\n    // BUG: Eagerly runs producer at construction time (behaves hot, not cold!)\n    this.cached = [];\n    this.ready = producer(async (v) => { this.cached.push(v); });\n  }\n  map(fn) { return this; }\n  filter(pred) { return this; }\n  take(n) { return this; }\n  async collect(collector) {\n    await this.ready;\n    for (const v of this.cached) await collector(v);\n  }\n}`,
+        hints: [
+          'Store `this.producer = producer;` in the constructor without calling it yet.',
+          '`map(fn)` and `filter(pred)` should return `new ColdFlow(async (emit) => { await this.collect(async (v) => { ... }); })`.',
+          'For `take(n)`: if `n <= 0` return immediately; otherwise track `taken`, throw a private `STOP` sentinel once `taken >= n`, and swallow only `STOP` in a `try/catch`.'
+        ],
+        solution: `class ColdFlow {\n  constructor(producer) {\n    this.producer = producer;\n  }\n  map(fn) {\n    return new ColdFlow(async (emit) => {\n      await this.collect(async (v) => {\n        await emit(await fn(v));\n      });\n    });\n  }\n  filter(pred) {\n    return new ColdFlow(async (emit) => {\n      await this.collect(async (v) => {\n        if (await pred(v)) await emit(v);\n      });\n    });\n  }\n  take(n) {\n    const STOP = Symbol('AbortTake');\n    return new ColdFlow(async (emit) => {\n      if (n <= 0) return;\n      let taken = 0;\n      try {\n        await this.collect(async (v) => {\n          taken++;\n          await emit(v);\n          if (taken >= n) throw STOP;\n        });\n      } catch (err) {\n        if (err !== STOP) throw err;\n      }\n    });\n  }\n  async collect(collector) {\n    await this.producer(async (v) => {\n      await collector(v);\n    });\n  }\n}`,
+        kotlinEquivalent: `val numbers = flow {\n    for (i in 1..10) { emit(i) }\n}\nval firstTwoDoubled = numbers\n    .filter { it % 2 == 0 }\n    .map { it * 2 }\n    .take(2)\n// Lazy: producer runs fresh per collect(), aborting after 2 emissions`,
+        tests: async (FlowClass) => runTestCases([
+          {
+            name: 'Lazy & Cold: producer never runs until collect(), and re-runs per collector',
+            run: async () => {
+              let runs = 0;
+              const f = new FlowClass(async (emit) => {
+                runs++;
+                const tag = runs;
+                await emit(`run${tag}-a`);
+                await emit(`run${tag}-b`);
+              });
+              assertEq(runs, 0, 'ColdFlow must NOT execute producer in constructor!');
+              const out1 = [];
+              await f.collect(async (v) => out1.push(v));
+              const out2 = [];
+              await f.collect(async (v) => out2.push(v));
+              assertEq(runs, 2, 'Expected producer to execute once per collect()');
+              assertDeepEq(out1, ['run1-a', 'run1-b']);
+              assertDeepEq(out2, ['run2-a', 'run2-b']);
+            }
+          },
+          {
+            name: 'map + filter pipeline transforms lazily without mutating base flow',
+            run: async () => {
+              const base = new FlowClass(async (emit) => {
+                for (const n of [1, 2, 3, 4, 5]) await emit(n);
+              });
+              const derived = base.filter((x) => x % 2 === 1).map((x) => x * 10);
+              const resA = [];
+              const resB = [];
+              await derived.collect(async (v) => resA.push(v));
+              await base.collect(async (v) => resB.push(v));
+              assertDeepEq(resA, [10, 30, 50]);
+              assertDeepEq(resB, [1, 2, 3, 4, 5]);
+            }
+          },
+          {
+            name: 'take(n) aborts upstream early and take(0) never starts producer',
+            run: async () => {
+              let produced = 0;
+              const infiniteLike = new FlowClass(async (emit) => {
+                for (let i = 1; i <= 10; i++) {
+                  produced++;
+                  await emit(i);
+                }
+              });
+              const zeroOut = [];
+              await infiniteLike.take(0).collect(async (v) => zeroOut.push(v));
+              assertEq(produced, 0, 'take(0) should not trigger producer');
+              assertDeepEq(zeroOut, []);
+
+              const threeOut = [];
+              await infiniteLike.filter((x) => x % 2 === 0).take(2).collect(async (v) => threeOut.push(v));
+              assertDeepEq(threeOut, [2, 4]);
+              assertEq(produced, 4, `Expected producer to stop at item 4, produced ${produced}`);
+            }
+          },
+          {
+            name: 'Sequential backpressure: emit awaits slow collector before next emit',
+            run: async () => {
+              const events = [];
+              const f = new FlowClass(async (emit) => {
+                events.push('emit-1-start');
+                await emit(1);
+                events.push('emit-2-start');
+                await emit(2);
+              });
+              await f.collect(async (v) => {
+                await new Promise((r) => setTimeout(r, 10));
+                events.push(`collect-${v}-done`);
+              });
+              assertDeepEq(events, ['emit-1-start', 'collect-1-done', 'emit-2-start', 'collect-2-done']);
+            }
+          }
+        ])
+      },
+      2: {
+        fnName: 'collectLatest',
+        starter: `async function collectLatest(itemsStream, handler) {\n  // BUG: Awaits each handler sequentially — never cancels stale in-flight work!\n  for await (const item of itemsStream) {\n    const controller = new AbortController();\n    await handler(item, controller.signal);\n  }\n}`,
+        hints: [
+          'Do NOT `await handler(...)` inside the `for await` loop—otherwise the loop stalls and misses newer upstream items.',
+          'Keep `let activeController = null;` and `const tasks = [];`. Before starting a new handler, call `if (activeController) activeController.abort();`.',
+          'Wrap each launched handler promise so expected cancellations (`controller.signal.aborted` + `AbortError`) are ignored while real errors still reject `await Promise.all(tasks)`.'
+        ],
+        solution: `async function collectLatest(itemsStream, handler) {\n  let activeController = null;\n  const tasks = [];\n  for await (const item of itemsStream) {\n    if (activeController) {\n      activeController.abort();\n    }\n    const controller = new AbortController();\n    activeController = controller;\n    const task = Promise.resolve()\n      .then(() => handler(item, controller.signal))\n      .catch((err) => {\n        if (controller.signal.aborted && err && err.name === 'AbortError') {\n          return;\n        }\n        throw err;\n      });\n    tasks.push(task);\n  }\n  await Promise.all(tasks);\n}`,
+        kotlinEquivalent: `queryFlow.collectLatest { query ->\n    // Automatically cancels previous block when a new query arrives\n    val results = api.search(query)\n    render(results)\n}`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Cancels previous in-flight handler via AbortSignal when faster emission arrives',
+            run: async () => {
+              const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+              async function* stream() {
+                yield 'a';
+                await sleep(15);
+                yield 'ab';
+                await sleep(15);
+                yield 'abc';
+              }
+              const completed = [];
+              const aborted = [];
+              await fn(stream(), async (item, signal) => {
+                await new Promise((resolve, reject) => {
+                  const timer = setTimeout(() => {
+                    if (signal.aborted) {
+                      aborted.push(item);
+                      const err = new Error('Aborted');
+                      err.name = 'AbortError';
+                      reject(err);
+                    } else {
+                      completed.push(item);
+                      resolve();
+                    }
+                  }, 45);
+                  signal.addEventListener('abort', () => {
+                    clearTimeout(timer);
+                    aborted.push(item);
+                    const err = new Error('Aborted');
+                    err.name = 'AbortError';
+                    reject(err);
+                  }, { once: true });
+                });
+              });
+              assertDeepEq(aborted, ['a', 'ab']);
+              assertDeepEq(completed, ['abc']);
+            }
+          },
+          {
+            name: 'Slow upstream allows all handlers to complete without cancellation',
+            run: async () => {
+              const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+              async function* slowStream() {
+                yield 1;
+                await sleep(40);
+                yield 2;
+              }
+              const seen = [];
+              await fn(slowStream(), async (item, signal) => {
+                await sleep(10);
+                if (!signal.aborted) seen.push(item);
+              });
+              assertDeepEq(seen, [1, 2]);
+            }
+          },
+          {
+            name: 'Awaits final active handler and propagates non-abort handler errors',
+            run: async () => {
+              async function* stream() {
+                yield 'ok';
+                yield 'boom';
+              }
+              let threw = false;
+              try {
+                await fn(stream(), async (item, signal) => {
+                  await new Promise((r) => setTimeout(r, 15));
+                  if (item === 'boom' && !signal.aborted) {
+                    throw new Error('Network 500');
+                  }
+                });
+              } catch (e) {
+                threw = e && e.message === 'Network 500';
+              }
+              assertEq(threw, true, 'Expected real handler error to propagate');
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'flowContextAndCatch',
+        starter: `async function flowContextAndCatch({ source, ops = [], collector, collectorContext = 'Main' }) {\n  // BUG 1: Allows emit() inside withContext() without checking context invariant\n  // BUG 2: catch naively swallows downstream collector errors too!\n  let flowCollect = async (emit) => {\n    const withContext = async (_ctx, fn) => fn();\n    await source({ emit, withContext, context: collectorContext });\n  };\n  for (const op of ops) {\n    const prev = flowCollect;\n    if (op.type === 'map') {\n      flowCollect = async (emit) => prev(async (v) => emit(await op.fn(v, collectorContext)));\n    } else if (op.type === 'catch') {\n      flowCollect = async (emit) => {\n        try { await prev(emit); } catch (err) { await op.handler(err, emit, collectorContext); }\n      };\n    }\n  }\n  await flowCollect((v) => collector(v, collectorContext));\n}`,
+        hints: [
+          'First walk `ops` from right to left (`ops.length - 1` down to `0`) tracking `ctx = collectorContext`; whenever `op.type === "flowOn"`, set `ctx = op.context`. Record `opContexts[i] = ctx` and `sourceContext = ctx`.',
+          'Track `activeCtx = sourceContext` inside `source`. `withContext(newCtx, fn)` temporarily swaps `activeCtx` in `try/finally`, and `emit(v)` throws if `activeCtx !== sourceContext`.',
+          'In `catch`, wrap the downstream `emit` to record `fromDownstream = e` before rethrowing; in `catch (err)`, if `err === fromDownstream` rethrow `err` instead of calling `op.handler`!'
+        ],
+        solution: `async function flowContextAndCatch({ source, ops = [], collector, collectorContext = 'Main' }) {\n  let ctx = collectorContext;\n  const opContexts = new Array(ops.length);\n  for (let i = ops.length - 1; i >= 0; i--) {\n    if (ops[i].type === 'flowOn') {\n      ctx = ops[i].context;\n    }\n    opContexts[i] = ctx;\n  }\n  const sourceContext = ctx;\n\n  let flowCollect = async (emit) => {\n    let activeCtx = sourceContext;\n    const withContext = async (newCtx, fn) => {\n      const prev = activeCtx;\n      activeCtx = newCtx;\n      try {\n        return await fn();\n      } finally {\n        activeCtx = prev;\n      }\n    };\n    const checkedEmit = async (val) => {\n      if (activeCtx !== sourceContext) {\n        throw new Error(\`Flow invariant is violated: emitted in \${activeCtx}, expected \${sourceContext}\`);\n      }\n      await emit(val);\n    };\n    await source({ emit: checkedEmit, withContext, context: sourceContext });\n  };\n\n  for (let i = 0; i < ops.length; i++) {\n    const op = ops[i];\n    const prevCollect = flowCollect;\n    const stageCtx = opContexts[i];\n    if (op.type === 'map') {\n      flowCollect = async (emit) => {\n        await prevCollect(async (val) => {\n          await emit(await op.fn(val, stageCtx));\n        });\n      };\n    } else if (op.type === 'flowOn') {\n      flowCollect = async (emit) => {\n        await prevCollect(emit);\n      };\n    } else if (op.type === 'catch') {\n      flowCollect = async (emit) => {\n        let fromDownstream = null;\n        try {\n          await prevCollect(async (val) => {\n            try {\n              await emit(val);\n            } catch (e) {\n              fromDownstream = e;\n              throw e;\n            }\n          });\n        } catch (err) {\n          if (err === fromDownstream) throw err;\n          await op.handler(err, emit, stageCtx);\n        }\n      };\n    }\n  }\n\n  await flowCollect(async (val) => {\n    await collector(val, collectorContext);\n  });\n}`,
+        kotlinEquivalent: `flow {\n    val raw = loadRaw() // runs on IO\n    emit(raw)\n}\n    .map { parse(it) }        // runs on IO\n    .flowOn(Dispatchers.IO)   // upstream only\n    .catch { emit(Fallback) } // upstream errors only\n    .collect { render(it) }   // runs on Main; errors propagate`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'flowOn changes upstream context only while preserving downstream collector context',
+            run: async () => {
+              const trace = [];
+              await fn({
+                collectorContext: 'Main',
+                source: async ({ emit, context }) => {
+                  trace.push(`src:${context}`);
+                  await emit(2);
+                },
+                ops: [
+                  { type: 'map', fn: async (v, ctx) => { trace.push(`m1:${ctx}`); return v * 10; } },
+                  { type: 'flowOn', context: 'IO' },
+                  { type: 'map', fn: async (v, ctx) => { trace.push(`m2:${ctx}`); return v + 1; } }
+                ],
+                collector: async (v, ctx) => { trace.push(`col:${ctx}:${v}`); }
+              });
+              assertDeepEq(trace, ['src:IO', 'm1:IO', 'm2:Main', 'col:Main:21']);
+            }
+          },
+          {
+            name: 'Rejects direct emit() inside withContext(), but allows compute-then-emit',
+            run: async () => {
+              let violated = false;
+              try {
+                await fn({
+                  collectorContext: 'Main',
+                  source: async ({ emit, withContext }) => {
+                    await withContext('IO', async () => {
+                      await emit(42);
+                    });
+                  },
+                  ops: [],
+                  collector: async () => {}
+                });
+              } catch (err) {
+                violated = /Flow invariant is violated/i.test(err.message);
+              }
+              assertEq(violated, true, 'Expected IllegalState / Flow invariant violation error');
+
+              const safeOut = [];
+              await fn({
+                collectorContext: 'Main',
+                source: async ({ emit, withContext }) => {
+                  const computed = await withContext('IO', async () => 99);
+                  await emit(computed);
+                },
+                ops: [],
+                collector: async (v, ctx) => safeOut.push(`${ctx}:${v}`)
+              });
+              assertDeepEq(safeOut, ['Main:99']);
+            }
+          },
+          {
+            name: 'catch recovers from upstream failures and emits fallback',
+            run: async () => {
+              const out = [];
+              await fn({
+                collectorContext: 'Main',
+                source: async ({ emit }) => {
+                  await emit(1);
+                  throw new Error('Upstream boom');
+                },
+                ops: [
+                  { type: 'flowOn', context: 'IO' },
+                  { type: 'catch', handler: async (err, emit, ctx) => { out.push(`caught@${ctx}:${err.message}`); await emit(-1); } }
+                ],
+                collector: async (v) => out.push(`val:${v}`)
+              });
+              assertDeepEq(out, ['val:1', 'caught@Main:Upstream boom', 'val:-1']);
+            }
+          },
+          {
+            name: 'Exception transparency: catch NEVER swallows downstream collector errors',
+            run: async () => {
+              let catchInvoked = false;
+              let propagated = false;
+              try {
+                await fn({
+                  collectorContext: 'Main',
+                  source: async ({ emit }) => { await emit(10); },
+                  ops: [
+                    { type: 'catch', handler: async () => { catchInvoked = true; } }
+                  ],
+                  collector: async () => { throw new Error('Downstream UI crash'); }
+                });
+              } catch (err) {
+                propagated = err && err.message === 'Downstream UI crash';
+              }
+              assertEq(catchInvoked, false, 'catch handler must NOT run for downstream errors!');
+              assertEq(propagated, true, 'Downstream collector error must propagate out!');
+            }
+          }
+        ])
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. You define a cold flow with flow { emit(fetchNonce()) } and collect it from two different screens. What happens?',
+        code: `val nonceFlow = flow { emit(api.fetchOneTimeNonce()) }\n// Screen A collects nonceFlow; Screen B also collects nonceFlow.`,
+        options: [
+          'Both collectors share one upstream coroutine and receive the exact same nonce value.',
+          'Each collector starts an independent producer execution and receives a newly fetched nonce.',
+          'The producer starts executing immediately upon creation and replays all buffered nonces.',
+          'The second collector throws an IllegalStateException because cold flows permit one subscriber.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Sharing a single upstream producer across subscribers describes a hot stream (SharedFlow/StateFlow), not a cold Flow.',
+          'CORRECT (B): Cold flows are lazy and unicast—the flow { } lambda executes from scratch on every collect() call.',
+          'WRONG (C): Cold flow builders capture a suspending lambda and execute nothing until a terminal operator like collect() runs.',
+          'WRONG (D): Any number of collectors may collect a cold Flow; each simply triggers its own independent execution.'
+        ]
+      },
+      {
+        stem: '2. Why does calling withContext(Dispatchers.IO) around emit() inside a flow { } builder throw IllegalStateException?',
+        code: `flow {\n    withContext(Dispatchers.IO) {\n        emit(database.readUser()) // Throws IllegalStateException!\n    }\n}`,
+        options: [
+          'Flow enforces context preservation so emit must execute in the collector coroutine context.',
+          'Dispatchers.IO is incompatible with Flow collectors because IO threads lack continuation support.',
+          'The withContext block spawns an unlinked GlobalScope child that leaks the collector job.',
+          'Kotlin forbids calling any suspending function inside the body of a flow builder.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): By default, emit() directly invokes the downstream collector; Flow checks that emitter and collector share the same CoroutineContext.',
+          'WRONG (B): Dispatchers.IO runs standard suspending continuations—the failure is violating Flow context preservation, which flowOn() solves.',
+          'WRONG (C): withContext() is structured and scoped to the caller coroutine; it does not use GlobalScope.',
+          'WRONG (D): The flow { } builder is explicitly a suspending block—you can call suspend functions, as long as emit() stays on the preserved context.'
+        ]
+      },
+      {
+        stem: '3. Given flow { emit(load()) }.map { parse(it) }.flowOn(Dispatchers.IO).map { ui(it) }.collect { render(it) }, where does each stage run?',
+        code: `// Collected from viewModelScope (Dispatchers.Main):\nflow { emit(load()) }\n    .map { parse(it) }\n    .flowOn(Dispatchers.IO)\n    .map { ui(it) }\n    .collect { render(it) }`,
+        options: [
+          'load and parse run on Dispatchers.IO while ui and render use collector context.',
+          'All stages from load through render switch to Dispatchers.IO for the entire pipeline.',
+          'Only load runs on Dispatchers.IO while parse, ui, and render use collector context.',
+          'load and parse use collector context while ui and render switch to Dispatchers.IO.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): flowOn() inserts a coroutine boundary that applies to all upstream stages (load and parse) while downstream stages (ui and render) remain on Main.',
+          'WRONG (B): flowOn() never leaks downstream; the collector and operators after flowOn stay on the collector CoroutineContext.',
+          'WRONG (C): Every intermediate operator above flowOn—including parse—is fused into the upstream coroutine running on Dispatchers.IO.',
+          'WRONG (D): That reverses the flowOn rule; flowOn affects upstream operators only, never downstream operators.'
+        ]
+      },
+      {
+        stem: '4. A search box emits "ko", then "kot" 30ms later while the "ko" network request takes 200ms. Which operator cancels "ko"?',
+        code: `searchQueryFlow\n    ./* ??? */ { q -> repository.searchApi(q) }\n    .collect { showResults(it) }`,
+        options: [
+          'flatMapConcat cancels the "ko" request immediately before launching the "kot" network call.',
+          'flatMapMerge aborts the slower "ko" coroutine and emits only the newest result.',
+          'flatMapLatest cancels the in-flight "ko" flow and collects the new "kot" flow.',
+          'buffer(1) cancels the active "ko" network request coroutine whenever "kot" arrives upstream.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): flatMapConcat waits sequentially for the entire "ko" inner flow to finish before starting "kot".',
+          'WRONG (B): flatMapMerge runs inner flows concurrently without cancelling older ones, risking out-of-order stale UI overwrites.',
+          'CORRECT (C): flatMapLatest cancels the active inner collection job as soon as a new upstream query arrives, avoiding wasted work and stale races.',
+          'WRONG (D): buffer(1) decouples upstream and downstream via a 1-item queue; it never cancels an in-flight transformation.'
+        ]
+      },
+      {
+        stem: '5. In flow { emit(1) }.catch { emit(-1) }.collect { error("UI crash") }, what happens when collect throws?',
+        code: `flow { emit(1) }\n    .catch { emit(-1) }\n    .collect { throw IllegalStateException("UI crash") }`,
+        options: [
+          'The catch operator intercepts the downstream crash and emits fallback value minus one.',
+          'The error propagates out of collect because catch handles upstream exceptions only.',
+          'The flow silently swallows the UI crash and completes normally without throwing.',
+          'The catch operator restarts the upstream producer three times before rethrowing anything.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Exception transparency guarantees that catch {} never hides exceptions thrown downstream of itself.',
+          'CORRECT (B): catch {} inspects the origin of the exception and only intercepts upstream errors, letting downstream collect {} crashes propagate.',
+          'WRONG (C): Swallowing downstream crashes would violate exception transparency; the IllegalStateException escapes collect().',
+          'WRONG (D): catch {} does not automatically retry—retrying requires explicit retry() or retryWhen() operators.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_11',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

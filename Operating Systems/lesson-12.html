@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 12: Kernel Networking Stack, Sockets &amp; Zero-Copy — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <style>
+    .skb-bar {
+      display: flex;
+      height: 36px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border-strong);
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 700;
+      margin: 0.65rem 0;
+    }
+    .skb-seg {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+      overflow: hidden;
+      transition: width 0.2s ease;
+    }
+    .skb-head { background: var(--bg-elev); color: var(--text-dim); }
+    .skb-hdr  { background: var(--amber-soft); color: var(--amber); border-left: 1px solid var(--amber); }
+    .skb-pay  { background: var(--accent-soft); color: var(--accent); border-left: 1px solid var(--accent); }
+    .skb-tail { background: var(--bg-elev); color: var(--text-dim); border-left: 1px dashed var(--border); }
+    .zc-compare {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.7rem;
+      margin-top: 0.65rem;
+    }
+    .zc-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem;
+      font-size: 0.82rem;
+    }
+    .zc-card.active {
+      border-color: var(--green);
+      background: var(--green-soft);
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 12</span>
+        <span>Kernel Networking Stack, Sockets &amp; Zero-Copy</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-11.html">&larr; Prev Lesson</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C &amp; Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">Code Labs (3)</a>
+        <a href="#quiz">Quiz (6)</a>
+        <a href="#senior-bar">Senior Bar</a>
+        <a href="lesson-13.html">Next Lesson &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="badge b-concept">PHASE 4 // I/O, STORAGE, FILESYSTEMS &amp; NETWORKING</span>
+      <h1>Lesson 12: Kernel Networking Stack, Sockets &amp; Zero-Copy</h1>
+      <p>
+        At 10–100 Gbps or across 5G mobile radios, allocating per-packet buffers, firing an IRQ per frame, and copying bytes twice
+        between user space and kernel space collapses CPU throughput and battery life. Master NIC DMA rings, NAPI polling,
+        <code>struct sk_buff</code> headroom mechanics, TCP socket queues, zero-copy <code>sendfile()</code>, and XDP fast paths.
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button id="markLessonComplete" class="btn btn-green btn-sm" type="button">Mark Lesson 12 Complete</button>
+      </div>
+    </section>
+
+    <!-- MODULE 1: MENTAL MODEL + INTERACTIVE SIMULATOR -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>From NIC DMA Ring to Socket Queue Without Wasting Copies</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. NIC DMA Ring &amp; NAPI Interrupt Mitigation</h3>
+          <p><strong>Receive Livelock Problem:</strong> If a NIC triggers a hardware IRQ for every incoming 64-byte packet at line rate, the CPU spends 100% of its time saving/restoring trap frames and never runs user apps to drain sockets.</p>
+          <p><strong>NAPI (New API) Hybrid IRQ + Poll:</strong><br/>
+            1. NIC writes incoming packets into pre-allocated DMA descriptors in the <strong>RX Ring</strong>.<br/>
+            2. NIC raises <em>one</em> hardware IRQ.<br/>
+            3. Driver masks further RX IRQs for that queue and calls <code>napi_schedule()</code>.<br/>
+            4. Kernel's <code>NET_RX_SOFTIRQ</code> loop invokes driver's <code>poll(budget=64)</code>, draining up to <code>budget</code> frames. If the ring empties, IRQs are re-enabled (<code>napi_complete_done</code>); if packets remain, it reschedules fairly.</p>
+        </div>
+
+        <div class="card">
+          <h3>2. <code>sk_buff</code> Headroom, Socket Buffers &amp; Zero-Copy</h3>
+          <p><strong><code>struct sk_buff</code> (skb):</strong> As a packet climbs/descends TCP &rarr; IP &rarr; Ethernet, the kernel never reallocates or <code>memcpy</code>s the payload to add/strip headers! An <code>skb</code> allocates extra <strong>headroom</strong> between <code>head</code> and <code>data</code>:</p>
+          <p>&bull; <code>skb_push(len)</code>: decrements <code>data</code> toward <code>head</code> to prepend a TCP/IP/ETH header in O(1).<br/>
+             &bull; <code>skb_pull(len)</code>: increments <code>data</code> toward <code>tail</code> to strip a lower-layer header in O(1).</p>
+          <p><strong>Socket Queues &amp; <code>TIME_WAIT</code>:</strong> Validated packets land in the socket's receive queue bounded by <code>sk_rmem_alloc &le; sk_rcvbuf</code> (full buffer = packet drop + TCP zero-window). Closing active TCP connections enters <code>TIME_WAIT</code> (2&times;MSL = 60s) so delayed old packets can't corrupt a new connection on the same 4-tuple.</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <strong>Zero-Copy Paths — <code>sendfile()</code>, <code>splice()</code>, <code>MSG_ZEROCOPY</code> &amp; XDP:</strong><br/>
+        &bull; <strong>Standard <code>read()</code> + <code>write()</code>:</strong> 4 data copies (Disk DMA &rarr; Page Cache &rarr; User buf &rarr; Socket buf &rarr; NIC DMA) + 4 mode switches.<br/>
+        &bull; <strong><code>sendfile(out_sock, in_file, &amp;off, n)</code>:</strong> Directs kernel to attach Page Cache page descriptors straight into the socket's <code>skb</code> scatter-gather fragments &rarr; NIC DMA (<strong>0 CPU copies!</strong> Note: user-space TLS breaks this unless using kernel TLS / <code>kTLS</code>).<br/>
+        &bull; <strong><code>splice()</code>:</strong> Moves pages between any two FDs via a kernel pipe buffer.<br/>
+        &bull; <strong>XDP (eXpress Data Path):</strong> Runs an eBPF program inside the NIC driver <em>before</em> <code>sk_buff</code> allocation—capable of <code>XDP_DROP</code> (DDoS mitigation at 20M+ pps/core), <code>XDP_PASS</code>, or <code>XDP_TX</code>.
+      </div>
+
+      <h3 style="margin:1.25rem 0 0.4rem;">Interactive Simulator: NIC Ring &rarr; NAPI Poll &rarr; <code>sk_buff</code> Push/Pull &amp; Zero-Copy</h3>
+      <p style="margin:0; font-size:0.89rem; color:var(--text-muted);">Inject bursts into the NIC RX ring, run bounded NAPI polls, manipulate <code>sk_buff</code> pointers, and compare standard vs <code>sendfile()</code> data paths.</p>
+
+      <div class="sim-box">
+        <div class="sim-controls">
+          <button class="btn btn-primary btn-sm" type="button" id="netInjectBtn">+ Inject 4 RX Packets</button>
+          <button class="btn btn-green btn-sm" type="button" id="netNapiBtn">Run NAPI Poll (Budget=3)</button>
+          <button class="btn btn-sm" type="button" id="netPushBtn">TX: skb_push(+20B Hdr)</button>
+          <button class="btn btn-sm" type="button" id="netPullBtn">RX: skb_pull(-20B Hdr)</button>
+          <button class="btn btn-amber btn-sm" type="button" id="netZcToggleBtn">Toggle Zero-Copy (sendfile)</button>
+          <button class="btn btn-sm" type="button" id="netResetBtn">Reset</button>
+        </div>
+
+        <div class="sim-grid">
+          <div class="reg-panel">
+            <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">NIC RX RING &amp; NAPI STATE</div>
+            <div class="reg-row"><span>RX Ring Queued</span><span class="reg-val" id="netRxCount">0 pkts</span></div>
+            <div class="reg-row"><span>NIC RX IRQ</span><span class="reg-val" id="netIrqState">ARMED (Enabled)</span></div>
+            <div class="reg-row"><span>NAPI State</span><span class="reg-val" id="netNapiState">IDLE</span></div>
+            <div class="reg-row"><span>Socket Queue (port 443)</span><span class="reg-val" id="netSockQueue">0 / 4096 B</span></div>
+            <div class="reg-row"><span>Dropped (rmem full)</span><span class="reg-val" id="netDropped">0 pkts</span></div>
+          </div>
+
+          <div class="reg-panel">
+            <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">STRUCT SK_BUFF POINTERS (256B Buffer)</div>
+            <div class="reg-row"><span>head / end</span><span class="reg-val">0 / 256</span></div>
+            <div class="reg-row"><span>data / tail</span><span class="reg-val" id="netSkbPtrs">64 / 192</span></div>
+            <div class="reg-row"><span>Headroom (data - head)</span><span class="reg-val" id="netHeadroom">64 B</span></div>
+            <div class="reg-row"><span>Packet Len (tail - data)</span><span class="reg-val" id="netPktLen">128 B</span></div>
+            <div class="skb-bar" id="netSkbBar"></div>
+          </div>
+        </div>
+
+        <div class="zc-compare">
+          <div class="zc-card active" id="zcStdCard">
+            <strong>Standard <code>read()</code> + <code>write()</code> Path:</strong>
+            <div style="color:var(--text-muted); margin-top:0.25rem;">4 copies (2 DMA + <strong>2 CPU copies</strong> across EL1&harr;EL0), 4 syscall/mode switches.</div>
+          </div>
+          <div class="zc-card" id="zcSfCard">
+            <strong>Zero-Copy <code>sendfile()</code> Path:</strong>
+            <div style="color:var(--text-muted); margin-top:0.25rem;">2 DMA transfers, <strong>0 CPU payload copies</strong> (Page Cache &rarr; <code>skb_frag</code> &rarr; NIC SG DMA), 2 mode switches.</div>
+          </div>
+        </div>
+        <div id="netExplain" style="font-size:0.84rem; color:var(--text-muted); margin-top:0.75rem;">
+          Click <strong>+ Inject 4 RX Packets</strong> to simulate an incoming burst triggering NAPI interrupt mitigation.
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 2: C & KERNEL REALITY -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C &amp; KERNEL REALITY</span>
+          <h2><code>sk_buff</code> Operations, NAPI Poll Loop, <code>sendfile()</code> &amp; XDP</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>skbuff_napi.c — Linux NAPI Poll &amp; Zero-Copy Header Push/Pull</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code12_1">Copy</button>
+          </div>
+          <pre class="code" id="code12_1">// Simplified NAPI poll &amp; sk_buff pointer arithmetic (net/core/skbuff.c)
+static inline unsigned char *skb_push_sim(struct sk_buff *skb, unsigned int len) {
+  skb-&gt;data -= len;     // Grow toward skb-&gt;head (prepend TCP/IP/ETH header)
+  skb-&gt;len  += len;
+  BUG_ON(skb-&gt;data &lt; skb-&gt;head); // skb_under_panic!
+  return skb-&gt;data;
+}
+
+static inline unsigned char *skb_pull_sim(struct sk_buff *skb, unsigned int len) {
+  if (len &gt; skb-&gt;len) return NULL;
+  skb-&gt;len  -= len;
+  return skb-&gt;data += len; // Strip outer header without memcpy!
+}
+
+int my_nic_napi_poll(struct napi_struct *napi, int budget) {
+  int work_done = 0;
+  while (work_done &lt; budget &amp;&amp; rx_ring_has_packet(napi)) {
+    struct sk_buff *skb = rx_ring_pop_skb(napi);
+    skb-&gt;protocol = eth_type_trans(skb, napi-&gt;dev); // calls skb_pull(ETH_HLEN)
+    napi_gro_receive(napi, skb);
+    work_done++;
+  }
+  if (work_done &lt; budget) {
+    napi_complete_done(napi, work_done); // Ring drained: re-arm NIC RX IRQ!
+    enable_nic_rx_irq(napi);
+  }
+  return work_done; // If work_done == budget, softirq keeps polling next round
+}</pre>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>zerocopy_xdp.c — sendfile(), MSG_ZEROCOPY &amp; XDP Drop</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code12_2">Copy</button>
+          </div>
+          <pre class="code" id="code12_2">// 1. User-space Zero-Copy file -&gt; TCP socket (no user buffer copy!)
+off_t offset = 0;
+ssize_t sent = sendfile(sock_fd, file_fd, &amp;offset, 1048576);
+
+// 2. MSG_ZEROCOPY for user-allocated buffers (pins user pages for NIC DMA!)
+int one = 1;
+setsockopt(sock_fd, SOL_SOCKET, SO_ZEROCOPY, &amp;one, sizeof(one));
+send(sock_fd, huge_buf, 65536, MSG_ZEROCOPY);
+// App MUST NOT overwrite huge_buf until completion notification arrives on MSG_ERRQUEUE!
+
+// 3. XDP eBPF hook: executes in driver RX ring BEFORE sk_buff allocation!
+SEC("xdp")
+int xdp_drop_port_9999(struct xdp_md *ctx) {
+  void *data     = (void *)(long)ctx-&gt;data;
+  void *data_end = (void *)(long)ctx-&gt;data_end;
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) &gt; data_end) return XDP_PASS;
+  // Inspect IP/UDP header with strict verifier bounds checks...
+  // Returning XDP_DROP frees/recycles RX ring page immediately (~24M pps/core)!
+  return XDP_PASS;
+}</pre>
+        </div>
+      </div>
+
+      <div class="callout amber">
+        <strong>TCP Congestion Control &amp; Socket Memory Backpressure:</strong><br/>
+        TCP maintains a congestion window (<code>cwnd</code>) and slow-start threshold (<code>ssthresh</code>). In <strong>Slow Start</strong> (<code>cwnd &lt; ssthresh</code>), every ACK increments <code>cwnd += 1</code> (exponential doubling per RTT). In <strong>Congestion Avoidance</strong> (<code>cwnd &ge; ssthresh</code>), each ACK adds <code>1 / cwnd</code> (linear +1 MSS per RTT). On <strong>3 duplicate ACKs</strong> (packet loss without full stall), TCP triggers Fast Recovery: <code>ssthresh = max(2, floor(cwnd / 2))</code> and sets <code>cwnd = ssthresh</code>. Meanwhile, if the receiving app fails to call <code>recv()</code>, <code>sk_rmem_alloc</code> fills up and the kernel advertises <code>TCP window = 0</code> (or drops UDP frames).
+      </div>
+    </section>
+
+    <!-- MODULE 3: ANDROID BRIDGE -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2>Mobile Radio Tail Energy, Cronet/OkHttp &amp; Android <code>eBPF</code> Netd</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. Mobile Radio Tail Energy &amp; OkHttp / Cronet Reactor</h3>
+          <p><strong>The RRC Tail Tax:</strong> Transmitting a single 60-byte TCP keepalive wakes the cellular modem from <code>RRC_IDLE</code> to high-power <code>RRC_CONNECTED</code>, where it stays powered for a 5–15 second <em>inactivity tail timer</em> burning ~500mW! Bursting/batching telemetry via WorkManager and multiplexing streams over HTTP/2 or QUIC (HTTP/3) dramatically cuts battery drain.</p>
+          <p><strong>OkHttp vs Cronet:</strong> OkHttp uses blocking sockets + thread pools (or HTTP/2 frame multiplexing per socket). Google's <strong>Cronet</strong> wraps Chromium's C++ network stack driven by an asynchronous <code>epoll</code> event loop with QUIC/0-RTT support and BBR-friendly pacing—essential on high-jitter cellular networks.</p>
+        </div>
+
+        <div class="card">
+          <h3>2. Android <code>eBPF</code> Traffic Accounting (<code>netd</code> / <code>xt_bpf</code>)</h3>
+          <p><strong>From <code>xt_qtaguid</code> to eBPF:</strong> Legacy Android used custom kernel netfilter modules to count per-UID bytes. Modern Android (9+) attaches <code>BPF_PROG_TYPE_CGROUP_SKB</code> programs directly to the cgroup v2 hierarchy via <code>bpfloader</code> and <code>netd</code>.</p>
+          <p><strong>Zero-Lock Per-CPU Maps:</strong> On every ingress/egress <code>sk_buff</code>, the eBPF filter reads <code>bpf_get_socket_uid(skb)</code>, checks per-UID Data Saver / background-restriction maps, and updates lock-free eBPF hash maps read by <code>NetworkStatsService</code> (<code>TrafficStats</code>) and <code>dumpsys netstats</code>.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: RUNNABLE CODE PRACTICE LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // RUNNABLE CODE PRACTICE LABS</span>
+          <h2>Hands-On Kernel Networking Labs (NAPI, <code>sk_buff</code>, TCP Reno)</h2>
+        </div>
+      </div>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // NIC RING &amp; NAPI</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>napiPoll(rxRing, sockets, budget)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Drain up to <code>budget</code> packets from the NIC RX ring, enforce per-socket <code>rmemMax</code> bounds, and report whether NAPI must reschedule.
+            </p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> <code>rxRing</code> is an array of <code>{ dstPort, size, payload? }</code> (dequeue from front using <code>shift()</code>). <code>sockets</code> maps port &rarr; <code>{ rmemUsed, rmemMax, queue: [] }</code>.<br/>
+          &bull; Process at most <code>Math.max(0, budget)</code> packets while <code>rxRing.length &gt; 0</code>.<br/>
+          &bull; For each packet popped: increment <code>processed</code>. Look up <code>sock = sockets[pkt.dstPort]</code>.<br/>
+          &bull; If <code>!sock</code> or <code>sock.rmemUsed + pkt.size &gt; sock.rmemMax</code>, increment <code>dropped</code>.<br/>
+          &bull; Otherwise add <code>pkt.size</code> to <code>sock.rmemUsed</code> and push <code>pkt</code> onto <code>sock.queue</code>.<br/>
+          &bull; Return <code>{ processed, dropped, reschedule: rxRing.length &gt; 0 }</code>.
+        </div>
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // SK_BUFF HEADROOM</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>skbOps(skb, actions)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Simulate zero-copy header prepending (<code>push</code>) and stripping (<code>pull</code>) with strict pointer bounds checks.
+            </p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> <code>skb</code> is <code>{ head, data, tail, end }</code> (with <code>head &le; data &le; tail &le; end</code>). <code>actions</code> is an array of <code>{ op: "push" | "pull", len: number }</code>.<br/>
+          &bull; Apply actions in order. Validate <code>Number.isInteger(len) &amp;&amp; len &ge; 0</code> (else return <code>{ ok: false, error: "EINVAL", data: skb.data, tail: skb.tail, len: skb.tail - skb.data }</code>).<br/>
+          &bull; On <code>"push"</code>: if <code>skb.data - len &lt; skb.head</code>, fail immediately with <code>{ ok: false, error: "HEADROOM_UNDERFLOW", data: skb.data, tail: skb.tail, len: skb.tail - skb.data }</code>. Else <code>skb.data -= len</code>.<br/>
+          &bull; On <code>"pull"</code>: if <code>skb.data + len &gt; skb.tail</code>, fail immediately with <code>{ ok: false, error: "LINEAR_OVERRUN", data: skb.data, tail: skb.tail, len: skb.tail - skb.data }</code>. Else <code>skb.data += len</code>.<br/>
+          &bull; If all actions succeed, return <code>{ ok: true, data: skb.data, tail: skb.tail, len: skb.tail - skb.data, headroom: skb.data - skb.head }</code>.
+        </div>
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // TCP CONGESTION CONTROL</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>tcpCwndUpdate(state, event)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Implement Slow Start, Congestion Avoidance, 3-dup-ACK Fast Recovery, and Timeout resets.
+            </p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>state = { cwnd, ssthresh, dupAcks? }</code> and <code>event</code> (<code>"ACK"</code> | <code>"DUP_ACK"</code> | <code>"TIMEOUT"</code>), return a new state object <code>{ cwnd, ssthresh, dupAcks, phase }</code> without mutating <code>state</code>:<br/>
+          &bull; <code>"ACK"</code>: reset <code>dupAcks = 0</code>. If <code>cwnd &lt; ssthresh</code>, <code>cwnd = cwnd + 1</code> (Slow Start); else <code>cwnd = cwnd + 1 / cwnd</code> (Congestion Avoidance).<br/>
+          &bull; <code>"DUP_ACK"</code>: <code>dupAcks = (state.dupAcks || 0) + 1</code>. If <code>dupAcks === 3</code>, set <code>ssthresh = Math.max(2, Math.floor(cwnd / 2))</code> and <code>cwnd = ssthresh</code>. If <code>dupAcks &gt; 3</code>, inflate <code>cwnd = cwnd + 1</code>. (For 1 or 2 dup ACKs, keep <code>cwnd</code> and <code>ssthresh</code> unchanged.)<br/>
+          &bull; <code>"TIMEOUT"</code>: <code>ssthresh = Math.max(2, Math.floor(cwnd / 2))</code>, <code>cwnd = 1</code>, <code>dupAcks = 0</code>.<br/>
+          &bull; Set <code>phase</code> to <code>"FAST_RECOVERY"</code> if <code>dupAcks &gt;= 3</code>, else <code>cwnd &lt; ssthresh ? "SLOW_START" : "CONGESTION_AVOIDANCE"</code>.
+        </div>
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: DIAGNOSTIC QUIZZES -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (6 Questions)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Inspecting Kernel Sockets, NAPI SoftIRQs &amp; eBPF Netd on Linux/Android</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header"><span>Real Linux / Android Network Forensics</span></div>
+          <pre class="code"># 1. Inspect TCP socket queues (Recv-Q / Send-Q), cwnd, rtt &amp; TIME_WAIT
+ss -tinp state established
+ss -s
+
+# 2. Check NAPI softirq packet drops &amp; time_squeeze (budget exhausted!)
+# Columns per CPU: total_processed, dropped, time_squeeze...
+cat /proc/net/softnet_stat
+
+# 3. Inspect NIC RX/TX ring drops &amp; errors
+ip -s link show
+
+# 4. Inspect Android eBPF network accounting &amp; per-UID stats
+adb shell dumpsys netstats --uid</pre>
+        </div>
+
+        <div class="card">
+          <h3>Senior Engineer Mastery Checklist</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can explain how NAPI eliminates receive livelock by masking NIC IRQs and draining up to <code>budget</code> packets in <code>NET_RX_SOFTIRQ</code>.</span></li>
+            <li><input type="checkbox" /> <span>I understand why <code>sk_buff</code> reserves headroom so <code>skb_push()</code>/<code>skb_pull()</code> manipulate headers in O(1) without copying payloads.</span></li>
+            <li><input type="checkbox" /> <span>I know when <code>sendfile()</code> achieves true zero-copy (and why user-space TLS forces copies unless <code>kTLS</code> is enabled).</span></li>
+            <li><input type="checkbox" /> <span>I can diagnose cellular tail-energy waste and inspect Android <code>eBPF</code> cgroup socket traffic accounting.</span></li>
+          </ul>
+          <div class="callout green" style="margin-top:0.85rem; margin-bottom:0; font-size:0.84rem;">
+            <strong>Capstone Link:</strong> Apply socket ring-buffer thinking to <a href="capstone.html">AegisOS-64 Capstone</a>. Next up: <a href="lesson-13.html">Lesson 13: Security, Namespaces, Seccomp &amp; SELinux &rarr;</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a class="btn" href="lesson-11.html">&larr; Prev: Lesson 11 (VFS, Ext4, F2FS)</a>
+      <a class="btn" href="master-plan.html">Master Plan</a>
+      <a class="btn btn-primary" href="lesson-13.html">Next: Lesson 13 (Security &amp; Sandboxing) &rarr;</a>
+    </div>
+  </main>
+
+  <script src="assets/os-course.js"></script>
+  <script>
+    /* ============================================================
+       INTERACTIVE SIMULATOR: NAPI + SK_BUFF + ZERO-COPY
+       ============================================================ */
+    (function () {
+      let rxRing = [];
+      let irqArmed = true;
+      let napiState = "IDLE";
+      let sockRmem = 0;
+      const sockMax = 4096;
+      let dropped = 0;
+      let skb = { head: 0, data: 64, tail: 192, end: 256 };
+      let zeroCopy = false;
+      let nextSeq = 1;
+
+      function renderNet(msg) {
+        document.getElementById("netRxCount").textContent = `${rxRing.length} pkts`;
+        document.getElementById("netIrqState").textContent = irqArmed ? "ARMED (Enabled)" : "MASKED (Polling)";
+        document.getElementById("netNapiState").textContent = napiState;
+        document.getElementById("netSockQueue").textContent = `${sockRmem} / ${sockMax} B`;
+        document.getElementById("netDropped").textContent = `${dropped} pkts`;
+
+        document.getElementById("netSkbPtrs").textContent = `${skb.data} / ${skb.tail}`;
+        document.getElementById("netHeadroom").textContent = `${skb.data - skb.head} B`;
+        document.getElementById("netPktLen").textContent = `${skb.tail - skb.data} B`;
+
+        const total = skb.end - skb.head;
+        const headPct = ((skb.data - skb.head) / total) * 100;
+        const hdrPct = Math.max(0, ((64 - skb.data) / total) * 100);
+        const payPct = ((skb.tail - Math.max(skb.data, 64)) / total) * 100;
+        const tailPct = ((skb.end - skb.tail) / total) * 100;
+
+        document.getElementById("netSkbBar").innerHTML = `
+          <div class="skb-seg skb-head" style="width:${headPct}%">${headPct > 10 ? "Headroom" : ""}</div>
+          ${hdrPct > 0 ? `<div class="skb-seg skb-hdr" style="width:${hdrPct}%">${hdrPct > 10 ? "Hdr" : ""}</div>` : ""}
+          <div class="skb-seg skb-pay" style="width:${payPct}%">Data (${skb.tail - skb.data}B)</div>
+          <div class="skb-seg skb-tail" style="width:${tailPct}%">${tailPct > 10 ? "Tail" : ""}</div>
+        `;
+
+        document.getElementById("zcStdCard").classList.toggle("active", !zeroCopy);
+        document.getElementById("zcSfCard").classList.toggle("active", zeroCopy);
+        if (msg) document.getElementById("netExplain").innerHTML = msg;
+      }
+
+      document.getElementById("netInjectBtn").addEventListener("click", () => {
+        for (let i = 0; i < 4; i++) {
+          rxRing.push({ seq: nextSeq++, size: 1024 });
+        }
+        irqArmed = false;
+        napiState = "SCHEDULED (NET_RX_SOFTIRQ)";
+        renderNet("NIC DMA wrote 4&times;1024B frames into RX ring, fired <strong>1 IRQ</strong>, masked RX IRQs, and scheduled NAPI poll.");
+      });
+
+      document.getElementById("netNapiBtn").addEventListener("click", () => {
+        if (rxRing.length === 0) {
+          irqArmed = true;
+          napiState = "IDLE";
+          renderNet("RX ring already empty; NIC RX IRQ remains armed.");
+          return;
+        }
+        let processed = 0, newlyDropped = 0;
+        const budget = 3;
+        while (processed < budget && rxRing.length > 0) {
+          const pkt = rxRing.shift();
+          processed++;
+          if (sockRmem + pkt.size > sockMax) {
+            dropped++;
+            newlyDropped++;
+          } else {
+            sockRmem += pkt.size;
+          }
+        }
+        if (rxRing.length === 0) {
+          irqArmed = true;
+          napiState = "COMPLETE -> IRQ RE-ARMED";
+          renderNet(`NAPI drained ${processed} packets (${newlyDropped} dropped due to full <code>sk_rmem</code>). Ring empty &rarr; re-enabled NIC IRQ!`);
+        } else {
+          irqArmed = false;
+          napiState = "RESCHEDULED (Budget Hit)";
+          renderNet(`NAPI hit budget=${budget}! Processed ${processed} packets (${newlyDropped} dropped). ${rxRing.length} packets still in ring &rarr; stays in polling mode!`);
+        }
+      });
+
+      document.getElementById("netPushBtn").addEventListener("click", () => {
+        if (skb.data - 20 < skb.head) {
+          renderNet("<strong>HEADROOM UNDERFLOW!</strong> Not enough headroom before <code>skb-&gt;data</code> to push 20B header without reallocating.");
+          return;
+        }
+        skb.data -= 20;
+        renderNet(`<code>skb_push(20)</code> moved <code>data</code> left to ${skb.data} (0 bytes copied!). Total packet len is now ${skb.tail - skb.data}B.`);
+      });
+
+      document.getElementById("netPullBtn").addEventListener("click", () => {
+        if (skb.data + 20 > skb.tail) {
+          renderNet("<strong>LINEAR OVERRUN!</strong> Cannot pull past <code>skb-&gt;tail</code>.");
+          return;
+        }
+        skb.data += 20;
+        renderNet(`<code>skb_pull(20)</code> stripped 20B outer header by advancing <code>data</code> to ${skb.data} (0 bytes copied!).`);
+      });
+
+      document.getElementById("netZcToggleBtn").addEventListener("click", () => {
+        zeroCopy = !zeroCopy;
+        renderNet(zeroCopy
+          ? "Switched to <strong><code>sendfile()</code> zero-copy</strong>: Page Cache pages are referenced directly in <code>skb</code> fragments for NIC DMA—0 CPU copies!"
+          : "Switched to <strong>standard <code>read()+write()</code></strong>: payload crosses EL1&harr;EL0 twice with 2 extra CPU <code>memcpy</code> passes.");
+      });
+
+      document.getElementById("netResetBtn").addEventListener("click", () => {
+        rxRing = [];
+        irqArmed = true;
+        napiState = "IDLE";
+        sockRmem = 0;
+        dropped = 0;
+        skb = { head: 0, data: 64, tail: 192, end: 256 };
+        renderNet("Simulator reset. Inject RX packets or test <code>skb_push</code>/<code>skb_pull</code>.");
+      });
+
+      renderNet();
+    })();
+
+    /* ============================================================
+       LESSON CONFIG: 3 LABS + 6 QUIZZES
+       ============================================================ */
+    window.LESSON_CONFIG = {
+      num: "12",
+      labs: {
+        1: {
+          fnName: "napiPoll",
+          starter: `function napiPoll(rxRing, sockets, budget) {\n  // TODO: drain up to budget packets, route by dstPort, check rmemMax\n  \n}`,
+          hints: [
+            "Hint 1: Track `let processed = 0, dropped = 0;` and loop `while (processed < budget && rxRing.length > 0)`.",
+            "Hint 2: Pop the front packet with `const pkt = rxRing.shift(); processed++;`, then look up `const sock = sockets[pkt.dstPort];`.",
+            "Hint 3: If `!sock || sock.rmemUsed + pkt.size > sock.rmemMax`, increment `dropped`; else update `sock.rmemUsed += pkt.size` and `sock.queue.push(pkt)`. Return `{ processed, dropped, reschedule: rxRing.length > 0 }`."
+          ],
+          solution: `function napiPoll(rxRing, sockets, budget) {\n  let processed = 0;\n  let dropped = 0;\n  const limit = Math.max(0, budget);\n\n  while (processed < limit && rxRing.length > 0) {\n    const pkt = rxRing.shift();\n    processed++;\n    const sock = sockets[pkt.dstPort];\n    if (!sock || sock.rmemUsed + pkt.size > sock.rmemMax) {\n      dropped++;\n    } else {\n      sock.rmemUsed += pkt.size;\n      sock.queue.push(pkt);\n    }\n  }\n  return { processed, dropped, reschedule: rxRing.length > 0 };\n}`,
+          solutionExplain: "NAPI bounds softirq CPU time via budget: if rxRing still has packets after budget frames, reschedule=true keeps polling without re-enabling noisy NIC IRQs.",
+          tests: function (fn) {
+            const ring1 = [
+              { dstPort: 80, size: 500 },
+              { dstPort: 80, size: 500 },
+              { dstPort: 80, size: 500 }, // exceeds 1000 rmemMax -> drop!
+              { dstPort: 99, size: 200 }, // no socket -> drop!
+              { dstPort: 443, size: 100 } // stays in ring because budget=4
+            ];
+            const socks1 = {
+              80: { rmemUsed: 0, rmemMax: 1000, queue: [] },
+              443: { rmemUsed: 0, rmemMax: 1000, queue: [] }
+            };
+            const r1 = fn(ring1, socks1, 4);
+            const r2 = fn(ring1, socks1, 4);
+            const r3 = fn([{ dstPort: 80, size: 100 }], socks1, 0);
+            return [
+              { name: "Budget cap stops at 4 and requests reschedule", pass: r1.processed === 4 && r1.dropped === 2 && r1.reschedule === true && socks1[80].queue.length === 2, detail: `r1=${JSON.stringify(r1)}, q80=${socks1[80].queue.length}` },
+              { name: "Second poll drains ring and clears reschedule", pass: r2.processed === 1 && r2.dropped === 0 && r2.reschedule === false && socks1[443].rmemUsed === 100, detail: `r2=${JSON.stringify(r2)}, rmem443=${socks1[443].rmemUsed}` },
+              { name: "Zero budget processes 0 and reschedules if non-empty", pass: r3.processed === 0 && r3.dropped === 0 && r3.reschedule === true, detail: `r3=${JSON.stringify(r3)}` }
+            ];
+          }
+        },
+        2: {
+          fnName: "skbOps",
+          starter: `function skbOps(skb, actions) {\n  // TODO: implement push(len) and pull(len) with head/tail bounds checks\n  \n}`,
+          hints: [
+            "Hint 1: Loop through `actions`. For each `{ op, len }`, verify `Number.isInteger(len) && len >= 0`, otherwise return `{ ok: false, error: \"EINVAL\", data: skb.data, tail: skb.tail, len: skb.tail - skb.data }`.",
+            "Hint 2: For `op === \"push\"`, check `if (skb.data - len < skb.head)` -> return `error: \"HEADROOM_UNDERFLOW\"`, else `skb.data -= len`.",
+            "Hint 3: For `op === \"pull\"`, check `if (skb.data + len > skb.tail)` -> return `error: \"LINEAR_OVERRUN\"`, else `skb.data += len`. Finally return `{ ok: true, data: skb.data, tail: skb.tail, len: skb.tail - skb.data, headroom: skb.data - skb.head }`."
+          ],
+          solution: `function skbOps(skb, actions) {\n  for (const act of actions) {\n    const len = act.len;\n    if (!Number.isInteger(len) || len < 0) {\n      return { ok: false, error: "EINVAL", data: skb.data, tail: skb.tail, len: skb.tail - skb.data };\n    }\n    if (act.op === "push") {\n      if (skb.data - len < skb.head) {\n        return { ok: false, error: "HEADROOM_UNDERFLOW", data: skb.data, tail: skb.tail, len: skb.tail - skb.data };\n      }\n      skb.data -= len;\n    } else if (act.op === "pull") {\n      if (skb.data + len > skb.tail) {\n        return { ok: false, error: "LINEAR_OVERRUN", data: skb.data, tail: skb.tail, len: skb.tail - skb.data };\n      }\n      skb.data += len;\n    } else {\n      return { ok: false, error: "EINVAL", data: skb.data, tail: skb.tail, len: skb.tail - skb.data };\n    }\n  }\n  return {\n    ok: true,\n    data: skb.data,\n    tail: skb.tail,\n    len: skb.tail - skb.data,\n    headroom: skb.data - skb.head\n  };\n}`,
+          solutionExplain: "Prepending TCP (20B), IP (20B), and Ethernet (14B) headers only decrements skb->data into pre-reserved headroom, avoiding expensive payload copies.",
+          tests: function (fn) {
+            const s1 = fn({ head: 0, data: 64, tail: 164, end: 256 }, [
+              { op: "push", len: 20 },
+              { op: "push", len: 20 },
+              { op: "push", len: 14 },
+              { op: "pull", len: 14 }
+            ]);
+            const s2 = fn({ head: 0, data: 16, tail: 64, end: 128 }, [{ op: "push", len: 20 }]);
+            const s3 = fn({ head: 0, data: 50, tail: 64, end: 128 }, [{ op: "pull", len: 20 }]);
+            return [
+              { name: "Push TCP+IP+ETH then pull ETH updates len & headroom", pass: s1.ok === true && s1.data === 24 && s1.len === 140 && s1.headroom === 24, detail: `s1=${JSON.stringify(s1)}` },
+              { name: "Detects HEADROOM_UNDERFLOW when pushing past head", pass: s2.ok === false && s2.error === "HEADROOM_UNDERFLOW" && s2.data === 16, detail: `s2=${JSON.stringify(s2)}` },
+              { name: "Detects LINEAR_OVERRUN when pulling past tail", pass: s3.ok === false && s3.error === "LINEAR_OVERRUN" && s3.data === 50, detail: `s3=${JSON.stringify(s3)}` }
+            ];
+          }
+        },
+        3: {
+          fnName: "tcpCwndUpdate",
+          starter: `function tcpCwndUpdate(state, event) {\n  // TODO: handle "ACK", "DUP_ACK", and "TIMEOUT" without mutating state\n  \n}`,
+          hints: [
+            "Hint 1: Copy `let cwnd = state.cwnd, ssthresh = state.ssthresh, dupAcks = state.dupAcks || 0;`.",
+            "Hint 2: On `\"ACK\"`: `dupAcks = 0`; if `cwnd < ssthresh`, `cwnd += 1`, else `cwnd += 1 / cwnd`. On `\"TIMEOUT\"`: `ssthresh = Math.max(2, Math.floor(cwnd / 2)); cwnd = 1; dupAcks = 0;`.",
+            "Hint 3: On `\"DUP_ACK\"`: `dupAcks++`; if `dupAcks === 3`, `ssthresh = Math.max(2, Math.floor(cwnd / 2)); cwnd = ssthresh;`; if `dupAcks > 3`, `cwnd += 1`. Compute `phase` and return `{ cwnd, ssthresh, dupAcks, phase }`."
+          ],
+          solution: `function tcpCwndUpdate(state, event) {\n  let cwnd = state.cwnd;\n  let ssthresh = state.ssthresh;\n  let dupAcks = state.dupAcks || 0;\n\n  if (event === "ACK") {\n    dupAcks = 0;\n    if (cwnd < ssthresh) {\n      cwnd = cwnd + 1;\n    } else {\n      cwnd = cwnd + 1 / cwnd;\n    }\n  } else if (event === "DUP_ACK") {\n    dupAcks += 1;\n    if (dupAcks === 3) {\n      ssthresh = Math.max(2, Math.floor(cwnd / 2));\n      cwnd = ssthresh;\n    } else if (dupAcks > 3) {\n      cwnd = cwnd + 1;\n    }\n  } else if (event === "TIMEOUT") {\n    ssthresh = Math.max(2, Math.floor(cwnd / 2));\n    cwnd = 1;\n    dupAcks = 0;\n  }\n\n  const phase = dupAcks >= 3\n    ? "FAST_RECOVERY"\n    : (cwnd < ssthresh ? "SLOW_START" : "CONGESTION_AVOIDANCE");\n\n  return { cwnd, ssthresh, dupAcks, phase };\n}`,
+          solutionExplain: "TCP Reno grows exponentially during Slow Start, linearly (+1/cwnd per ACK) during Congestion Avoidance, halves into Fast Recovery on 3 duplicate ACKs, and resets cwnd=1 only on severe RTO timeouts.",
+          tests: function (fn) {
+            const st0 = { cwnd: 4, ssthresh: 16, dupAcks: 2 };
+            const a1 = fn(st0, "ACK"); // slow start -> cwnd=5, dupAcks=0
+            const a2 = fn({ cwnd: 16, ssthresh: 16, dupAcks: 0 }, "ACK"); // CA -> 16.0625
+            const d3 = fn({ cwnd: 15, ssthresh: 16, dupAcks: 2 }, "DUP_ACK"); // 3rd dup -> ssthresh=7, cwnd=7
+            const t1 = fn({ cwnd: 3, ssthresh: 16, dupAcks: 1 }, "TIMEOUT"); // ssthresh=2, cwnd=1
+            return [
+              { name: "Input state not mutated + Slow Start ACK (+1)", pass: st0.cwnd === 4 && a1.cwnd === 5 && a1.dupAcks === 0 && a1.phase === "SLOW_START", detail: `a1=${JSON.stringify(a1)}` },
+              { name: "Congestion Avoidance ACK (+1/cwnd)", pass: Math.abs(a2.cwnd - 16.0625) < 1e-9 && a2.phase === "CONGESTION_AVOIDANCE", detail: `a2=${JSON.stringify(a2)}` },
+              { name: "3rd DUP_ACK halves cwnd/ssthresh into FAST_RECOVERY", pass: d3.ssthresh === 7 && d3.cwnd === 7 && d3.dupAcks === 3 && d3.phase === "FAST_RECOVERY", detail: `d3=${JSON.stringify(d3)}` },
+              { name: "TIMEOUT clamps ssthresh >= 2 and resets cwnd = 1", pass: t1.ssthresh === 2 && t1.cwnd === 1 && t1.dupAcks === 0, detail: `t1=${JSON.stringify(t1)}` }
+            ];
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "1. At 10Gbps+ packet rates, why does Linux NAPI disable the NIC's RX hardware interrupt during bursts and switch to polling?",
+          options: [
+            "A. Because DMA cannot write into RAM while interrupts are enabled.",
+            "B. Because firing a hardware IRQ for every single packet causes 'receive livelock', burning 100% of CPU in trap entry/exit while starving user sockets.",
+            "C. Because TCP headers cannot be parsed inside interrupt context on ARM64.",
+            "D. Because NAPI bypasses the Linux scheduler completely."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): NIC DMA operates asynchronously via PCIe/memory bus regardless of CPU IRQ masking.",
+            "Correct (B): Per-packet IRQs at millions of pps overwhelm the CPU with trap-frame saves/restores (`receive livelock`). NAPI masks RX IRQs after the first interrupt and drains batches up to `budget` in softirq.",
+            "Wrong (C): The issue is trap overhead and softirq fairness, not an ARM64 ISA restriction.",
+            "Wrong (D): `NET_RX_SOFTIRQ` cooperates with `ksoftirqd` and the kernel scheduler via `budget` limits."
+          ]
+        },
+        {
+          q: "2. Why does `struct sk_buff` allocate extra `headroom` bytes before `skb->data` on transmit?",
+          options: [
+            "A. So TCP, IP, and Ethernet layers can prepend headers in O(1) via `skb_push()` without copying the payload.",
+            "B. To store TLS encryption keys inside every packet.",
+            "C. Because NIC DMA hardware requires 4KB alignment between TCP and IP headers.",
+            "D. To duplicate the payload for automatic retransmission."
+          ],
+          correct: 0,
+          why: [
+            "Correct (A): `skb_push()` simply subtracts header length from `skb->data` toward `skb->head`, eliminating payload `memcpy` as packets move down the protocol stack.",
+            "Wrong (B): TLS keys live in socket/kTLS crypto context, never inside packet headroom.",
+            "Wrong (C): TCP and IP headers are contiguous bytes (`skb_push` places them back-to-back).",
+            "Wrong (D): Retransmissions use `sk_write_queue` skb cloning/refcounting, not headroom duplication."
+          ]
+        },
+        {
+          q: "3. Why can a standard HTTPS web server using OpenSSL in user space NOT simply use `sendfile(sock_fd, file_fd, ...)` for zero-copy static file serving?",
+          options: [
+            "A. `sendfile()` only works with UDP sockets.",
+            "B. User-space TLS must encrypt every plaintext byte before writing to the socket; `sendfile()` bypasses user space unless Kernel TLS (`kTLS`) offloads encryption into EL1/NIC.",
+            "C. `sendfile()` fails on files larger than 64KB.",
+            "D. `sendfile()` locks the Page Cache exclusively so no other process can read."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `sendfile()` is explicitly designed for stream/TCP sockets (`out_fd`).",
+            "Correct (B): Because `sendfile()` sends raw Page Cache pages straight to the socket without returning bytes to user space, a user-space TLS library cannot encrypt them—which is why Linux added `kTLS` (`TLS_TX` socket option) to restore zero-copy TLS `sendfile()`.",
+            "Wrong (C): `sendfile()` streams gigabytes efficiently in chunks.",
+            "Wrong (D): Page Cache pages are shared read-only via reference counts."
+          ]
+        },
+        {
+          q: "4. Why does TCP keep a closed connection's socket in `TIME_WAIT` for 2*MSL (typically 60s), and why do servers set `SO_REUSEADDR`?",
+          options: [
+            "A. To prevent delayed duplicate packets from the old connection from corrupting a new connection on the same 4-tuple, while `SO_REUSEADDR` lets a restarted server rebind its listening port immediately.",
+            "B. Because the kernel garbage-collects sockets only once per minute.",
+            "C. To keep the NIC's RX DMA ring powered on.",
+            "D. `TIME_WAIT` only occurs when a packet is dropped by `XDP_DROP`."
+          ],
+          correct: 0,
+          why: [
+            "Correct (A): `TIME_WAIT` absorbs stray in-flight segments and ensures the peer receives the final ACK. Without `SO_REUSEADDR`, restarting a server fails `bind()` with `EADDRINUSE` if prior connections on that port are still in `TIME_WAIT`.",
+            "Wrong (B): `TIME_WAIT` uses an explicit 2*MSL protocol timer (RFC 9293), not a 1-minute GC sweep.",
+            "Wrong (C): NIC rings are independent of TCP connection state.",
+            "Wrong (D): `TIME_WAIT` is a normal active-close TCP state."
+          ]
+        },
+        {
+          q: "5. Why is XDP (`XDP_DROP`) orders of magnitude faster for DDoS mitigation than an `iptables` DROP rule?",
+          options: [
+            "A. `iptables` runs in Java/ART on Android.",
+            "B. XDP executes an eBPF program directly in the NIC driver RX ring BEFORE allocating `struct sk_buff` or traversing the kernel netfilter/IP stack.",
+            "C. XDP disables TCP congestion control on all sockets.",
+            "D. `iptables` writes every dropped packet to disk via JBD2."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `iptables`/`nftables` run inside the Linux kernel (`net/netfilter/`).",
+            "Correct (B): Allocating, initializing, and freeing `struct sk_buff` + netfilter hook traversal costs hundreds of CPU cycles per packet. XDP inspects raw DMA ring memory before `sk_buff` exists and recycles the page immediately.",
+            "Wrong (C): XDP operates at L2/L3 ingress and does not alter socket congestion control.",
+            "Wrong (D): `iptables DROP` does not write packets to disk."
+          ]
+        },
+        {
+          q: "6. On Android, why does sending a tiny 80-byte analytics ping every 30 seconds drain far more battery than batching pings every 15 minutes?",
+          options: [
+            "A. Because every 80-byte TCP packet forces an immediate `fsync()` on F2FS.",
+            "B. Because each cellular wake pulls the LTE/5G modem into high-power `RRC_CONNECTED` state for a 5–15 second tail-energy timer.",
+            "C. Because `sk_buff` allocates 64MB per packet on ARM64.",
+            "D. Because `eBPF` in `netd` blocks batched packets."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Sending network packets does not trigger filesystem `fsync()`.",
+            "Correct (B): Cellular radios hold the transmitter powered in `RRC_CONNECTED` (or `INACTIVE`) for seconds after the last packet ('tail energy') to avoid frequent signaling handshakes, dominating mobile radio battery cost.",
+            "Wrong (C): `sk_buff` structures are tiny (~256 bytes plus packet linear/frag data).",
+            "Wrong (D): `netd`'s eBPF cgroup filters account traffic regardless of batching."
+          ]
+        }
+      ]
+    };
+
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

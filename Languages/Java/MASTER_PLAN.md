@@ -1,4 +1,4 @@
-# Master Curriculum Plan: Java 25 LTS & Spring Boot 4.0 (86 Lessons)
+# Master Curriculum Plan: Java 25 LTS & Spring Boot 4.0 (90 Lessons)
 
 This workspace transitions an Android developer who can read Kotlin into writing, debugging, and architecting production backend Java systems for 2027. Core Java 25, standard utilities, JVM/AOT internals, and Spring Boot 4.0 + Architecture + Spring AI + Kafka form the **Main Track**; DSA Interview Patterns (`0041`–`0053`) and Spark/Flink Big Data (`0071`–`0073`) live in **Demoted Optional Tracks** at the end so they never block backend mastery.
 
@@ -62,23 +62,27 @@ This workspace transitions an Android developer who can read Kotlin into writing
    - `0058`: [Transactions, Isolation, Locking & Flyway Migrations](lessons/0058-transactions-locking-isolation-and-flyway.html) ([Reference](reference/0058-transactions-locking-and-flyway.html))
    - `0059`: [Servlet 6.1 Containers, Filters & Tomcat Virtual Threads](lessons/0059-servlet-spec-web-containers-virtual-threads.html) ([Reference](reference/0059-servlet-and-virtual-threads.html))
 
-3. **Main Track — Phase 3: Spring Boot 4.0, Software Architecture, Spring AI, Event-Driven Kafka & Distributed Sagas (`0060`–`0070`, `0081`, `0083`–`0086`, 16 Lessons)**
+3. **Main Track — Phase 3: Spring Boot 4.0, Software Architecture, API Security, Scaling, Spring AI & Kafka (`0060`–`0070`, `0081`, `0083`–`0090`, 20 Lessons)**
    - `0060`: [IoC, Bean Scopes & `BeanPostProcessor` Internals](lessons/0060-ioc-and-bean-lifecycle.html) ([Reference](reference/0060-spring-ioc-basics.html))
    - `0061`: [Spring Boot 4 Modular Starters, Auto-Configuration & Record Properties](lessons/0061-spring-boot-auto-configuration-and-properties.html) ([Reference](reference/0061-auto-configuration-and-properties.html))
    - `0062`: [REST APIs, Validation, JSpecify & RFC 9457 `ProblemDetail`](lessons/0062-rest-apis-dtos-validation-problemdetail.html) ([Reference](reference/0062-rest-dtos-and-validation.html))
-   - `0086`: [Beyond REST: gRPC (HTTP/2 & Protobuf), OpenAPI 3.1 Contracts & `Spring for GraphQL` (`@BatchMapping`)](lessons/0086-grpc-protobuf-openapi-and-graphql.html) ([Reference](reference/0086-grpc-openapi-and-graphql.html)) **NEW**
+   - `0086`: [Beyond REST: gRPC (HTTP/2 & Protobuf), OpenAPI 3.1 Contracts & `Spring for GraphQL` (`@BatchMapping`)](lessons/0086-grpc-protobuf-openapi-and-graphql.html) ([Reference](reference/0086-grpc-openapi-and-graphql.html))
+   - `0088`: [Real-Time & Event-Driven HTTP APIs: `SSE` (`SseEmitter`), WebSockets/STOMP & Signed Webhooks](lessons/0088-realtime-apis-sse-websockets-and-webhooks.html) ([Reference](reference/0088-realtime-sse-websockets-webhooks.html)) **NEW**
    - `0063`: [Spring Data JPA: Projections, Keyset Pagination & OSIV Off](lessons/0063-spring-data-jpa-repositories-transactions.html) ([Reference](reference/0063-data-jpa-and-transactions.html))
+   - `0087`: [SQL Profiling (`EXPLAIN ANALYZE`), Index Internals, Read Replicas, Sharding & CAP](lessons/0087-database-profiling-indexes-scaling-and-cap.html) ([Reference](reference/0087-database-profiling-scaling-and-cap.html)) **NEW**
    - `0064`: [Resilient HTTP: `RestClient`, Framework 7 `@Retryable`, Resilience4j & Idempotency](lessons/0064-restclient-resilience4j-and-idempotency.html) ([Reference](reference/0064-restclient-and-resilience4j.html))
    - `0065`: [Multi-Tier Caching: Caffeine (`W-TinyLFU`) & Redis](lessons/0065-caching-architecture-caffeine-and-redis.html) ([Reference](reference/0065-caffeine-and-redis-caching.html))
    - `0066`: [Testing Pyramid: `RestTestClient`, `MockMvcTester`, WireMock & Testcontainers](lessons/0066-production-testing-mockmvc-testcontainers.html) ([Reference](reference/0066-testing-and-testcontainers.html))
-   - `0083`: [Software Architecture: Modular Monoliths (`Spring Modulith`), Hexagonal Boundaries & `ArchUnit`](lessons/0083-modular-monoliths-hexagonal-and-archunit.html) ([Reference](reference/0083-spring-modulith-and-archunit.html)) **NEW**
+   - `0083`: [Software Architecture: Modular Monoliths (`Spring Modulith`), Hexagonal Boundaries & `ArchUnit`](lessons/0083-modular-monoliths-hexagonal-and-archunit.html) ([Reference](reference/0083-spring-modulith-and-archunit.html))
    - `0067`: [Spring Security 7 Filter Chains, OAuth2 JWT & Layered Docker](lessons/0067-security-oauth2-jwt-and-containerization.html) ([Reference](reference/0067-security-oauth2-and-docker.html))
+   - `0089`: [API Security (OWASP Top 10, BOLA/IDOR, CORS), ABAC/ReBAC, HTTP Caching (`ETag`) & Sunset](lessons/0089-api-security-owasp-cors-caching-and-lifecycle.html) ([Reference](reference/0089-api-security-cors-etag-lifecycle.html)) **NEW**
    - `0068`: [Observability: OpenTelemetry Starter, Micrometer Tracing & MDC](lessons/0068-observability-opentelemetry-and-logging.html) ([Reference](reference/0068-opentelemetry-and-logging.html))
-   - `0081`: [Spring Boot 4.0 Deep Delta: Jackson 3, JSpecify, Native API Versioning, `RestTestClient`, Quarkus & Javalin](lessons/0081-spring-boot-4-and-modern-web-ecosystem.html) ([Reference](reference/0081-spring-boot-4-and-web-alternatives.html)) **NEW**
-   - `0084`: [Production AI Engineering in Java: `Spring AI`, Structured `record` Outputs, RAG (`PgVector`) & `@Tool` Calling](lessons/0084-spring-ai-llm-rag-and-tool-calling.html) ([Reference](reference/0084-spring-ai-and-rag-patterns.html)) **NEW**
+   - `0090`: [Edge Gateways (`Nginx` & `Spring Cloud Gateway`), 12-Factor Secrets, CI/CD, Contract & Load Testing](lessons/0090-edge-gateway-cicd-contract-and-load-testing.html) ([Reference](reference/0090-gateway-cicd-contract-and-load-testing.html)) **NEW**
+   - `0081`: [Spring Boot 4.0 Deep Delta: Jackson 3, JSpecify, Native API Versioning, `RestTestClient`, Quarkus & Javalin](lessons/0081-spring-boot-4-and-modern-web-ecosystem.html) ([Reference](reference/0081-spring-boot-4-and-web-alternatives.html))
+   - `0084`: [Production AI Engineering in Java: `Spring AI`, Structured `record` Outputs, RAG (`PgVector`) & `@Tool` Calling](lessons/0084-spring-ai-llm-rag-and-tool-calling.html) ([Reference](reference/0084-spring-ai-and-rag-patterns.html))
    - `0069`: [Apache Kafka Internals: KRaft, ISR & Idempotent Producers](lessons/0069-apache-kafka-architecture-and-clients.html) ([Reference](reference/0069-kafka-architecture.html))
    - `0070`: [Spring Kafka Async Publishing, Retry/DLT & Transactional Outbox](lessons/0070-spring-kafka-outbox-and-kafka-streams.html) ([Reference](reference/0070-spring-kafka-and-outbox.html))
-   - `0085`: [Distributed Coordination & Production Survival: Sagas, `ShedLock`, Rate Limiting, VT Bulkheads & Incident Diagnostics](lessons/0085-sagas-rate-limiting-bulkheads-and-incidents.html) ([Reference](reference/0085-sagas-bulkheads-and-diagnostics.html)) **NEW**
+   - `0085`: [Distributed Coordination & Production Survival: Sagas, `ShedLock`, Rate Limiting, VT Bulkheads & Incident Diagnostics](lessons/0085-sagas-rate-limiting-bulkheads-and-incidents.html) ([Reference](reference/0085-sagas-bulkheads-and-diagnostics.html))
 
 4. **`[Optional Track A]` Coding Interviews & Algorithmic Patterns (`0041`–`0053`, 13 Lessons — Demoted for Post-Backend Interview Prep)**
    - `0041`: [Java Interview Traps, Autoboxing & Fast I/O](lessons/0041-java-interview-traps-autoboxing-io.html) ([Reference](reference/0041-java-interview-traps-cheatsheet.html))

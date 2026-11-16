@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 09: Page Cache, MGLRU, ZRAM, PSI &amp; Android LMKD — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <style>
+    .gen-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 0.75rem;
+      margin: 0.75rem 0;
+    }
+    .gen-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.7rem;
+    }
+    .gen-col h4 {
+      margin: 0 0 0.5rem;
+      font-size: 0.8rem;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+    }
+    .page-chip {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.35rem 0.55rem;
+      margin-bottom: 0.38rem;
+      border-radius: 7px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-code);
+      font-family: var(--font-mono);
+      font-size: 0.76rem;
+      cursor: pointer;
+    }
+    .page-chip:hover { border-color: var(--accent); }
+    .page-chip.ref { border-color: var(--green); background: var(--green-soft); }
+    .page-chip.dirty { border-left: 4px solid var(--amber); }
+    .proc-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      margin-top: 0.6rem;
+    }
+    .proc-table th, .proc-table td {
+      padding: 0.42rem 0.55rem;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+    }
+    .proc-row-victim { background: var(--red-soft); color: var(--red); font-weight: 700; }
+    .proc-row-protected { color: var(--text-dim); }
+    .sim-divider {
+      border-top: 1px dashed var(--border-strong);
+      margin: 1.25rem 0;
+      padding-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 09</span>
+        <span>Page Cache, MGLRU, ZRAM, PSI &amp; Android LMKD</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-08.html">&larr; Lesson 08</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C &amp; Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">Code Labs (3)</a>
+        <a href="#quiz">Quiz (6)</a>
+        <a href="lesson-10.html">Lesson 10 &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="badge b-concept">PHASE 3: VIRTUAL MEMORY, ALLOCATORS &amp; RECLAIM</span>
+      <h1>Lesson 09: Page Cache, MGLRU, ZRAM, PSI &amp; Android LMKD</h1>
+      <p>
+        In Linux and Android, "free RAM is wasted RAM"—the kernel aggressively fills spare physical frames with the
+        <strong>Page Cache</strong>. When memory tightens, the OS must decide which pages to drop, write back, or compress
+        into <strong>ZRAM</strong> using <strong>Multi-Gen LRU (MGLRU)</strong>—and when thrashing threatens UI frames,
+        <strong>PSI (Pressure Stall Information)</strong> triggers Android's <strong>lmkd</strong> before the kernel OOM killer freezes the phone.
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button id="markLessonComplete" class="btn btn-green btn-sm" type="button">Mark Lesson 09 Complete</button>
+      </div>
+    </section>
+
+    <!-- MODULE 1: MENTAL MODEL + SIMULATOR -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>Page Cache, Multi-Gen LRU Aging &amp; Pressure-Driven Reclaim</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. Page Cache: File-Backed vs Anonymous Pages</h3>
+          <p><strong>Clean File Pages:</strong> Read from APK/DEX/shared libraries or ext4/f2fs files via <code>address_space</code>. Since an exact copy already lives on flash, the kernel can drop a clean page instantaneously (zero I/O) on reclaim.</p>
+          <p><strong>Dirty File Pages:</strong> Modified in RAM (e.g. SQLite write before <code>fsync</code>). Must be written back to storage by flusher threads before the frame can be reused.</p>
+          <p><strong>Anonymous Pages:</strong> Heap/stack/Zygote CoW private pages have no backing file on disk. Reclaiming them requires either compressing them into <strong>ZRAM</strong> (in-RAM block device) or swapping to disk.</p>
+        </div>
+
+        <div class="card">
+          <h3>2. From Clock &amp; Active/Inactive LRU to MGLRU</h3>
+          <p><strong>Clock (Second-Chance):</strong> Scans frames circularly; if the hardware Accessed/Reference bit is 1, clears it and grants a second chance; if 0, evicts.</p>
+          <p><strong>Why Classic 2-List LRU Struggles:</strong> Linux's legacy Active/Inactive lists struggle on 16GB phones running background apps + large sequential media reads, causing working-set thrashing and high CPU lock contention.</p>
+          <p><strong>MGLRU (Linux 6.1+):</strong> Groups folios into multiple generations numbered <code>min_seq .. max_seq</code>. Referenced pages promote to <code>max_seq</code>; reclaim scans <code>min_seq</code> (oldest) first and prefers clean pages over dirty pages.</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <strong>PSI (Pressure Stall Information) &amp; Cgroups v2:</strong><br/>
+        <code>/proc/pressure/memory</code> exposes exact microsecond stall percentages: <code>some</code> (at least one task stalled waiting on reclaim/swap) and <code>full</code> (<em>all</em> non-idle tasks stalled simultaneously—UI is frozen!). Paired with cgroups v2 (<code>memory.min</code> hard floor, <code>memory.low</code> soft protection, <code>memory.high</code> throttle), PSI lets Android's <code>lmkd</code> measure real user pain rather than guessing from raw free-page counts.
+      </div>
+
+      <h3 style="margin:1.25rem 0 0.4rem;">Interactive Simulator A: MGLRU Multi-Generation Aging &amp; Eviction</h3>
+      <p style="margin:0; font-size:0.89rem; color:var(--text-muted);">Click any page chip to simulate a memory access (sets <code>Ref=1</code>), then advance aging or reclaim to watch MGLRU promote hot pages and evict oldest clean pages first.</p>
+
+      <div class="sim-box">
+        <div class="sim-controls">
+          <button class="btn btn-primary btn-sm" id="mglruAgeBtn" type="button">Age / Promote (max_seq++)</button>
+          <button class="btn btn-amber btn-sm" id="mglruReclaimBtn" type="button">Reclaim 1 Page</button>
+          <button class="btn btn-sm" id="mglruResetBtn" type="button">Reset Generations</button>
+          <span class="pill" id="mglruSeqPill">min_seq=0 | max_seq=2</span>
+        </div>
+        <div class="gen-grid" id="mglruGrid"></div>
+        <div class="reg-panel" style="margin-top:0.5rem;">
+          <div style="font-weight:700; margin-bottom:0.25rem; color:var(--text-muted);">MGLRU KERNEL EVENT LOG</div>
+          <div id="mglruLog" style="font-family:var(--font-sans); font-size:0.84rem;">Click a page chip to set its Reference bit, or click Reclaim 1 Page.</div>
+        </div>
+
+        <div class="sim-divider">
+          <h3 style="margin:0 0 0.4rem;">Interactive Simulator B: PSI Stall Monitor &amp; Android <code>lmkd</code> Victim Selector</h3>
+          <p style="margin:0 0 0.65rem; font-size:0.86rem; color:var(--text-muted);">Adjust live <code>PSI full</code> stall % (threshold = <strong>10.0%</strong>) to see when <code>lmkd</code> triggers and which process receives <code>SIGKILL</code>.</p>
+          <div class="sim-controls">
+            <label for="psiSlider" style="font-family:var(--font-mono); font-size:0.82rem;">PSI full stall:</label>
+            <input id="psiSlider" type="range" min="0" max="30" value="4" />
+            <span class="pill" id="psiPctLabel">4% (Threshold: 10%)</span>
+            <button class="btn btn-amber btn-sm" id="lmkdStepBtn" type="button">Kill Selected Victim</button>
+            <button class="btn btn-sm" id="lmkdResetBtn" type="button">Restore Processes</button>
+          </div>
+          <div id="lmkdDecision" class="callout green" style="margin:0.5rem 0;"></div>
+          <table class="proc-table">
+            <thead>
+              <tr><th>PID</th><th>Process Name</th><th>oom_score_adj</th><th>RSS (MB)</th><th>Status</th></tr>
+            </thead>
+            <tbody id="lmkdTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 2: C & KERNEL REALITY -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C &amp; KERNEL REALITY</span>
+          <h2>MGLRU Generations, ZRAM Swap-Out &amp; PSI <code>poll()</code> Triggers</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>mglru_reclaim.c — Linux mm/vmscan.c MGLRU Aging &amp; Scan</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code1">Copy</button>
+          </div>
+          <pre class="code" id="code1">// Simplified Linux Multi-Gen LRU (mm/vmscan.c)
+struct lru_gen_folio {
+  unsigned long max_seq;          // Newest generation counter
+  unsigned long min_seq[ANON_AND_FILE]; // Oldest unreclaimed generation
+  struct list_head folios[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+};
+
+// Aging walks page table PTE Accessed bits (or folio_test_referenced)
+// and advances max_seq, keeping hot working-set folios in recent gens.
+static int isolate_folios(struct lruvec *lruvec, int swappiness, int *type) {
+  int gen = lru_gen_from_seq(lruvec-&gt;lrugen.min_seq[*type]);
+  // Scan oldest generation: if folio_referenced(), promote to max_seq!
+  // Otherwise isolate clean file folios first; dirty folios wait for writeback
+  // or ZRAM compression if anon swappiness permits.
+  return scan_gen_list(lruvec, gen, *type);
+}</pre>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>lmkd_psi.c — Monitoring /proc/pressure/memory via epoll</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code2">Copy</button>
+          </div>
+          <pre class="code" id="code2">// Android system/memory/lmkd/lmkd.cpp pattern:
+int psi_fd = open("/proc/pressure/memory", O_RDWR | O_CLOEXEC);
+// Trigger EPOLLPRI when "full" memory stall exceeds 100ms in a 1s window (10%)
+const char trigger[] = "full 100000 1000000";
+write(psi_fd, trigger, sizeof(trigger));
+
+struct epoll_event ev = { .events = EPOLLPRI, .data.fd = psi_fd };
+epoll_ctl(epfd, EPOLL_CTL_ADD, psi_fd, &amp;ev);
+
+// When epoll_wait wakes on psi_fd:
+// 1. Walk /proc/&lt;pid&gt;/oom_score_adj and /proc/&lt;pid&gt;/statm (RSS)
+// 2. Skip protected processes (oom_score_adj &lt; 0)
+// 3. Pick highest oom_score_adj (tiebreak: largest RSS) -&gt; pidfd_send_signal(SIGKILL)</pre>
+        </div>
+      </div>
+
+      <div class="callout green">
+        <strong>Cgroups v2 Memory Controllers &amp; Direct Reclaim Avoidance:</strong><br/>
+        Modern Linux uses cgroups v2 unified hierarchy for per-app / per-slice protection: <code>memory.min</code> guarantees hard protection (never reclaimed unless global OOM), <code>memory.low</code> gives best-effort soft protection, and <code>memory.high</code> throttles allocating threads into reclaim without hard-killing them. Keeping a healthy pool of free pages via background <code>kswapd</code> + ZRAM avoids synchronous <em>direct reclaim</em> on the UI render thread.
+      </div>
+    </section>
+
+    <!-- MODULE 3: ANDROID BRIDGE -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2>Why Android Uses ZRAM (Not Disk Swap) &amp; How <code>lmkd</code> Prevents Kernel OOM</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>Why Android Has Zero Disk Swap &amp; Relies on ZRAM</h3>
+          <p><strong>Flash Wear &amp; Latency:</strong> Swapping dirty anonymous pages to UFS/eMMC NAND flash causes severe write amplification, wearing out soldered storage prematurely and causing 50–200ms random read stalls when switching back to an app.</p>
+          <p><strong>ZRAM Compressed RAM Swap:</strong> Android creates <code>/dev/block/zram0</code> in RAM using <code>lz4</code> or <code>zstd</code>. Cold anonymous pages (e.g. background app heaps) are compressed ~2.5x–3x inside RAM in microseconds—giving an 8GB phone ~11GB of effective memory with zero flash wear!</p>
+        </div>
+
+        <div class="card">
+          <h3>Android <code>lmkd</code> vs Linux Kernel OOM Killer</h3>
+          <p><strong>Kernel OOM Killer Is Too Late:</strong> The Linux OOM killer only triggers when page allocation completely fails—after the device has already thrashed and frozen for seconds. Worse, its <code>oom_badness()</code> heuristic doesn't understand Android's foreground/cached activity lifecycle.</p>
+          <p><strong><code>lmkd</code> (Low Memory Killer Daemon):</strong> Runs in user space, receives real-time kernel PSI notifications via <code>epoll_wait()</code>, and kills processes ordered by <code>ActivityManagerService</code>'s <code>oom_score_adj</code> (<code>900..999</code> cached &rarr; <code>700</code> previous &rarr; <code>200</code> perceptible &rarr; <code>0</code> foreground; negative values like <code>-900</code> for <code>system_server</code> are untouchable).</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: RUNNABLE CODE PRACTICE LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // RUNNABLE CODE PRACTICE LABS</span>
+          <h2>Hands-On Page Replacement, MGLRU &amp; LMKD Labs</h2>
+        </div>
+      </div>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // CLOCK (SECOND-CHANCE) REPLACEMENT</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>clockReplace(capacity, refs)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Simulate the circular Clock algorithm with hardware reference-bit second chances.</p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>capacity</code> (integer &ge; 1) and <code>refs</code> (array of page IDs):<br/>
+          &bull; Maintain a ring of occupied frames (initially empty <code>[]</code>) and clock <code>hand = 0</code>.<br/>
+          &bull; For each <code>pageId</code> in <code>refs</code>:<br/>
+          &nbsp;&nbsp;1. If <code>pageId</code> is already in frames: increment <code>hits</code>, set that frame's <code>refBit = 1</code> (do <strong>not</strong> move <code>hand</code>).<br/>
+          &nbsp;&nbsp;2. Else: increment <code>misses</code>. If <code>frames.length &lt; capacity</code>, push <code>{ pageId, refBit: 1 }</code>.<br/>
+          &nbsp;&nbsp;3. Else (ring is full): advance in a loop—while <code>frames[hand].refBit === 1</code>, clear <code>frames[hand].refBit = 0</code> and advance <code>hand = (hand + 1) % capacity</code>. Once a frame with <code>refBit === 0</code> is found, replace it with <code>{ pageId, refBit: 1 }</code>, increment <code>evictions</code>, and advance <code>hand = (hand + 1) % capacity</code>.<br/>
+          &bull; Return <code>{ hits, misses, evictions, frames: frames.map(f =&gt; f.pageId) }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // MGLRU GENERATION AGING &amp; EVICTION</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>mglruReclaim(pages, maxGen, needed)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Promote referenced pages to the newest generation, then reclaim oldest clean pages before dirty pages.</p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>pages</code> (array of <code>{ id, gen, referenced, dirty }</code>), <code>maxGen</code> (integer &ge; 0), and <code>needed</code> (integer &ge; 0):<br/>
+          1. Clone every page object so the caller's array is not mutated.<br/>
+          2. <strong>Aging / Promotion pass:</strong> For each cloned page, if <code>page.referenced === true</code>, promote it to <code>page.gen = maxGen</code> and clear <code>page.referenced = false</code>.<br/>
+          3. <strong>Reclaim pass:</strong> Evict <code>Math.min(needed, cloned.length)</code> pages ordered by:<br/>
+          &nbsp;&nbsp;&bull; Lowest <code>gen</code> first (oldest generation <code>0</code> before <code>1</code>, etc.)<br/>
+          &nbsp;&nbsp;&bull; Within the same <code>gen</code>, clean (<code>dirty === false</code>) before dirty (<code>dirty === true</code>)<br/>
+          &nbsp;&nbsp;&bull; Preserve original input order on ties.<br/>
+          4. Return <code>{ evictedIds, remaining }</code> where <code>evictedIds</code> lists evicted page IDs in eviction order, and <code>remaining</code> lists surviving cloned pages (in original relative order).
+        </div>
+
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // PSI &amp; ANDROID LMKD VICTIM SELECTOR</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>selectLmkdVictim(procs, psiFullPct, thresholdPct)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Enforce Android's PSI pressure gate, protected system-process immunity, and <code>oom_score_adj</code> ranking.</p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>procs</code> (array of <code>{ pid, name, oomScoreAdj, rssKb }</code>), <code>psiFullPct</code>, and <code>thresholdPct</code>:<br/>
+          &bull; If <code>psiFullPct &lt; thresholdPct</code>, return <code>{ action: "NONE", victim: null }</code>.<br/>
+          &bull; Filter to killable processes with <code>oomScoreAdj &gt;= 0</code> (processes with <code>oomScoreAdj &lt; 0</code> are protected).<br/>
+          &bull; If no killable processes exist, return <code>{ action: "NO_KILLABLE", victim: null }</code>.<br/>
+          &bull; Otherwise select the single process with the highest <code>oomScoreAdj</code>; break ties by largest <code>rssKb</code>, then smallest <code>pid</code>. Return <code>{ action: "KILL", victim }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: QUIZ -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (6 Questions)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Live Reclaim, ZRAM &amp; PSI Forensics</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header"><span>Real Linux / Android Memory Pressure CLI</span><button class="btn btn-sm copy-btn" type="button" data-copy="cli1">Copy</button></div>
+          <pre class="code" id="cli1"># 1. Read live PSI memory stall metrics (some vs full %)
+cat /proc/pressure/memory
+
+# 2. Check if Multi-Gen LRU (MGLRU) is enabled (bitmask: 7 = all enabled)
+cat /sys/kernel/mm/lru_gen/enabled
+
+# 3. Inspect ZRAM compression ratio (orig_data_size / compr_data_size)
+cat /sys/block/zram0/mm_stat
+
+# 4. Inspect an app's oom_score_adj on Android
+adb shell cat /proc/$(adb shell pidof com.android.chrome)/oom_score_adj</pre>
+        </div>
+
+        <div class="card">
+          <h3>Senior Engineer Mastery Checklist</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can explain why clean file-backed Page Cache frames drop with zero disk I/O while dirty or anonymous frames require writeback or ZRAM.</span></li>
+            <li><input type="checkbox" /> <span>I can contrast Clock / 2-list LRU against MGLRU generations (<code>min_seq .. max_seq</code>) and explain why MGLRU reduces thrashing.</span></li>
+            <li><input type="checkbox" /> <span>I understand why Android disables disk swap in favor of ZRAM and how PSI <code>some</code> vs <code>full</code> detects real UI stalls.</span></li>
+            <li><input type="checkbox" /> <span>I can trace how Android <code>lmkd</code> uses PSI + <code>oom_score_adj</code> to preserve foreground smoothness before the kernel OOM killer triggers.</span></li>
+          </ul>
+          <div class="callout green" style="margin-top:0.85rem; margin-bottom:0; font-size:0.84rem;">
+            <strong>Next Step:</strong> Ready for Phase 4? Continue to <a href="lesson-10.html">Lesson 10: I/O Subsystem, Block Layer, epoll &amp; io_uring &rarr;</a> or return to <a href="master-plan.html">Master Plan</a>.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a href="lesson-08.html" class="btn">&larr; Lesson 08: Buddy, SLUB, Scudo &amp; MTE</a>
+      <a href="master-plan.html" class="btn">Master Plan</a>
+      <a href="lesson-10.html" class="btn btn-primary">Lesson 10: Block Layer, epoll &amp; io_uring &rarr;</a>
+    </div>
+  </main>
+
+  <script src="assets/os-course.js"></script>
+  <script>
+    /* ============================================================
+       SIMULATOR A: MGLRU MULTI-GENERATION AGING & EVICTION
+       ============================================================ */
+    (function () {
+      let minSeq = 0;
+      let maxSeq = 2;
+      let pages = [];
+
+      function resetMglru() {
+        minSeq = 0;
+        maxSeq = 2;
+        pages = [
+          { id: "libc.so", gen: 0, ref: false, dirty: false },
+          { id: "db.wal", gen: 0, ref: false, dirty: true },
+          { id: "bg_heap", gen: 0, ref: true, dirty: true },
+          { id: "art.oat", gen: 1, ref: false, dirty: false },
+          { id: "img_buf", gen: 1, ref: true, dirty: false },
+          { id: "ui_tex", gen: 2, ref: true, dirty: false }
+        ];
+        renderMglru("Initialized 6 pages across generations 0..2. Click a page to toggle its Reference bit.");
+      }
+
+      function renderMglru(msg) {
+        document.getElementById("mglruSeqPill").textContent = `min_seq=${minSeq} | max_seq=${maxSeq}`;
+        const grid = document.getElementById("mglruGrid");
+        const gens = [minSeq, minSeq + 1, minSeq + 2, maxSeq].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
+
+        grid.innerHTML = gens.map((g) => {
+          const list = pages.filter((p) => p.gen === g);
+          return `
+            <div class="gen-col">
+              <h4>GEN ${g} ${g === minSeq ? "(OLDEST)" : g === maxSeq ? "(NEWEST)" : ""}</h4>
+              ${list.length ? list.map((p) => `
+                <div class="page-chip ${p.ref ? "ref" : ""} ${p.dirty ? "dirty" : ""}" data-id="${p.id}">
+                  <span>${p.id}</span>
+                  <span>R=${p.ref ? 1 : 0} ${p.dirty ? "DIRTY" : "CLEAN"}</span>
+                </div>
+              `).join("") : `<div style="color:var(--text-dim); font-size:0.78rem;">(empty)</div>`}
+            </div>
+          `;
+        }).join("");
+
+        grid.querySelectorAll(".page-chip").forEach((el) => {
+          el.addEventListener("click", () => {
+            const p = pages.find((x) => x.id === el.dataset.id);
+            if (p) {
+              p.ref = !p.ref;
+              renderMglru(`Toggled access bit on <code>${p.id}</code> -> Ref=${p.ref ? 1 : 0}.`);
+            }
+          });
+        });
+        document.getElementById("mglruLog").innerHTML = msg;
+      }
+
+      document.getElementById("mglruAgeBtn").addEventListener("click", () => {
+        maxSeq++;
+        const promoted = [];
+        pages.forEach((p) => {
+          if (p.ref) {
+            p.gen = maxSeq;
+            p.ref = false;
+            promoted.push(p.id);
+          }
+        });
+        while (pages.length > 0 && !pages.some((p) => p.gen === minSeq) && minSeq < maxSeq) minSeq++;
+        renderMglru(`Advanced <code>max_seq</code> to ${maxSeq}. Promoted referenced pages: [${promoted.join(", ") || "none"}].`);
+      });
+
+      document.getElementById("mglruReclaimBtn").addEventListener("click", () => {
+        if (pages.length === 0) {
+          renderMglru("All pages already reclaimed! Click Reset Generations.");
+          return;
+        }
+        // Promote referenced pages found in oldest gen first (MGLRU lazy aging on scan)
+        const promoted = [];
+        pages.forEach((p) => {
+          if (p.gen === minSeq && p.ref) {
+            p.gen = maxSeq;
+            p.ref = false;
+            promoted.push(p.id);
+          }
+        });
+        while (pages.length > 0 && !pages.some((p) => p.gen === minSeq) && minSeq < maxSeq) minSeq++;
+        const candidates = pages.filter((p) => p.gen === minSeq);
+        candidates.sort((a, b) => Number(a.dirty) - Number(b.dirty));
+        const victim = candidates[0];
+        pages = pages.filter((p) => p.id !== victim.id);
+        while (pages.length > 0 && !pages.some((p) => p.gen === minSeq) && minSeq < maxSeq) minSeq++;
+        renderMglru(`${promoted.length ? "Promoted hot pages [" + promoted.join(", ") + "] -> Gen " + maxSeq + ". " : ""}Evicted <strong>${victim.id}</strong> (${victim.dirty ? "DIRTY writeback/ZRAM" : "CLEAN instant drop"}) from oldest Gen ${victim.gen}.`);
+      });
+
+      document.getElementById("mglruResetBtn").addEventListener("click", resetMglru);
+      resetMglru();
+    })();
+
+    /* ============================================================
+       SIMULATOR B: PSI + ANDROID LMKD VICTIM SELECTOR
+       ============================================================ */
+    (function () {
+      const THRESHOLD = 10;
+      const INITIAL_PROCS = [
+        { pid: 1012, name: "system_server", oomScoreAdj: -900, rssMb: 420 },
+        { pid: 1450, name: "com.android.systemui", oomScoreAdj: -800, rssMb: 280 },
+        { pid: 4100, name: "com.app.foreground", oomScoreAdj: 0, rssMb: 510 },
+        { pid: 4320, name: "com.sync.worker", oomScoreAdj: 700, rssMb: 190 },
+        { pid: 4510, name: "com.maps.cached", oomScoreAdj: 900, rssMb: 340 },
+        { pid: 4680, name: "com.chrome.cached", oomScoreAdj: 900, rssMb: 610 }
+      ];
+      let procs = [];
+
+      function getVictim(psiPct) {
+        if (psiPct < THRESHOLD) return null;
+        const killable = procs.filter((p) => p.oomScoreAdj >= 0);
+        if (!killable.length) return null;
+        return [...killable].sort((a, b) =>
+          (b.oomScoreAdj - a.oomScoreAdj) || (b.rssMb - a.rssMb) || (a.pid - b.pid)
+        )[0];
+      }
+
+      function renderLmkd() {
+        const psiPct = Number(document.getElementById("psiSlider").value);
+        document.getElementById("psiPctLabel").textContent = `${psiPct}% (Threshold: ${THRESHOLD}%)`;
+        const victim = getVictim(psiPct);
+        const dec = document.getElementById("lmkdDecision");
+
+        if (psiPct < THRESHOLD) {
+          dec.className = "callout green";
+          dec.innerHTML = `<strong>PSI Normal (${psiPct}% &lt; ${THRESHOLD}%):</strong> No apps killed. Page Cache &amp; ZRAM handle minor reclaim smoothly.`;
+        } else if (!victim) {
+          dec.className = "callout amber";
+          dec.innerHTML = `<strong>PSI High (${psiPct}%), No Killable Apps Left:</strong> Only protected negative-<code>oom_score_adj</code> system processes remain.`;
+        } else {
+          dec.className = "callout red";
+          dec.innerHTML = `<strong>PSI Triggered (${psiPct}% &ge; ${THRESHOLD}%):</strong> <code>lmkd</code> targets <strong>${victim.name}</strong> (PID ${victim.pid}, <code>oom_score_adj=${victim.oomScoreAdj}</code>, ${victim.rssMb} MB RSS) to reclaim RAM immediately!`;
+        }
+
+        document.getElementById("lmkdTableBody").innerHTML = procs.map((p) => {
+          const isVictim = victim && p.pid === victim.pid;
+          const isProt = p.oomScoreAdj < 0;
+          const cls = isVictim ? "proc-row-victim" : (isProt ? "proc-row-protected" : "");
+          const tag = isVictim ? "NEXT VICTIM (SIGKILL)" : (isProt ? "PROTECTED (<0)" : "Killable");
+          return `<tr class="${cls}"><td>${p.pid}</td><td>${p.name}</td><td>${p.oomScoreAdj}</td><td>${p.rssMb} MB</td><td>${tag}</td></tr>`;
+        }).join("");
+      }
+
+      document.getElementById("psiSlider").addEventListener("input", renderLmkd);
+      document.getElementById("lmkdStepBtn").addEventListener("click", () => {
+        const psiPct = Number(document.getElementById("psiSlider").value);
+        const victim = getVictim(psiPct);
+        if (victim) procs = procs.filter((p) => p.pid !== victim.pid);
+        renderLmkd();
+      });
+      document.getElementById("lmkdResetBtn").addEventListener("click", () => {
+        procs = INITIAL_PROCS.map((p) => ({ ...p }));
+        renderLmkd();
+      });
+      procs = INITIAL_PROCS.map((p) => ({ ...p }));
+      renderLmkd();
+    })();
+
+    /* ============================================================
+       LESSON 09 CONFIG: LABS & QUIZZES
+       ============================================================ */
+    window.LESSON_CONFIG = {
+      num: "09",
+      labs: {
+        1: {
+          fnName: "clockReplace",
+          starter: `function clockReplace(capacity, refs) {
+  const frames = [];
+  let hand = 0;
+  let hits = 0;
+  let misses = 0;
+  let evictions = 0;
+
+  for (const pageId of refs) {
+    // TODO: check hit (set refBit = 1), else miss (fill empty or advance clock hand)
+  }
+
+  return { hits, misses, evictions, frames: frames.map((f) => f.pageId) };
+}`,
+          hints: [
+            "Hint 1: On each pageId, search frames with frames.findIndex(f => f.pageId === pageId). If found (idx !== -1), increment hits and set frames[idx].refBit = 1 (leave hand unchanged).",
+            "Hint 2: On a miss, increment misses. If frames.length < capacity, simply frames.push({ pageId, refBit: 1 }) and continue.",
+            "Hint 3: When full, loop while (frames[hand].refBit === 1) { frames[hand].refBit = 0; hand = (hand + 1) % capacity; }. Then replace frames[hand] = { pageId, refBit: 1 }, increment evictions, and set hand = (hand + 1) % capacity."
+          ],
+          solution: `function clockReplace(capacity, refs) {
+  const frames = [];
+  let hand = 0;
+  let hits = 0;
+  let misses = 0;
+  let evictions = 0;
+
+  for (const pageId of refs) {
+    const idx = frames.findIndex((f) => f.pageId === pageId);
+    if (idx !== -1) {
+      hits++;
+      frames[idx].refBit = 1;
+      continue;
+    }
+    misses++;
+    if (frames.length < capacity) {
+      frames.push({ pageId, refBit: 1 });
+    } else {
+      while (frames[hand].refBit === 1) {
+        frames[hand].refBit = 0;
+        hand = (hand + 1) % capacity;
+      }
+      frames[hand] = { pageId, refBit: 1 };
+      evictions++;
+      hand = (hand + 1) % capacity;
+    }
+  }
+
+  return { hits, misses, evictions, frames: frames.map((f) => f.pageId) };
+}`,
+          solutionExplain: "Clock approximates LRU in O(1) amortized time using a single circular hand and hardware Accessed/Reference bits instead of moving list nodes on every memory read.",
+          tests: function (fn) {
+            const out = [];
+            const r1 = fn(3, [1, 2, 3, 1, 4, 2, 5]);
+            // [1(1),2(1),3(1)] -> hit 1 -> miss 4: clears 1,2,3 -> evicts 1 -> [4(1),2(0),3(0)], hand=1
+            // hit 2 -> [4(1),2(1),3(0)], hand=1 -> miss 5: clears 2 -> evicts 3 -> [4(1),2(0),5(1)]
+            out.push({
+              name: "Second-chance rescue skips referenced frames and evicts unreferenced victim",
+              pass: r1.hits === 2 && r1.misses === 5 && r1.evictions === 2 && JSON.stringify(r1.frames) === JSON.stringify([4, 2, 5]),
+              detail: JSON.stringify(r1)
+            });
+
+            const r2 = fn(2, [10, 20, 10, 20, 10]);
+            out.push({
+              name: "Working set fitting in capacity produces zero evictions",
+              pass: r2.hits === 3 && r2.misses === 2 && r2.evictions === 0,
+              detail: JSON.stringify(r2)
+            });
+
+            const r3 = fn(1, ["A", "B", "B", "C"]);
+            out.push({
+              name: "Capacity 1 edge case handles hits and evictions cleanly",
+              pass: r3.hits === 1 && r3.misses === 3 && r3.evictions === 2 && JSON.stringify(r3.frames) === JSON.stringify(["C"]),
+              detail: JSON.stringify(r3)
+            });
+
+            const r4 = fn(4, []);
+            out.push({
+              name: "Empty reference stream returns zeros and empty frames",
+              pass: r4.hits === 0 && r4.misses === 0 && r4.evictions === 0 && r4.frames.length === 0,
+              detail: JSON.stringify(r4)
+            });
+            return out;
+          }
+        },
+        2: {
+          fnName: "mglruReclaim",
+          starter: `function mglruReclaim(pages, maxGen, needed) {
+  // TODO: clone pages, promote referenced pages to maxGen, then evict oldest clean-first up to needed
+}`,
+          hints: [
+            "Hint 1: Map pages into cloned objects while tracking original index idx: const cloned = pages.map((p, idx) => ({ ...p, _idx: idx })). If p.referenced is true, set gen = maxGen and referenced = false.",
+            "Hint 2: Sort a candidate array by (a.gen - b.gen) || (Number(Boolean(a.dirty)) - Number(Boolean(b.dirty))) || (a._idx - b._idx).",
+            "Hint 3: Take the first count = Math.min(needed, cloned.length) items from sorted candidates as evicted; collect their ids into evictedIds and a Set, then build remaining from cloned filtered by !evictedSet.has(_idx) without the internal _idx helper field."
+          ],
+          solution: `function mglruReclaim(pages, maxGen, needed) {
+  const cloned = pages.map((p, idx) => ({
+    id: p.id,
+    gen: p.referenced ? maxGen : p.gen,
+    referenced: false,
+    dirty: Boolean(p.dirty),
+    _idx: idx
+  }));
+
+  const count = Math.max(0, Math.min(needed, cloned.length));
+  const sorted = [...cloned].sort((a, b) =>
+    (a.gen - b.gen) ||
+    (Number(a.dirty) - Number(b.dirty)) ||
+    (a._idx - b._idx)
+  );
+
+  const victims = sorted.slice(0, count);
+  const evictedIdxSet = new Set(victims.map((v) => v._idx));
+  const evictedIds = victims.map((v) => v.id);
+  const remaining = cloned
+    .filter((p) => !evictedIdxSet.has(p._idx))
+    .map(({ _idx, ...rest }) => rest);
+
+  return { evictedIds, remaining };
+}`,
+          solutionExplain: "Promotion moves active working-set pages to maxGen before reclaim runs. Reclaim then drains oldest generations first, preferring clean pages (zero writeback I/O) before dirty pages.",
+          tests: function (fn) {
+            const out = [];
+            const input = [
+              { id: "p1", gen: 0, referenced: true, dirty: false },
+              { id: "p2", gen: 0, referenced: false, dirty: true },
+              { id: "p3", gen: 0, referenced: false, dirty: false },
+              { id: "p4", gen: 1, referenced: false, dirty: false }
+            ];
+            const res = fn(input, 3, 2);
+            out.push({
+              name: "Promotes referenced Gen-0 page to maxGen and evicts Gen-0 clean before Gen-0 dirty",
+              pass: JSON.stringify(res.evictedIds) === JSON.stringify(["p3", "p2"]) &&
+                res.remaining.some((p) => p.id === "p1" && p.gen === 3 && p.referenced === false) &&
+                input[0].gen === 0,
+              detail: `evicted=${JSON.stringify(res.evictedIds)}, inputMutated=${input[0].gen !== 0}`
+            });
+
+            const res2 = fn([
+              { id: "a", gen: 1, referenced: false, dirty: true },
+              { id: "b", gen: 0, referenced: false, dirty: true },
+              { id: "c", gen: 1, referenced: false, dirty: false }
+            ], 2, 2);
+            out.push({
+              name: "Drains Gen 0 dirty before moving up to Gen 1 clean",
+              pass: JSON.stringify(res2.evictedIds) === JSON.stringify(["b", "c"]) && res2.remaining.length === 1 && res2.remaining[0].id === "a",
+              detail: `evicted=${JSON.stringify(res2.evictedIds)}`
+            });
+
+            const res3 = fn(input, 3, 0);
+            out.push({
+              name: "needed = 0 still ages referenced pages without evicting anything",
+              pass: res3.evictedIds.length === 0 && res3.remaining.length === 4 && res3.remaining[0].gen === 3,
+              detail: `remainingLen=${res3.remaining.length}, p1Gen=${res3.remaining[0].gen}`
+            });
+
+            const res4 = fn([{ id: "x", gen: 0, referenced: false, dirty: false }], 2, 5);
+            out.push({
+              name: "needed > pages.length safely evicts all available pages",
+              pass: JSON.stringify(res4.evictedIds) === JSON.stringify(["x"]) && res4.remaining.length === 0,
+              detail: JSON.stringify(res4)
+            });
+            return out;
+          }
+        },
+        3: {
+          fnName: "selectLmkdVictim",
+          starter: `function selectLmkdVictim(procs, psiFullPct, thresholdPct) {
+  // TODO: gate on psiFullPct < thresholdPct, exclude oomScoreAdj < 0, pick max oomScoreAdj (tie: max rssKb, min pid)
+}`,
+          hints: [
+            "Hint 1: First check if (psiFullPct < thresholdPct) return { action: \"NONE\", victim: null }.",
+            "Hint 2: Filter killable = procs.filter(p => p.oomScoreAdj >= 0). If killable.length === 0, return { action: \"NO_KILLABLE\", victim: null }.",
+            "Hint 3: Sort a copy of killable with (b.oomScoreAdj - a.oomScoreAdj) || (b.rssKb - a.rssKb) || (a.pid - b.pid) and return { action: \"KILL\", victim: sorted[0] }."
+          ],
+          solution: `function selectLmkdVictim(procs, psiFullPct, thresholdPct) {
+  if (psiFullPct < thresholdPct) {
+    return { action: "NONE", victim: null };
+  }
+  const killable = procs.filter((p) => p.oomScoreAdj >= 0);
+  if (killable.length === 0) {
+    return { action: "NO_KILLABLE", victim: null };
+  }
+  const sorted = [...killable].sort((a, b) =>
+    (b.oomScoreAdj - a.oomScoreAdj) ||
+    (b.rssKb - a.rssKb) ||
+    (a.pid - b.pid)
+  );
+  return { action: "KILL", victim: sorted[0] };
+}`,
+          solutionExplain: "lmkd sleeps until PSI stall pressure crosses its configured threshold, strictly spares protected negative oom_score_adj system daemons, and sacrifices the highest-adj (least important) / largest-RSS app first.",
+          tests: function (fn) {
+            const out = [];
+            const procs = [
+              { pid: 100, name: "system_server", oomScoreAdj: -900, rssKb: 800000 },
+              { pid: 200, name: "foreground", oomScoreAdj: 0, rssKb: 400000 },
+              { pid: 310, name: "cached_a", oomScoreAdj: 900, rssKb: 150000 },
+              { pid: 320, name: "cached_b", oomScoreAdj: 900, rssKb: 320000 }
+            ];
+
+            const r1 = fn(procs, 7.5, 10.0);
+            out.push({
+              name: "Returns NONE when PSI full is below threshold",
+              pass: r1.action === "NONE" && r1.victim === null,
+              detail: JSON.stringify(r1)
+            });
+
+            const r2 = fn(procs, 10.0, 10.0);
+            out.push({
+              name: "Selects highest oomScoreAdj and breaks tie by largest rssKb",
+              pass: r2.action === "KILL" && r2.victim && r2.victim.pid === 320,
+              detail: JSON.stringify(r2)
+            });
+
+            const r3 = fn([{ pid: 10, name: "init", oomScoreAdj: -1000, rssKb: 999999 }], 25, 10);
+            out.push({
+              name: "Protects negative oomScoreAdj processes and returns NO_KILLABLE",
+              pass: r3.action === "NO_KILLABLE" && r3.victim === null,
+              detail: JSON.stringify(r3)
+            });
+
+            const r4 = fn([
+              { pid: 55, name: "tie2", oomScoreAdj: 700, rssKb: 10000 },
+              { pid: 42, name: "tie1", oomScoreAdj: 700, rssKb: 10000 }
+            ], 12, 10);
+            out.push({
+              name: "Breaks equal oomScoreAdj & equal rssKb deterministically by lowest pid",
+              pass: r4.action === "KILL" && r4.victim.pid === 42,
+              detail: JSON.stringify(r4)
+            });
+            return out;
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "1. Why can the Linux kernel drop a *clean* file-backed Page Cache frame almost instantly during memory reclaim, whereas an *anonymous* frame cannot simply be discarded?",
+          options: [
+            "A. Clean file pages live in CPU L3 cache instead of DRAM.",
+            "B. Clean file pages already have an identical backing copy on storage (e.g., ext4/f2fs), whereas anonymous pages (heap/stack) exist nowhere else and must be compressed into ZRAM or written to swap.",
+            "C. Anonymous pages belong to the kernel and are always pinned.",
+            "D. File-backed pages are never mapped into user-space page tables."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Page Cache frames are physical DRAM pages tracked by `struct address_space`.",
+            "Correct (B): Dropping a clean file page loses zero data because a future page fault can re-read it from disk/flash. Discarding an anonymous heap page without writing it to ZRAM/swap would corrupt user memory.",
+            "Wrong (C): Anonymous pages are normal swappable user memory (heap, stack, private CoW).",
+            "Wrong (D): Shared libraries, APKs, and `mmap`ed files are mapped directly into user PTEs."
+          ]
+        },
+        {
+          q: "2. In the Clock (Second-Chance) page replacement algorithm, what happens when the clock hand encounters a frame whose hardware Reference/Accessed bit is `1`?",
+          options: [
+            "A. That frame is evicted immediately because `1` means 'ready to free'.",
+            "B. The Reference bit is cleared to `0`, the frame is spared (second chance), and the clock hand advances to check the next frame.",
+            "C. The page is moved to ZRAM and its Reference bit stays `1`.",
+            "D. The algorithm halts and invokes the kernel OOM killer."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `refBit === 1` indicates the page was recently accessed.",
+            "Correct (B): Clearing `refBit` to `0` gives the page one full sweep of the clock hand to prove it is still actively used; if no access sets `refBit = 1` before the hand returns, it gets evicted.",
+            "Wrong (C): Clock spares the page in RAM rather than swapping it out.",
+            "Wrong (D): Eviction continues clockwise; OOM only triggers if no reclaimable frames exist anywhere."
+          ]
+        },
+        {
+          q: "3. How does Linux Multi-Gen LRU (MGLRU) improve upon the classic 2-list Active/Inactive LRU for modern Android devices?",
+          options: [
+            "A. MGLRU replaces DRAM with NVMe SSDs.",
+            "B. MGLRU ages folios across multiple numbered generations (`min_seq..max_seq`), reducing lock contention and distinguishing hot working sets from one-off large sequential reads.",
+            "C. MGLRU disables the Page Cache completely.",
+            "D. MGLRU only runs inside user space."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): MGLRU is a kernel page-reclaim algorithm in `mm/vmscan.c`, not a storage swap driver.",
+            "Correct (B): With only 2 lists, scanning a large file or switching heavy apps easily pollutes lists and forces expensive list locking. MGLRU tracks multi-generation age accurately with lower CPU overhead and higher hit rates.",
+            "Wrong (C): MGLRU optimizes Page Cache and anonymous reclaim; it keeps Page Cache active.",
+            "Wrong (D): MGLRU runs inside the Linux kernel (`EL1`)."
+          ]
+        },
+        {
+          q: "4. Why do Android smartphones ship with ZRAM enabled instead of a swap partition/swapfile on UFS flash storage?",
+          options: [
+            "A. Linux does not support swapfiles on ARM64.",
+            "B. NAND flash wears out rapidly under heavy swap writes and random flash swap-in latency causes severe UI jank, whereas ZRAM compresses cold pages in DRAM in microseconds.",
+            "C. ZRAM lets apps bypass SELinux permissions.",
+            "D. ZRAM makes CPU cores run at higher clock frequencies."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Linux supports `swapon` on ARM64; it is deliberately avoided on mobile due to flash physics and latency.",
+            "Correct (B): Soldered UFS flash cannot be replaced if worn out, and flash read latency (hundreds of microseconds to milliseconds) breaks 120Hz UI frame budgets. LZ4/zstd ZRAM trades tiny CPU cycles for 2.5x–3x effective RAM.",
+            "Wrong (C): ZRAM is a transparent kernel block/swap layer and has nothing to do with SELinux.",
+            "Wrong (D): ZRAM consumes small CPU cycles for compression rather than boosting clock frequencies."
+          ]
+        },
+        {
+          q: "5. What is the critical difference between PSI `some` and PSI `full` in `/proc/pressure/memory`?",
+          options: [
+            "A. `some` counts page faults per second; `full` counts total RAM in bytes.",
+            "B. `some` is the % of time at least one runnable task is stalled on memory; `full` is the % of time ALL non-idle tasks are simultaneously stalled (total system freeze).",
+            "C. `some` tracks CPU temperature; `full` tracks battery voltage.",
+            "D. `full` only counts kernel-thread stalls and ignores user apps."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): PSI measures time percentages (`avg10`, `avg60`, `avg300`) spent stalled, not raw fault counts or byte totals.",
+            "Correct (B): If one background thread is stalled (`some` > 0) while the UI thread renders smoothly, the user feels zero lag. When `full` rises, *every* runnable task—including the UI—is blocked waiting on memory reclaim.",
+            "Wrong (C): Thermal/battery telemetry lives in `/sys/class/thermal` and `/sys/class/power_supply`.",
+            "Wrong (D): PSI `full` reflects stalls across all non-idle tasks in the cgroup/system."
+          ]
+        },
+        {
+          q: "6. Under extreme memory pressure on Android, why does `lmkd` kill a cached app (`oom_score_adj = 900`) proactively instead of letting the Linux kernel OOM killer handle it?",
+          options: [
+            "A. The Linux kernel OOM killer cannot send `SIGKILL`.",
+            "B. Kernel OOM only fires after the system is already frozen in direct reclaim/thrashing and lacks Android's foreground/background lifecycle awareness (`oom_score_adj` + PSI triggers).",
+            "C. `lmkd` repairs memory leaks inside Java objects without killing processes.",
+            "D. Kernel OOM killer always kills PID 1 (`/init`) first."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): The kernel OOM killer also kills tasks via `SIGKILL`, just much too late.",
+            "Correct (B): By watching PSI thresholds via `epoll_wait()`, `lmkd` harvests low-priority cached apps (`oom_score_adj >= 900`) well before allocation failure or severe UI jank occurs.",
+            "Wrong (C): `lmkd` kills whole processes (`pidfd_send_signal(SIGKILL)`), freeing their entire anonymous/ZRAM footprint instantly.",
+            "Wrong (D): PID 1 is protected (`SIGNAL_UNKILLABLE`) and never chosen by the OOM killer."
+          ]
+        }
+      ]
+    };
+
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

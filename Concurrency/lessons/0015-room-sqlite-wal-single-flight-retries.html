@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 15 — Room/SQLite WAL Contention, Single-Flight Caching &amp; Retries</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 15 · Room WAL, Single-Flight &amp; Retries</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 5 · Lesson 15 · Storage &amp; Network Resilience</div>
+      <h1>Room/SQLite WAL Contention, Single-Flight Caching &amp; Retries</h1>
+      <p class="hero-sub">
+        Local persistence and network retries fail in production for the same reason: uncoordinated concurrency around shared bottlenecks.
+        Understand SQLite Write-Ahead Logging (WAL) concurrent readers vs. single writer, eliminate Room <code>withTransaction</code> coroutine deadlocks, coalesce duplicate requests with single-flight caching, and prevent thundering herds using Full Jitter and <code>Idempotency-Key</code> headers.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. Interactive WAL &amp; Retry Visualizer</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Kotlin &amp; Room Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>Database Contention, Coalescing &amp; Jittered Recovery</h2>
+      <p class="section-lead">
+        Most mobile engineers treat SQLite as a multi-writer server and HTTP retries as harmless loops.
+        Senior engineers model <strong>file-level lock contention</strong>
+        (<a href="https://www.sqlite.org/wal.html" target="_blank" rel="noopener">SQLite WAL Specification</a>),
+        <strong>Room's single-writer transaction discipline</strong>
+        (<a href="https://developer.android.com/training/data-storage/room" target="_blank" rel="noopener">Android Room Guide</a>),
+        and <strong>distributed retry amplification</strong>
+        (<a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">AWS Exponential Backoff &amp; Jitter</a>).
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">1. SQLite WAL: N Readers + 1 Writer</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            In legacy <strong>Rollback Journal</strong> mode, writers acquire an <code>EXCLUSIVE</code> lock on the database file and stall every reader; readers hold <code>SHARED</code> locks and stall writers.<br/><br/>
+            With <strong>Write-Ahead Logging (WAL)</strong> (Room's default on API 16+), writes append committed pages to <code>-wal</code> instead of mutating the main database file in place. Readers resolve a snapshot mark via the <code>-shm</code> index, so <strong>multiple readers run concurrently alongside one writer</strong>. However, SQLite still allows <strong>only one active writer at a time</strong>—a second concurrent writer hits <code>SQLITE_BUSY</code> once <code>busy_timeout</code> expires.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">2. Room <code>withTransaction</code> &amp; Deadlock Hazards</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            Room's <code>withTransaction { ... }</code> acquires a dedicated transaction thread/connection and stores a <code>TransactionElement</code> in the coroutine's <code>CoroutineContext</code> (<a href="https://kotlinlang.org/docs/coroutines-guide.html" target="_blank" rel="noopener">Kotlin Coroutines Guide</a>).<br/><br/>
+            <strong>The trap:</strong> Switching to an unrelated dispatcher (<code>withContext(Dispatchers.IO)</code>) or launching a blocking <code>runBlocking</code> DAO query onto another thread while holding the single write connection causes self-deadlock: the inner query waits for the write connection already held by the outer transaction! Mixing a coroutine <code>Mutex</code> with <code>withTransaction</code> in inconsistent lock order produces classic AB-BA deadlocks.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--green);">3. Single-Flight Request Deduplication</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            During screen rotation, feed scrolling, or cold start, multiple view models or Flow collectors often request the same resource (<code>GET /users/42</code>) at the exact same millisecond.<br/><br/>
+            A <strong>single-flight cache</strong> maps each active key to one shared in-flight <code>Deferred</code>. Concurrent callers await the same network call instead of issuing N redundant requests. Crucially, the key <strong>must be evicted in a <code>finally</code> block</strong> on both success and failure—otherwise one transient timeout permanently poisons future callers with a failed <code>Deferred</code>.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--amber);">4. Full Jitter + Idempotency Keys</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            Deterministic exponential backoff (<code>base * 2^attempt</code>) fails under correlated outages: clients that failed together at <code>t = 0</code> wake up together in synchronized waves at <code>100ms</code>, <code>200ms</code>, and <code>400ms</code> (a <strong>thundering herd</strong>).<br/><br/>
+            <strong>Full Jitter</strong> draws <code>random(0, min(cap, base * 2^attempt))</code> to spread retries smoothly across the window. For state-mutating endpoints (<code>POST /payments</code>), attach a single UUID <code>Idempotency-Key</code> generated <em>before</em> the retry loop so the server deduplicates retries if an earlier response was lost in transit.
+          </p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 24px;">SQLite Locking &amp; Retry Architecture Comparison</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Mechanism</th>
+              <th>Concurrent Readers</th>
+              <th>Concurrent Writers</th>
+              <th>Reader vs. Writer Blocking</th>
+              <th>Primary Failure Mode</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Rollback Journal (<code>TRUNCATE</code>)</strong></td>
+              <td>Yes (<code>SHARED</code> lock)</td>
+              <td>No (<code>EXCLUSIVE</code> lock)</td>
+              <td>Mutually blocking on main DB file</td>
+              <td>UI read stalls during background sync writes</td>
+            </tr>
+            <tr>
+              <td><strong>SQLite WAL (Room Default)</strong></td>
+              <td>Yes (snapshot via <code>-shm</code>)</td>
+              <td>No (serialized 1 writer)</td>
+              <td>Readers &amp; 1 writer run concurrently; checkpoint waits for old readers</td>
+              <td><code>SQLITE_BUSY</code> on unserialized multi-process/raw writers; WAL bloat if long read transaction blocks checkpoint</td>
+            </tr>
+            <tr>
+              <td><strong>Room <code>withTransaction</code></strong></td>
+              <td>Read pool continues in WAL</td>
+              <td>Serialized on transaction thread</td>
+              <td>Deadlocks if inner call hops off transaction context onto blocked write slot</td>
+              <td><code>runBlocking</code> / <code>Mutex</code> lock-order inversion across transaction boundary</td>
+            </tr>
+            <tr>
+              <td><strong>Deterministic Backoff</strong></td>
+              <td>N/A (network scheduling)</td>
+              <td>Synchronized retry spikes</td>
+              <td>All clients collide at <code>2^attempt</code> boundaries</td>
+              <td>Thundering herd collapses recovering server</td>
+            </tr>
+            <tr>
+              <td><strong>Full Jitter + Idempotency Key</strong></td>
+              <td>N/A (network scheduling)</td>
+              <td>Uniformly spread across <code>[0, cap]</code></td>
+              <td>Smooth traffic + safe server-side deduplication</td>
+              <td>Forgetting to reuse the same key across retries duplicates mutations</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>WAL Checkpoint Starvation Trap:</strong> Even in WAL mode, a long-running read transaction (e.g., keeping a cursor open across network I/O) pins an old snapshot in <code>-shm</code>. SQLite cannot checkpoint pages newer than the oldest active reader back into the main database, causing the <code>-wal</code> file to grow unboundedly and slowing subsequent reads. Keep SQLite transactions strictly short and free of network calls!
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive WAL &amp; Thundering-Herd Visualizer</div>
+      <h2>Inspect SQLite Lock Contention &amp; Jittered Retry Waves</h2>
+      <p class="section-lead">
+        Switch between database locking modes and retry scheduling modes below. Use <strong>Step →</strong>, <strong>▶ Play</strong>, <strong>⚡ Action</strong>, and <strong>↺ Reset</strong> to observe live lane timelines, lock state, and trace events.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="wal">1. SQLite WAL (R+W)</button>
+            <button class="btn" data-mode="rollback">2. Rollback Journal</button>
+            <button class="btn" data-mode="herd">3. Retry Spike (No Jitter)</button>
+            <button class="btn" data-mode="jitter">4. Full Jitter Backoff</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn" id="sim-action">⚡ Re-roll Jitter / Burst</button>
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span id="lbl-lane0">Reader 1 / Client 1</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-0"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span id="lbl-lane1">Reader 2 / Client 2</span><span id="sub-lane1">Concurrent Lane</span></div>
+              <div class="timeline-track" id="lane-1"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span id="lbl-lane2">Writer A / Client 3</span><span id="sub-lane2">Write / Retry Lane</span></div>
+              <div class="timeline-track" id="lane-2"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span id="lbl-lane3">Writer B / Client 4</span><span id="sub-lane3">Contention / Server Lane</span></div>
+              <div class="timeline-track" id="lane-3"></div>
+            </div>
+
+            <div class="registers-grid">
+              <div class="reg-card"><div class="reg-name" id="reg0-name">Active Readers</div><div class="reg-val" id="reg0-val" style="color:var(--accent);">0</div></div>
+              <div class="reg-card"><div class="reg-name" id="reg1-name">Writer Lock</div><div class="reg-val" id="reg1-val" style="color:var(--purple);">FREE</div></div>
+              <div class="reg-card"><div class="reg-name" id="reg2-name">Contention / Peak</div><div class="reg-val" id="reg2-val" style="color:var(--green);">0</div></div>
+            </div>
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Select a mode and click <strong>Step →</strong> or <strong>▶ Play</strong> to trace WAL concurrency or retry herd behavior.
+            </div>
+          </div>
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">EXECUTION TRACE LOG</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; Android</div>
+      <h2>Junior Traps vs. Senior Patterns in Room &amp; Networking</h2>
+      <p class="section-lead">
+        Production Android repositories combine Room transactions, in-memory request coalescing, and resilient HTTP retries. Compare the common failure traps against hardened senior implementations.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Single-Flight Request Deduplication (With Error Cleanup)</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Races or Caches Failed Deferred</span></div>
+<pre>private val cache = ConcurrentHashMap&lt;String, Deferred&lt;User&gt;&gt;()
+
+suspend fun getUser(id: String): User = coroutineScope {
+    // Trap A: check-then-put races two callers!
+    // Trap B: failed Deferred stays in map forever!
+    cache[id]?.await() ?: async { api.fetchUser(id) }
+        .also { cache[id] = it }
+        .await()
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Atomic Map + <code>finally</code> Eviction</span></div>
+<pre>private val mutex = Mutex()
+private val inFlight = HashMap&lt;String, Deferred&lt;User&gt;&gt;()
+
+suspend fun getUser(id: String): User = coroutineScope {
+    val (deferred, isOwner) = mutex.withLock {
+        inFlight[id]?.let { it to false } ?: async {
+            try { api.fetchUser(id) } finally {
+                mutex.withLock { inFlight.remove(id) }
+            }
+        }.let { inFlight[id] = it; it to true }
+    }
+    deferred.await()
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: Room <code>withTransaction</code> &amp; Dispatcher/Mutex Deadlock Avoidance</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Dispatcher Hop / Lock Inversion</span></div>
+<pre>suspend fun syncOrder(order: Order) {
+    // Trap A: External mutex acquired BEFORE transaction,
+    // while another path calls withTransaction then mutex -> AB-BA deadlock!
+    syncMutex.withLock {
+        db.withTransaction {
+            // Trap B: Hopping out of transaction context or calling
+            // runBlocking { dao.insert(...) } deadlocks the 1 write slot!
+            withContext(Dispatchers.IO) { blockingLegacyWrite(order) }
+        }
+    }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Network Outside, Pure Suspend Inside</span></div>
+<pre>suspend fun syncOrder(orderId: String) {
+    // 1. Perform network I/O outside SQLite locks
+    val remote = api.fetchOrder(orderId)
+
+    // 2. Keep transaction short, single-context, no external Mutex inversion
+    db.withTransaction {
+        orderDao.upsert(remote.toEntity())
+        auditDao.recordSync(orderId, clock.now())
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: Exponential Backoff with Full Jitter + <code>Idempotency-Key</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Lockstep Retries &amp; Duplicate Charges</span></div>
+<pre>suspend fun submitPayment(req: PaymentReq): Receipt {
+    repeat(3) { attempt -&gt;
+        try {
+            // Missing Idempotency-Key -> timeout retry double-charges!
+            return api.charge(req)
+        } catch (e: Exception) { // Even retries 400 Bad Request!
+            delay(200L * (1L shl attempt)) // Deterministic spike!
+        }
+    }
+    return api.charge(req)
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Full Jitter + One Key Per Operation</span></div>
+<pre>suspend fun submitPayment(req: PaymentReq): Receipt {
+    val idempotencyKey = UUID.randomUUID().toString()
+    var attempt = 0
+    while (true) {
+        try {
+            return api.charge(idempotencyKey, req)
+        } catch (e: HttpException) {
+            if (e.code() in 400..499 &amp;&amp; e.code() != 429) throw e
+            if (attempt &gt;= 3) throw e
+            val cap = minOf(4_000L, 200L * (1L shl attempt++))
+            delay(Random.nextLong(0L, cap + 1L)) // Full Jitter
+        }
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Write code below and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>). Starter code intentionally exposes a production bug you must fix.</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 15.1 · SINGLE-FLIGHT DEDUPLICATION</span>
+            <h3 style="margin:8px 0 4px;"><code>SingleFlightCache</code> — Coalesce Concurrent Requests</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>singleFlight(key, fetchFn)</code> on <code>SingleFlightCache</code> so concurrent callers for the same <code>key</code> trigger <code>fetchFn</code> only once and clear the in-flight entry on completion or failure.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • If <code>key</code> already has an in-flight Promise in <code>this.inFlight</code>, return/await that same Promise.<br/>
+          • Otherwise start <code>fetchFn()</code>, store its Promise under <code>key</code> before it settles, and delete <code>key</code> in <code>finally</code> (both on resolve and reject).<br/>
+          • Different keys must execute independently in parallel.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_15_1_single_flight.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 15.2 · FULL JITTER BACKOFF</span>
+            <h3 style="margin:8px 0 4px;"><code>retryWithFullJitter</code> — Implement <code>retryWithBackoff(fn, opts)</code></h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>retryWithBackoff(fn, opts)</code> using Full Jitter and skipping retries on non-retryable errors.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          Options: <code>{ maxRetries = 3, baseMs = 100, maxMs = 2000, rng = Math.random, sleep = defaultSleep }</code>.<br/>
+          • Call <code>await fn(attempt)</code> starting at <code>attempt = 0</code>.<br/>
+          • If <code>err &amp;&amp; err.retryable === false</code> or <code>attempt &gt;= maxRetries</code>, rethrow <code>err</code> immediately (no trailing sleep).<br/>
+          • Otherwise sleep <code>rng() * Math.min(maxMs, baseMs * (2 ** attempt))</code> before the next attempt.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_15_2_retry_full_jitter.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 15.3 · SQLITE WAL COORDINATOR</span>
+            <h3 style="margin:8px 0 4px;"><code>WalDbCoordinator</code> — Concurrent Readers, Exclusive Writer, Fair Wakeup</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>read(fn)</code> and <code>write(fn)</code> on <code>WalDbCoordinator</code> allowing N concurrent readers simultaneously while giving writers exclusive access without starving readers.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>await coord.read(fn)</code>: multiple readers run concurrently when no writer is active or waiting.<br/>
+          • <code>await coord.write(fn)</code>: waits until <code>activeReaders === 0 &amp;&amp; !activeWriter</code>, then runs exclusively.<br/>
+          • Anti-starvation: when a writer finishes, wake all waiting readers before admitting the next waiting writer; always release in <code>finally</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_15_3_wal_coordinator.js</span><span>Fair Readers-Writers Coordinator</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in length so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Sources:</strong>
+          Read <a href="https://developer.android.com/training/data-storage/room" target="_blank" rel="noopener">Android Developers: Room Database &amp; WAL Mode</a>,
+          review <a href="https://www.sqlite.org/wal.html" target="_blank" rel="noopener">SQLite Write-Ahead Logging</a> and
+          <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">AWS Exponential Backoff and Jitter</a>,
+          and keep <a href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a> open while building repositories.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"Why can a long read cursor bloat the SQLite -wal file?"</em> or <em>"Walk me through why Full Jitter beats Equal Jitter under high concurrency"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0014-android-frame-budgets-compose-mvi.html">← Lesson 14</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0016-workmanager-foreground-process-death.html">Lesson 16 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_MODES = {
+      wal: {
+        labels: [
+          ['Reader 1 (UI Feed)', 'Snapshot t=1'],
+          ['Reader 2 (Badge Count)', 'Snapshot t=1'],
+          ['Writer A (Sync Worker)', 'Appends to -wal'],
+          ['Writer B (Mark Read)', 'Single-Writer Queue']
+        ],
+        regNames: ['Active Readers', 'Writer Lock', 'WAL State'],
+        steps: [
+          { l0: { cls: 'ta', txt: 'R1: SNAP' }, reg0: '1', reg1: 'FREE', reg2: '0 frames', type: 'good', msg: 'Reader 1 starts SELECT using -shm snapshot mark (1 reader active).' },
+          { l1: { cls: 'ta', txt: 'R2: SNAP' }, l2: { cls: 'tb', txt: 'WA: LOCK' }, reg0: '2', reg1: 'WA HELD', reg2: '1 frame', type: 'good', msg: 'Reader 2 reads concurrently while Writer A acquires the single WAL write lock!' },
+          { l0: { cls: 'ta', txt: 'R1: READ' }, l1: { cls: 'ta', txt: 'R2: READ' }, l2: { cls: 'tb', txt: 'WA: -WAL' }, l3: { cls: 'sw', txt: 'WB: WAIT' }, reg0: '2', reg1: 'WA HELD', reg2: '2 frames', type: 'warn', msg: 'R1 & R2 continue unblocked; Writer A appends to -wal; Writer B waits in single-writer queue.' },
+          { l0: { cls: 'idle', txt: 'R1: DONE' }, l1: { cls: 'idle', txt: 'R2: DONE' }, l2: { cls: 'tb', txt: 'WA: COMMIT' }, l3: { cls: 'sw', txt: 'WB: WAIT' }, reg0: '0', reg1: 'WA -> WB', reg2: 'COMMIT 1', type: 'good', msg: 'Readers finish; Writer A commits to -wal and hands write lock to Writer B.' },
+          { l3: { cls: 'tb', txt: 'WB: -WAL' }, reg0: '0', reg1: 'WB HELD', reg2: '3 frames', type: '', msg: 'Writer B appends its commit to -wal without touching main DB.' },
+          { l3: { cls: 'io', txt: 'CHKPT OK' }, reg0: '0', reg1: 'FREE', reg2: 'CHECKPOINT', type: 'good', msg: 'No active old readers remain -> checkpoint merges -wal frames cleanly into main DB.' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>WAL Advantage:</strong> Readers never stalled on Writer A, and writers still stayed strictly serialized (1 writer at a time).' }
+      },
+      rollback: {
+        labels: [
+          ['Reader 1 (UI Feed)', 'SHARED Lock'],
+          ['Reader 2 (Badge Count)', 'SHARED Lock'],
+          ['Writer A (Sync Worker)', 'EXCLUSIVE Lock'],
+          ['Writer B (Mark Read)', 'EXCLUSIVE Lock']
+        ],
+        regNames: ['Active Readers', 'DB File Lock', 'Contention Errors'],
+        steps: [
+          { l0: { cls: 'ta', txt: 'R1: SHARED' }, reg0: '1', reg1: 'SHARED', reg2: '0', type: '', msg: 'Reader 1 acquires SHARED lock on main database file.' },
+          { l2: { cls: 'sw', txt: 'WA: STALL' }, reg0: '1', reg1: 'SHARED', reg2: '1 wait', type: 'warn', msg: 'Writer A needs EXCLUSIVE lock to mutate main DB—stalls behind Reader 1.' },
+          { l0: { cls: 'idle', txt: 'R1: DONE' }, l2: { cls: 'tb', txt: 'WA: EXCL' }, reg0: '0', reg1: 'EXCLUSIVE', reg2: '1 wait', type: 'warn', msg: 'Reader 1 releases SHARED; Writer A grabs EXCLUSIVE lock and writes rollback journal.' },
+          { l1: { cls: 'bad', txt: 'R2: BLOCKED' }, l2: { cls: 'tb', txt: 'WA: WRITE' }, l3: { cls: 'bad', txt: 'WB: BUSY' }, reg0: '0', reg1: 'EXCLUSIVE', reg2: '2 blocked', type: 'bad', msg: 'UI Reader 2 stalls (jank!) and Writer B hits SQLITE_BUSY because main DB is locked!' },
+          { l2: { cls: 'tb', txt: 'WA: FSYNC' }, l1: { cls: 'bad', txt: 'R2: WAIT' }, reg0: '0', reg1: 'EXCLUSIVE', reg2: '2 blocked', type: 'warn', msg: 'Writer A must fsync and delete rollback journal before readers can resume.' },
+          { l1: { cls: 'ta', txt: 'R2: RESUME' }, l2: { cls: 'idle', txt: 'WA: DONE' }, reg0: '1', reg1: 'SHARED', reg2: '2 stalls', type: 'warn', msg: 'Writer A releases EXCLUSIVE; Reader 2 finally reads after full write latency.' }
+        ],
+        finalVerdict: { cls: 'callout danger', html: '<strong>Rollback Journal Bottleneck:</strong> Readers and writers block each other on the main DB file, causing UI jank and <code>SQLITE_BUSY</code>.' }
+      },
+      herd: {
+        labels: [
+          ['Client 1', 'base=100ms, cap=800ms'],
+          ['Client 2', 'base=100ms, cap=800ms'],
+          ['Client 3', 'base=100ms, cap=800ms'],
+          ['Server Load', 'Max Capacity = 2']
+        ],
+        regNames: ['Retry Wave', 'Backoff Delay', 'Peak Server Hits'],
+        steps: [
+          { l0: { cls: 'bad', txt: 'FAIL t=0' }, l1: { cls: 'bad', txt: 'FAIL t=0' }, l2: { cls: 'bad', txt: 'FAIL t=0' }, l3: { cls: 'bad', txt: 'SPIKE: 3' }, reg0: 't = 0ms', reg1: '100ms fixed', reg2: '3 / 2 (OVER)', type: 'bad', msg: 't=0ms: Outage drops all 3 clients. All compute exact same backoff: 100 * 2^0 = 100ms.' },
+          { l0: { cls: 'sw', txt: 'WAIT 100' }, l1: { cls: 'sw', txt: 'WAIT 100' }, l2: { cls: 'sw', txt: 'WAIT 100' }, l3: { cls: 'idle', txt: 'IDLE' }, reg0: 't = 50ms', reg1: '100ms fixed', reg2: '0 / 2', type: '', msg: 'All 3 clients sit idle until exact same millisecond t=100ms.' },
+          { l0: { cls: 'bad', txt: 'HIT t=100' }, l1: { cls: 'bad', txt: 'HIT t=100' }, l2: { cls: 'bad', txt: 'HIT t=100' }, l3: { cls: 'bad', txt: 'SPIKE: 3!' }, reg0: 't = 100ms', reg1: '200ms fixed', reg2: '3 / 2 (OVER)', type: 'bad', msg: 't=100ms: THUNDERING HERD! All 3 collide again -> server overloaded -> all schedule 200ms!' },
+          { l0: { cls: 'sw', txt: 'WAIT 200' }, l1: { cls: 'sw', txt: 'WAIT 200' }, l2: { cls: 'sw', txt: 'WAIT 200' }, l3: { cls: 'idle', txt: 'IDLE' }, reg0: 't = 200ms', reg1: '200ms fixed', reg2: '0 / 2', type: '', msg: 'Server sits idle for 200ms, then braces for another synchronized collision.' },
+          { l0: { cls: 'bad', txt: 'HIT t=300' }, l1: { cls: 'bad', txt: 'HIT t=300' }, l2: { cls: 'bad', txt: 'HIT t=300' }, l3: { cls: 'bad', txt: 'SPIKE: 3!' }, reg0: 't = 300ms', reg1: '400ms fixed', reg2: '3 / 2 (OVER)', type: 'bad', msg: 't=300ms: Synchronized wave #2 knocks the recovering server back over!' }
+        ],
+        finalVerdict: { cls: 'callout danger', html: '<strong>Thundering Herd Reproduced:</strong> Deterministic exponential backoff shifts collisions in lockstep instead of spreading load.' }
+      },
+      jitter: {
+        labels: [
+          ['Client 1', 'Full Jitter rng()'],
+          ['Client 2', 'Full Jitter rng()'],
+          ['Client 3', 'Full Jitter rng()'],
+          ['Server Load', 'Max Capacity = 2']
+        ],
+        regNames: ['Window / Tick', 'Jitter Delays (ms)', 'Peak Server Hits'],
+        steps: [] // dynamically built using jitterSeed!
+      }
+    };
+
+    let jitterSamples = [24, 61, 92];
+    function buildJitterSteps() {
+      const sorted = [
+        { client: 0, delay: jitterSamples[0] },
+        { client: 1, delay: jitterSamples[1] },
+        { client: 2, delay: jitterSamples[2] }
+      ].sort((a, b) => a.delay - b.delay);
+
+      const delayLabel = `${jitterSamples[0]}, ${jitterSamples[1]}, ${jitterSamples[2]}`;
+      const steps = [
+        { l0: { cls: 'bad', txt: 'FAIL t=0' }, l1: { cls: 'bad', txt: 'FAIL t=0' }, l2: { cls: 'bad', txt: 'FAIL t=0' }, l3: { cls: 'bad', txt: 'INIT 3' }, reg0: 't = 0ms', reg1: delayLabel, reg2: '3 -> spread', type: 'warn', msg: `t=0ms: All 3 fail, but Full Jitter draws independent delays in [0, 100ms]: ${delayLabel}ms.` }
+      ];
+      sorted.forEach((entry, idx) => {
+        const s = {
+          reg0: `t = ${entry.delay}ms`,
+          reg1: delayLabel,
+          reg2: `1 / 2 (OK)`,
+          type: 'good',
+          msg: `t=${entry.delay}ms: Client ${entry.client + 1} retries alone -> server load 1/2 -> HTTP 200 OK!`
+        };
+        s[`l${entry.client}`] = { cls: 'io', txt: `OK ${entry.delay}ms` };
+        s.l3 = { cls: 'io', txt: `LOAD 1/2` };
+        steps.push(s);
+      });
+      steps.push({
+        l3: { cls: 'io', txt: 'HEALTHY' },
+        reg0: 'DONE',
+        reg1: delayLabel,
+        reg2: 'Peak 1 / 2',
+        type: 'good',
+        msg: 'All 3 clients recovered within 100ms without ever exceeding server capacity!'
+      });
+      SIM_MODES.jitter.steps = steps;
+      SIM_MODES.jitter.finalVerdict = {
+        cls: 'callout tip',
+        html: `<strong>Full Jitter Spread (${delayLabel}ms):</strong> Peak retry concurrency stayed <code>1 / 2</code> instead of colliding in lockstep.`
+      };
+    }
+    buildJitterSteps();
+
+    let currentSimMode = 'wal';
+    let simStepIdx = 0;
+    let simTimer = null;
+
+    function resetSim() {
+      if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+      simStepIdx = 0;
+      const sc = SIM_MODES[currentSimMode];
+      for (let i = 0; i < 4; i++) {
+        document.getElementById(`lane-${i}`).innerHTML = '';
+        document.getElementById(`lbl-lane${i}`).textContent = sc.labels[i][0];
+        if (i > 0) document.getElementById(`sub-lane${i}`).textContent = sc.labels[i][1];
+      }
+      document.getElementById('reg0-name').textContent = sc.regNames[0];
+      document.getElementById('reg1-name').textContent = sc.regNames[1];
+      document.getElementById('reg2-name').textContent = sc.regNames[2];
+      document.getElementById('reg0-val').textContent = '—';
+      document.getElementById('reg1-val').textContent = '—';
+      document.getElementById('reg2-val').textContent = '—';
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${sc.steps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step →, ▶ Play, or ⚡ Action.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through this timeline to compare lock contention and retry distribution.';
+    }
+
+    function stepSim() {
+      const sc = SIM_MODES[currentSimMode];
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      for (let i = 0; i < 4; i++) {
+        const slot = s[`l${i}`];
+        if (slot) {
+          const d = document.createElement('div');
+          d.className = `slot ${slot.cls}`;
+          d.textContent = slot.txt;
+          document.getElementById(`lane-${i}`).appendChild(d);
+        }
+      }
+      document.getElementById('reg0-val').textContent = s.reg0;
+      document.getElementById('reg1-val').textContent = s.reg1;
+      document.getElementById('reg2-val').textContent = s.reg2;
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${sc.steps.length}`;
+
+      const logEl = document.getElementById('sim-log');
+      if (simStepIdx === 1) logEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.className = `trace-line ${s.type}`;
+      line.textContent = `[${simStepIdx}] ${s.msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+      }
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+
+    document.getElementById('sim-action').addEventListener('click', () => {
+      if (currentSimMode === 'jitter') {
+        const a = Math.floor(8 + Math.random() * 25);
+        const b = Math.floor(38 + Math.random() * 25);
+        const c = Math.floor(68 + Math.random() * 28);
+        jitterSamples = [a, b, c];
+        buildJitterSteps();
+        resetSim();
+        while (simStepIdx < SIM_MODES[currentSimMode].steps.length) stepSim();
+      } else {
+        resetSim();
+        while (simStepIdx < SIM_MODES[currentSimMode].steps.length) stepSim();
+      }
+    });
+
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) { clearInterval(simTimer); simTimer = null; btn.textContent = '▶ Play'; }
+      else {
+        if (simStepIdx >= SIM_MODES[currentSimMode].steps.length) resetSim();
+        btn.textContent = '⏸ Pause';
+        simTimer = setInterval(stepSim, 750);
+      }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'SingleFlightCache',
+        starter: `class SingleFlightCache {\n  constructor() {\n    this.inFlight = new Map();\n  }\n\n  async singleFlight(key, fetchFn) {\n    // BUG: Fires a duplicate fetchFn() for every concurrent caller!\n    return await fetchFn();\n  }\n}`,
+        hints: [
+          'Check `if (this.inFlight.has(key))` first and return `await this.inFlight.get(key)`.',
+          'Start `const promise = Promise.resolve().then(() => fetchFn());` and store `this.inFlight.set(key, promise)` before awaiting.',
+          'Wrap `return await promise;` in `try { ... } finally { if (this.inFlight.get(key) === promise) this.inFlight.delete(key); }` so errors also clear the key.'
+        ],
+        solution: `class SingleFlightCache {\n  constructor() {\n    this.inFlight = new Map();\n  }\n\n  async singleFlight(key, fetchFn) {\n    if (this.inFlight.has(key)) {\n      return await this.inFlight.get(key);\n    }\n    const promise = Promise.resolve().then(() => fetchFn());\n    this.inFlight.set(key, promise);\n    try {\n      return await promise;\n    } finally {\n      if (this.inFlight.get(key) === promise) {\n        this.inFlight.delete(key);\n      }\n    }\n  }\n}`,
+        kotlinEquivalent: `class SingleFlightCache<K, V> {\n    private val mutex = Mutex()\n    private val inFlight = HashMap<K, Deferred<V>>()\n\n    suspend fun singleFlight(key: K, fetch: suspend () -> V): V = coroutineScope {\n        val deferred = mutex.withLock {\n            inFlight[key] ?: async {\n                try { fetch() } finally { mutex.withLock { inFlight.remove(key) } }\n            }.also { inFlight[key] = it }\n        }\n        deferred.await()\n    }\n}`,
+        tests: async (Cls) => runTestCases([
+          {
+            name: 'Coalesces 5 concurrent callers on same key into 1 fetchFn execution',
+            run: async () => {
+              const sf = new Cls();
+              let calls = 0;
+              const results = await Promise.all(
+                Array.from({ length: 5 }, () => sf.singleFlight('user:42', async () => {
+                  calls++;
+                  await new Promise((r) => setTimeout(r, 20));
+                  return { id: 42, calls };
+                }))
+              );
+              assertEq(calls, 1, `Expected 1 fetchFn call, got ${calls}`);
+              for (const res of results) assertDeepEq(res, { id: 42, calls: 1 });
+            }
+          },
+          {
+            name: 'Independent keys run concurrently without blocking each other',
+            run: async () => {
+              const sf = new Cls();
+              let active = 0, maxActive = 0;
+              const runKey = (k) => sf.singleFlight(k, async () => {
+                active++; maxActive = Math.max(maxActive, active);
+                await new Promise((r) => setTimeout(r, 20));
+                active--;
+                return k.toUpperCase();
+              });
+              const [a, b] = await Promise.all([runKey('k1'), runKey('k2')]);
+              assertEq(a, 'K1');
+              assertEq(b, 'K2');
+              assertEq(maxActive, 2, `Expected 2 keys in flight concurrently, saw ${maxActive}`);
+            }
+          },
+          {
+            name: 'Clears in-flight entry after completion so subsequent calls re-fetch',
+            run: async () => {
+              const sf = new Cls();
+              let seq = 0;
+              const v1 = await sf.singleFlight('feed', async () => ++seq);
+              const v2 = await sf.singleFlight('feed', async () => ++seq);
+              assertEq(v1, 1);
+              assertEq(v2, 2, 'Stale resolved value was cached instead of clearing inFlight!');
+            }
+          },
+          {
+            name: 'Clears in-flight entry on async rejection and synchronous throw',
+            run: async () => {
+              const sf = new Cls();
+              let attempt = 0;
+              const results = await Promise.allSettled([
+                sf.singleFlight('bad', async () => {
+                  attempt++;
+                  await new Promise((r) => setTimeout(r, 10));
+                  throw new Error('HTTP 503');
+                }),
+                sf.singleFlight('bad', async () => { attempt++; return 'unexpected'; })
+              ]);
+              assertEq(attempt, 1, 'Expected concurrent callers to share the failing attempt');
+              assertEq(results[0].status, 'rejected');
+              assertEq(results[1].status, 'rejected');
+
+              const recovered = await sf.singleFlight('bad', async () => 'ok');
+              assertEq(recovered, 'ok', 'Failed entry poisoned future callers!');
+
+              let syncErr = false;
+              try {
+                await sf.singleFlight('sync', () => { throw new Error('Sync boom'); });
+              } catch (e) { syncErr = true; }
+              assertEq(syncErr, true);
+              const syncRecover = await sf.singleFlight('sync', async () => 'recovered');
+              assertEq(syncRecover, 'recovered', 'Sync throw left inFlight entry behind!');
+            }
+          }
+        ])
+      },
+      2: {
+        fnName: 'retryWithBackoff',
+        starter: `async function retryWithBackoff(fn, opts = {}) {\n  const { maxRetries = 3, baseMs = 100, maxMs = 2000, rng = Math.random, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = opts;\n  // BUG: Uses deterministic backoff (thundering herd) and retries non-retryable errors!\n  for (let attempt = 0; attempt <= maxRetries; attempt++) {\n    try {\n      return await fn(attempt);\n    } catch (err) {\n      if (attempt >= maxRetries) throw err;\n      const delayMs = Math.min(maxMs, baseMs * (2 ** attempt));\n      await sleep(delayMs);\n    }\n  }\n}`,
+        hints: [
+          'Check `if (err && err.retryable === false) throw err;` immediately inside `catch`.',
+          'Check `if (attempt >= maxRetries) throw err;` before sleeping so you never sleep after the last failed attempt.',
+          'Compute `const cap = Math.min(maxMs, baseMs * (2 ** attempt));` and `await sleep(rng() * cap);` for Full Jitter.'
+        ],
+        solution: `async function retryWithBackoff(fn, opts = {}) {\n  const {\n    maxRetries = 3,\n    baseMs = 100,\n    maxMs = 2000,\n    rng = Math.random,\n    sleep = (ms) => new Promise((r) => setTimeout(r, ms))\n  } = opts;\n\n  for (let attempt = 0; attempt <= maxRetries; attempt++) {\n    try {\n      return await fn(attempt);\n    } catch (err) {\n      if (err && err.retryable === false) throw err;\n      if (attempt >= maxRetries) throw err;\n      const cap = Math.min(maxMs, baseMs * (2 ** attempt));\n      const delayMs = rng() * cap;\n      await sleep(delayMs);\n    }\n  }\n}`,
+        kotlinEquivalent: `suspend fun <T> retryWithFullJitter(\n    maxRetries: Int = 3,\n    baseMs: Long = 100L,\n    maxMs: Long = 2_000L,\n    block: suspend (Int) -> T\n): T {\n    for (attempt in 0..maxRetries) {\n        try {\n            return block(attempt)\n        } catch (e: HttpException) {\n            if (e.code() in 400..499 && e.code() != 429) throw e\n            if (attempt >= maxRetries) throw e\n            val cap = minOf(maxMs, baseMs * (1L shl attempt))\n            delay(Random.nextLong(0L, cap + 1L))\n        }\n    }\n    error("Unreachable")\n}`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Returns immediately on first success with zero sleeps',
+            run: async () => {
+              const sleeps = [];
+              const res = await fn(async () => 'ok', { sleep: async (ms) => sleeps.push(ms) });
+              assertEq(res, 'ok');
+              assertDeepEq(sleeps, []);
+            }
+          },
+          {
+            name: 'Applies Full Jitter rng() * Math.min(maxMs, baseMs * 2**attempt) and respects maxMs cap',
+            run: async () => {
+              const sleeps = [];
+              const rngSeq = [0.5, 0.25, 0.75];
+              let i = 0;
+              const res = await fn(
+                async (attempt) => {
+                  if (attempt < 3) throw new Error('503 Unavailable');
+                  return 'recovered';
+                },
+                {
+                  maxRetries: 3,
+                  baseMs: 100,
+                  maxMs: 300,
+                  rng: () => rngSeq[i++],
+                  sleep: async (ms) => sleeps.push(ms)
+                }
+              );
+              assertEq(res, 'recovered');
+              // attempt 0: 0.5 * min(300, 100) = 50
+              // attempt 1: 0.25 * min(300, 200) = 50
+              // attempt 2: 0.75 * min(300, 400) = 225
+              assertDeepEq(sleeps, [50, 50, 225]);
+            }
+          },
+          {
+            name: 'Rethrows last error after maxRetries without trailing sleep',
+            run: async () => {
+              const sleeps = [];
+              let calls = 0, threw = false;
+              try {
+                await fn(
+                  async () => { calls++; throw new Error('Timeout'); },
+                  { maxRetries: 2, baseMs: 50, maxMs: 500, rng: () => 0.4, sleep: async (ms) => sleeps.push(ms) }
+                );
+              } catch (e) { threw = e.message === 'Timeout'; }
+              assertEq(threw, true);
+              assertEq(calls, 3, 'Expected initial attempt + 2 retries = 3 calls');
+              assertDeepEq(sleeps, [20, 40]);
+            }
+          },
+          {
+            name: 'Skips retries immediately when err.retryable === false',
+            run: async () => {
+              const sleeps = [];
+              let calls = 0, caught = null;
+              try {
+                await fn(
+                  async () => {
+                    calls++;
+                    const err = new Error('HTTP 400 Bad Request');
+                    err.retryable = false;
+                    throw err;
+                  },
+                  { maxRetries: 3, sleep: async (ms) => sleeps.push(ms) }
+                );
+              } catch (e) { caught = e; }
+              assertEq(calls, 1, 'Non-retryable error must not be retried');
+              assertDeepEq(sleeps, []);
+              assertEq(caught && caught.retryable, false);
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'WalDbCoordinator',
+        starter: `class WalDbCoordinator {\n  constructor() {\n    this.activeReaders = 0;\n    this.activeWriter = false;\n    this.waitingReaders = [];\n    this.waitingWriters = [];\n  }\n\n  async read(fn) {\n    // BUG: Does not wait for active writers or coordinate fairness\n    return await fn();\n  }\n\n  async write(fn) {\n    // BUG: Does not enforce exclusive write access\n    return await fn();\n  }\n}`,
+        hints: [
+          'In `read(fn)`, enter immediately only if `!this.activeWriter && this.waitingWriters.length === 0`; otherwise push a Promise resolver to `this.waitingReaders`.',
+          'In `write(fn)`, enter immediately only if `!this.activeWriter && this.activeReaders === 0`; otherwise push a Promise resolver to `this.waitingWriters`.',
+          'In `finally`: `_releaseRead()` wakes the next waiting writer when `activeReaders === 0`; `_releaseWrite()` wakes ALL `waitingReaders` as a batch first (preventing reader starvation!) before checking `waitingWriters`.'
+        ],
+        solution: `class WalDbCoordinator {\n  constructor() {\n    this.activeReaders = 0;\n    this.activeWriter = false;\n    this.waitingReaders = [];\n    this.waitingWriters = [];\n  }\n\n  async _acquireRead() {\n    if (!this.activeWriter && this.waitingWriters.length === 0) {\n      this.activeReaders++;\n      return;\n    }\n    await new Promise((resolve) => this.waitingReaders.push(resolve));\n  }\n\n  _releaseRead() {\n    this.activeReaders--;\n    if (this.activeReaders === 0 && this.waitingWriters.length > 0) {\n      this.activeWriter = true;\n      const nextWriter = this.waitingWriters.shift();\n      nextWriter();\n    }\n  }\n\n  async _acquireWrite() {\n    if (!this.activeWriter && this.activeReaders === 0) {\n      this.activeWriter = true;\n      return;\n    }\n    await new Promise((resolve) => this.waitingWriters.push(resolve));\n  }\n\n  _releaseWrite() {\n    this.activeWriter = false;\n    if (this.waitingReaders.length > 0) {\n      const batch = this.waitingReaders.splice(0, this.waitingReaders.length);\n      this.activeReaders += batch.length;\n      for (const resolve of batch) resolve();\n    } else if (this.waitingWriters.length > 0) {\n      this.activeWriter = true;\n      const nextWriter = this.waitingWriters.shift();\n      nextWriter();\n    }\n  }\n\n  async read(fn) {\n    await this._acquireRead();\n    try {\n      return await fn();\n    } finally {\n      this._releaseRead();\n    }\n  }\n\n  async write(fn) {\n    await this._acquireWrite();\n    try {\n      return await fn();\n    } finally {\n      this._releaseWrite();\n    }\n  }\n}`,
+        kotlinEquivalent: `// Room uses a dedicated transaction thread + read connection pool in WAL mode;\n// in-process RW coordination uses a fair Readers-Writers lock:\nclass WalCoordinator {\n    private val sem = Semaphore(MAX_READERS)\n    suspend fun <T> read(block: suspend () -> T): T = sem.withPermit { block() }\n    suspend fun <T> write(block: suspend () -> T): T {\n        repeat(MAX_READERS) { sem.acquire() }\n        try { return block() } finally { repeat(MAX_READERS) { sem.release() } }\n    }\n}`,
+        tests: async (Cls) => runTestCases([
+          {
+            name: 'Allows N=4 concurrent readers simultaneously',
+            run: async () => {
+              const coord = new Cls();
+              let cur = 0, maxSeen = 0;
+              const res = await Promise.all([1, 2, 3, 4].map((n) => coord.read(async () => {
+                cur++; maxSeen = Math.max(maxSeen, cur);
+                await new Promise((r) => setTimeout(r, 20));
+                cur--;
+                return n * 10;
+              })));
+              assertDeepEq(res, [10, 20, 30, 40]);
+              assertEq(maxSeen, 4, `Expected 4 concurrent readers, saw ${maxSeen}`);
+            }
+          },
+          {
+            name: 'Enforces exclusive write access (no overlap with readers or other writers)',
+            run: async () => {
+              const coord = new Cls();
+              let activeR = 0, activeW = 0, violations = 0, balance = 0;
+              const tasks = [];
+              for (let i = 0; i < 4; i++) {
+                tasks.push(coord.read(async () => {
+                  activeR++;
+                  if (activeW > 0) violations++;
+                  await new Promise((r) => setTimeout(r, 10));
+                  activeR--;
+                  return balance;
+                }));
+                tasks.push(coord.write(async () => {
+                  activeW++;
+                  if (activeW > 1 || activeR > 0) violations++;
+                  const prev = balance;
+                  await new Promise((r) => setTimeout(r, 10));
+                  balance = prev + 1;
+                  activeW--;
+                }));
+              }
+              await Promise.all(tasks);
+              assertEq(violations, 0, `Detected ${violations} mutual-exclusion violations!`);
+              assertEq(balance, 4);
+            }
+          },
+          {
+            name: 'Does not starve queued readers behind a backlog of writers',
+            run: async () => {
+              const coord = new Cls();
+              const order = [];
+              const pW1 = coord.write(async () => {
+                order.push('W1');
+                await new Promise((r) => setTimeout(r, 15));
+              });
+              const pR1 = coord.read(async () => { order.push('R1'); });
+              const pR2 = coord.read(async () => { order.push('R2'); });
+              const pW2 = coord.write(async () => {
+                order.push('W2');
+                await new Promise((r) => setTimeout(r, 15));
+              });
+              await Promise.all([pW1, pR1, pR2, pW2]);
+              assertEq(order[0], 'W1');
+              assertEq(order.indexOf('R1') < order.indexOf('W2'), true, `Readers starved behind W2: ${order.join(',')}`);
+              assertEq(order.indexOf('R2') < order.indexOf('W2'), true, `Readers starved behind W2: ${order.join(',')}`);
+            }
+          },
+          {
+            name: 'Exception safety: releases read and write locks if callback throws',
+            run: async () => {
+              const coord = new Cls();
+              let threwW = false, threwR = false;
+              try { await coord.write(async () => { throw new Error('Write abort'); }); } catch (e) { threwW = true; }
+              try { await coord.read(async () => { throw new Error('Read abort'); }); } catch (e) { threwR = true; }
+              assertEq(threwW && threwR, true);
+              const ok = await coord.write(async () => 'clean');
+              assertEq(ok, 'clean');
+            }
+          }
+        ])
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. In Room with SQLite WAL mode enabled, 3 coroutines execute SELECT queries while 1 coroutine runs an INSERT. What happens?',
+        code: `// Room default WAL mode\nlaunch { userDao.observeFeed() }     // Reader 1\nlaunch { userDao.countUnread() }     // Reader 2\nlaunch { userDao.loadProfile() }     // Reader 3\nlaunch { userDao.insertItems(list) } // Writer 1`,
+        options: [
+          'All three readers stall immediately until the single writer finishes flushing pages to disk.',
+          'All three readers run concurrently with the single writer using consistent WAL snapshot marks.',
+          'SQLite throws SQLITE_BUSY immediately whenever a reader starts during an active write.',
+          'Room allocates four independent write connections so every coroutine modifies pages simultaneously.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): That describes legacy rollback journal mode, where writers hold an EXCLUSIVE lock on the main DB file.',
+          'CORRECT (B): WAL appends writes to -wal while readers view a consistent snapshot via -shm, allowing concurrent reads alongside 1 writer.',
+          'WRONG (C): WAL allows concurrent readers and 1 writer; SQLITE_BUSY occurs when competing writers exceed busy_timeout.',
+          'WRONG (D): SQLite fundamentally enforces a single-writer lock per database regardless of read connection pool size.'
+        ]
+      },
+      {
+        stem: '2. Why can switching dispatchers or calling runBlocking inside Room withTransaction deadlock your database?',
+        code: `database.withTransaction {\n    val items = fetchLocally()\n    runBlocking(Dispatchers.IO) { itemDao.upsertAll(items) }\n}`,
+        options: [
+          'The outer transaction holds the write slot while the inner query awaits it.',
+          'Room rejects every suspend DAO function whenever a coroutine executes on Dispatchers.IO.',
+          'SQLite WAL disables all read snapshots permanently inside nested Kotlin coroutine scopes.',
+          'Kotlin automatically promotes runBlocking blocks to the Main UI thread causing strict ANRs.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): withTransaction occupies Room’s single write connection/transaction thread; an unattached runBlocking query tries to acquire that same occupied slot and deadlocks.',
+          'WRONG (B): Suspend DAO methods run on Room’s query/transaction executors and work normally from Dispatchers.IO outside mismatched transaction contexts.',
+          'WRONG (C): Read snapshots remain available in WAL mode regardless of coroutine nesting.',
+          'WRONG (D): runBlocking blocks whichever thread calls it (here Dispatchers.IO), rather than migrating onto the Main UI thread.'
+        ]
+      },
+      {
+        stem: '3. What production failure occurs if a SingleFlightCache forgets to remove keys inside a finally block when a request fails?',
+        code: `val job = inFlight.getOrPut(key) {\n    async { api.fetchUser(key) }\n}\nreturn job.await() // Key removed only after await() succeeds`,
+        options: [
+          'Future callers for that key continue awaiting the same failed Deferred permanently.',
+          'The Kotlin compiler rejects async blocks that omit an explicit try-finally handler.',
+          'Every subsequent request for different keys blocks until the crashed Deferred restarts.',
+          'Concurrent callers receive stale cached values from the previous successful response.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Once a Deferred fails, it stays in the failed state forever; leaving it in the map causes all later callers for that key to fail immediately without retrying the network.',
+          'WRONG (B): The Kotlin compiler does not require try-finally around async blocks; this is a runtime state-cleanup bug.',
+          'WRONG (C): Keys are isolated entries in the map, so an orphaned entry under key A does not block key B.',
+          'WRONG (D): A failed Deferred holds an exception rather than a previous successful result.'
+        ]
+      },
+      {
+        stem: '4. Why does Exponential Backoff with Full Jitter outperform deterministic exponential backoff during a backend recovery?',
+        code: `// Deterministic: delay(baseMs * 2^attempt)\n// Full Jitter:   delay(rng(0, min(maxMs, baseMs * 2^attempt)))`,
+        options: [
+          'Full Jitter shrinks the worst-case maximum retry delay down to zero milliseconds.',
+          'Full Jitter spreads client retries across the window instead of colliding in waves.',
+          'Deterministic backoff forces clients to retry synchronously on the Main Android UI thread.',
+          'Full Jitter lets the HTTP client skip TCP handshakes during temporary server outages.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): The upper bound of Full Jitter is still min(maxMs, baseMs * 2^attempt); only individual random draws can be near zero.',
+          'CORRECT (B): Clients that failed together at t=0 would otherwise collide at t=100ms, 200ms, 400ms; randomizing over [0, cap] flattens peak server load.',
+          'WRONG (C): Delay scheduling uses coroutine dispatchers and never forces execution onto the Main UI thread.',
+          'WRONG (D): Jitter only adjusts sleep timing between attempts; transport-layer TCP/TLS behavior is unchanged.'
+        ]
+      },
+      {
+        stem: '5. Why must a client generate an Idempotency-Key once before the retry loop rather than generating a fresh UUID per attempt?',
+        code: `suspend fun createOrder(req: OrderReq): Receipt {\n    val key = UUID.randomUUID().toString() // Must be outside loop\n    return retryWithBackoff { api.postOrder(key, req) }\n}`,
+        options: [
+          'HTTP clients reject requests whose Idempotency-Key header changes between consecutive TCP packets.',
+          'Reusing one key lets the server recognize retries and prevent duplicate mutations.',
+          'Generating a UUID inside a suspend loop leaks native thread-local memory buffers.',
+          'SQLite WAL requires matching HTTP UUID headers before committing local Room rows.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): HTTP clients do not inspect or reject changing Idempotency-Key headers across separate HTTP requests.',
+          'CORRECT (B): If the server processed attempt 1 but the response dropped on the network, retrying with the same Idempotency-Key returns the stored result instead of creating a second order.',
+          'WRONG (C): UUID.randomUUID() allocates a small object and does not leak native thread-local memory.',
+          'WRONG (D): SQLite WAL has no knowledge of HTTP headers or idempotency tokens.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_15',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

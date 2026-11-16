@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 08: Physical Allocators, SLUB, Scudo &amp; ARMv9 Memory Tagging — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <style>
+    .buddy-track {
+      display: grid;
+      grid-template-columns: repeat(16, 1fr);
+      gap: 4px;
+      margin: 0.75rem 0;
+    }
+    .buddy-cell {
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 0.45rem 0.2rem;
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      background: var(--bg-card);
+      color: var(--text-muted);
+      cursor: default;
+      user-select: none;
+    }
+    .buddy-cell.alloc {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .buddy-cell.alloc:hover { filter: brightness(1.15); }
+    .mte-granules {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(115px, 1fr));
+      gap: 0.5rem;
+      margin-top: 0.65rem;
+    }
+    .granule-box {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 0.65rem;
+      background: var(--bg-card);
+      font-family: var(--font-mono);
+      font-size: 0.76rem;
+    }
+    .granule-box.match { border-color: var(--green); background: var(--green-soft); }
+    .granule-box.fault { border-color: var(--red); background: var(--red-soft); }
+    .sim-divider {
+      border-top: 1px dashed var(--border-strong);
+      margin: 1.25rem 0;
+      padding-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 08</span>
+        <span>Physical Allocators, SLUB, Scudo &amp; ARMv9 MTE</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-07.html">&larr; Lesson 07</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C &amp; Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">Code Labs (3)</a>
+        <a href="#quiz">Quiz (6)</a>
+        <a href="lesson-09.html">Lesson 09 &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="badge b-concept">PHASE 3: VIRTUAL MEMORY, ALLOCATORS &amp; RECLAIM</span>
+      <h1>Lesson 08: Physical Allocators, SLUB, Scudo &amp; ARMv9 Memory Tagging</h1>
+      <p>
+        Page tables map 4KB or 16KB pages, but kernels and apps do not allocate 4KB every time they need a 64-byte
+        <code>task_struct</code> or a 24-byte C++ object. Follow memory from raw physical page frames in the
+        <strong>Buddy Allocator</strong>, through Linux <strong>SLUB</strong> object caches, to Android's hardened
+        <strong>Scudo</strong> allocator and hardware-enforced <strong>ARMv9 Memory Tagging Extension (MTE)</strong>.
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button id="markLessonComplete" class="btn btn-green btn-sm" type="button">Mark Lesson 08 Complete</button>
+      </div>
+    </section>
+
+    <!-- MODULE 1: MENTAL MODEL + SIMULATOR -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>From Physical Page Frames to Hardened Object Heaps</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. The Binary Buddy Allocator (Page-Frame Granularity)</h3>
+          <p><strong>Problem:</strong> Physical RAM is managed in 4KB/16KB frames. DMA engines and hugepages need physically contiguous multi-page blocks, while naive free lists suffer severe <strong>external fragmentation</strong>.</p>
+          <p><strong>Power-of-2 Splitting:</strong> Blocks are grouped by order <code>k</code> of size <code>2^k</code> pages (e.g. Order 0 = 1 page, Order 3 = 8 pages). To satisfy Order <code>k</code>, if <code>free[k]</code> is empty, split a block from Order <code>k+1</code> into two buddies.</p>
+          <p><strong>O(1) XOR Coalescing:</strong> Every block at frame index <code>addr</code> of order <code>k</code> has a unique buddy at <code>addr ^ (1 &lt;&lt; k)</code>. When freed, if its buddy is also free at order <code>k</code>, they merge recursively up to <code>MAX_ORDER</code>.</p>
+        </div>
+
+        <div class="card">
+          <h3>2. SLUB (Kernel) &amp; Scudo (Hardened User Heap)</h3>
+          <p><strong>Why Buddy Isn't Enough:</strong> Allocating a whole 4KB page for a 128-byte kernel object wastes 97% of RAM (<strong>internal fragmentation</strong>).</p>
+          <p><strong>Linux SLUB:</strong> Requests multi-page slabs from the buddy allocator and slices each slab into identically sized slots for hot types (<code>inode</code>, <code>dentry</code>, <code>kmalloc-128</code>). Free slots form an O(1) per-CPU lockless freelist stored inside the unallocated slots themselves.</p>
+          <p><strong>Android Scudo:</strong> Replaces <code>jemalloc</code> with security-first design: size-classed primary regions + <code>mmap</code> secondary with guard pages, checksummed chunk headers, quarantine queues, and hardware MTE hooks.</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <strong>ARMv9 MTE (Lock-and-Key Hardware Memory Safety):</strong><br/>
+        ARM64 enables <strong>Top-Byte Ignore (TBI)</strong> so bits <code>[59:56]</code> of a 64-bit virtual pointer store a <strong>4-bit pointer tag</strong> (16 values) without altering address translation. Every 16-byte aligned physical memory granule stores a matching <strong>4-bit allocation tag</strong> in hidden tag RAM. On allocation, <code>IRG</code> picks a random tag and <code>STG</code> paints the granules. On <code>free()</code>, granules are re-tagged. Every load/store checks <code>ptrTag == granuleTag</code> in silicon—catching <strong>Use-After-Free</strong> and <strong>buffer overflows</strong> on the spot!
+      </div>
+
+      <h3 style="margin:1.25rem 0 0.4rem;">Interactive Simulator A: Binary Buddy Allocator (16 Physical Pages, Orders 0..4)</h3>
+      <p style="margin:0; font-size:0.89rem; color:var(--text-muted);">Allocate power-of-2 orders to watch larger blocks split, then click any blue allocated frame to free it and watch recursive XOR buddy coalescing.</p>
+
+      <div class="sim-box">
+        <div class="sim-controls">
+          <button class="btn btn-primary btn-sm" id="buddyAlloc0" type="button">Alloc Order 0 (1p)</button>
+          <button class="btn btn-primary btn-sm" id="buddyAlloc1" type="button">Alloc Order 1 (2p)</button>
+          <button class="btn btn-primary btn-sm" id="buddyAlloc2" type="button">Alloc Order 2 (4p)</button>
+          <button class="btn btn-primary btn-sm" id="buddyAlloc3" type="button">Alloc Order 3 (8p)</button>
+          <button class="btn btn-sm" id="buddyReset" type="button">Reset Buddy (16p)</button>
+        </div>
+
+        <div class="buddy-track" id="buddyTrack"></div>
+
+        <div class="sim-grid">
+          <div class="reg-panel" id="buddyFreeLists"></div>
+          <div class="reg-panel">
+            <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">LAST BUDDY OPERATION</div>
+            <div id="buddyLog" style="font-family:var(--font-sans); font-size:0.84rem; color:var(--text);">
+              Initialized 1 free block at Frame 0 (Order 4 = 16 pages).
+            </div>
+          </div>
+        </div>
+
+        <div class="sim-divider">
+          <h3 style="margin:0 0 0.4rem;">Interactive Simulator B: ARMv9 MTE 4-bit Pointer &amp; Granule Tag Verifier</h3>
+          <p style="margin:0 0 0.75rem; font-size:0.86rem; color:var(--text-muted);">Test how 4-bit tags on 16-byte granules catch linear overflows and Use-After-Free faults.</p>
+          <div class="sim-controls">
+            <button class="btn btn-primary btn-sm" id="mteAllocBtn" type="button">1. malloc(32B) [IRG + STG]</button>
+            <button class="btn btn-sm" id="mteValidReadBtn" type="button">2. Valid Read (ptr + 16, 8B)</button>
+            <button class="btn btn-amber btn-sm" id="mteOverflowBtn" type="button">3. Heap Overflow (ptr + 32, 4B)</button>
+            <button class="btn btn-amber btn-sm" id="mteFreeUafBtn" type="button">4. free(ptr) &amp; Stale UAF Read</button>
+          </div>
+          <div class="sim-grid">
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">TAGGED POINTER (TBI BITS 59:56)</div>
+              <div class="reg-row"><span>64-bit Ptr</span><span id="mtePtrHex" class="reg-val">0x0000_007A_1000_0000</span></div>
+              <div class="reg-row"><span>Ptr Tag</span><span id="mtePtrTag" class="reg-val">0x0</span></div>
+              <div class="reg-row"><span>Access Range</span><span id="mteAccessRange" class="reg-val">-</span></div>
+              <div class="reg-row"><span>Hardware Fault</span><span id="mteFaultStatus" class="reg-val">NONE</span></div>
+            </div>
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">16-BYTE MEMORY GRANULES (0x00..0x3F)</div>
+              <div class="mte-granules" id="mteGranules"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 2: C & KERNEL REALITY -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C &amp; KERNEL REALITY</span>
+          <h2>Linux Buddy Orders, SLUB Freelists, Scudo Headers &amp; ARMv9 MTE</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>buddy_slub.c — Kernel Buddy Coalesce &amp; SLUB Fast Path</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code1">Copy</button>
+          </div>
+          <pre class="code" id="code1">// Linux mm/page_alloc.c concept: XOR buddy lookup
+static inline unsigned long find_buddy_pfn(unsigned long pfn, unsigned int order) {
+  return pfn ^ (1UL &lt;&lt; order);
+}
+
+// mm/slub.c: O(1) per-CPU lockless allocation fast path
+struct kmem_cache_cpu {
+  void **freelist;       // Next free object in active CPU slab
+  unsigned long tid;     // Lockless preemption/IRQ guard counter
+  struct slab *slab;     // Current slab page backing this CPU
+};
+
+void *slab_alloc_fast(struct kmem_cache *s, struct kmem_cache_cpu *c) {
+  void *obj = c-&gt;freelist;
+  if (likely(obj)) {
+    // Hardened SLUB obfuscates next pointer: ptr ^ s-&gt;random ^ swab(ptr_addr)
+    c-&gt;freelist = get_freepointer_safe(s, obj);
+    return obj;
+  }
+  return __slab_alloc_slowpath(s, c); // Refill from node partial list or buddy
+}</pre>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>scudo_mte.c — Scudo Checksum Header &amp; ARMv9 MTE Tagging</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code2">Copy</button>
+          </div>
+          <pre class="code" id="code2">// Android Scudo: 64-bit atomic header immediately before user payload
+struct scudo_chunk_header {
+  uint64_t class_id : 8;
+  uint64_t state    : 2;  // AVAILABLE, ALLOCATED, QUARANTINED
+  uint64_t size_or_unused : 38;
+  uint64_t checksum : 16; // CRC/BSD checksum(cookie ^ ptr ^ header_fields)
+};
+
+// ARMv9 MTE inline primitives (compiled with -march=armv8.5-a+memtag)
+static inline void *mte_tag_alloc(void *ptr, size_t aligned_sz) {
+  void *tagged;
+  __asm__ volatile("irg %0, %1" : "=r"(tagged) : "r"(ptr)); // Random 4b tag
+  for (size_t off = 0; off &lt; aligned_sz; off += 16) {
+    __asm__ volatile("stg %0, [%0, %1]" :: "r"(tagged), "r"(off) : "memory");
+  }
+  return tagged;
+}</pre>
+        </div>
+      </div>
+
+      <div class="callout green">
+        <strong>Why Hardened SLUB &amp; Scudo Both Authenticate Metadata:</strong><br/>
+        In classic slab/heap allocators, a single 8-byte buffer overflow or UAF write could overwrite the embedded <code>freelist</code> next pointer—tricking the next <code>malloc()</code> / <code>kmalloc()</code> into returning an arbitrary kernel/GOT address (a classic exploitation primitive). Linux <code>CONFIG_SLAB_FREELIST_HARDENED</code> XOR-encrypts the freelist pointer with a per-cache random secret and the slot's own address, while Scudo verifies a 16-bit secret-salted <code>checksum</code> on every <code>free()</code> / <code>realloc()</code> and aborts immediately on header tampering.
+      </div>
+    </section>
+
+    <!-- MODULE 3: ANDROID BRIDGE -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2>Scudo, HWASan, MTE &amp; <code>heapprofd</code> in Production Android</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>Scudo vs <code>jemalloc</code> &amp; Media/Codec Hardening</h3>
+          <p><strong>Android 11+ Native Allocator Switch:</strong> AOSP replaced <code>jemalloc</code> with LLVM's <strong>Scudo</strong> for system services and apps. While <code>jemalloc</code> optimizes multi-core throughput via aggressive thread caches, Scudo prioritizes exploit mitigation against vulnerabilities in C++ parsers (<code>libstagefright</code>, <code>libskia</code>, Binder parcels).</p>
+          <p><strong>Primary + Secondary Split:</strong> Small/medium allocations come from randomized Primary size-class regions with no in-band chunk headers adjacent to guard zones; large allocations (&gt;=64KB) use Secondary <code>mmap</code> regions flanked by unmapped <code>PROT_NONE</code> guard pages.</p>
+          <p><strong>Quarantine:</strong> Recently freed chunks sit in a ring quarantine before reuse, breaking deterministic Use-After-Free heap feng-shui.</p>
+        </div>
+
+        <div class="card">
+          <h3>MTE vs HWASan &amp; Live Heap Profiling (<code>heapprofd</code>)</h3>
+          <p><strong>HWASan (Software, 8-bit TBI tags):</strong> Compiles instrumentation around every load/store in C/C++, giving a 256-tag space (1/256 collision) at ~1.3x CPU and ~15% RAM overhead—ideal for dogfooding/CI.</p>
+          <p><strong>ARMv9 MTE (Hardware, 4-bit tags):</strong> Supported on Pixel 8+ / modern ARMv9 SoCs. Runs in <strong>Sync</strong> mode (exact <code>SIGSEGV / SEGV_MTESERR</code> fault PC for critical binaries like Bluetooth/Media) or <strong>Async</strong> mode (low-overhead flag checked on syscall/kernel exit) or <strong>Asymmetric</strong> (sync reads, async writes).</p>
+          <p><strong><code>heapprofd</code>:</strong> Hooks <code>bionic</code>'s Scudo dispatch table out-of-process via shared memory + stack unwinding, capturing native leaks into Perfetto without recompiling the app.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: RUNNABLE CODE PRACTICE LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // RUNNABLE CODE PRACTICE LABS</span>
+          <h2>Hands-On Allocator &amp; Memory Safety Labs</h2>
+        </div>
+      </div>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // BINARY BUDDY ALLOCATOR</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>createBuddyAllocator(totalPages)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Split larger power-of-2 blocks on demand and coalesce freed buddies recursively using XOR.</p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Assume <code>totalPages</code> is a power of 2 (&ge; 1). Let <code>maxOrder = Math.log2(totalPages)</code>. Initially, order <code>maxOrder</code> has one free block at address <code>0</code>. Return an object with:<br/>
+          &bull; <code>alloc(order)</code>: If <code>order</code> is not an integer in <code>[0, maxOrder]</code>, return <code>-1</code>. Find the smallest <code>k &gt;= order</code> with a free block. If none exists, return <code>-1</code>. Pop the <strong>lowest-address</strong> free block from order <code>k</code>. While <code>k &gt; order</code>, decrement <code>k</code>, split into left <code>addr</code> and right buddy <code>addr + (1 &lt;&lt; k)</code>, add the right buddy to free list <code>k</code>, and continue splitting the left half. Record <code>(addr, order)</code> as allocated and return <code>addr</code>.<br/>
+          &bull; <code>free(addr, order)</code>: Validate <code>order</code> is an integer in <code>[0, maxOrder]</code>, <code>addr</code> is a valid allocated block of that exact order. If invalid or double-free, return <code>false</code>. Remove from allocated set, then loop while <code>curOrder &lt; maxOrder</code>: compute <code>buddy = curAddr ^ (1 &lt;&lt; curOrder)</code>. If <code>buddy</code> is free at <code>curOrder</code>, remove <code>buddy</code> from free list <code>curOrder</code>, set <code>curAddr = Math.min(curAddr, buddy)</code>, and <code>curOrder++</code>; else break. Add <code>curAddr</code> to free list <code>curOrder</code> and return <code>true</code>.<br/>
+          &bull; <code>freeLists()</code>: Return an array of length <code>maxOrder + 1</code> where index <code>o</code> is a sorted ascending array of free start addresses at order <code>o</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // SLUB OBJECT CACHE</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>createSlabCache(objSize, objsPerSlab)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Carve fixed-size objects from multi-slab freelists with O(1) alloc/free and zero internal fragmentation.</p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given positive integers <code>objSize</code> and <code>objsPerSlab</code>, let <code>slabBytes = objSize * objsPerSlab</code>. Return an object with:<br/>
+          &bull; <code>alloc()</code>: Find the lowest-index existing slab with a free slot in its freelist; if all slabs are full (or none exist), grow by creating a new slab (<code>slabId = slabs.length</code>) pre-populated with slots <code>0 .. objsPerSlab - 1</code>. Pop a free slot index in O(1) (e.g. LIFO stack or pop) and return <code>{ slabId, offset, ptr }</code> where <code>offset = slot * objSize</code> and <code>ptr = slabId * slabBytes + offset</code>.<br/>
+          &bull; <code>free(ptr)</code>: Validate <code>ptr</code> is an integer, maps to an existing <code>slabId</code>, is aligned (<code>offset % objSize === 0</code>), and that slot is currently allocated. If invalid or double-free, return <code>false</code>. Mark slot free, push <code>slot</code> back onto that slab's O(1) freelist, and return <code>true</code>.<br/>
+          &bull; <code>stats()</code>: Return <code>{ totalSlabs, allocatedObjs, freeObjs, internalWasteBytes: 0 }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // ARMV9 MTE TAG VERIFIER</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>mteAccessCheck(granules, taggedPtr, accessSize)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Enforce 4-bit pointer-to-granule tag matching across 16-byte granules to catch UAF and out-of-bounds bugs.</p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong><br/>
+          &bull; <code>granules</code>: array of 4-bit integer tags (<code>0..15</code>), one per 16-byte granule.<br/>
+          &bull; <code>taggedPtr</code>: <code>{ tag: number, addr: number }</code>.<br/>
+          &bull; <code>accessSize</code>: bytes accessed in <code>[addr, addr + accessSize)</code>.<br/>
+          1. Validate <code>Number.isInteger(accessSize) &amp;&amp; accessSize &gt; 0</code>, <code>Number.isInteger(taggedPtr.addr) &amp;&amp; taggedPtr.addr &gt;= 0</code>, and <code>Number.isInteger(taggedPtr.tag) &amp;&amp; taggedPtr.tag &gt;= 0 &amp;&amp; taggedPtr.tag &lt;= 15</code>. Otherwise return <code>{ ok: false, fault: "INVALID_ACCESS", mismatchGranule: null }</code>.<br/>
+          2. Compute <code>startG = Math.floor(addr / 16)</code> and <code>endG = Math.floor((addr + accessSize - 1) / 16)</code>.<br/>
+          3. If <code>endG &gt;= granules.length</code>, return <code>{ ok: false, fault: "OUT_OF_BOUNDS", mismatchGranule: granules.length }</code>.<br/>
+          4. Loop <code>g</code> from <code>startG</code> to <code>endG</code>: if <code>granules[g] !== taggedPtr.tag</code>, immediately return <code>{ ok: false, fault: "TAG_MISMATCH", mismatchGranule: g, ptrTag: taggedPtr.tag, granuleTag: granules[g] }</code>.<br/>
+          5. If all granules match, return <code>{ ok: true, fault: null, checkedGranules: endG - startG + 1 }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: QUIZ -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (6 Questions)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Live Allocator Forensics &amp; Interview Readiness</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header"><span>Real Linux / Android Heap &amp; Kernel Forensics</span><button class="btn btn-sm copy-btn" type="button" data-copy="cli1">Copy</button></div>
+          <pre class="code" id="cli1"># 1. Inspect Linux buddy allocator free blocks by order (0..10)
+cat /proc/buddyinfo
+
+# 2. Inspect SLUB kernel object caches (active objs, slab size)
+sudo cat /proc/slabinfo | head -n 20
+
+# 3. Inspect Android native Scudo heap &amp; ashmem/ZRAM breakdown
+adb shell dumpsys meminfo &lt;package_name&gt;
+
+# 4. Enable ARMv9 MTE Sync mode for a debuggable app on Android 14+
+adb shell setprop arm64.memtag.process.com.example.app sync</pre>
+        </div>
+
+        <div class="card">
+          <h3>Senior Engineer Mastery Checklist</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can trace buddy splitting and XOR coalescing (<code>pfn ^ (1 &lt;&lt; order)</code>) and explain why external fragmentation still requires compaction (<code>kcompactd</code>) for high-order allocations.</span></li>
+            <li><input type="checkbox" /> <span>I understand how Linux SLUB avoids locks via per-CPU freelists and why hardened SLUB obfuscates freelist pointers.</span></li>
+            <li><input type="checkbox" /> <span>I can compare <code>jemalloc</code> vs Android <code>Scudo</code> (checksummed headers, quarantine, secondary guard pages).</span></li>
+            <li><input type="checkbox" /> <span>I can explain ARMv9 MTE (TBI + 16B granules + Sync vs Async modes) and its 1/16 probabilistic collision tradeoff vs HWASan.</span></li>
+          </ul>
+          <div class="callout green" style="margin-top:0.85rem; margin-bottom:0; font-size:0.84rem;">
+            <strong>Capstone Link:</strong> Your physical buddy + slab cache pairs directly with <strong>Lesson 09 (Page Cache, MGLRU, ZRAM &amp; LMKD)</strong>. Continue to <a href="lesson-09.html">Lesson 09 &rarr;</a> or return to <a href="master-plan.html">Master Plan</a>.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a href="lesson-07.html" class="btn">&larr; Lesson 07: Virtual Memory &amp; TLB</a>
+      <a href="master-plan.html" class="btn">Master Plan</a>
+      <a href="lesson-09.html" class="btn btn-primary">Lesson 09: MGLRU, ZRAM &amp; LMKD &rarr;</a>
+    </div>
+  </main>
+
+  <script src="assets/os-course.js"></script>
+  <script>
+    /* ============================================================
+       SIMULATOR A: BINARY BUDDY ALLOCATOR (16 PAGES, ORDERS 0..4)
+       ============================================================ */
+    (function () {
+      const TOTAL = 16;
+      const MAX_ORDER = 4;
+      let freeByOrder = [];
+      let allocated = new Map(); // addr -> { order, label }
+      let nextTagId = 1;
+
+      function resetBuddy() {
+        freeByOrder = Array.from({ length: MAX_ORDER + 1 }, () => []);
+        freeByOrder[MAX_ORDER] = [0];
+        allocated = new Map();
+        nextTagId = 1;
+        renderBuddy("Initialized 1 free block at Frame 0 (Order 4 = 16 pages).");
+      }
+
+      function allocBuddy(order) {
+        let k = order;
+        while (k <= MAX_ORDER && freeByOrder[k].length === 0) k++;
+        if (k > MAX_ORDER) {
+          renderBuddy(`Allocation FAILED for Order ${order} (${1 << order} pages): no contiguous block large enough!`);
+          return;
+        }
+        freeByOrder[k].sort((a, b) => a - b);
+        const addr = freeByOrder[k].shift();
+        const splits = [];
+        while (k > order) {
+          k--;
+          const buddy = addr + (1 << k);
+          freeByOrder[k].push(buddy);
+          freeByOrder[k].sort((a, b) => a - b);
+          splits.push(`split@${addr}->[${addr},${buddy}] (ord ${k})`);
+        }
+        const label = "A" + nextTagId++;
+        allocated.set(addr, { order, label });
+        renderBuddy(`Allocated <strong>${label}</strong> at Frame ${addr} (Order ${order}, ${1 << order}p). ${splits.length ? "Splits: " + splits.join(", ") : "Exact order hit!"}`);
+      }
+
+      function freeBuddy(addr) {
+        const info = allocated.get(addr);
+        if (!info) return;
+        allocated.delete(addr);
+        let curAddr = addr;
+        let curOrder = info.order;
+        const merges = [];
+        while (curOrder < MAX_ORDER) {
+          const buddy = curAddr ^ (1 << curOrder);
+          const idx = freeByOrder[curOrder].indexOf(buddy);
+          if (idx === -1) break;
+          freeByOrder[curOrder].splice(idx, 1);
+          const merged = Math.min(curAddr, buddy);
+          merges.push(`${curAddr}^${1 << curOrder}=${buddy} -> Frame ${merged} (ord ${curOrder + 1})`);
+          curAddr = merged;
+          curOrder++;
+        }
+        freeByOrder[curOrder].push(curAddr);
+        freeByOrder[curOrder].sort((a, b) => a - b);
+        renderBuddy(`Freed <strong>${info.label}</strong> (Frame ${addr}, ord ${info.order}). ${merges.length ? "XOR Coalesced: " + merges.join(" | ") : "Buddy busy — no coalesce."}`);
+      }
+
+      function renderBuddy(msg) {
+        const track = document.getElementById("buddyTrack");
+        const owners = Array(TOTAL).fill(null);
+        allocated.forEach((info, start) => {
+          const len = 1 << info.order;
+          for (let i = 0; i < len; i++) owners[start + i] = { start, ...info };
+        });
+
+        track.innerHTML = owners.map((own, idx) => {
+          if (own) {
+            return `<div class="buddy-cell alloc" data-start="${own.start}" title="Click to free ${own.label} (Frame ${own.start}, order ${own.order})"><div>F${idx}</div><strong>${own.label}</strong></div>`;
+          }
+          return `<div class="buddy-cell"><div>F${idx}</div><span>free</span></div>`;
+        }).join("");
+
+        track.querySelectorAll(".buddy-cell.alloc").forEach((el) => {
+          el.addEventListener("click", () => freeBuddy(Number(el.dataset.start)));
+        });
+
+        const fl = document.getElementById("buddyFreeLists");
+        fl.innerHTML = `<div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">FREE LISTS BY ORDER</div>` +
+          freeByOrder.map((arr, o) => `<div class="reg-row"><span>Order ${o} (${1 << o}p)</span><span class="reg-val">[${arr.join(", ")}]</span></div>`).join("");
+
+        document.getElementById("buddyLog").innerHTML = msg;
+      }
+
+      document.getElementById("buddyAlloc0").addEventListener("click", () => allocBuddy(0));
+      document.getElementById("buddyAlloc1").addEventListener("click", () => allocBuddy(1));
+      document.getElementById("buddyAlloc2").addEventListener("click", () => allocBuddy(2));
+      document.getElementById("buddyAlloc3").addEventListener("click", () => allocBuddy(3));
+      document.getElementById("buddyReset").addEventListener("click", resetBuddy);
+      resetBuddy();
+    })();
+
+    /* ============================================================
+       SIMULATOR B: ARMV9 MTE 4-BIT TAG VERIFIER
+       ============================================================ */
+    (function () {
+      let granules = [2, 2, 7, 7]; // 4 x 16B granules (0x00..0x3F)
+      let ptrTag = 0;
+      let ptrAddr = 0x00;
+      let freed = false;
+
+      function renderMte(rangeText, faultText, activeIdx, isFault) {
+        const tagHex = ptrTag.toString(16).toUpperCase();
+        document.getElementById("mtePtrHex").textContent = `0x0${tagHex}00_007A_1000_00${ptrAddr.toString(16).padStart(2, "0").toUpperCase()}`;
+        document.getElementById("mtePtrTag").textContent = `0x${tagHex} (${ptrTag})`;
+        document.getElementById("mteAccessRange").textContent = rangeText;
+        const faultEl = document.getElementById("mteFaultStatus");
+        faultEl.textContent = faultText;
+        faultEl.style.color = isFault ? "var(--red)" : "var(--green)";
+
+        document.getElementById("mteGranules").innerHTML = granules.map((gTag, idx) => {
+          const base = idx * 16;
+          const cls = idx === activeIdx ? (isFault ? "fault" : "match") : "";
+          return `<div class="granule-box ${cls}"><div>G${idx} [0x${base.toString(16).padStart(2, "0")}..0x${(base + 15).toString(16).padStart(2, "0")}]</div><div>Tag: <strong>0x${gTag.toString(16).toUpperCase()}</strong></div></div>`;
+        }).join("");
+      }
+
+      document.getElementById("mteAllocBtn").addEventListener("click", () => {
+        ptrTag = ((ptrTag + 5) % 14) + 1; // deterministic non-zero 4-bit IRG simulation
+        granules = [ptrTag, ptrTag, (ptrTag + 3) % 15 + 1, (ptrTag + 3) % 15 + 1];
+        ptrAddr = 0x00;
+        freed = false;
+        renderMte("Allocated [0x00..0x1F] (32B)", "OK (IRG + STG painted G0, G1)", 0, false);
+      });
+
+      document.getElementById("mteValidReadBtn").addEventListener("click", () => {
+        if (ptrTag === 0) document.getElementById("mteAllocBtn").click();
+        const match = !freed && granules[1] === ptrTag;
+        renderMte("[0x10..0x17] (Granule G1)", match ? "PASS: PtrTag == GranuleTag" : `SIGSEGV (SEGV_MTESERR)! Ptr 0x${ptrTag.toString(16).toUpperCase()} != G1 0x${granules[1].toString(16).toUpperCase()}`, 1, !match);
+      });
+
+      document.getElementById("mteOverflowBtn").addEventListener("click", () => {
+        if (ptrTag === 0) document.getElementById("mteAllocBtn").click();
+        renderMte("[0x20..0x23] (Granule G2)", `SIGSEGV (SEGV_MTESERR)! Overflow: Ptr 0x${ptrTag.toString(16).toUpperCase()} != G2 0x${granules[2].toString(16).toUpperCase()}`, 2, true);
+      });
+
+      document.getElementById("mteFreeUafBtn").addEventListener("click", () => {
+        if (ptrTag === 0) document.getElementById("mteAllocBtn").click();
+        const newTag = (ptrTag % 14) + 2;
+        granules[0] = newTag;
+        granules[1] = newTag;
+        freed = true;
+        renderMte("[0x00..0x07] (Stale Ptr -> G0)", `SIGSEGV (SEGV_MTESERR)! UAF caught: Stale Ptr 0x${ptrTag.toString(16).toUpperCase()} != Re-tagged G0 0x${newTag.toString(16).toUpperCase()}`, 0, true);
+      });
+
+      renderMte("-", "IDLE (Click step 1)", -1, false);
+    })();
+
+    /* ============================================================
+       LESSON 08 CONFIG: LABS & QUIZZES
+       ============================================================ */
+    window.LESSON_CONFIG = {
+      num: "08",
+      labs: {
+        1: {
+          fnName: "createBuddyAllocator",
+          starter: `function createBuddyAllocator(totalPages) {
+  const maxOrder = Math.log2(totalPages);
+  // free[o] holds sorted ascending start addresses of free blocks of order o
+  const free = Array.from({ length: maxOrder + 1 }, () => []);
+  free[maxOrder].push(0);
+  const allocated = new Map(); // addr -> order
+
+  function alloc(order) {
+    // TODO: validate order, find smallest k >= order with free block, split down, record & return addr
+    return -1;
+  }
+
+  function freeBlock(addr, order) {
+    // TODO: validate allocated block, XOR buddy coalescing up to maxOrder
+    return false;
+  }
+
+  return {
+    alloc,
+    free: freeBlock,
+    freeLists: () => free.map((arr) => [...arr].sort((a, b) => a - b))
+  };
+}`,
+          hints: [
+            "Hint 1: In alloc(order), check Number.isInteger(order) && order >= 0 && order <= maxOrder. Scan k from order up to maxOrder to find free[k].length > 0. Always shift() the lowest address from free[k] (keep free[k] sorted ascending).",
+            "Hint 2: While k > order, decrement k, compute rightBuddy = addr + (1 << k), insert rightBuddy into free[k] (and keep free[k] sorted), while keeping addr as the left half to split further or return.",
+            "Hint 3: In freeBlock(addr, order), verify allocated.get(addr) === order first, then delete addr from allocated. Loop while curOrder < maxOrder: buddy = curAddr ^ (1 << curOrder). If buddy is in free[curOrder], splice it out, curAddr = Math.min(curAddr, buddy), curOrder++; else break. Finally push curAddr into free[curOrder]."
+          ],
+          solution: `function createBuddyAllocator(totalPages) {
+  const maxOrder = Math.log2(totalPages);
+  const free = Array.from({ length: maxOrder + 1 }, () => []);
+  free[maxOrder].push(0);
+  const allocated = new Map();
+
+  function insertSorted(arr, val) {
+    arr.push(val);
+    arr.sort((a, b) => a - b);
+  }
+
+  function alloc(order) {
+    if (!Number.isInteger(order) || order < 0 || order > maxOrder) return -1;
+    let k = order;
+    while (k <= maxOrder && free[k].length === 0) k++;
+    if (k > maxOrder) return -1;
+
+    const addr = free[k].shift();
+    while (k > order) {
+      k--;
+      insertSorted(free[k], addr + (1 << k));
+    }
+    allocated.set(addr, order);
+    return addr;
+  }
+
+  function freeBlock(addr, order) {
+    if (!Number.isInteger(order) || order < 0 || order > maxOrder) return false;
+    if (allocated.get(addr) !== order) return false;
+    allocated.delete(addr);
+
+    let curAddr = addr;
+    let curOrder = order;
+    while (curOrder < maxOrder) {
+      const buddy = curAddr ^ (1 << curOrder);
+      const idx = free[curOrder].indexOf(buddy);
+      if (idx === -1) break;
+      free[curOrder].splice(idx, 1);
+      curAddr = Math.min(curAddr, buddy);
+      curOrder++;
+    }
+    insertSorted(free[curOrder], curAddr);
+    return true;
+  }
+
+  return {
+    alloc,
+    free: freeBlock,
+    freeLists: () => free.map((arr) => [...arr])
+  };
+}`,
+          solutionExplain: "Splitting descends from the smallest available order k to the requested order, pushing right halves onto intermediate free lists. Freeing checks ownership in O(1) and merges with buddy = addr ^ (1 << curOrder) recursively as long as the buddy is free at the exact same order.",
+          tests: function (fn) {
+            const out = [];
+            const b1 = fn(16);
+            const a0 = b1.alloc(0);
+            const a1 = b1.alloc(0);
+            const a2 = b1.alloc(1);
+            const a3 = b1.alloc(2);
+            out.push({
+              name: "Splits 16-page block down for orders 0, 0, 1, 2",
+              pass: a0 === 0 && a1 === 1 && a2 === 2 && a3 === 4 && JSON.stringify(b1.freeLists()) === JSON.stringify([[], [], [], [8], []]),
+              detail: `addrs=[${a0},${a1},${a2},${a3}], free=${JSON.stringify(b1.freeLists())}`
+            });
+
+            const fOk = b1.free(a2, 1) && b1.free(a0, 0) && b1.free(a3, 2) && b1.free(a1, 0);
+            out.push({
+              name: "Out-of-order frees coalesce back to single order-4 block [0]",
+              pass: fOk && JSON.stringify(b1.freeLists()) === JSON.stringify([[], [], [], [], [0]]),
+              detail: `fOk=${fOk}, free=${JSON.stringify(b1.freeLists())}`
+            });
+
+            const b2 = fn(8);
+            const x0 = b2.alloc(0), x1 = b2.alloc(0), x2 = b2.alloc(0), x3 = b2.alloc(0);
+            const noMerge = b2.free(x0, 0) && b2.free(x2, 0);
+            out.push({
+              name: "Busy buddies prevent coalescing (frames 0 & 2 stay order 0)",
+              pass: noMerge && JSON.stringify(b2.freeLists()) === JSON.stringify([[0, 2], [], [4], []]),
+              detail: `free=${JSON.stringify(b2.freeLists())}`
+            });
+
+            const b3 = fn(4);
+            const full = b3.alloc(2);
+            const oom = b3.alloc(0);
+            const badFree1 = b3.free(full, 1);
+            const badFree2 = b3.free(full, 2) && !b3.free(full, 2);
+            const badOrder = b3.alloc(-1) === -1 && b3.alloc(3) === -1;
+            out.push({
+              name: "OOM returns -1; wrong order, double-free & invalid orders rejected",
+              pass: full === 0 && oom === -1 && badFree1 === false && badFree2 === true && badOrder,
+              detail: `full=${full}, oom=${oom}, badOrder=${badOrder}`
+            });
+            return out;
+          }
+        },
+        2: {
+          fnName: "createSlabCache",
+          starter: `function createSlabCache(objSize, objsPerSlab) {
+  const slabBytes = objSize * objsPerSlab;
+  const slabs = []; // Each slab: { freelist: number[], used: Set<number> }
+
+  function alloc() {
+    // TODO: find slab with free slot or allocate new slab, pop slot in O(1), return { slabId, offset, ptr }
+  }
+
+  function free(ptr) {
+    // TODO: validate ptr alignment, bounds, and active allocation; push slot back to slab freelist
+  }
+
+  function stats() {
+    // TODO: return { totalSlabs, allocatedObjs, freeObjs, internalWasteBytes: 0 }
+  }
+
+  return { alloc, free, stats };
+}`,
+          hints: [
+            "Hint 1: Maintain each slab with a freelist array (holding unused slot indices 0..objsPerSlab-1) and a Set or boolean array tracking which slots are currently allocated.",
+            "Hint 2: In alloc(), scan slabs 0..slabs.length-1 for slab.freelist.length > 0. If none found, push a new slab with freelist [objsPerSlab-1, ..., 0] (so pop() returns 0 first). Pop slot, mark used, return { slabId, offset: slot * objSize, ptr: slabId * slabBytes + slot * objSize }.",
+            "Hint 3: In free(ptr), verify Number.isInteger(ptr) && ptr >= 0. slabId = Math.floor(ptr / slabBytes), offset = ptr % slabBytes. Check slabId < slabs.length, offset % objSize === 0, slot = offset / objSize, and slab.used.has(slot). Delete from used and push back onto slab.freelist."
+          ],
+          solution: `function createSlabCache(objSize, objsPerSlab) {
+  const slabBytes = objSize * objsPerSlab;
+  const slabs = [];
+
+  function createNewSlab() {
+    const freelist = [];
+    for (let i = objsPerSlab - 1; i >= 0; i--) freelist.push(i);
+    slabs.push({ freelist, used: new Set() });
+    return slabs.length - 1;
+  }
+
+  function alloc() {
+    let slabId = slabs.findIndex((s) => s.freelist.length > 0);
+    if (slabId === -1) slabId = createNewSlab();
+    const slab = slabs[slabId];
+    const slot = slab.freelist.pop();
+    slab.used.add(slot);
+    const offset = slot * objSize;
+    return { slabId, offset, ptr: slabId * slabBytes + offset };
+  }
+
+  function free(ptr) {
+    if (!Number.isInteger(ptr) || ptr < 0) return false;
+    const slabId = Math.floor(ptr / slabBytes);
+    if (slabId >= slabs.length) return false;
+    const offset = ptr % slabBytes;
+    if (offset % objSize !== 0) return false;
+    const slot = offset / objSize;
+    const slab = slabs[slabId];
+    if (!slab.used.has(slot)) return false;
+    slab.used.delete(slot);
+    slab.freelist.push(slot);
+    return true;
+  }
+
+  function stats() {
+    let allocatedObjs = 0;
+    let freeObjs = 0;
+    for (const s of slabs) {
+      allocatedObjs += s.used.size;
+      freeObjs += s.freelist.length;
+    }
+    return { totalSlabs: slabs.length, allocatedObjs, freeObjs, internalWasteBytes: 0 };
+  }
+
+  return { alloc, free, stats };
+}`,
+          solutionExplain: "Each slab maintains an O(1) stack of free slot indices and an occupancy Set. Freed slots are immediately reused on subsequent alloc() calls without touching the underlying page allocator.",
+          tests: function (fn) {
+            const out = [];
+            const cache = fn(64, 4);
+            const p0 = cache.alloc();
+            const p1 = cache.alloc();
+            const p2 = cache.alloc();
+            const p3 = cache.alloc();
+            const s1 = cache.stats();
+            out.push({
+              name: "Exact objSize stride & zero internal waste in slab 0",
+              pass: p0.ptr === 0 && p1.ptr === 64 && p2.ptr === 128 && p3.ptr === 192 && s1.totalSlabs === 1 && s1.allocatedObjs === 4 && s1.freeObjs === 0 && s1.internalWasteBytes === 0,
+              detail: `ptrs=[${p0.ptr},${p1.ptr},${p2.ptr},${p3.ptr}], slabs=${s1.totalSlabs}`
+            });
+
+            const p4 = cache.alloc();
+            const s2 = cache.stats();
+            out.push({
+              name: "Grows seamlessly to slab 1 when slab 0 is full",
+              pass: p4.slabId === 1 && p4.offset === 0 && p4.ptr === 256 && s2.totalSlabs === 2 && s2.allocatedObjs === 5 && s2.freeObjs === 3,
+              detail: `p4=${JSON.stringify(p4)}, stats=${JSON.stringify(s2)}`
+            });
+
+            const freed = cache.free(p1.ptr);
+            const reused = cache.alloc();
+            const s3 = cache.stats();
+            out.push({
+              name: "O(1) free returns slot to slab 0 and reuses it without creating slab 2",
+              pass: freed === true && reused.ptr === p1.ptr && s3.totalSlabs === 2 && s3.allocatedObjs === 5,
+              detail: `reused=${reused.ptr}, slabs=${s3.totalSlabs}`
+            });
+
+            const df = cache.free(p0.ptr) === true && cache.free(p0.ptr) === false;
+            const unaligned = cache.free(10) === false;
+            const oob = cache.free(9999) === false && cache.free(-64) === false;
+            out.push({
+              name: "Rejects double-free, unaligned pointer, and out-of-range pointer",
+              pass: df && unaligned && oob,
+              detail: `doubleFreeBlocked=${df}, unalignedBlocked=${unaligned}, oobBlocked=${oob}`
+            });
+            return out;
+          }
+        },
+        3: {
+          fnName: "mteAccessCheck",
+          starter: `function mteAccessCheck(granules, taggedPtr, accessSize) {
+  // TODO: validate inputs, compute start/end 16-byte granules, check bounds and tag match
+}`,
+          hints: [
+            "Hint 1: First validate taggedPtr && Number.isInteger(taggedPtr.addr) && taggedPtr.addr >= 0, Number.isInteger(taggedPtr.tag) && taggedPtr.tag >= 0 && taggedPtr.tag <= 15, and Number.isInteger(accessSize) && accessSize > 0.",
+            "Hint 2: Map byte range [addr, addr + accessSize - 1] to 16-byte granule indices: startG = Math.floor(addr / 16) and endG = Math.floor((addr + accessSize - 1) / 16). Check endG >= granules.length for OUT_OF_BOUNDS.",
+            "Hint 3: Loop g from startG to endG: if (granules[g] !== taggedPtr.tag) return { ok: false, fault: \"TAG_MISMATCH\", mismatchGranule: g, ptrTag: taggedPtr.tag, granuleTag: granules[g] }."
+          ],
+          solution: `function mteAccessCheck(granules, taggedPtr, accessSize) {
+  if (
+    !taggedPtr ||
+    !Number.isInteger(accessSize) || accessSize <= 0 ||
+    !Number.isInteger(taggedPtr.addr) || taggedPtr.addr < 0 ||
+    !Number.isInteger(taggedPtr.tag) || taggedPtr.tag < 0 || taggedPtr.tag > 15
+  ) {
+    return { ok: false, fault: "INVALID_ACCESS", mismatchGranule: null };
+  }
+
+  const startG = Math.floor(taggedPtr.addr / 16);
+  const endG = Math.floor((taggedPtr.addr + accessSize - 1) / 16);
+  if (endG >= granules.length) {
+    return { ok: false, fault: "OUT_OF_BOUNDS", mismatchGranule: granules.length };
+  }
+
+  for (let g = startG; g <= endG; g++) {
+    if (granules[g] !== taggedPtr.tag) {
+      return {
+        ok: false,
+        fault: "TAG_MISMATCH",
+        mismatchGranule: g,
+        ptrTag: taggedPtr.tag,
+        granuleTag: granules[g]
+      };
+    }
+  }
+  return { ok: true, fault: null, checkedGranules: endG - startG + 1 };
+}`,
+          solutionExplain: "An access starting at addr for accessSize bytes covers granules floor(addr/16) through floor((addr + accessSize - 1)/16). Checking every covered granule catches both unaligned cross-granule overflows and Use-After-Free accesses.",
+          tests: function (fn) {
+            const out = [];
+            const granules = [5, 5, 9, 9]; // 64 bytes: [0..31] tag 5, [32..63] tag 9
+
+            const r1 = fn(granules, { tag: 5, addr: 12 }, 10); // bytes 12..21 -> granules 0, 1
+            out.push({
+              name: "Unaligned multi-granule access within tagged object succeeds",
+              pass: r1.ok === true && r1.fault === null && r1.checkedGranules === 2,
+              detail: JSON.stringify(r1)
+            });
+
+            const r2 = fn(granules, { tag: 5, addr: 28 }, 5); // bytes 28..32 -> hits granule 2 (tag 9)
+            out.push({
+              name: "1-byte heap buffer overflow into granule 2 triggers TAG_MISMATCH",
+              pass: r2.ok === false && r2.fault === "TAG_MISMATCH" && r2.mismatchGranule === 2 && r2.ptrTag === 5 && r2.granuleTag === 9,
+              detail: JSON.stringify(r2)
+            });
+
+            const freedGranules = [11, 11, 9, 9]; // freed & re-tagged from 5 -> 11
+            const r3 = fn(freedGranules, { tag: 5, addr: 0 }, 8);
+            out.push({
+              name: "Use-After-Free with stale pointer tag 5 fails on re-tagged granule 0 (tag 11)",
+              pass: r3.ok === false && r3.fault === "TAG_MISMATCH" && r3.mismatchGranule === 0,
+              detail: JSON.stringify(r3)
+            });
+
+            const r4 = fn(granules, { tag: 9, addr: 60 }, 8);
+            const r5 = fn(granules, { tag: 5, addr: 0 }, 0);
+            out.push({
+              name: "Catches OUT_OF_BOUNDS beyond granule array and invalid 0-byte access",
+              pass: r4.ok === false && r4.fault === "OUT_OF_BOUNDS" && r5.ok === false && r5.fault === "INVALID_ACCESS",
+              detail: `oob=${r4.fault}, zeroSize=${r5.fault}`
+            });
+            return out;
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "1. In a Binary Buddy Allocator, a 4-page block (order 2) starting at physical frame 12 is freed. What is the exact frame index of its buddy, and can they coalesce if frame 8 is also free at order 2?",
+          options: [
+            "A. Buddy is frame 16; no coalesce because 16 > 12.",
+            "B. Buddy is frame 8 (`12 ^ (1 << 2) = 8`); yes, they coalesce into an order-3 (8-page) block starting at frame 8.",
+            "C. Buddy is frame 14 (`12 ^ 2 = 14`); they coalesce into an order-3 block at frame 12.",
+            "D. Buddy is frame 4; they coalesce into an order-4 block."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Frame 16 is in the next 8-page aligned region [16..23], not the buddy of [12..15].",
+            "Correct (B): Buddy address = `addr ^ (1 << order)` = `12 ^ 4 = 8`. Since frame 8 is free at the same order (order 2), `[8..11]` and `[12..15]` merge into `[8..15]` (order 3 at frame 8).",
+            "Wrong (C): XOR uses `1 << order` (`4`), not `order` (`2`).",
+            "Wrong (D): Frame 4 is 8 frames away and belongs to `[0..7]`."
+          ]
+        },
+        {
+          q: "2. Why does Linux SLUB layer an object cache on top of the physical Buddy Allocator instead of giving every `kmalloc(96)` a 4KB buddy page?",
+          options: [
+            "A. The Buddy Allocator cannot allocate less than 1MB.",
+            "B. Giving a full 4KB page to a 96-byte object causes ~97.6% internal fragmentation and wastes TLB/cache lines; SLUB packs identical objects into slab pages with O(1) per-CPU freelists.",
+            "C. SLUB enables user-space processes to bypass page tables.",
+            "D. Buddy Allocator memory is non-cacheable."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Order 0 in the Buddy Allocator is 1 page (4KB or 16KB), not 1MB.",
+            "Correct (B): Buddy operates at page granularity. SLUB eliminates internal fragmentation for small kernel structs and avoids global spinlocks using lockless per-CPU slab freelists.",
+            "Wrong (C): SLUB is a kernel-internal allocator; user space never accesses SLUB directly.",
+            "Wrong (D): Buddy pages are normal cacheable physical RAM."
+          ]
+        },
+        {
+          q: "3. How does `CONFIG_SLAB_FREELIST_HARDENED` in Linux (and checksummed chunk headers in Android Scudo) mitigate heap/slab exploitation?",
+          options: [
+            "A. By placing every 16-byte allocation on its own 4KB page.",
+            "B. By obfuscating embedded freelist pointers with a secret + address XOR (SLUB) or verifying a secret-salted header checksum (Scudo), detecting corruption before returning arbitrary pointers.",
+            "C. By disabling all C++ destructors.",
+            "D. By encrypting the entire DRAM bus with AES-256."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Per-object 4KB pages would explode RAM usage by 100x+ (only done selectively in tools like Electric Fence / GWP-ASan sampling).",
+            "Correct (B): Authenticating/obfuscating freelist pointers and chunk headers prevents an attacker who has a linear overflow or UAF write from forging a fake freelist pointer to hijack control flow.",
+            "Wrong (C): Allocators do not control language destructors.",
+            "Wrong (D): DRAM bus encryption protects against cold-boot physical attacks, not intra-process heap metadata corruption."
+          ]
+        },
+        {
+          q: "4. Why did Android switch its default native user-space allocator from `jemalloc` to `Scudo` starting in Android 11?",
+          options: [
+            "A. `jemalloc` could not allocate more than 2GB of RAM.",
+            "B. Scudo is built specifically for security hardening: quarantined frees, checksummed headers, isolated primary/secondary regions with guard pages, and native ARMv9 MTE integration.",
+            "C. Scudo runs inside the kernel at EL1 to avoid syscalls.",
+            "D. `jemalloc` did not support 64-bit pointers."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `jemalloc` supports 64-bit address spaces well beyond 2GB.",
+            "Correct (B): Android's threat model targets native C/C++ memory corruption in media, Bluetooth, and system services. Scudo trades a tiny fraction of peak multi-core throughput for strong deterministic/probabilistic exploit mitigation.",
+            "Wrong (C): Scudo is a user-space allocator inside `bionic` (`EL0`), calling `mmap` only to grow regions.",
+            "Wrong (D): `jemalloc` has full 64-bit support."
+          ]
+        },
+        {
+          q: "5. How does ARMv9 MTE store a 4-bit tag inside a 64-bit pointer without breaking virtual address translation in the MMU?",
+          options: [
+            "A. It stores the tag in the lowest 4 bits `[3:0]` and shifts every pointer by 4.",
+            "B. It leverages ARM64 Top-Byte Ignore (TBI), placing the 4-bit pointer tag in bits `[59:56]` while the MMU ignores bits `[63:56]` during page-table translation and tag logic compares it against tag RAM.",
+            "C. It writes the tag into a dedicated kernel syscall table on every pointer dereference.",
+            "D. It stores the tag in the TLB ASID field."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Low bits `[3:0]` are needed for byte-level addressing (e.g., `char *` at `0x...03`).",
+            "Correct (B): TBI instructs the ARM64 MMU to mask off the top byte `[63:56]` for address translation, letting bits `[59:56]` carry the 4-bit MTE tag verified against the 16-byte granule's hidden tag.",
+            "Wrong (C): Syscalls per dereference would slow code by 1000x; MTE checks happen inline in CPU load/store units.",
+            "Wrong (D): ASID identifies an entire process's address space in the TLB, not individual 16-byte allocations."
+          ]
+        },
+        {
+          q: "6. A developer runs an ARMv9 device with MTE enabled in Synchronous mode and asks: 'Can MTE guarantee 100% detection of every possible Use-After-Free?' What is the accurate Senior Engineer answer?",
+          options: [
+            "A. Yes, 4 bits is mathematically collision-free.",
+            "B. No — because MTE uses a 4-bit tag (16 values, or 15 excluding tag 0/match), random re-tagging on free/realloc has a ~1/15 to 1/16 chance of picking the exact same tag (probabilistic, not deterministic 100%).",
+            "C. No, MTE only checks stack variables and ignores the heap.",
+            "D. Yes, because `free()` zeroes out all virtual memory."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): 4 bits only provides `2^4 = 16` distinct tags, which guarantees pigeonhole collisions over many allocations.",
+            "Correct (B): MTE detects sequential 1-granule overflows deterministically when adjacent allocations get different tags, and catches UAF probabilistically (~93.75% per random re-tag, higher when excluding the previous tag). HWASan uses 8-bit tags (~99.6%) in software.",
+            "Wrong (C): MTE supports both heap (Scudo) and stack (`-fsanitize=memtag-stack`) tagging.",
+            "Wrong (D): Zeroing memory data does not prevent a stale pointer from dereferencing reused memory unless the tag mismatches or page is unmapped."
+          ]
+        }
+      ]
+    };
+
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

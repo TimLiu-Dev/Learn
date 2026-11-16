@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0088: Real-Time &amp; Event-Driven HTTP APIs: SSE, WebSockets &amp; Signed Webhooks</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0086-grpc-protobuf-openapi-and-graphql.html">&larr; Prev: Lesson 0086</a></div>
+      <div class="lesson-nav-center">
+        <a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a>
+        &nbsp;|&nbsp;
+        <a href="../reference/0088-realtime-sse-websockets-webhooks.html">&#128214; Cheat Sheet 0088</a>
+      </div>
+      <div><a href="0063-spring-data-jpa-repositories-transactions.html">Next: Lesson 0063 &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Main Track 3 &bull; Real-Time &amp; Async HTTP APIs &bull; Lesson 0088</div>
+      <h1>Real-Time &amp; Event-Driven HTTP APIs: <code>SSE</code> (<code>SseEmitter</code>), WebSockets/STOMP &amp; Signed Webhooks</h1>
+      <p class="lesson-subtitle">
+        Replace wasteful client polling with Server-Sent Events (SSE) for LLM/live feeds, WebSockets/STOMP for bidirectional chat/collaboration, and HMAC-verified, replay-safe Webhooks for asynchronous partner integrations.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. Choosing Polling vs. SSE vs. WebSockets vs. Webhooks</h2>
+      <p>
+        Both <code>roadmap.sh/api-design</code> and <code>roadmap.sh/backend</code> highlight real-time and event-driven API patterns. Picking the wrong transport wastes server sockets or forces painful sticky-session infrastructure:
+      </p>
+      <table>
+        <thead>
+          <tr><th>Pattern</th><th>Direction &amp; Transport</th><th>2027 Spring Boot Fit</th><th>Key Operational Trade-Off</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Server-Sent Events (<code>SSE</code>)</strong></td><td>Server &rarr; Client over standard HTTP (<code>text/event-stream</code>)</td><td><code>SseEmitter</code> (MVC + Virtual Threads) or <code>Flux&lt;ServerSentEvent&lt;T&gt;&gt;</code></td><td>Unidirectional only; built-in browser reconnect + <code>Last-Event-ID</code> resume; works seamlessly over HTTP/2.</td></tr>
+          <tr><td><strong>WebSockets + STOMP</strong></td><td>Full-duplex persistent TCP upgrade (<code>ws://</code>/<code>wss://</code>)</td><td><code>spring-boot-starter-websocket</code> (<code>@MessageMapping</code>)</td><td>Multi-pod scaling requires an external broker relay (Redis/RabbitMQ) instead of in-memory <code>SimpleBroker</code>.</td></tr>
+          <tr><td><strong>Webhooks</strong></td><td>Server &rarr; Partner Server async HTTP <code>POST</code></td><td><code>RestClient</code> outbound + HMAC-verifying <code>@RestController</code> inbound</td><td>Must authenticate payloads via HMAC signature, reject old timestamps (replay attacks), and handle duplicate deliveries idempotently.</td></tr>
+        </tbody>
+      </table>
+      <div class="callout tip">
+        <div class="callout-title">&#9889; What About SOAP &amp; Full HATEOAS on <code>roadmap.sh/api-design</code>?</div>
+        <strong>SOAP (XML/WSDL)</strong> is legacy-only in 2027 (encountered only when integrating older banking/ERP systems), and <strong>full HATEOAS (Richardson Level 3)</strong> is rarely needed outside specialized hypermedia APIs. Focus your engineering depth on REST + OpenAPI 3.1 (<a href="0062-rest-apis-dtos-validation-problemdetail.html">0062</a>), gRPC/GraphQL (<a href="0086-grpc-protobuf-openapi-and-graphql.html">0086</a>), and the three async HTTP patterns below.
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Production <code>SseEmitter</code> Streaming &amp; Memory-Leak Prevention</h2>
+      <p>
+        With Java 25 Virtual Threads enabled, Spring MVC's <code>SseEmitter</code> scales to tens of thousands of open streams cleanly—for example, streaming Spring AI tokens or order-status events. The #1 bug is registering an <code>SseEmitter</code> in a collection without removing it on disconnect, timeout, or broken-pipe I/O errors:
+      </p>
+      <pre><code>// IDIOMATIC SPRING BOOT 4: Lifecycle-Safe SseEmitter + Heartbeat Cleanup
+@RestController
+@RequestMapping("/api/events")
+public class OrderStreamController {
+    private final Map&lt;String, Set&lt;SseEmitter&gt;&gt; subscribers = new ConcurrentHashMap&lt;&gt;();
+
+    @GetMapping(path = "/{tenantId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter subscribe(@PathVariable String tenantId) {
+        SseEmitter emitter = new SseEmitter(Duration.ofMinutes(5).toMillis());
+        Set&lt;SseEmitter&gt; set = subscribers.computeIfAbsent(tenantId, k -&gt; ConcurrentHashMap.newKeySet());
+        set.add(emitter);
+
+        Runnable cleanup = () -&gt; set.remove(emitter);
+        emitter.onCompletion(cleanup);
+        emitter.onTimeout(() -&gt; { cleanup.run(); emitter.complete(); });
+        emitter.onError(ex -&gt; cleanup.run());
+        return emitter;
+    }
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>3. Inbound Webhook Security: Raw Body, HMAC-SHA256 &amp; Anti-Replay</h2>
+      <p>
+        Never trust an unauthenticated webhook <code>POST</code>, and never verify HMAC signatures against a re-serialized Java DTO (whitespace or key-ordering differences break the MAC!). Always verify against the <strong>exact raw UTF-8 request bytes</strong>, check a strict timestamp window (e.g., &le; 300 seconds), compare digests with constant-time <code>MessageDigest.isEqual</code> (<a href="0079-java-cryptography-kdf-and-password-hashing.html">Lesson 0079</a>), and deduplicate by event ID:
+      </p>
+      <pre><code>// ANTI-PATTERN: Re-serializing parsed DTO + Arrays.equals (whitespace mismatch + timing leak!)
+// boolean ok = Arrays.equals(hmac(objectMapper.writeValueAsBytes(dto)), headerSig);
+
+// IDIOMATIC JAVA 25: Raw-Body HMAC-SHA256 + Anti-Replay Window + Constant-Time Check
+public static boolean verifyWebhook(byte[] rawBody, long timestampSec, String signatureHex,
+                                    String secret, long nowEpochSec) throws Exception {
+    if (Math.abs(nowEpochSec - timestampSec) &gt; 300) {
+        return false; // Reject stale replay attacks!
+    }
+    String signedPayload = timestampSec + "." + new String(rawBody, StandardCharsets.UTF_8);
+    Mac mac = Mac.getInstance("HmacSHA256");
+    mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+    byte[] expected = mac.doFinal(signedPayload.getBytes(StandardCharsets.UTF_8));
+    byte[] provided = HexFormat.of().parseHex(signatureHex);
+    return MessageDigest.isEqual(expected, provided); // Constant-time compare!
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>4. Hands-On Practice Workbenches</h2>
+      <div id="ex-1" class="workbench-container"></div>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>5. Senior Concept &amp; Code Quiz</h2>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <ul>
+        <li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html#mvc-ann-async-http-streaming" target="_blank" rel="noopener"><strong>Spring Framework Reference &mdash; HTTP Streaming &amp; <code>SseEmitter</code></strong></a></li>
+        <li><a href="https://docs.spring.io/spring-framework/reference/web/websocket/stomp.html" target="_blank" rel="noopener"><strong>Spring Framework Reference &mdash; WebSockets &amp; STOMP Broker Relay</strong></a></li>
+      </ul>
+
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> Why does Spring WebSocket's built-in <code>enableSimpleBroker</code> silently drop messages between users once you scale to 3 Kubernetes pods, and how does <code>enableStompBrokerRelay</code> fix it?
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0086-grpc-protobuf-openapi-and-graphql.html">&larr; Prev: Lesson 0086</a></div>
+      <div><a href="../reference/0088-realtime-sse-websockets-webhooks.html">&#128196; Reference Sheet 0088</a> &bull; <a href="0001-master-plan-and-curriculum.html">Course Hub</a></div>
+      <div><a href="0063-spring-data-jpa-repositories-transactions.html">Next: Lesson 0063 &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+  {
+    "exercises": [
+      {
+        "id": "ex-1",
+        "filename": "HmacWebhookVerifier.java",
+        "badge": "Implementation Drill",
+        "instructions": "<p>Implement replay-safe webhook verification in <code>verify(String rawBody, long timestampSec, String sigHex, String secret, long nowEpochSec)</code>:</p><ol><li>Reject timestamps older or newer than <code>300</code> seconds (<code>Math.abs(nowEpochSec - timestampSec) &gt; 300</code>).</li><li>Compute <code>HmacSHA256</code> over <code>timestampSec + \".\" + rawBody</code> in UTF-8.</li><li>Verify against <code>HexFormat.of().parseHex(sigHex)</code> using constant-time <code>MessageDigest.isEqual(...)</code>.</li></ol>",
+        "initialCode": "import javax.crypto.Mac;\nimport javax.crypto.spec.SecretKeySpec;\nimport java.nio.charset.StandardCharsets;\nimport java.security.MessageDigest;\nimport java.util.HexFormat;\n\npublic class HmacWebhookVerifier {\n    public static boolean verify(String rawBody, long timestampSec, String sigHex, String secret, long nowEpochSec) throws Exception {\n        // TODO 1: Enforce 300-second replay window\n        // TODO 2: Compute HmacSHA256 over (timestampSec + \".\" + rawBody)\n        // TODO 3: Compare in constant time via MessageDigest.isEqual\n        return false;\n    }\n\n    public static void main(String[] args) throws Exception {\n        String secret = \"whsec_prod_key\";\n        String body = \"{\\\"event\\\":\\\"charge.succeeded\\\"}\";\n        long ts = 1700000100L;\n        Mac mac = Mac.getInstance(\"HmacSHA256\");\n        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), \"HmacSHA256\"));\n        String sig = HexFormat.of().formatHex(mac.doFinal((ts + \".\" + body).getBytes(StandardCharsets.UTF_8)));\n        System.out.println(\"Fresh valid: \" + verify(body, ts, sig, secret, 1700000120L));\n        System.out.println(\"Replay rejected: \" + verify(body, ts, sig, secret, 1700000900L));\n    }\n}\n",
+        "solution": "import javax.crypto.Mac;\nimport javax.crypto.spec.SecretKeySpec;\nimport java.nio.charset.StandardCharsets;\nimport java.security.MessageDigest;\nimport java.util.HexFormat;\n\npublic class HmacWebhookVerifier {\n    public static boolean verify(String rawBody, long timestampSec, String sigHex, String secret, long nowEpochSec) throws Exception {\n        if (Math.abs(nowEpochSec - timestampSec) > 300) {\n            return false;\n        }\n        Mac mac = Mac.getInstance(\"HmacSHA256\");\n        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), \"HmacSHA256\"));\n        byte[] expected = mac.doFinal((timestampSec + \".\" + rawBody).getBytes(StandardCharsets.UTF_8));\n        byte[] provided = HexFormat.of().parseHex(sigHex);\n        return MessageDigest.isEqual(expected, provided);\n    }\n\n    public static void main(String[] args) throws Exception {\n        String secret = \"whsec_prod_key\";\n        String body = \"{\\\"event\\\":\\\"charge.succeeded\\\"}\";\n        long ts = 1700000100L;\n        Mac mac = Mac.getInstance(\"HmacSHA256\");\n        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), \"HmacSHA256\"));\n        String sig = HexFormat.of().formatHex(mac.doFinal((ts + \".\" + body).getBytes(StandardCharsets.UTF_8)));\n        System.out.println(\"Fresh valid: \" + verify(body, ts, sig, secret, 1700000120L));\n        System.out.println(\"Replay rejected: \" + verify(body, ts, sig, secret, 1700000900L));\n    }\n}\n",
+        "solutionExplanation": "Binding the timestamp into the HMAC payload and enforcing a 300-second window blocks replay attacks, while MessageDigest.isEqual prevents timing side-channel leaks.",
+        "hints": [
+          "Guard the window first: <code>if (Math.abs(nowEpochSec - timestampSec) &gt; 300) return false;</code>.",
+          "Initialize <code>Mac.getInstance(\"HmacSHA256\")</code> with <code>SecretKeySpec</code> and hash <code>(timestampSec + \".\" + rawBody).getBytes(StandardCharsets.UTF_8)</code>.",
+          "Decode <code>sigHex</code> using <code>HexFormat.of().parseHex(sigHex)</code> and return <code>MessageDigest.isEqual(expected, provided)</code>."
+        ],
+        "tests": [
+          {
+            "name": "Enforces 300-second anti-replay window",
+            "regex": "Math\\.abs\\s*\\(\\s*nowEpochSec\\s*-\\s*timestampSec\\s*\\)\\s*>\\s*300",
+            "flags": "m",
+            "passMessage": "Rejects replayed webhook timestamps outside 300s window.",
+            "failMessage": "Check Math.abs(nowEpochSec - timestampSec) > 300."
+          },
+          {
+            "name": "Computes HmacSHA256 signature",
+            "regex": "verify\\s*\\([\\s\\S]*?Mac\\.getInstance\\s*\\(\\s*\"HmacSHA256\"\\s*\\)[\\s\\S]*?public\\s+static\\s+void\\s+main",
+            "flags": "m",
+            "passMessage": "Computes HmacSHA256 inside verify() over signed timestamp + rawBody.",
+            "failMessage": "Use Mac.getInstance(\"HmacSHA256\") inside verify()."
+          },
+          {
+            "name": "Uses constant-time MessageDigest.isEqual",
+            "regex": "MessageDigest\\.isEqual\\s*\\(",
+            "flags": "m",
+            "passMessage": "Verifies signature bytes in constant time.",
+            "failMessage": "Use MessageDigest.isEqual(expected, provided) instead of Arrays.equals."
+          }
+        ],
+        "simulatedOutput": "Fresh valid: true\nReplay rejected: false\nProcess finished with exit code 0"
+      },
+      {
+        "id": "ex-2",
+        "filename": "SseRegistryCleanupFix.java",
+        "badge": "Bug-Fix Challenge",
+        "instructions": "<p>This simulated <code>SseRegistryCleanupFix</code> leaks disconnected clients and aborts broadcasting to healthy subscribers whenever one client throws an <code>IOException</code>.</p><ol><li>Register a cleanup callback removing dead emitters in <code>subscribe</code>.</li><li>Inside <code>broadcast</code>, wrap <code>emitter.send(payload)</code> in a <code>try/catch (IOException ex)</code> and evict the failed emitter instead of aborting the loop.</li></ol>",
+        "initialCode": "import java.io.IOException;\nimport java.util.Set;\nimport java.util.concurrent.ConcurrentHashMap;\n\npublic class SseRegistryCleanupFix {\n    public interface Emitter {\n        void send(String event) throws IOException;\n        void onCompletion(Runnable r);\n    }\n\n    private final Set<Emitter> active = ConcurrentHashMap.newKeySet();\n\n    public void subscribe(Emitter emitter) {\n        active.add(emitter);\n        // BUG 1: Missing onCompletion cleanup leaks disconnected emitters forever!\n    }\n\n    public void broadcast(String payload) throws IOException {\n        // BUG 2: One broken pipe throws IOException and stops delivery to healthy subscribers!\n        for (Emitter emitter : active) {\n            emitter.send(payload);\n        }\n    }\n\n    public int activeCount() { return active.size(); }\n\n    public static void main(String[] args) throws IOException {\n        var reg = new SseRegistryCleanupFix();\n        reg.subscribe(new Emitter() {\n            public void send(String e) throws IOException { throw new IOException(\"Broken pipe\"); }\n            public void onCompletion(Runnable r) {}\n        });\n        reg.subscribe(new Emitter() {\n            public void send(String e) { System.out.println(\"Delivered: \" + e); }\n            public void onCompletion(Runnable r) {}\n        });\n        reg.broadcast(\"order.paid\");\n        System.out.println(\"Remaining active: \" + reg.activeCount());\n    }\n}\n",
+        "solution": "import java.io.IOException;\nimport java.util.Set;\nimport java.util.concurrent.ConcurrentHashMap;\n\npublic class SseRegistryCleanupFix {\n    public interface Emitter {\n        void send(String event) throws IOException;\n        void onCompletion(Runnable r);\n    }\n\n    private final Set<Emitter> active = ConcurrentHashMap.newKeySet();\n\n    public void subscribe(Emitter emitter) {\n        active.add(emitter);\n        emitter.onCompletion(() -> active.remove(emitter));\n    }\n\n    public void broadcast(String payload) {\n        for (Emitter emitter : active) {\n            try {\n                emitter.send(payload);\n            } catch (IOException ex) {\n                active.remove(emitter);\n            }\n        }\n    }\n\n    public int activeCount() { return active.size(); }\n\n    public static void main(String[] args) {\n        var reg = new SseRegistryCleanupFix();\n        reg.subscribe(new Emitter() {\n            public void send(String e) throws IOException { throw new IOException(\"Broken pipe\"); }\n            public void onCompletion(Runnable r) {}\n        });\n        reg.subscribe(new Emitter() {\n            public void send(String e) { System.out.println(\"Delivered: \" + e); }\n            public void onCompletion(Runnable r) {}\n        });\n        reg.broadcast(\"order.paid\");\n        System.out.println(\"Remaining active: \" + reg.activeCount());\n    }\n}\n",
+        "solutionExplanation": "ConcurrentHashMap.newKeySet() permits safe removal during iteration, while catching IOException per emitter ensures one client disconnect never starves other active SSE streams.",
+        "hints": [
+          "Inside <code>subscribe</code>, register <code>emitter.onCompletion(() -&gt; active.remove(emitter));</code>.",
+          "Inside <code>broadcast</code>, wrap <code>emitter.send(payload)</code> in <code>try { ... } catch (IOException ex) { active.remove(emitter); }</code>."
+        ],
+        "tests": [
+          {
+            "name": "Registers onCompletion cleanup",
+            "regex": "emitter\\.onCompletion\\s*\\(\\s*\\(\\)\\s*->\\s*active\\.remove\\s*\\(\\s*emitter\\s*\\)\\s*\\)",
+            "flags": "m",
+            "passMessage": "Registers lifecycle cleanup on emitter completion.",
+            "failMessage": "Add emitter.onCompletion(() -> active.remove(emitter)) in subscribe."
+          },
+          {
+            "name": "Handles broken-pipe IOException per emitter",
+            "regex": "catch\\s*\\(\\s*IOException\\s+\\w+\\s*\\)\\s*\\{\\s*active\\.remove\\s*\\(\\s*emitter\\s*\\);",
+            "flags": "m",
+            "passMessage": "Evicts dead emitters cleanly without aborting broadcast.",
+            "failMessage": "Catch IOException around emitter.send(payload) and call active.remove(emitter)."
+          }
+        ],
+        "simulatedOutput": "Delivered: order.paid\nRemaining active: 1\nProcess finished with exit code 0"
+      }
+    ],
+    "quiz": {
+      "id": "quiz-main",
+      "questions": [
+        {
+          "question": "1. Why must inbound webhook HMAC signatures be computed over raw HTTP request bytes rather than a deserialized DTO?",
+          "correctIndex": 2,
+          "options": [
+            {
+              "text": "Jackson 3 strips all cryptographic header values before controller invocation.",
+              "explanation": "Jackson deserializes only the HTTP body; request headers are still readable via `@RequestHeader`."
+            },
+            {
+              "text": "HmacSHA256 algorithms inside JCA cannot accept UTF-8 strings from Java records.",
+              "explanation": "Any string can be converted to UTF-8 bytes; the issue is that re-serialization changes the exact byte representation."
+            },
+            {
+              "text": "Re-serializing a parsed DTO alters whitespace or key order and breaks MAC verification.",
+              "explanation": "Even a single extra space or reordered JSON property produces a completely different SHA-256 HMAC digest than the sender signed."
+            },
+            {
+              "text": "Spring Security disables TLS certificates whenever JSON payloads exceed 4 kilobytes.",
+              "explanation": "TLS validation happens at the transport layer regardless of JSON payload size or DTO serialization."
+            }
+          ]
+        },
+        {
+          "question": "2. When is Server-Sent Events (`SseEmitter`) preferable to WebSockets in a Spring Boot 4 service?",
+          "correctIndex": 0,
+          "options": [
+            {
+              "text": "When updates flow only server-to-client and standard HTTP reconnects suffice.",
+              "explanation": "SSE streams over regular HTTP with built-in browser `EventSource` reconnection and zero STOMP broker overhead."
+            },
+            {
+              "text": "When clients must send high-frequency binary frames upstream to the server.",
+              "explanation": "SSE is strictly server-to-client UTF-8 text; bidirectional binary/low-latency frames require WebSockets or gRPC streaming."
+            },
+            {
+              "text": "When partner organizations need asynchronous retries while offline for hours.",
+              "explanation": "Long-lived server-to-server delivery across disconnects belongs to Webhooks with durable retry queues, not open browser SSE streams."
+            },
+            {
+              "text": "When clients require strict SOAP WSDL envelopes over UDP sockets.",
+              "explanation": "SSE runs over HTTP TCP streams with `text/event-stream`, completely unrelated to SOAP or UDP."
+            }
+          ]
+        },
+        {
+          "question": "3. What fails when a Spring WebSocket app using `enableSimpleBroker` scales from 1 pod to 4 Kubernetes pods?",
+          "correctIndex": 3,
+          "options": [
+            {
+              "text": "Spring Boot refuses to start WebSocket endpoints whenever replicas exceed one.",
+              "explanation": "The application starts normally on all 4 pods; the bug surfaces silently at runtime across separate clients."
+            },
+            {
+              "text": "The JVM pins Virtual Threads permanently during every HTTP upgrade handshake.",
+              "explanation": "Java 25 JEP 491 unpins `synchronized` monitors, and broker scaling is a distributed state issue, not thread pinning."
+            },
+            {
+              "text": "Browsers automatically downgrade every WebSocket upgrade into JSON polling.",
+              "explanation": "Browsers keep the WebSocket connection open to whichever pod accepted the handshake."
+            },
+            {
+              "text": "In-memory subscriptions stay isolated per pod so messages miss clients elsewhere.",
+              "explanation": "`SimpleBroker` lives only in local JVM heap; multi-pod routing requires an external broker relay such as RabbitMQ or Redis pub/sub."
+            }
+          ]
+        }
+      ]
+    }
+  }
+  </script>
+  <script src="../assets/workbench.js"></script>
+  <script src="../assets/quiz.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const data = JSON.parse(document.getElementById('lesson-data').textContent);
+      data.exercises.forEach(ex => new JavaExercise(ex));
+      new JavaQuiz(data.quiz);
+    });
+  </script>
+</body>
+</html>

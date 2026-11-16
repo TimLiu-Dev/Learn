@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 8: Crash Recovery, WAL, MVCC Tuple Versioning &amp; Vacuum Bloat</title>
+  <link rel="stylesheet" href="assets/course.css" />
+</head>
+<body data-lesson-id="lesson-08">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="master-plan.html">
+        <span class="brand-mark">DB</span>
+        <span>
+          Lesson 8 &bull; WAL, MVCC &amp; Vacuum
+          <span class="brand-sub">Phase 2 &bull; <span style="color:var(--accent);">&larr; Back to Master Plan</span></span>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <div id="engine-status" class="engine-pill">
+          <span class="engine-dot"></span>
+          <span class="engine-label">Loading SQLite...</span>
+        </div>
+        <a class="btn btn-sm" href="lesson-07.html">&larr; Lesson 7</a>
+        <a class="btn btn-sm" href="master-plan.html">Master Plan</a>
+        <a class="btn btn-primary btn-sm" href="lesson-09.html">Lesson 9 &rarr;</a>
+        <button id="theme-toggle" class="btn btn-sm" type="button">Light Mode</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar">
+      <div class="sidebar-title">Lesson 8 Contents</div>
+      <ul class="toc-list">
+        <li><a href="#room-bridge">1. Room WAL Mode vs Postgres</a></li>
+        <li><a href="#wal-recovery">2. WAL, fsync, Checkpoints &amp; ARIES</a></li>
+        <li><a href="#sqlite-wal">3. SQLite Rollback vs WAL Mode</a></li>
+        <li><a href="#mvcc">4. PostgreSQL MVCC (xmin / xmax)</a></li>
+        <li><a href="#vacuum-bloat">5. Dead Tuples, HOT, VACUUM &amp; Wraparound</a></li>
+        <li><a href="#sandbox">6. Free Recovery &amp; MVCC Sandbox</a></li>
+        <li><a href="#labs">7. Coding Labs (4 Auto-Checked)</a></li>
+        <li><a href="#quizzes">8. Senior Quizzes (6 MCQs)</a></li>
+        <li><a href="#cheatsheet">9. Senior Checklist</a></li>
+      </ul>
+
+      <div class="progress-box">
+        <div class="sidebar-title" style="margin-bottom:0.35rem;">Lesson 8 Progress</div>
+        <div class="progress-bar-track">
+          <div id="lesson-progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <div class="progress-meta">
+          <span id="lesson-progress-text">0/10 completed (0%)</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section class="hero">
+        <div class="meta-row">
+          <span class="badge badge-purple">Phase 2 &bull; Lesson 8</span>
+          <span class="badge badge-blue">Durability &amp; Concurrency Internals</span>
+          <span class="badge badge-green">WAL, MVCC &amp; VACUUM</span>
+        </div>
+        <h1>Crash Recovery, WAL, MVCC Tuple Versioning &amp; Vacuum Bloat</h1>
+        <p class="lead">
+          How can a database promise zero data loss when the power cord is yanked mid-transaction, while simultaneously letting thousands of readers query consistent snapshots without blocking writers?
+          The answer lies in <strong>Write-Ahead Logging (WAL)</strong>, <strong>MVCC tuple versioning</strong>, and disciplined <strong><code>VACUUM</code></strong> hygiene.
+        </p>
+        <div class="meta-row">
+          <span class="topic-chip">4 Interactive Demos</span>
+          <span class="topic-chip">1 Open Sandbox</span>
+          <span class="topic-chip">4 Coding Labs (Auto-Verified)</span>
+          <span class="topic-chip">6 Diagnostic Quizzes</span>
+        </div>
+      </section>
+
+      <!-- SECTION 1: ROOM BRIDGE -->
+      <section id="room-bridge" class="section-card">
+        <h2><span class="badge badge-purple">Room Bridge</span> 1. Why Room Defaults to WAL Mode&mdash;and How Server PostgreSQL Differs</h2>
+        <p>
+          Starting in Android Pie (API 28), Room enables <code>JournalMode.WRITE_AHEAD_LOGGING</code> (<code>PRAGMA journal_mode = WAL;</code>) by default:
+        </p>
+        <pre><code>Room.databaseBuilder(context, AppDatabase::class.java, "app.db")
+    // Default in modern Room: WRITE_AHEAD_LOGGING
+    // Allows background UI reads concurrently while a coroutine writes!
+    .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+    .build()</code></pre>
+
+        <div class="callout room">
+          <div class="callout-title">SQLite WAL vs PostgreSQL MVCC + WAL</div>
+          <p style="margin:0;">
+            In <strong>SQLite WAL mode</strong>, readers don&rsquo;t block the writer and the writer doesn&rsquo;t block readers&mdash;but there is still <strong>only ONE writer at a time</strong> across the whole database file!
+            In <strong>PostgreSQL</strong>, WAL handles crash durability while <strong>MVCC (Multi-Version Concurrency Control)</strong> stores row versions right inside heap pages so <strong>hundreds of writers</strong> on different rows run concurrently without blocking readers or each other.
+          </p>
+        </div>
+      </section>
+
+      <!-- SECTION 2: WAL, FSYNC, CHECKPOINTS & ARIES -->
+      <section id="wal-recovery" class="section-card">
+        <h2><span class="badge badge-blue">Durability</span> 2. Write-Ahead Logging (WAL), <code>fsync</code>, Checkpoints &amp; ARIES Recovery</h2>
+        <p>
+          Modifying scattered 8KB B+Tree pages directly on disk before returning <code>COMMIT OK</code> has two fatal flaws: random disk I/O is slow, and a power cut halfway through leaves torn/half-written pages.
+        </p>
+        <ul>
+          <li><strong>The WAL Rule:</strong> Before any dirty data page is allowed to overwrite the main datafile, its log record (what changed + <code>lsn</code> Log Sequence Number) MUST be appended sequentially to the WAL and flushed via <strong><code>fsync()</code></strong>.</li>
+          <li><strong>Commit = Sequential WAL Flush:</strong> On <code>COMMIT</code>, the engine appends a <code>COMMIT</code> record and calls <code>fsync()</code> on the WAL file alone&mdash;dirty heap pages stay in RAM and flush lazily later!</li>
+          <li><strong>Checkpoints:</strong> Periodically (or when WAL hits <code>max_wal_size</code>), a background checkpointer flushes dirty pages from RAM to the main datafile and advances the redo recovery starting point so old WAL segments can be recycled.</li>
+          <li><strong>ARIES Crash Recovery (Redo + Undo):</strong> After a crash, the engine replays WAL forward from the last checkpoint (<strong>Redo</strong>) to bring pages back to the exact crash state, then rolls back any transaction that lacked a <code>COMMIT</code> record (<strong>Undo</strong>&mdash;note PostgreSQL doesn&rsquo;t even need Undo because uncommitted MVCC tuples are simply invisible!).</li>
+        </ul>
+
+        <div class="code-demo" data-demo-id="demo-wal-redo">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 1</span> WAL Redo Log &amp; Crash Recovery Simulator</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <textarea class="sql-editor" spellcheck="false">-- Simulate an append-only WAL after a sudden power loss:
+-- txid 1 & 2 committed; txid 3 explicitly aborted; txid 4 was IN-FLIGHT when power died!
+CREATE TABLE wal_log (
+  lsn INTEGER PRIMARY KEY,
+  txid INTEGER NOT NULL,
+  op TEXT NOT NULL CHECK (op IN ('WRITE', 'COMMIT', 'ABORT')),
+  account_id INTEGER,
+  delta_cents INTEGER
+) STRICT;
+
+INSERT INTO wal_log VALUES
+  (1, 1, 'WRITE',  101, 5000),
+  (2, 1, 'COMMIT', NULL, NULL),
+  (3, 2, 'WRITE',  101, -1200),
+  (4, 3, 'WRITE',  102, 99999),
+  (5, 3, 'ABORT',  NULL, NULL),
+  (6, 4, 'WRITE',  101, -3000), -- Crash happened BEFORE txid 4 wrote COMMIT!
+  (7, 2, 'COMMIT', NULL, NULL);
+
+-- Crash Recovery Redo: materialize ONLY transactions with a durable COMMIT record!
+WITH committed_txs AS (
+  SELECT txid FROM wal_log WHERE op = 'COMMIT'
+)
+SELECT
+  w.account_id,
+  SUM(w.delta_cents) AS recovered_balance_cents
+FROM wal_log w
+JOIN committed_txs c ON c.txid = w.txid
+WHERE w.op = 'WRITE'
+GROUP BY w.account_id
+ORDER BY w.account_id;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 3: SQLITE ROLLBACK JOURNAL VS WAL MODE -->
+      <section id="sqlite-wal" class="section-card">
+        <h2><span class="badge badge-amber">SQLite Journaling</span> 3. Rollback Journal (<code>DELETE</code>) vs <code>WAL</code> Mode</h2>
+        <div class="grid-2">
+          <div class="mini-card">
+            <h4>Rollback Journal (<code>DELETE</code>, legacy default)</h4>
+            <ul style="margin:0.4rem 0 0;padding-left:1.2rem;font-size:0.89rem;color:var(--text-muted);">
+              <li>Copies original pages into <code>-journal</code>, overwrites main <code>.db</code> in place, deletes journal on commit.</li>
+              <li><strong>Writers block readers</strong> and readers block writers (2&times; I/O + lock contention).</li>
+            </ul>
+          </div>
+          <div class="mini-card">
+            <h4>SQLite WAL Mode (Room default)</h4>
+            <ul style="margin:0.4rem 0 0;padding-left:1.2rem;font-size:0.89rem;color:var(--text-muted);">
+              <li>Appends new page frames to <code>-wal</code>; main <code>.db</code> stays untouched until checkpoint.</li>
+              <li>Readers record an end-of-WAL mark and read concurrently with 1 writer!</li>
+              <li><strong>Trap:</strong> A long-running open read transaction prevents checkpoints from resetting <code>-wal</code>, causing unbounded WAL file growth!</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 4: POSTGRESQL MVCC -->
+      <section id="mvcc" class="section-card">
+        <h2><span class="badge badge-green">Concurrency</span> 4. PostgreSQL MVCC: <code>xmin</code>, <code>xmax</code> &amp; Snapshot Isolation</h2>
+        <p>
+          In PostgreSQL, <strong><code>UPDATE</code> never overwrites a row in place</strong>. Every physical tuple header carries two transaction IDs:
+        </p>
+        <ul>
+          <li><strong><code>xmin</code></strong>: The <code>txid</code> that inserted (created) this tuple version.</li>
+          <li><strong><code>xmax</code></strong>: The <code>txid</code> that deleted or updated this tuple version (<code>0</code> if untouched, or a row-locker XID/MultiXactId flagged by <code>HEAP_XMAX_LOCK_ONLY</code> when locked via <code>SELECT ... FOR UPDATE</code>).</li>
+        </ul>
+        <p>
+          When you run <code>UPDATE wallets SET balance = 80 WHERE id = 1</code>, PostgreSQL sets <code>xmax = current_txid</code> on the old tuple AND inserts a brand-new tuple with <code>xmin = current_txid, xmax = 0</code>!
+          A real PostgreSQL snapshot records <code>(xmin, xmax, xip[])</code>&mdash;tracking which transactions were still <strong>in-flight (<code>xip[]</code>)</strong> at snapshot start so even if one commits a millisecond later, the older snapshot keeps ignoring it.
+          <strong>Readers never block writers, and writers never block readers.</strong>
+        </p>
+
+        <div class="code-demo" data-demo-id="demo-mvcc">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 2</span> Interactive MVCC <code>xmin</code> / <code>xmax</code> Snapshot Simulator</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <textarea class="sql-editor" spellcheck="false">-- Simulate PostgreSQL heap tuples with xmin/xmax + CLOG transaction status:
+CREATE TABLE tx_clog (
+  txid INTEGER PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('COMMITTED', 'ABORTED', 'IN_PROGRESS'))
+) STRICT;
+
+CREATE TABLE mvcc_tuples (
+  tuple_id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL,
+  balance_cents INTEGER NOT NULL,
+  xmin INTEGER NOT NULL,
+  xmax INTEGER NOT NULL -- 0 means never deleted/updated
+) STRICT;
+
+INSERT INTO tx_clog VALUES
+  (100, 'COMMITTED'),
+  (101, 'COMMITTED'),
+  (102, 'ABORTED'),
+  (103, 'IN_PROGRESS'),
+  (104, 'COMMITTED');
+
+INSERT INTO mvcc_tuples VALUES
+  (1, 1, 5000, 100, 101), -- Original row created by 100, superseded by 101
+  (2, 1, 7500, 101, 103), -- Updated by 101; tx 103 is updating it right now (IN_PROGRESS!)
+  (3, 1, 9000, 103, 0),   -- Uncommitted new version from tx 103
+  (4, 2, 3000, 100, 102), -- Deleted by tx 102 which ABORTED!
+  (5, 3, 4200, 104, 0);   -- Created by tx 104 (committed AFTER snapshot 101!)
+
+-- Snapshot taken at max_txid = 101 (tx 102 aborted, tx 103 in progress, tx 104 is in the future):
+-- Rule: visible iff xmin committed & <= 101, AND (xmax = 0 OR xmax > 101 OR xmax not committed)
+SELECT t.tuple_id, t.account_id, t.balance_cents, t.xmin, t.xmax
+FROM mvcc_tuples t
+JOIN tx_clog cx ON cx.txid = t.xmin
+LEFT JOIN tx_clog cy ON cy.txid = t.xmax
+WHERE cx.state = 'COMMITTED' AND t.xmin <= 101
+  AND (t.xmax = 0 OR t.xmax > 101 OR COALESCE(cy.state, '') != 'COMMITTED')
+ORDER BY t.account_id;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 5: DEAD TUPLES, HOT, VACUUM & WRAPAROUND -->
+      <section id="vacuum-bloat" class="section-card">
+        <h2><span class="badge badge-red">Bloat &amp; Maintenance</span> 5. Dead Tuples, HOT Updates, <code>VACUUM</code> vs <code>VACUUM FULL</code> &amp; TXID Wraparound</h2>
+        <p>
+          Keeping old tuple versions enables lock-free MVCC&mdash;but once all active transactions move past an old tuple&rsquo;s <code>xmax</code>, that tuple becomes a <strong>dead tuple</strong> wasting disk and buffer pool RAM.
+        </p>
+        <ul>
+          <li><strong>HOT (Heap-Only Tuple) Updates:</strong> If an <code>UPDATE</code> does <em>not</em> change any indexed column AND the same 8KB heap page has free space (tuned via <code>fillfactor = 80</code> on update-heavy tables), PostgreSQL avoids touching any secondary indexes by chaining the new tuple directly on the same page!</li>
+          <li><strong><code>VACUUM</code> (Standard / Autovacuum):</strong> Runs online without blocking reads or writes. Marks dead tuples reusable inside existing heap pages, updates the Visibility Map (enabling Index-Only Scans!), and freezes old <code>xmin</code>s. Note: space is reused by future inserts, not returned to the OS unless trailing pages are empty.</li>
+          <li><strong><code>VACUUM FULL</code> (Senior Outage Trap!):</strong> Rewrites the entire table + all indexes to shrink the OS file&mdash;while holding an <strong><code>ACCESS EXCLUSIVE</code> lock</strong> that blocks every <code>SELECT</code>, <code>INSERT</code>, and <code>UPDATE</code> for minutes/hours! Use <code>pg_repack</code> online instead (and <code>REINDEX CONCURRENTLY</code> for bloated indexes). Note: PostgreSQL 17 introduced a streaming <code>TidStore</code> removing the legacy 1GB <code>maintenance_work_mem</code> cap for dead-tuple tracking.</li>
+          <li><strong><code>AUTOVACUUM</code> Scale Factor Trap:</strong> Default <code>autovacuum_vacuum_scale_factor = 0.2</code> (20%) means a 100M-row table accumulates <strong>20 MILLION dead tuples</strong> before autovacuum even wakes up! Tune per-table <code>autovacuum_vacuum_scale_factor = 0.01</code> (1%) or fixed thresholds on large tables.</li>
+          <li><strong>TXID Wraparound:</strong> PostgreSQL transaction IDs are 32-bit (~4.2 billion, ~2.1B visible horizon). <code>VACUUM FREEZE</code> kicks in around <code>autovacuum_freeze_max_age</code> (200M default); if neglected as <code>age(relfrozenxid)</code> approaches 2 billion, PostgreSQL shuts down writes to prevent ancient rows from suddenly looking &ldquo;in the future&rdquo;!</li>
+        </ul>
+
+        <div class="callout postgres">
+          <div class="callout-title">Durability Parity: <code>full_page_writes</code> &amp; <code>synchronous_commit</code></div>
+          <p style="margin:0;">
+            OS disk blocks (4KB) are smaller than PostgreSQL 8KB pages, so a crash mid-write can leave a <em>torn page</em>. Keeping <code>full_page_writes = on</code> logs the full page image on the first change after each checkpoint so WAL recovery repairs torn pages cleanly. You can also tune durability vs latency per transaction with <code>synchronous_commit</code> (<code>on</code> = flush primary + standby WAL; <code>local</code> = flush primary only; <code>off</code> = async group commit risk up to ~<code>wal_writer_delay</code>).
+          </p>
+        </div>
+
+        <div class="callout postgres">
+          <div class="callout-title">PostgreSQL Parity: Monitoring Dead Tuples &amp; Wraparound Risk</div>
+          <pre><code>-- Inspect live vs dead tuples &amp; transaction age in production PostgreSQL:
+SELECT
+  relname,
+  n_live_tup,
+  n_dead_tup,
+  round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
+  age(c.relfrozenxid) AS txid_age
+FROM pg_stat_user_tables s
+JOIN pg_class c ON c.oid = s.relid
+ORDER BY n_dead_tup DESC LIMIT 10;</code></pre>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-vacuum-pages">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 3</span> SQLite Freelist Bloat After Deletes &amp; Compaction via <code>VACUUM</code></span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <textarea class="sql-editor" spellcheck="false">CREATE TABLE events_log (id INTEGER PRIMARY KEY, body TEXT NOT NULL) STRICT;
+WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1000)
+INSERT INTO events_log SELECT x, printf('event-%0200d', x) FROM cnt;
+
+CREATE TABLE metrics (stage TEXT PRIMARY KEY, page_count INT NOT NULL, freelist_count INT NOT NULL) STRICT;
+INSERT INTO metrics SELECT '1. Loaded 1000 rows', c.page_count, f.freelist_count FROM pragma_page_count() c, pragma_freelist_count() f;
+
+-- Delete 85% of rows -> pages move to freelist, page_count stays high!
+DELETE FROM events_log WHERE id <= 850;
+INSERT INTO metrics SELECT '2. After DELETE 850 rows', c.page_count, f.freelist_count FROM pragma_page_count() c, pragma_freelist_count() f;
+
+-- VACUUM compacts remaining 150 rows into contiguous pages:
+VACUUM;
+INSERT INTO metrics SELECT '3. After VACUUM', c.page_count, f.freelist_count FROM pragma_page_count() c, pragma_freelist_count() f;
+
+SELECT * FROM metrics;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-hot-bloat">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 4</span> Autovacuum Threshold &amp; Table Bloat Calculator</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <textarea class="sql-editor" spellcheck="false">-- Compare default scale_factor = 0.20 vs tuned 0.01 on a 100M-row table:
+WITH table_stats(tbl, live_tup, dead_tup, threshold, scale_factor) AS (
+  VALUES
+    ('orders_default_cfg', 100000000, 5000000, 50, 0.20),
+    ('orders_tuned_cfg',   100000000, 5000000, 50, 0.01)
+)
+SELECT
+  tbl,
+  dead_tup,
+  CAST(threshold + scale_factor * live_tup AS INTEGER) AS autovacuum_trigger_tup,
+  CASE WHEN dead_tup >= threshold + scale_factor * live_tup
+       THEN 'TRIGGERED' ELSE 'SLEEPING (5M dead tuples ignored!)' END AS autovacuum_state
+FROM table_stats;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 6: SANDBOX -->
+      <section id="sandbox" class="section-card">
+        <h2><span class="badge badge-blue">Playground</span> 6. Free WAL, MVCC &amp; Bloat Sandbox</h2>
+        <p>
+          Query the pre-seeded <code>mvcc_tuples</code>, <code>tx_clog</code>, and <code>wal_log</code> tables to experiment with different snapshot horizons and crash-recovery edge cases.
+        </p>
+        <div class="code-demo" data-demo-id="demo-sandbox">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-green">Live Sandbox</span> MVCC &amp; WAL Playground</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Query (&#8984;/Ctrl+Enter)</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE tx_clog (txid INTEGER PRIMARY KEY, state TEXT NOT NULL) STRICT;
+            CREATE TABLE mvcc_tuples (tuple_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, balance_cents INTEGER NOT NULL, xmin INTEGER NOT NULL, xmax INTEGER NOT NULL) STRICT;
+            INSERT INTO tx_clog VALUES (100,'COMMITTED'),(101,'COMMITTED'),(102,'ABORTED'),(103,'IN_PROGRESS'),(104,'COMMITTED');
+            INSERT INTO mvcc_tuples VALUES (1,1,5000,100,101),(2,1,7500,101,103),(3,1,9000,103,0),(4,2,3000,100,102),(5,3,4200,104,0);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- Inspect all physical tuple versions currently sitting in the heap:
+SELECT t.tuple_id, t.account_id, t.balance_cents,
+       t.xmin, cx.state AS xmin_state,
+       t.xmax, COALESCE(cy.state, 'LIVE') AS xmax_state
+FROM mvcc_tuples t
+JOIN tx_clog cx ON cx.txid = t.xmin
+LEFT JOIN tx_clog cy ON cy.txid = t.xmax
+ORDER BY t.tuple_id;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 7: LABS -->
+      <section id="labs" class="section-card">
+        <h2><span class="badge badge-green">Hands-On Labs</span> 7. Coding Practice (4 Auto-Checked Labs)</h2>
+        <p>
+          Implement real MVCC snapshot visibility rules, WAL crash-recovery redo replay, autovacuum bloat diagnostics, and SQLite page compaction.
+        </p>
+        <div class="lab-card" data-lab-id="lab-1"></div>
+        <div class="lab-card" data-lab-id="lab-2"></div>
+        <div class="lab-card" data-lab-id="lab-3"></div>
+        <div class="lab-card" data-lab-id="lab-4"></div>
+      </section>
+
+      <!-- SECTION 8: QUIZZES -->
+      <section id="quizzes" class="section-card">
+        <h2><span class="badge badge-pink">Knowledge Checks</span> 8. Senior WAL, MVCC &amp; Vacuum Quizzes (6 MCQs)</h2>
+        <p>
+          Test your understanding of <code>fsync</code> durability, SQLite WAL checkpoint starvation, MVCC tuple chains, HOT updates, <code>VACUUM FULL</code> outages, and TXID wraparound.
+        </p>
+        <div class="quiz-card" data-quiz-id="quiz-1"></div>
+        <div class="quiz-card" data-quiz-id="quiz-2"></div>
+        <div class="quiz-card" data-quiz-id="quiz-3"></div>
+        <div class="quiz-card" data-quiz-id="quiz-4"></div>
+        <div class="quiz-card" data-quiz-id="quiz-5"></div>
+        <div class="quiz-card" data-quiz-id="quiz-6"></div>
+      </section>
+
+      <!-- SECTION 9: CHEATSHEET -->
+      <section id="cheatsheet" class="section-card">
+        <h2><span class="badge badge-blue">Summary</span> 9. Lesson 8 Senior Engineering Checklist</h2>
+        <ul>
+          <li>WAL gives durability via sequential <code>fsync()</code> before commit acknowledgment and enables ARIES crash recovery.</li>
+          <li>In SQLite WAL mode, close read transactions promptly so readers don&rsquo;t starve WAL checkpoints.</li>
+          <li>PostgreSQL MVCC never overwrites tuples in place: <code>xmin</code>/<code>xmax</code> let readers and writers run concurrently without blocking.</li>
+          <li>Never run <code>VACUUM FULL</code> in production traffic (<code>ACCESS EXCLUSIVE</code> lock); tune <code>autovacuum_vacuum_scale_factor</code> down on massive tables and use <code>fillfactor</code> to encourage HOT updates.</li>
+          <li>Monitor <code>age(relfrozenxid)</code> so <code>VACUUM FREEZE</code> prevents catastrophic TXID wraparound lockouts.</li>
+        </ul>
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem;flex-wrap:wrap;">
+          <a class="btn" href="lesson-07.html">&larr; Previous: Lesson 7</a>
+          <a class="btn" href="master-plan.html">Master Plan</a>
+          <a class="btn btn-primary" href="lesson-09.html">Next: Lesson 9 (ACID &amp; Isolation Levels) &rarr;</a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.COURSE_LABS = {
+      "lab-1": {
+        title: "Lab 1: Write an MVCC Snapshot Visibility Query",
+        difficulty: "Lab 1 of 4 \u2022 MVCC Visibility",
+        promptHtml: `
+          <p>The pre-seeded heap table <code>mvcc_tuples(tuple_id, account_id, balance_cents, xmin, xmax)</code> and transaction status log <code>tx_clog(txid, state)</code> hold multiple physical versions of accounts.</p>
+          <p>Write a query returning <code>tuple_id, account_id, balance_cents</code> for a reader holding snapshot <strong><code>snapshot_max_txid = 104</code></strong> (where <code>txid = 103</code> is still <code>IN_PROGRESS</code>, <code>txid = 102</code> is <code>ABORTED</code>, and <code>txid = 105</code> committed in the future!):</p>
+          <ul>
+            <li>A tuple is visible iff:
+              <ol>
+                <li><code>xmin</code> is <code>'COMMITTED'</code> AND <code>xmin &lt;= 104</code>, AND</li>
+                <li><code>xmax = 0</code> OR <code>xmax &gt; 104</code> OR <code>xmax</code>&rsquo;s state in <code>tx_clog</code> is NOT <code>'COMMITTED'</code>.</li>
+              </ol>
+            </li>
+            <li>Order output by <code>account_id ASC</code>.</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE tx_clog (
+            txid INTEGER PRIMARY KEY,
+            state TEXT NOT NULL CHECK (state IN ('COMMITTED', 'ABORTED', 'IN_PROGRESS'))
+          ) STRICT;
+          CREATE TABLE mvcc_tuples (
+            tuple_id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            balance_cents INTEGER NOT NULL,
+            xmin INTEGER NOT NULL,
+            xmax INTEGER NOT NULL
+          ) STRICT;
+          INSERT INTO tx_clog VALUES
+            (100, 'COMMITTED'),
+            (101, 'COMMITTED'),
+            (102, 'ABORTED'),
+            (103, 'IN_PROGRESS'),
+            (104, 'COMMITTED'),
+            (105, 'COMMITTED');
+          INSERT INTO mvcc_tuples VALUES
+            (1, 10, 1000, 100, 101), -- dead for snapshot 104 (deleted by committed 101)
+            (2, 10, 2500, 101, 103), -- visible! (103 is IN_PROGRESS)
+            (3, 10, 9999, 103, 0),   -- invisible (created by IN_PROGRESS 103)
+            (4, 20, 4000, 100, 102), -- visible! (102 ABORTED)
+            (5, 30, 5500, 104, 105), -- visible! (104 <= 104, and deleter 105 > 104!)
+            (6, 30, 6000, 105, 0);   -- invisible (105 > 104)
+        `,
+        starterSql: `-- Write the MVCC visibility query for snapshot_max_txid = 104:\n-- Return (tuple_id, account_id, balance_cents) ordered by account_id ASC.\n`,
+        hints: [
+          "Join <code>tx_clog cx ON cx.txid = t.xmin</code> and <code>LEFT JOIN tx_clog cy ON cy.txid = t.xmax</code> (<code>LEFT JOIN</code> because <code>xmax = 0</code> has no row in <code>tx_clog</code>!).",
+          "Filter creator: <code>WHERE cx.state = 'COMMITTED' AND t.xmin &lt;= 104</code>.",
+          "Filter deleter: <code>AND (t.xmax = 0 OR t.xmax &gt; 104 OR COALESCE(cy.state, '') != 'COMMITTED')</code>."
+        ],
+        solutionSql: `SELECT t.tuple_id, t.account_id, t.balance_cents
+FROM mvcc_tuples t
+JOIN tx_clog cx ON cx.txid = t.xmin
+LEFT JOIN tx_clog cy ON cy.txid = t.xmax
+WHERE cx.state = 'COMMITTED'
+  AND t.xmin <= 104
+  AND (
+    t.xmax = 0
+    OR t.xmax > 104
+    OR COALESCE(cy.state, '') != 'COMMITTED'
+  )
+ORDER BY t.account_id ASC;`,
+        solutionExplanationHtml: `
+          <p>Tuple <code>2</code> is visible because <code>xmax=103</code> is still <code>IN_PROGRESS</code>; tuple <code>4</code> is visible because <code>xmax=102</code> aborted; tuple <code>5</code> is visible because <code>xmin=104</code> is within snapshot and <code>xmax=105</code> happened after the snapshot! Notice how MVCC isolates this reader without taking a single row lock.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            const last = res.length ? res[res.length - 1] : null;
+            checks.push({ label: "Query returns a result set", passed: Boolean(last) });
+            if (!last) return { passed: false, checks };
+
+            const expected = [
+              [2, 10, 2500],
+              [4, 20, 4000],
+              [5, 30, 5500]
+            ];
+            const ok = JSON.stringify(last.values) === JSON.stringify(expected);
+            checks.push({
+              label: "Returns exact visible tuples [(2,10,2500), (4,20,4000), (5,30,5500)]",
+              passed: ok,
+              detail: `Got: ${JSON.stringify(last.values)}`
+            });
+
+            // Dynamic test: simulate tx 103 committing! On a snapshot where 103 was in-flight? Wait:
+            // If 103 commits AND we update mvcc_tuples to test dynamic query (not hardcoded tuple_id IN (2,4,5)):
+            const dbDyn = new SQL.Database();
+            dbDyn.run(setupSql);
+            dbDyn.run("UPDATE tx_clog SET state = 'COMMITTED' WHERE txid = 103;");
+            const resDyn = dbDyn.exec(userSql);
+            const lastDyn = resDyn.length ? resDyn[resDyn.length - 1] : null;
+            const dynExpected = [
+              [3, 10, 9999],
+              [4, 20, 4000],
+              [5, 30, 5500]
+            ];
+            const dynOk = Boolean(lastDyn && JSON.stringify(lastDyn.values) === JSON.stringify(dynExpected));
+            dbDyn.close();
+            checks.push({
+              label: "Dynamic check: query evaluates tx_clog state (not hardcoded tuple IDs)",
+              passed: dynOk,
+              detail: lastDyn ? `With tx 103 committed: ${JSON.stringify(lastDyn.values)}` : "No result on dynamic DB."
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-2": {
+        title: "Lab 2: WAL Redo Crash Recovery Replay",
+        difficulty: "Lab 2 of 4 \u2022 WAL Recovery",
+        promptHtml: `
+          <p>After a sudden server power loss, the pre-seeded <code>wal_records(lsn, txid, op, account_id, delta_cents)</code> table holds interleaved write, commit, and abort records&mdash;including an in-flight transaction (<code>txid = 4</code>) that crashed before writing <code>COMMIT</code>.</p>
+          <p>Write a crash-recovery query returning <code>account_id, balance_cents</code> (ordered by <code>account_id ASC</code>) that replays <strong>ONLY</strong> <code>WRITE</code> records belonging to transactions with a durable <code>COMMIT</code> record in the WAL.</p>
+        `,
+        setupSql: `
+          CREATE TABLE wal_records (
+            lsn INTEGER PRIMARY KEY,
+            txid INTEGER NOT NULL,
+            op TEXT NOT NULL CHECK (op IN ('WRITE', 'COMMIT', 'ABORT')),
+            account_id INTEGER,
+            delta_cents INTEGER
+          ) STRICT;
+          INSERT INTO wal_records VALUES
+            (1, 1, 'WRITE',  1, 10000),
+            (2, 2, 'WRITE',  2, 5000),
+            (3, 1, 'COMMIT', NULL, NULL),
+            (4, 3, 'WRITE',  1, -4000),
+            (5, 3, 'ABORT',  NULL, NULL),
+            (6, 4, 'WRITE',  2, -2500), -- crashed mid-tx! no COMMIT
+            (7, 5, 'WRITE',  1, 2500),
+            (8, 2, 'COMMIT', NULL, NULL),
+            (9, 5, 'COMMIT', NULL, NULL);
+        `,
+        starterSql: `-- Recover durable (account_id, balance_cents) from wal_records ordered by account_id ASC:\n`,
+        hints: [
+          "First find all durable transaction IDs: <code>SELECT txid FROM wal_records WHERE op = 'COMMIT'</code>.",
+          "Join or filter <code>wal_records</code> where <code>op = 'WRITE'</code> and <code>txid IN (...)</code>.",
+          "Aggregate with <code>SUM(delta_cents) AS balance_cents</code> grouped by <code>account_id</code>."
+        ],
+        solutionSql: `WITH committed AS (
+  SELECT txid FROM wal_records WHERE op = 'COMMIT'
+)
+SELECT
+  w.account_id,
+  SUM(w.delta_cents) AS balance_cents
+FROM wal_records w
+JOIN committed c ON c.txid = w.txid
+WHERE w.op = 'WRITE'
+GROUP BY w.account_id
+ORDER BY w.account_id ASC;`,
+        solutionExplanationHtml: `
+          <p>Account 1 sums tx 1 (<code>+10000</code>) and tx 5 (<code>+2500</code>) = <code>12500</code> (ignoring aborted tx 3). Account 2 keeps tx 2 (<code>+5000</code>) and discards uncommitted crashed tx 4.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            const last = res.length ? res[res.length - 1] : null;
+            checks.push({ label: "Query returns a result set", passed: Boolean(last) });
+            if (!last) return { passed: false, checks };
+
+            const colsOk =
+              last.columns.length === 2 &&
+              last.columns[0].toLowerCase() === "account_id" &&
+              last.columns[1].toLowerCase() === "balance_cents";
+            checks.push({
+              label: "Columns are (account_id, balance_cents)",
+              passed: colsOk,
+              detail: `Got: ${last.columns.join(", ")}`
+            });
+
+            const expected = [
+              [1, 12500],
+              [2, 5000]
+            ];
+            const ok = JSON.stringify(last.values) === JSON.stringify(expected);
+            checks.push({
+              label: "Recovers exact committed balances [(1, 12500), (2, 5000)]",
+              passed: ok,
+              detail: `Got: ${JSON.stringify(last.values)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-3": {
+        title: "Lab 3: Diagnose Dead-Tuple Bloat, Autovacuum Triggers & Wraparound Risk",
+        difficulty: "Lab 3 of 4 \u2022 Production Diagnostics",
+        promptHtml: `
+          <p>The pre-seeded table <code>pg_stat_sim(table_name, n_live_tup, n_dead_tup, relfrozenxid_age, av_threshold, av_scale_factor)</code> mirrors PostgreSQL table statistics.</p>
+          <p>Write a diagnostic query returning these exact 5 columns, ordered by <code>dead_pct DESC</code>:</p>
+          <ol>
+            <li><code>table_name</code></li>
+            <li><code>dead_pct</code>: Percentage of dead tuples out of total (<code>live + dead</code>), rounded to 2 decimal places (use <code>100.0 * ...</code> to avoid integer division).</li>
+            <li><code>trigger_tup</code>: Integer autovacuum dead-tuple threshold (<code>av_threshold + av_scale_factor * n_live_tup</code>, cast to <code>INTEGER</code>).</li>
+            <li><code>needs_vacuum</code>: <code>1</code> if dead tuples have reached/exceeded <code>trigger_tup</code>, else <code>0</code>.</li>
+            <li><code>wraparound_risk</code>: <code>1</code> if <code>relfrozenxid_age &gt;= 150000000</code>, else <code>0</code>.</li>
+          </ol>
+        `,
+        setupSql: `
+          CREATE TABLE pg_stat_sim (
+            table_name TEXT PRIMARY KEY,
+            n_live_tup INTEGER NOT NULL,
+            n_dead_tup INTEGER NOT NULL,
+            relfrozenxid_age INTEGER NOT NULL,
+            av_threshold INTEGER NOT NULL,
+            av_scale_factor REAL NOT NULL
+          ) STRICT;
+          INSERT INTO pg_stat_sim VALUES
+            ('orders_huge', 10000000, 800000, 45000000, 50, 0.20),
+            ('sessions_hot', 50000, 30000, 12000000, 50, 0.20),
+            ('audit_archive', 20000000, 100000, 185000000, 50, 0.01);
+        `,
+        starterSql: `-- Write the bloat & wraparound diagnostic query ordered by dead_pct DESC:\n`,
+        hints: [
+          "Compute <code>dead_pct</code> with <code>ROUND(100.0 * n_dead_tup / (n_live_tup + n_dead_tup), 2) AS dead_pct</code>.",
+          "Use <code>CASE WHEN n_dead_tup >= av_threshold + av_scale_factor * n_live_tup THEN 1 ELSE 0 END AS needs_vacuum</code>.",
+          "Flag <code>wraparound_risk</code> when <code>relfrozenxid_age >= 150000000</code>."
+        ],
+        solutionSql: `SELECT
+  table_name,
+  ROUND(100.0 * n_dead_tup / (n_live_tup + n_dead_tup), 2) AS dead_pct,
+  CAST(av_threshold + av_scale_factor * n_live_tup AS INTEGER) AS trigger_tup,
+  CASE
+    WHEN n_dead_tup >= av_threshold + av_scale_factor * n_live_tup THEN 1
+    ELSE 0
+  END AS needs_vacuum,
+  CASE
+    WHEN relfrozenxid_age >= 150000000 THEN 1
+    ELSE 0
+  END AS wraparound_risk
+FROM pg_stat_sim
+ORDER BY dead_pct DESC;`,
+        solutionExplanationHtml: `
+          <p>Notice the subtle production insight: <code>orders_huge</code> has 800k dead tuples, yet <code>needs_vacuum = 0</code> because default <code>0.20</code> scale factor waits for 2,000,050 dead tuples! Meanwhile <code>audit_archive</code> has low dead-tuple percentage (0.5%) but urgent <code>wraparound_risk = 1</code> requiring <code>VACUUM FREEZE</code>.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            const last = res.length ? res[res.length - 1] : null;
+            checks.push({ label: "Query returns a result set", passed: Boolean(last) });
+            if (!last) return { passed: false, checks };
+
+            const expectedCols = ["table_name", "dead_pct", "trigger_tup", "needs_vacuum", "wraparound_risk"];
+            const colsOk = last.columns.map((c) => c.toLowerCase()).join(",") === expectedCols.join(",");
+            checks.push({
+              label: "Exact 5 columns (table_name, dead_pct, trigger_tup, needs_vacuum, wraparound_risk)",
+              passed: colsOk,
+              detail: `Got: ${last.columns.join(", ")}`
+            });
+
+            const expected = [
+              ["sessions_hot", 37.5, 10050, 1, 0],
+              ["orders_huge", 7.41, 2000050, 0, 0],
+              ["audit_archive", 0.5, 200050, 0, 1]
+            ];
+            const rowsOk = JSON.stringify(last.values) === JSON.stringify(expected);
+            checks.push({
+              label: "Diagnostic metrics & risk flags match expected values",
+              passed: rowsOk,
+              detail: `Got: ${JSON.stringify(last.values)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-4": {
+        title: "Lab 4: Purge Expired Rows & Reclaim Freelist Pages with VACUUM",
+        difficulty: "Lab 4 of 4 \u2022 Compaction",
+        promptHtml: `
+          <p>The pre-seeded <code>session_cache</code> table contains 1,000 rows: 850 expired rows (<code>expires_at &lt; 1000</code>) and 150 active rows (<code>expires_at &gt;= 1000</code>).</p>
+          <ol>
+            <li>Delete all expired rows (<code>WHERE expires_at &lt; 1000</code>) from <code>session_cache</code>.</li>
+            <li>Compact the database with <code>VACUUM;</code> so all freed pages are reclaimed (<code>freelist_count = 0</code> and <code>page_count</code> shrinks).</li>
+            <li>Run a final <code>SELECT COUNT(*) AS live_rows FROM session_cache;</code>.</li>
+          </ol>
+        `,
+        setupSql: `
+          CREATE TABLE session_cache (
+            id INTEGER PRIMARY KEY,
+            expires_at INTEGER NOT NULL,
+            token_blob TEXT NOT NULL
+          ) STRICT;
+          WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1000)
+          INSERT INTO session_cache SELECT
+            x,
+            CASE WHEN x <= 850 THEN 500 ELSE 2000 END,
+            printf('tok-%0200d', x)
+          FROM cnt;
+        `,
+        starterSql: `-- 1. DELETE expired rows (expires_at < 1000) from session_cache\n-- 2. Run VACUUM;\n-- 3. SELECT COUNT(*) AS live_rows FROM session_cache;\n`,
+        hints: [
+          "First run <code>DELETE FROM session_cache WHERE expires_at < 1000;</code>.",
+          "Then run <code>VACUUM;</code> as a standalone statement.",
+          "Finally <code>SELECT COUNT(*) AS live_rows FROM session_cache;</code>."
+        ],
+        solutionSql: `DELETE FROM session_cache WHERE expires_at < 1000;
+VACUUM;
+SELECT COUNT(*) AS live_rows FROM session_cache;`,
+        solutionExplanationHtml: `
+          <p>Deleting 850 rows alone leaves ~50 freed pages on SQLite&rsquo;s freelist without reducing file size. Running <code>VACUUM;</code> rebuilds the B+Tree cleanly, dropping <code>freelist_count</code> to <code>0</code> and cutting <code>page_count</code> by ~80%.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const pagesBefore = db.exec("PRAGMA page_count;")[0].values[0][0];
+
+            const res = db.exec(userSql);
+            const liveRows = db.exec("SELECT COUNT(*) FROM session_cache;")[0].values[0][0];
+            const expiredLeft = db.exec("SELECT COUNT(*) FROM session_cache WHERE expires_at < 1000;")[0].values[0][0];
+            checks.push({
+              label: "Expired rows deleted and 150 active rows preserved",
+              passed: liveRows === 150 && expiredLeft === 0,
+              detail: `Live: ${liveRows}, Expired remaining: ${expiredLeft}`
+            });
+
+            const pagesAfter = db.exec("PRAGMA page_count;")[0].values[0][0];
+            const freeAfter = db.exec("PRAGMA freelist_count;")[0].values[0][0];
+            checks.push({
+              label: "VACUUM shrank page_count and zeroed freelist_count",
+              passed: pagesAfter < pagesBefore && freeAfter === 0,
+              detail: `Pages: ${pagesBefore} -> ${pagesAfter}, freelist_count: ${freeAfter}`
+            });
+
+            const last = res.length ? res[res.length - 1] : null;
+            const selectOk = Boolean(last && last.values.length === 1 && last.values[0][0] === 150);
+            checks.push({ label: "Final SELECT returns live_rows = 150", passed: selectOk });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      }
+    };
+
+    window.COURSE_QUIZZES = {
+      "quiz-1": {
+        tag: "WAL Durability",
+        questionHtml: "Why can PostgreSQL return <code>COMMIT OK</code> to a client immediately after <code>fsync()</code>ing a sequential WAL record&mdash;without flushing modified 8KB heap/index pages to disk first?",
+        options: [
+          {
+            labelHtml: "Because modified heap pages stay in volatile RAM permanently and never hit disk.",
+            correct: false,
+            whyHtml: "Dirty heap pages are flushed asynchronously by background writer and checkpoint processes."
+          },
+          {
+            labelHtml: "Because calling <code>fsync()</code> on the WAL deletes any uncommitted heap tuples automatically.",
+            correct: false,
+            whyHtml: "<code>fsync()</code> flushes OS file buffers to durable storage; MVCC visibility ignores uncommitted tuples."
+          },
+          {
+            labelHtml: "Because PostgreSQL client drivers buffer dirty heap pages locally until the next checkpoint.",
+            correct: false,
+            whyHtml: "The server writes and <code>fsync()</code>s the WAL before acknowledging <code>COMMIT</code> (unless <code>synchronous_commit = off</code> is explicitly configured)."
+          },
+          {
+            labelHtml: "Because crash recovery replays durable WAL records from the last checkpoint to rebuild pages.",
+            correct: true,
+            whyHtml: "Write-Ahead Logging guarantees that the redo instructions are durable on disk before commit acknowledgment, turning slow random page writes on commit into fast sequential WAL appends."
+          }
+        ]
+      },
+
+      "quiz-2": {
+        tag: "SQLite WAL Mode",
+        questionHtml: "An Android app or backend service uses SQLite in <code>WAL</code> mode. Suddenly the <code>app.db-wal</code> file balloons to 4 GB and checkpoints refuse to truncate it! What is the most likely cause?",
+        options: [
+          {
+            labelHtml: "Too many short <code>SELECT</code> queries executing concurrently without indexed <code>WHERE</code> filter predicates.",
+            correct: false,
+            whyHtml: "Fast completed <code>SELECT</code> queries immediately release their WAL read mark."
+          },
+          {
+            labelHtml: "An open read transaction or unclosed cursor pins an old snapshot, blocking WAL truncation.",
+            correct: true,
+            whyHtml: "In SQLite WAL mode, a checkpoint cannot advance past the oldest active reader's end-of-WAL mark! One forgotten open <code>Cursor</code> or idle <code>BEGIN</code> read transaction starves checkpoint truncation indefinitely."
+          },
+          {
+            labelHtml: "Enabling <code>PRAGMA foreign_keys = ON</code> forces SQLite to retain every historical WAL frame.",
+            correct: false,
+            whyHtml: "Foreign keys do not block WAL checkpoints."
+          },
+          {
+            labelHtml: "Choosing <code>UUIDv4</code> primary keys instead of <code>INTEGER PRIMARY KEY</code> prevents WAL reset.",
+            correct: false,
+            whyHtml: "Key type does not block WAL checkpoint truncation."
+          }
+        ]
+      },
+
+      "quiz-3": {
+        tag: "PostgreSQL MVCC",
+        questionHtml: "In PostgreSQL, Transaction A runs <code>UPDATE accounts SET balance = 900 WHERE id = 1;</code> and commits. Why does Transaction B (which started <code>REPEATABLE READ</code> before A) still read the old balance without blocking?",
+        options: [
+          {
+            labelHtml: "Transaction A wrote a new tuple version; B's older snapshot reads the prior version.",
+            correct: true,
+            whyHtml: "MVCC keeps multiple physical versions in the heap. Writers never overwrite the version older snapshots are reading, eliminating read-write lock contention."
+          },
+          {
+            labelHtml: "PostgreSQL blocked Transaction A's commit in memory until Transaction B closed its query.",
+            correct: false,
+            whyHtml: "Transaction A commits immediately without waiting on readers."
+          },
+          {
+            labelHtml: "Transaction B bypasses heap buffers and reconstructs old rows directly from WAL files.",
+            correct: false,
+            whyHtml: "PostgreSQL readers read heap/shared buffer pages (unlike Oracle/MySQL InnoDB undo logs), using <code>xmin</code>/<code>xmax</code> visibility checks."
+          },
+          {
+            labelHtml: "<code>UPDATE</code> holds an <code>ACCESS EXCLUSIVE</code> lock that hides new values from active readers.",
+            correct: false,
+            whyHtml: "<code>UPDATE</code> only takes a row-level lock on the updated row and a <code>ROW EXCLUSIVE</code> table lock, never blocking concurrent readers."
+          }
+        ]
+      },
+
+      "quiz-4": {
+        tag: "HOT Updates",
+        questionHtml: "A PostgreSQL table receives 10,000 <code>UPDATE</code>s/sec on a non-indexed <code>last_seen_at</code> column, causing massive index bloat. How do you maximize <strong>HOT (Heap-Only Tuple)</strong> updates?",
+        options: [
+          {
+            labelHtml: "Add a covering B+Tree index on <code>last_seen_at</code> so updates use index-only scans.",
+            correct: false,
+            whyHtml: "Indexing <code>last_seen_at</code> guarantees updates to it CANNOT be HOT updates, forcing every index to be updated on every write!"
+          },
+          {
+            labelHtml: "Recreate the table using <code>WITHOUT ROWID</code> clustering to eliminate secondary index pointers.",
+            correct: false,
+            whyHtml: "<code>WITHOUT ROWID</code> is a SQLite feature, not PostgreSQL."
+          },
+          {
+            labelHtml: "Lower table <code>fillfactor</code> (e.g., 80) to reserve free page space for same-page tuples.",
+            correct: true,
+            whyHtml: "A HOT update requires two conditions: (1) no indexed column changed, and (2) the new tuple fits on the SAME 8KB heap page. Setting <code>fillfactor = 80</code> reserves room on each page for in-page HOT updates!"
+          },
+          {
+            labelHtml: "Disable <code>AUTOVACUUM</code> on the table so dead tuple slots stay untouched in memory.",
+            correct: false,
+            whyHtml: "Disabling autovacuum stops dead-tuple cleanup inside pages, starving HOT updates of free space!"
+          }
+        ]
+      },
+
+      "quiz-5": {
+        tag: "VACUUM vs VACUUM FULL",
+        questionHtml: "Disk usage on a 400 GB PostgreSQL <code>orders</code> table grew due to bloat. An engineer suggests running <code>VACUUM FULL orders;</code> during peak daytime traffic. Why should you block that?",
+        options: [
+          {
+            labelHtml: "It takes an <code>ACCESS EXCLUSIVE</code> lock during the multi-hour rewrite, blocking all traffic.",
+            correct: true,
+            whyHtml: "<code>VACUUM FULL</code> copies every live row into a brand-new file and rebuilds all indexes under an <code>ACCESS EXCLUSIVE</code> lock. Use regular <code>VACUUM</code> (non-blocking) or online tools like <code>pg_repack</code> in production."
+          },
+          {
+            labelHtml: "It permanently purges live rows older than the table's configured autovacuum threshold.",
+            correct: false,
+            whyHtml: "<code>VACUUM FULL</code> preserves all live rows."
+          },
+          {
+            labelHtml: "It disables WAL logging while compacting, breaking streaming replication to read replicas.",
+            correct: false,
+            whyHtml: "<code>VACUUM FULL</code> is fully WAL-logged (which actually adds heavy WAL volume during the rewrite)."
+          },
+          {
+            labelHtml: "It only compacts partitioned tables and immediately errors out on standalone heap tables.",
+            correct: false,
+            whyHtml: "It works on regular tables, which is why running it carelessly causes outages."
+          }
+        ]
+      },
+
+      "quiz-6": {
+        tag: "AUTOVACUUM & TXID Wraparound",
+        questionHtml: "Why can an ignored PostgreSQL alert showing <code>age(relfrozenxid) = 1.95 billion</code> lead to a hard production write outage?",
+        options: [
+          {
+            labelHtml: "<code>relfrozenxid</code> counts table size in bytes and triggers a 2 GB storage cap.",
+            correct: false,
+            whyHtml: "<code>relfrozenxid</code> is a transaction ID age counter, not byte size."
+          },
+          {
+            labelHtml: "PostgreSQL B+Tree index pages only address up to two billion distinct row pointers.",
+            correct: false,
+            whyHtml: "B+Trees have no 2-billion-row limit."
+          },
+          {
+            labelHtml: "<code>AUTOVACUUM</code> switches tables to read-only once row count exceeds one billion tuples.",
+            correct: false,
+            whyHtml: "It is 32-bit TXID age (~2B transactions), not row count, that triggers wraparound protection."
+          },
+          {
+            labelHtml: "32-bit TXIDs wrap around near 2.1B, forcing a write halt until <code>VACUUM FREEZE</code> runs.",
+            correct: true,
+            whyHtml: "With 32-bit TXIDs, modular comparison breaks if an unfrozen tuple is more than 2^31 transactions old&mdash;committed historical data would suddenly look like 'the future' and vanish! PostgreSQL refuses new TXIDs ~1M&ndash;3M before wraparound until manual/forced vacuuming completes."
+          }
+        ]
+      }
+    };
+  </script>
+  <script src="assets/sql-asm.js"></script>
+  <script src="assets/course-engine.js"></script>
+</body>
+</html>

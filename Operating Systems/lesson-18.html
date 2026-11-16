@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 18: Signals, ELF Dynamic Linking, ASLR &amp; Tombstones — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <style>
+    .sig-pill {
+      padding: 0.18rem 0.55rem;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      font-weight: 700;
+    }
+    .sig-wait { background: var(--amber-soft); color: var(--amber); }
+    .sig-run { background: var(--green-soft); color: var(--green); }
+    .sig-dead { background: var(--red-soft); color: var(--red); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 18</span>
+        <span>Signals, ELF Dynamic Linking &amp; Tombstones</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-17.html">&larr; Prev Lesson</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C &amp; Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">Code Labs (3)</a>
+        <a href="#quiz">Quiz (6)</a>
+        <a href="lesson-19.html">Next Lesson &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="badge b-concept">PHASE 6 // SIGNALS, EXECVE &amp; DYNAMIC LINKING</span>
+      <h1>Lesson 18: Kernel Signal Delivery, ELF64 Dynamic Linking, ASLR &amp; Android Tombstones</h1>
+      <p>
+        How does Linux deliver a <code>SIGSEGV</code> or <code>SIGCHLD</code> asynchronously to a running thread, unwind back
+        into user code via <code>rt_sigreturn</code>, and prevent PID-reuse races with <code>pidfd</code>? And when
+        <code>execve()</code> launches an ELF binary, how do <code>auxv</code>, <strong>ASLR</strong>, <strong>PLT/GOT</strong>,
+        <strong>Full RELRO</strong>, and the <code>bionic</code> linker wire shared libraries together?
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button id="markLessonComplete" class="btn btn-green btn-sm" type="button">Mark Lesson 18 Complete</button>
+      </div>
+    </section>
+
+    <!-- MODULE 1 -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>Asynchronous Signal Trampolines &amp; The <code>execve()</code> Memory Blueprint</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. How the Kernel Delivers a Signal on ARM64</h3>
+          <p><strong>Pending vs. Blocked Bitmasks:</strong> Every task tracks <code>pending</code> and <code>blocked</code> (<code>sigprocmask</code>) 64-bit masks. Before returning from <code>EL1 &rarr; EL0</code>, Linux checks <code>pending &amp; ~blocked</code>. Note: <code>SIGKILL</code> (9) and <code>SIGSTOP</code> (19) can never be caught or blocked.</p>
+          <p><strong><code>rt_sigframe</code> &amp; <code>rt_sigreturn</code>:</strong> To invoke a user handler, the kernel pushes the interrupted user registers (`pt_regs`) onto `SP_EL0` (or `sigaltstack` if `SA_ONSTACK` is set), sets `ELR_EL1 = handler_pc`, sets `x30` (LR) to the vDSO's `__kernel_rt_sigreturn` trampoline, and executes `ERET`. When the handler returns, `rt_sigreturn` traps back into EL1 to pop the original registers!</p>
+        </div>
+
+        <div class="card">
+          <h3>2. ELF64 <code>execve()</code>, ASLR, PLT/GOT &amp; RELRO</h3>
+          <p><strong>Kernel Setup:</strong> <code>execve()</code> tears down the old <code>mm_struct</code>, maps the binary's <code>PT_LOAD</code> segments (and <code>PT_INTERP</code>, e.g. <code>/system/bin/linker64</code>) at randomized <strong>ASLR</strong> bases, maps <code>[vvar]</code>/<code>[vdso]</code>, and pushes <code>argc</code>, <code>argv</code>, <code>envp</code>, and <strong><code>auxv</code></strong> (<code>AT_PAGESZ</code>, <code>AT_RANDOM</code>, <code>AT_BASE</code>, <code>AT_SYSINFO_EHDR</code>) onto the user stack.</p>
+          <p><strong>PLT / GOT &amp; RELRO:</strong> Position-Independent Executables (<code>PIE</code>) resolve external functions via the <strong>GOT</strong> (Global Offset Table) and <strong>PLT</strong> stubs. Under lazy binding, the GOT stays writable so attackers can overwrite function pointers; with <strong><code>BIND_NOW</code> + Full RELRO</strong> (default on modern Android), the dynamic linker resolves all symbols at startup and marks the GOT <strong>read-only (<code>mprotect PROT_READ</code>)</strong> before <code>main()</code> runs.</p>
+        </div>
+      </div>
+
+      <div class="sim-box">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem; margin-bottom:0.85rem;">
+          <strong style="font-size:0.95rem;">Interactive Simulator: Kernel Signal Delivery &amp; <code>EINTR</code> / <code>SA_RESTART</code></strong>
+          <span id="sigSimBadge" class="sig-pill sig-wait">BLOCKED IN READ()</span>
+        </div>
+
+        <div class="sim-controls">
+          <button class="btn btn-primary btn-sm" id="sigRestartBtn" type="button">Deliver SIGUSR1 (SA_RESTART=true)</button>
+          <button class="btn btn-sm" id="sigEintrBtn" type="button">Deliver SIGUSR1 (SA_RESTART=false)</button>
+          <button class="btn btn-sm" id="sigKillBtn" type="button">Deliver SIGKILL (Uncatchable)</button>
+          <button class="btn btn-sm" id="sigStepBtn" type="button">Step Signal Flow &rarr;</button>
+        </div>
+
+        <div class="sim-grid" style="margin-top:0.85rem;">
+          <div class="kv"><div class="k">EL0 PC / Handler</div><div class="v" id="sigPc">0x00402010 (inside read SVC)</div></div>
+          <div class="kv"><div class="k">User Stack (SP_EL0)</div><div class="v" id="sigSp">0x7FF800 (Normal Frame)</div></div>
+          <div class="kv"><div class="k">Signal Mask State</div><div class="v" id="sigMask">pending=0, blocked=0</div></div>
+          <div class="kv"><div class="k">Syscall Return (x0)</div><div class="v" id="sigRet">Sleeping on pipe</div></div>
+        </div>
+        <div class="callout" id="sigExplain" style="margin-top:0.85rem; margin-bottom:0;">
+          Choose a signal scenario above and click <strong>Step Signal Flow &rarr;</strong> to see how <code>rt_sigframe</code>, <code>rt_sigreturn</code>, and <code>SA_RESTART</code> work.
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 2 -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C, LINUX 6.x &amp; LINKER SECURITY</span>
+          <h2>Async-Signal Safety, <code>pidfd</code> &amp; Inspecting ELF Dynamic Headers</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>Safe Signal Handler + PID-Reuse-Proof Killing (<code>pidfd</code>)</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code-sig-c">Copy</button>
+          </div>
+          <pre class="code" id="code-sig-c">static volatile sig_atomic_t g_stop = 0;
+
+// ONLY async-signal-safe calls here (NEVER printf or malloc!)
+static void on_sigterm(int sig) {
+  (void)sig;
+  g_stop = 1; // Or write(wake_pipe_fd, "x", 1) to wake epoll!
+}
+
+// Race-free process termination (used by Android lmkd)
+int kill_safely(int pid) {
+  int pfd = syscall(__NR_pidfd_open, pid, 0);
+  if (pfd &lt; 0) return -1;
+  int rc = syscall(__NR_pidfd_send_signal, pfd, SIGKILL, NULL, 0);
+  close(pfd);
+  return rc;
+}</pre>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>Why Calling <code>malloc()</code> in a Signal Handler Deadlocks</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code-sig-deadlock">Copy</button>
+          </div>
+          <pre class="code" id="code-sig-deadlock">// Thread T1 is inside Scudo/glibc malloc():
+malloc() {
+  lock(&amp;arena_mutex);       // &lt;-- T1 holds arena_mutex
+  // ... SIGSEGV / SIGUSR1 arrives RIGHT HERE!
+  // Kernel hijacks T1's PC to run signal_handler()
+  // If signal_handler() calls malloc() or printf():
+  //   malloc() tries lock(&amp;arena_mutex) -&gt; SELF-DEADLOCK!
+}
+// Fix: Use sigaltstack() + write(2) / _exit() or self-pipe!</pre>
+        </div>
+      </div>
+
+      <p style="font-size:0.86rem; color:var(--text-muted); margin-top:0.85rem;">
+        <strong>Primary Sources:</strong>
+        <a href="https://man7.org/linux/man-pages/man7/signal-safety.7.html" target="_blank" rel="noopener">signal-safety(7) Async-Signal-Safe Functions</a> &middot;
+        <a href="https://source.android.com/docs/core/tests/debug/native-crash" target="_blank" rel="noopener">AOSP Native Crash &amp; Tombstone Architecture</a> &middot;
+        <a href="https://android.googlesource.com/platform/bionic/+/main/android-changes-for-ndk-developers.md" target="_blank" rel="noopener">Android Bionic Linker &amp; Namespaces</a>
+      </p>
+    </section>
+
+    <!-- MODULE 3 -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2>Android <code>debuggerd</code> Tombstones &amp; <code>bionic</code> Linker Namespaces</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>How Android Captures Native Tombstones (<code>SIGSEGV</code> / <code>SIGABRT</code>)</h3>
+          <p>Every Android process installs a <code>debuggerd</code> signal handler on a dedicated <strong><code>sigaltstack</code></strong> (essential if the crash was a stack overflow—otherwise pushing <code>rt_sigframe</code> onto an exhausted stack triggers an instant double fault!). The handler avoids Scudo locks, talks to <code>tombstoned</code> over a socket to receive a crash dump FD, and freezes threads via <code>ptrace</code>/process_vm_readv.</p>
+        </div>
+        <div class="card">
+          <h3><code>bionic</code> Linker Namespaces &amp; 16KB ELF Alignment</h3>
+          <p>When Android apps load native <code>.so</code> libraries via <code>System.loadLibrary()</code>, <code>/system/bin/linker64</code> enforces <strong>linker namespaces</strong> so apps cannot `dlopen` private vendor/platform `.so`s. All `PT_LOAD` segments must also be <strong>16KB-aligned (`0x4000`)</strong> with <strong>Full RELRO (`BIND_NOW`)</strong> so GOT entries become immutable before app code runs.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // RUNNABLE CODE PRACTICE LABS</span>
+          <h2>Hands-On Signal Delivery, ELF64 Loading &amp; PLT/GOT Labs</h2>
+        </div>
+      </div>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // KERNEL SIGNAL ARBITER</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement Signal Delivery &amp; <code>SA_RESTART</code> (<code>deliverSignalStep</code>)</h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Respect blocked masks, uncatchable signals, and interrupted syscall restart semantics.
+            </p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>task = { pending: Set&lt;string&gt;, blocked: Set&lt;string&gt;, handlers: Map/Object, inBlockingSyscall: bool }</code>:<br/>
+          &bull; <code>"SIGKILL"</code> and <code>"SIGSTOP"</code> ignore <code>blocked</code>. If <code>pending.has("SIGKILL")</code>, consume it and return <code>{ action: "TERMINATE", signal: "SIGKILL", syscallResult: null }</code>.<br/>
+          &bull; Otherwise pick the first deliverable signal in sorted order where <code>!blocked.has(sig)</code> (or <code>sig === "SIGSTOP"</code>). If none, return <code>{ action: "NONE", signal: null, syscallResult: "OK" }</code>.<br/>
+          &bull; Consume the signal from a copy/update of pending. If <code>sig === "SIGSTOP"</code> return <code>{ action: "STOP", signal: "SIGSTOP", syscallResult: null }</code>.<br/>
+          &bull; Look up <code>h = task.handlers[sig]</code>: if missing or <code>"DFL"</code>, return <code>{ action: "TERMINATE", signal: sig, syscallResult: null }</code>; if <code>"IGN"</code>, return <code>{ action: "IGNORE", signal: sig, syscallResult: task.inBlockingSyscall ? "CONTINUE" : "OK" }</code>; else <code>h</code> is <code>{ fn, saRestart }</code>: return <code>{ action: "CALL_HANDLER", signal: sig, syscallResult: task.inBlockingSyscall ? (h.saRestart ? "RESTART_SYSCALL" : -4) : "OK" }</code> (<code>-4 = -EINTR</code>).
+        </div>
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // ELF64 LOADER &amp; 16KB ALIGNMENT</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement ELF64 <code>PT_LOAD</code> Mapper &amp; <code>auxv</code> Validator (<code>loadElfLayout</code>)</h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Reject misaligned ELF segments for Android 16KB pages and verify <code>vaddr % pageSize === offset % pageSize</code>.
+            </p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>segments</code> (array of <code>{ vaddr, offset, filesz, memsz, align, flags }</code>), <code>aslrBase</code>, and <code>pageSize</code> (e.g. <code>16384</code>):<br/>
+          &bull; Validate each segment: <code>memsz &gt;= filesz</code>, <code>align &gt;= pageSize</code>, and <code>(vaddr % pageSize) === (offset % pageSize)</code>. On failure return <code>{ ok: false, reason }</code> (<code>"INVALID_MEMSZ"</code>, <code>"BAD_PAGE_ALIGN"</code>, or <code>"VADDR_OFFSET_MISMATCH"</code>).<br/>
+          &bull; For valid segments, compute mapped page-aligned start <code>mapStart = aslrBase + Math.floor(vaddr / pageSize) * pageSize</code>, mapped end rounded up to <code>pageSize</code>, and <code>bssBytes = memsz - filesz</code>.<br/>
+          &bull; Return <code>{ ok: true, mappings, auxv: { AT_PAGESZ: pageSize, AT_BASE: aslrBase } }</code>.
+        </div>
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // PLT/GOT &amp; FULL RELRO</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement Dynamic Linker GOT Resolver &amp; RELRO Guard (<code>resolveGotPlt</code>)</h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Contrast lazy PLT resolution against eager <code>BIND_NOW</code> + Full RELRO hardening.
+            </p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>imports</code> (array of symbol names), <code>symbolTable</code> (object <code>name -&gt; addr</code>), and <code>fullRelro</code> (boolean):<br/>
+          &bull; If <code>fullRelro</code> is true: resolve every symbol upfront; if any is missing return <code>{ ok: false, missing }</code>; otherwise return <code>{ ok: true, got, gotWritable: false, lazyTraps: 0 }</code>.<br/>
+          &bull; If <code>fullRelro</code> is false: initialize <code>got[sym] = "PLT_RESOLVER_STUB"</code>, leave <code>gotWritable: true</code>, and return a callable <code>callSymbol(name)</code> method that lazily populates <code>got[name]</code> on first call (incrementing <code>lazyTraps</code>) or returns <code>null</code> if missing.
+        </div>
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: QUIZZES -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (6 Questions)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Inspecting ELF Headers, RELRO, ASLR &amp; Tombstones Live</h2>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header"><span>Live ELF &amp; Signal Forensics CLI</span></div>
+          <pre class="code"># 1. Verify 16KB ELF PT_LOAD alignment &amp; PT_INTERP (/system/bin/linker64)
+readelf -lW libnative.so
+
+# 2. Check Full RELRO (BIND_NOW + GNU_RELRO) and PIE
+readelf -dW libnative.so | grep -E "BIND_NOW|FLAGS"
+
+# 3. Dump process auxiliary vector (AT_PAGESZ, AT_SYSINFO_EHDR)
+LD_SHOW_AUXV=1 /bin/true
+
+# 4. Inspect Android native crash tombstones
+adb shell ls -lt /data/tombstones/</pre>
+        </div>
+        <div class="card">
+          <h3>Senior Mastery Checklist &amp; AegisOS-64 Bridge</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can trace <code>rt_sigframe</code> push &rarr; handler &rarr; <code>rt_sigreturn</code> and why <code>malloc()</code> inside a signal handler deadlocks.</span></li>
+            <li><input type="checkbox" /> <span>I can explain why 16KB pages require ELF <code>p_align &gt;= 0x4000</code> and how Full RELRO protects the GOT.</span></li>
+            <li><input type="checkbox" /> <span><strong>AegisOS-64 Milestone 4 Task:</strong> Parse ELF64 <code>PT_LOAD</code> headers in kernel memory and jump to <code>user/init.c</code> in <code>EL0</code>.</span></li>
+          </ul>
+          <p style="font-size:0.84rem; color:var(--text-muted); margin-bottom:0;">
+            Unclear about <code>sigaltstack</code>, <code>auxv</code>, or <code>bionic</code> linker namespaces? Ask your AI teacher!
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a class="btn" href="lesson-17.html">&larr; Lesson 17: Interrupts &amp; Timers</a>
+      <a class="btn" href="master-plan.html">Master Plan</a>
+      <a class="btn btn-primary" href="lesson-19.html">Lesson 19: Power &amp; Thermal &rarr;</a>
+    </div>
+  </main>
+
+  <script src="assets/os-course.js"></script>
+  <script>
+    const SIG_SCENARIOS = {
+      restart: [
+        { badge: ["SIGNAL PENDING", "sig-wait"], pc: "0x00402010 (read SVC)", sp: "0x7FF800 (Normal)", mask: "pending={SIGUSR1}", ret: "Woken early", explain: "<strong>Interrupting Sleep:</strong> Task was blocked inside <code>read()</code>. Kernel marks <code>SIGUSR1</code> pending and wakes the task to check signal handlers before returning to EL0." },
+        { badge: ["HANDLER RUNNING (EL0)", "sig-run"], pc: "0x00401200 (on_sigusr1)", sp: "0x7FF680 (rt_sigframe)", mask: "blocked={SIGUSR1}", ret: "Saved in pt_regs", explain: "<strong>rt_sigframe Pushed:</strong> Kernel pushes saved registers onto <code>SP_EL0</code>, sets <code>x30 = __kernel_rt_sigreturn</code>, and ERETs to <code>on_sigusr1</code>." },
+        { badge: ["SYSCALL RESTARTED", "sig-run"], pc: "0x0040200C (restart SVC)", sp: "0x7FF800 (Restored)", mask: "pending=0, blocked=0", ret: "ERESTARTSYS -> retry", explain: "<strong>SA_RESTART Active:</strong> <code>rt_sigreturn</code> restores the pre-signal registers and transparently restarts <code>read()</code>—user code never sees <code>EINTR</code>!" }
+      ],
+      eintr: [
+        { badge: ["SIGNAL PENDING", "sig-wait"], pc: "0x00402010 (read SVC)", sp: "0x7FF800 (Normal)", mask: "pending={SIGUSR1}", ret: "Woken early", explain: "<strong>Interrupting Sleep:</strong> <code>SIGUSR1</code> arrives while sleeping in <code>read()</code>, with <code>SA_RESTART = false</code>." },
+        { badge: ["HANDLER RUNNING (EL0)", "sig-run"], pc: "0x00401200 (on_sigusr1)", sp: "0x7FF680 (rt_sigframe)", mask: "blocked={SIGUSR1}", ret: "x0 = -EINTR (-4)", explain: "<strong>Handler Runs:</strong> Kernel saves <code>x0 = -EINTR</code> inside <code>rt_sigframe</code> and runs <code>on_sigusr1</code>." },
+        { badge: ["RETURNS -EINTR", "sig-wait"], pc: "0x00402010 (after read)", sp: "0x7FF800 (Restored)", mask: "pending=0, blocked=0", ret: "-1 (errno=EINTR)", explain: "<strong>Caller Must Retry:</strong> After <code>rt_sigreturn</code>, <code>read()</code> returns <code>-1</code> with <code>errno = EINTR</code>! Unchecked C loops fail silently here." }
+      ],
+      kill: [
+        { badge: ["SIGKILL QUEUED", "sig-dead"], pc: "0x00402010 (read SVC)", sp: "0x7FF800", mask: "pending={SIGKILL}", ret: "Uncatchable", explain: "<strong>Uncatchable Signal:</strong> Even if the app blocked all signals and installed handlers, <code>SIGKILL</code> cannot be masked or caught." },
+        { badge: ["PROCESS TERMINATED", "sig-dead"], pc: "N/A (do_group_exit)", sp: "Freed", mask: "Teardown mm_struct", ret: "EXIT_ZOMBIE (waitpid)", explain: "<strong>Immediate Kernel Teardown:</strong> Kernel skips <code>rt_sigframe</code> completely, tears down <code>mm_struct</code> + FDs across the entire thread group, and leaves <code>EXIT_ZOMBIE</code> for parent/init." }
+      ]
+    };
+    let curSig = "restart";
+    let sigStep = 0;
+
+    function renderSigSim() {
+      const st = SIG_SCENARIOS[curSig][sigStep];
+      const badge = document.getElementById("sigSimBadge");
+      badge.textContent = st.badge[0];
+      badge.className = "sig-pill " + st.badge[1];
+      document.getElementById("sigPc").textContent = st.pc;
+      document.getElementById("sigSp").textContent = st.sp;
+      document.getElementById("sigMask").textContent = st.mask;
+      document.getElementById("sigRet").textContent = st.ret;
+      document.getElementById("sigExplain").innerHTML = st.explain;
+    }
+
+    document.getElementById("sigRestartBtn").addEventListener("click", () => { curSig = "restart"; sigStep = 0; renderSigSim(); });
+    document.getElementById("sigEintrBtn").addEventListener("click", () => { curSig = "eintr"; sigStep = 0; renderSigSim(); });
+    document.getElementById("sigKillBtn").addEventListener("click", () => { curSig = "kill"; sigStep = 0; renderSigSim(); });
+    document.getElementById("sigStepBtn").addEventListener("click", () => {
+      sigStep = (sigStep + 1) % SIG_SCENARIOS[curSig].length;
+      renderSigSim();
+    });
+    renderSigSim();
+
+    window.LESSON_CONFIG = {
+      num: "18",
+      labs: {
+        1: {
+          fnName: "deliverSignalStep",
+          hints: [
+            "Hint 1: Always check `SIGKILL` first—it ignores `task.blocked` and custom handlers.",
+            "Hint 2: Next sort `Array.from(task.pending)` and find the first signal that is `sig === 'SIGSTOP' || !task.blocked.has(sig)`.",
+            "Hint 3: For a caught handler `{ fn, saRestart }` while `task.inBlockingSyscall` is true, return `RESTART_SYSCALL` when `saRestart` is true, else `-4` (`-EINTR`)."
+          ],
+          starter: `function deliverSignalStep(task) {
+  // task: { pending: Set, blocked: Set, handlers: Object, inBlockingSyscall: bool }
+  
+}`,
+          solution: `function deliverSignalStep(task) {
+  if (task.pending.has("SIGKILL")) {
+    task.pending.delete("SIGKILL");
+    return { action: "TERMINATE", signal: "SIGKILL", syscallResult: null };
+  }
+  const deliverable = Array.from(task.pending)
+    .sort()
+    .find((s) => s === "SIGSTOP" || !task.blocked.has(s));
+
+  if (!deliverable) {
+    return { action: "NONE", signal: null, syscallResult: "OK" };
+  }
+  task.pending.delete(deliverable);
+  if (deliverable === "SIGSTOP") {
+    return { action: "STOP", signal: "SIGSTOP", syscallResult: null };
+  }
+  const h = task.handlers && task.handlers[deliverable];
+  if (!h || h === "DFL") {
+    return { action: "TERMINATE", signal: deliverable, syscallResult: null };
+  }
+  if (h === "IGN") {
+    return { action: "IGNORE", signal: deliverable, syscallResult: task.inBlockingSyscall ? "CONTINUE" : "OK" };
+  }
+  return {
+    action: "CALL_HANDLER",
+    signal: deliverable,
+    syscallResult: task.inBlockingSyscall ? (h.saRestart ? "RESTART_SYSCALL" : -4) : "OK"
+  };
+}`,
+          solutionExplain: "Linux prioritizes SIGKILL/SIGSTOP regardless of sigprocmask, and converts interrupted blocking syscalls to RESTART or -EINTR based on SA_RESTART.",
+          tests(fn) {
+            const t1 = { pending: new Set(["SIGUSR1", "SIGKILL"]), blocked: new Set(["SIGKILL"]), handlers: { SIGKILL: "IGN" }, inBlockingSyscall: true };
+            const r1 = fn(t1);
+            const t2 = { pending: new Set(["SIGUSR1"]), blocked: new Set(["SIGUSR1"]), handlers: { SIGUSR1: { saRestart: false } }, inBlockingSyscall: true };
+            const r2 = fn(t2);
+            const t3 = { pending: new Set(["SIGUSR1"]), blocked: new Set(), handlers: { SIGUSR1: { saRestart: false } }, inBlockingSyscall: true };
+            const r3 = fn(t3);
+            const t4 = { pending: new Set(["SIGUSR2"]), blocked: new Set(), handlers: { SIGUSR2: { saRestart: true } }, inBlockingSyscall: true };
+            const r4 = fn(t4);
+            return [
+              { name: "SIGKILL bypasses blocked mask and custom ignore handler", pass: r1.action === "TERMINATE" && r1.signal === "SIGKILL", detail: JSON.stringify(r1) },
+              { name: "Blocked signal stays pending (action=NONE)", pass: r2.action === "NONE" && t2.pending.has("SIGUSR1"), detail: JSON.stringify(r2) },
+              { name: "SA_RESTART=false interrupts syscall with -4 (-EINTR)", pass: r3.action === "CALL_HANDLER" && r3.syscallResult === -4, detail: JSON.stringify(r3) },
+              { name: "SA_RESTART=true yields RESTART_SYSCALL", pass: r4.action === "CALL_HANDLER" && r4.syscallResult === "RESTART_SYSCALL", detail: JSON.stringify(r4) }
+            ];
+          }
+        },
+        2: {
+          fnName: "loadElfLayout",
+          hints: [
+            "Hint 1: Check `seg.memsz < seg.filesz` -> `INVALID_MEMSZ`; `seg.align < pageSize` -> `BAD_PAGE_ALIGN`; `(seg.vaddr % pageSize) !== (seg.offset % pageSize)` -> `VADDR_OFFSET_MISMATCH`.",
+            "Hint 2: For valid segments, `pageStart = Math.floor(seg.vaddr / pageSize) * pageSize`, `pageEnd = Math.ceil((seg.vaddr + seg.memsz) / pageSize) * pageSize`.",
+            "Hint 3: Shift by `aslrBase` for `mapStart` and `mapEnd`, and include `bssBytes: seg.memsz - seg.filesz`."
+          ],
+          starter: `function loadElfLayout(segments, aslrBase, pageSize) {
+  // Validate segments for pageSize (e.g. 16384) and compute ASLR mappings
+  
+}`,
+          solution: `function loadElfLayout(segments, aslrBase, pageSize) {
+  const mappings = [];
+  for (const s of segments) {
+    if (s.memsz < s.filesz) return { ok: false, reason: "INVALID_MEMSZ" };
+    if (s.align < pageSize) return { ok: false, reason: "BAD_PAGE_ALIGN" };
+    if ((s.vaddr % pageSize) !== (s.offset % pageSize)) {
+      return { ok: false, reason: "VADDR_OFFSET_MISMATCH" };
+    }
+    const relStart = Math.floor(s.vaddr / pageSize) * pageSize;
+    const relEnd = Math.ceil((s.vaddr + s.memsz) / pageSize) * pageSize;
+    mappings.push({
+      mapStart: aslrBase + relStart,
+      mapEnd: aslrBase + relEnd,
+      bssBytes: s.memsz - s.filesz,
+      flags: s.flags
+    });
+  }
+  return { ok: true, mappings, auxv: { AT_PAGESZ: pageSize, AT_BASE: aslrBase } };
+}`,
+          solutionExplain: "Android 15/16 requires ELF PT_LOAD segments aligned to 16KB (`align >= 16384`) and matching `vaddr === offset (mod pageSize)` so mmap works without copying.",
+          tests(fn) {
+            const ok = fn([{ vaddr: 0x4000, offset: 0x4000, filesz: 8192, memsz: 12288, align: 16384, flags: "RW" }], 0x100000, 16384);
+            const bad4k = fn([{ vaddr: 0x1000, offset: 0x1000, filesz: 512, memsz: 512, align: 4096, flags: "RX" }], 0x100000, 16384);
+            const badOff = fn([{ vaddr: 0x4100, offset: 0x4000, filesz: 512, memsz: 512, align: 16384, flags: "R" }], 0x100000, 16384);
+            const badMem = fn([{ vaddr: 0x4000, offset: 0x4000, filesz: 2048, memsz: 1024, align: 16384, flags: "RW" }], 0x100000, 16384);
+            return [
+              { name: "Maps 16KB-aligned PT_LOAD with ASLR base and zero-filled .bss", pass: ok.ok && ok.mappings[0].mapStart === 0x104000 && ok.mappings[0].mapEnd === 0x108000 && ok.mappings[0].bssBytes === 4096 && ok.auxv.AT_PAGESZ === 16384, detail: JSON.stringify(ok) },
+              { name: "Rejects legacy 4KB-aligned ELF on 16KB system", pass: bad4k.ok === false && bad4k.reason === "BAD_PAGE_ALIGN", detail: JSON.stringify(bad4k) },
+              { name: "Rejects vaddr/offset congruence mismatch", pass: badOff.ok === false && badOff.reason === "VADDR_OFFSET_MISMATCH", detail: JSON.stringify(badOff) },
+              { name: "Rejects memsz < filesz", pass: badMem.ok === false && badMem.reason === "INVALID_MEMSZ", detail: JSON.stringify(badMem) }
+            ];
+          }
+        },
+        3: {
+          fnName: "resolveGotPlt",
+          hints: [
+            "Hint 1: Check `Object.prototype.hasOwnProperty.call(symbolTable, sym)` when resolving symbols.",
+            "Hint 2: For `fullRelro === true`, resolve all upfront (collect missing symbols into an array and fail if non-empty), then freeze/return `gotWritable: false, lazyTraps: 0`.",
+            "Hint 3: For `fullRelro === false`, seed `got[sym] = 'PLT_RESOLVER_STUB'` and keep a closure `lazyTraps` counter incremented only on the first call to each stubbed symbol."
+          ],
+          starter: `function resolveGotPlt(imports, symbolTable, fullRelro) {
+  // Support eager Full RELRO vs lazy PLT/GOT binding
+  
+}`,
+          solution: `function resolveGotPlt(imports, symbolTable, fullRelro) {
+  const got = {};
+  if (fullRelro) {
+    const missing = [];
+    for (const sym of imports) {
+      if (Object.prototype.hasOwnProperty.call(symbolTable, sym)) {
+        got[sym] = symbolTable[sym];
+      } else {
+        missing.push(sym);
+      }
+    }
+    if (missing.length > 0) return { ok: false, missing };
+    return { ok: true, got, gotWritable: false, lazyTraps: 0 };
+  }
+
+  for (const sym of imports) {
+    got[sym] = "PLT_RESOLVER_STUB";
+  }
+  const state = { ok: true, got, gotWritable: true, lazyTraps: 0 };
+  state.callSymbol = function (name) {
+    if (!Object.prototype.hasOwnProperty.call(got, name)) return null;
+    if (got[name] === "PLT_RESOLVER_STUB") {
+      if (!Object.prototype.hasOwnProperty.call(symbolTable, name)) return null;
+      got[name] = symbolTable[name];
+      state.lazyTraps++;
+    }
+    return got[name];
+  };
+  return state;
+}`,
+          solutionExplain: "Full RELRO resolves all GOT entries before main() and marks the GOT read-only; lazy PLT binding keeps the GOT writable so stubs can patch it on first call.",
+          tests(fn) {
+            const syms = { malloc: "0x7f100", write: "0x7f200" };
+            const relro = fn(["malloc", "write"], syms, true);
+            const relroMiss = fn(["malloc", "foo"], syms, true);
+            const lazy = fn(["malloc", "write"], syms, false);
+            const a1 = lazy.callSymbol("malloc");
+            const a2 = lazy.callSymbol("malloc");
+            const a3 = lazy.callSymbol("write");
+            return [
+              { name: "Full RELRO resolves eagerly and sets gotWritable=false", pass: relro.ok && relro.got.malloc === "0x7f100" && relro.gotWritable === false && relro.lazyTraps === 0, detail: JSON.stringify(relro) },
+              { name: "Full RELRO fails upfront on missing symbol", pass: relroMiss.ok === false && relroMiss.missing[0] === "foo", detail: JSON.stringify(relroMiss) },
+              { name: "Lazy PLT resolves on first call only (2 calls -> 1 trap per symbol)", pass: lazy.gotWritable === true && a1 === "0x7f100" && a2 === "0x7f100" && a3 === "0x7f200" && lazy.lazyTraps === 2, detail: `lazyTraps=${lazy.lazyTraps}` }
+            ];
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "1. Why must Android's debuggerd register its SIGSEGV handler with SA_ONSTACK and a dedicated sigaltstack?",
+          options: [
+            "A. Because SIGSEGV cannot run on ARM64 without EL2 hypervisor support.",
+            "B. Because a stack overflow leaves SP_EL0 unmapped, so pushing rt_sigframe faults.",
+            "C. Because SA_ONSTACK disables ASLR for all shared libraries in the process.",
+            "D. Because sigaltstack automatically retries failed malloc() calls in place."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Signal delivery is purely an EL1 kernel to EL0 user mechanism.",
+            "Correct (B): If a thread crashed by overflowing its normal stack onto the guard page, pushing `rt_sigframe` onto `SP_EL0` fails with another fault and kills the app silently without a tombstone.",
+            "Wrong (C): ASLR memory layout is fixed at `execve()`/`mmap()` and unrelated to `sigaltstack`.",
+            "Wrong (D): `sigaltstack` simply provides an alternate stack buffer for signal frame delivery."
+          ]
+        },
+        {
+          q: "2. Why is calling printf() or malloc() inside a POSIX signal handler a classic concurrency bug?",
+          options: [
+            "A. Because the interrupted thread may already hold printf or arena locks.",
+            "B. Because signal handlers execute inside EL1 kernel space with MMU off.",
+            "C. Because POSIX prohibits integer arithmetic inside signal handlers.",
+            "D. Because printf() immediately sends SIGKILL to the parent process."
+          ],
+          correct: 0,
+          why: [
+            "Correct (A): Signals asynchronously hijack the thread mid-execution; if that thread currently holds `arena_mutex` or a stdio lock, calling `malloc()`/`printf()` inside the handler self-deadlocks.",
+            "Wrong (B): Signal handlers execute in EL0 user space with normal virtual memory.",
+            "Wrong (C): Local arithmetic and `volatile sig_atomic_t` updates are completely safe.",
+            "Wrong (D): `printf()` writes to stdout/buffer; it never sends `SIGKILL`."
+          ]
+        },
+        {
+          q: "3. Why does Linux offer pidfd_open() + pidfd_send_signal() instead of relying solely on kill(pid, sig)?",
+          options: [
+            "A. Because pidfd encrypts signal numbers using AES inside the kernel.",
+            "B. Because a plain integer PID can be recycled before kill() executes.",
+            "C. Because kill() only delivers signals to threads in the same process.",
+            "D. Because pidfd allows user apps to bypass SELinux permission checks."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `pidfd` is a file descriptor handle referencing a kernel task, not an encryption wrapper.",
+            "Correct (B): If target `pid` dies and the OS wraps around and assigns the same numeric PID to a brand-new process, `kill(pid, SIGKILL)` kills the wrong app; a `pidfd` pins the exact `struct pid` instance.",
+            "Wrong (C): `kill()` delivers signals across processes (subject to UID/`CAP_KILL` checks).",
+            "Wrong (D): `pidfd_send_signal()` enforces the same SELinux/UID security checks."
+          ]
+        },
+        {
+          q: "4. What security guarantee does compiling and linking Android native binaries with Full RELRO (BIND_NOW + GNU_RELRO) provide?",
+          options: [
+            "A. It strips all debug symbols and prevents strace from logging syscalls.",
+            "B. It resolves GOT pointers at startup and remaps the GOT read-only.",
+            "C. It encrypts .text code pages in RAM using the ARMv9 MTE key.",
+            "D. It disables ASLR so shared libraries always load at predictable addresses."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `strip` removes symbols, and `strace` traces EL1 syscalls regardless of RELRO.",
+            "Correct (B): Lazy PLT binding requires a writable GOT; Full RELRO (`BIND_NOW`) binds all symbols upfront and marks the GOT `PROT_READ`, blocking GOT-overwrite exploits.",
+            "Wrong (C): MTE tags heap pointers/granules; it does not encrypt `.text` pages.",
+            "Wrong (D): Modern Android pairs Full RELRO with PIE + ASLR."
+          ]
+        },
+        {
+          q: "5. A blocking read() returns -1 with errno == EINTR after a harmless SIGUSR1 handler runs. Why didn't the kernel resume read() automatically?",
+          options: [
+            "A. Because the handler was registered without the SA_RESTART flag.",
+            "B. Because read() is never allowed to block on pipes or sockets.",
+            "C. Because rt_sigreturn forgot to pop ELR_EL1 from kernel stack.",
+            "D. Because ASLR randomized the file descriptor number during the signal."
+          ],
+          correct: 0,
+          why: [
+            "Correct (A): Without `SA_RESTART`, interrupted slow syscalls return `-EINTR` to user space so event loops can check flags; with `SA_RESTART`, the kernel transparently restarts eligible syscalls.",
+            "Wrong (B): Blocking `read()` on pipes/sockets is standard behavior.",
+            "Wrong (C): `rt_sigreturn` popped `ELR_EL1` accurately, landing right after the `SVC` with `x0 = -EINTR`.",
+            "Wrong (D): ASLR randomizes virtual addresses, never file descriptor numbers."
+          ]
+        },
+        {
+          q: "6. On an Android 15/16 device running a 16KB kernel page size, why does dlopen() reject an older .so whose PT_LOAD alignment is 4KB (0x1000)?",
+          options: [
+            "A. Because ARM64 CPUs cannot execute instructions stored in 4KB multiples.",
+            "B. Because mmap() cannot map disjoint file permissions within one 16KB page.",
+            "C. Because bionic linker64 refuses to load libraries smaller than 16KB.",
+            "D. Because 16KB kernels drop support for position-independent ELF binaries."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Instructions execute fine regardless of file offset; the issue is virtual-memory page granularity.",
+            "Correct (B): Hardware PTE permissions (`R-X` vs `RW-`) apply per 16KB page. If `.text` and `.data` share the same 16KB page (`p_align = 4KB`), `mmap()` cannot enforce W^X separation without corrupting or exposing pages.",
+            "Wrong (C): Libraries smaller than 16KB work fine as long as `p_align >= 0x4000`.",
+            "Wrong (D): PIE/ASLR is mandatory on modern Android regardless of page size."
+          ]
+        }
+      ]
+    };
+
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

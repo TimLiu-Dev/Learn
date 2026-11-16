@@ -1,0 +1,1142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 02 — CPU Caches, Memory Visibility &amp; the JVM Memory Model (JMM)</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 02 · Hardware &amp; JMM</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/concurrency-cheat-sheet.html">Cheat Sheet</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 1 · Lesson 02 · Hardware Reality &amp; JSR-133</div>
+      <h1>CPU Caches, Memory Visibility &amp; the JVM Memory Model (JMM)</h1>
+      <p class="hero-sub">
+        Why Thread B never sees Thread A's write even after it happened in wall-clock time:
+        per-core L1/L2 caches, store buffers, instruction reordering, happens-before edges, <code>@Volatile</code>, and safe publication.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. Store-Buffer &amp; Cache Visualizer</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Kotlin Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>Why "Happened Earlier in Time" ≠ "Visible to Another Core"</h2>
+      <p class="section-lead">
+        Most engineers picture shared memory as one blackboard that every OS Thread reads and writes directly.
+        In reality, reading Main RAM costs ~100ns (~300 CPU cycles), so modern CPUs sit behind private caches, <strong>Store Buffers</strong>, and <strong>Invalidation Queues</strong>—while compilers and CPUs reorder independent instructions. The <a href="https://jcp.org/en/jsr/detail?id=133" target="_blank" rel="noopener">JSR-133 Java Memory Model (JMM)</a> defines the exact contract that bridges this hardware gap.
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">1. Store Buffers &amp; Stale L1 Caches</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            When Core 0 writes a non-volatile field <code>stop = true</code>, it does <em>not</em> stall waiting for other cores to invalidate their L1 caches.
+            Instead, Core 0 pushes the write into its private <strong>Store Buffer</strong> and continues executing immediately.
+            <br/><br/>
+            Meanwhile, Core 1 keeps reading <code>stop = false</code> from its own L1 cache (or the JIT hoists <code>!stop</code> into a CPU register), creating an infinite loop even seconds after Core 0 wrote <code>true</code>.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">2. Instruction Reordering &amp; Store-Load</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            Compilers, the JVM JIT, and out-of-order CPU pipelines may reorder operations that have no single-thread data dependency.
+            <br/><br/>
+            On x86/ARM hardware, a core can execute a later <strong>LOAD</strong> (reading from L1) while its earlier <strong>STORE</strong> is still sitting in its Store Buffer—producing outcomes like <code>(r1 = 0, r2 = 0)</code> that are impossible under any simple interleaving of lines of code.
+          </p>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 4px;">
+        <h3 style="margin-top:0; color:var(--green);">Hardware Path: Core 0 → Store Buffer → Coherence → Core 1</h3>
+<pre>Core 0 (Writer)                                     Core 1 (Reader)
+┌──────────────────────┐                            ┌──────────────────────┐
+│ Registers / Pipeline │                            │ Registers / Pipeline │
+└──────────┬───────────┘                            └──────────▲───────────┘
+           │ write (local)                                     │ read (local)
+           ▼                                                   │
+┌──────────────────────┐                            ┌──────────┴───────────┐
+│  Store Buffer (FIFO) │  <-- stays buffered!       │   L1 / L2 Cache      │ <-- may stay STALE!
+└──────────┬───────────┘                            └──────────▲───────────┘
+           │ Release Fence (@Volatile write)                   │ Acquire Fence (@Volatile read)
+           ▼                                                   │
+┌──────────────────────────────────────────────────────────────┴───────────┐
+│        Cache Coherence Fabric (MESI) + Shared L3 / Main RAM              │
+└──────────────────────────────────────────────────────────────────────────┘</pre>
+      </div>
+
+      <h3 style="margin-top: 24px;">JMM Happens-Before Edges &amp; Memory Synchronization Primitives</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Mechanism</th>
+              <th>Hardware Effect</th>
+              <th>Visibility Guarantee</th>
+              <th>Atomicity?</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Plain <code>var</code> (No Sync)</strong></td>
+              <td>Writes sit in Store Buffer; reads use L1/register; JIT may hoist</td>
+              <td>None across OS Threads (stale reads &amp; reordering allowed)</td>
+              <td>No (64-bit word tearing also possible on 32-bit JVMs without <code>@Volatile</code>)</td>
+            </tr>
+            <tr>
+              <td><strong><code>@Volatile</code> Read / Write</strong></td>
+              <td>Release fence drains Store Buffer; Acquire fence invalidates stale L1</td>
+              <td><strong>Happens-before edge</strong> from volatile write to subsequent volatile read (transitive!)</td>
+              <td>Single read/write only — <strong>NOT</strong> compound <code>x++</code></td>
+            </tr>
+            <tr>
+              <td><strong>Mutex / <code>synchronized</code></strong></td>
+              <td>Acquire barrier on lock entry; Release barrier + Store Buffer flush on unlock</td>
+              <td>Unlock happens-before every subsequent lock of the same monitor</td>
+              <td><strong>Yes</strong> (Mutual Exclusion over entire critical section)</td>
+            </tr>
+            <tr>
+              <td><strong><code>val</code> (JVM <code>final</code>)</strong></td>
+              <td>Store-Store freeze fence at end of constructor before reference escapes</td>
+              <td><strong>Safe Publication</strong>: any thread seeing the object observes frozen <code>val</code> fields</td>
+              <td>Immutable post-construction (provided <code>this</code> never leaked in <code>init</code>)</td>
+            </tr>
+            <tr>
+              <td><strong><code>Thread.start()</code> / <code>join()</code></strong></td>
+              <td>Memory barrier across thread spawn and termination handoff</td>
+              <td>Pre-<code>start()</code> writes visible to new thread; thread writes visible after <code>join()</code></td>
+              <td>Only at the spawn / join boundary</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Happens-Before Transitivity (Piggybacking):</strong> Per <a href="https://jcp.org/en/jsr/detail?id=133" target="_blank" rel="noopener">JSR-133</a>, if Thread A writes plain fields <code>payload = 42; config = "prod"</code> and <em>then</em> writes <code>@Volatile ready = true</code>, any Thread B that reads <code>ready == true</code> is guaranteed to observe <code>payload == 42</code> and <code>config == "prod"</code> too—because program order + volatile write→read compose transitively!
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive Hardware &amp; Memory Visibility Visualizer</div>
+      <h2>Trace Store Buffers, Stale L1 Caches &amp; Happens-Before Edges</h2>
+      <p class="section-lead">
+        Step through how Core 0's Store Buffer, Main RAM, and Core 1's L1 Cache behave under three synchronization models.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="none">No Synchronization</button>
+            <button class="btn" data-mode="volatile">@Volatile (Memory Fence)</button>
+            <button class="btn" data-mode="hb">Happens-Before Release/Acquire</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span>CPU Core 0 (Thread A · Writer)</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-core0"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>CPU Core 1 (Thread B · Reader)</span><span>Parallel Core</span></div>
+              <div class="timeline-track" id="lane-core1"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Coherence Bus / Memory Barrier</span></div>
+              <div class="timeline-track" id="lane-bus"></div>
+            </div>
+
+            <div class="registers-grid">
+              <div class="reg-card">
+                <div class="reg-name">Core 0 Store Buffer</div>
+                <div class="reg-val" id="reg-sb0" style="color:var(--amber); font-size:0.95rem;">Empty</div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">Main RAM (Shared)</div>
+                <div class="reg-val" id="reg-ram" style="color:var(--green); font-size:0.95rem;">stop=false</div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">Core 1 L1 Cache</div>
+                <div class="reg-val" id="reg-l1b" style="color:var(--purple); font-size:0.95rem;">stop=false</div>
+              </div>
+            </div>
+            <div class="registers-grid" style="margin-top:8px;">
+              <div class="reg-card">
+                <div class="reg-name">Core 0 L1 Cache</div>
+                <div class="reg-val" id="reg-l1a" style="color:var(--accent); font-size:0.95rem;">stop=false</div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">Core 1 Inv. Queue</div>
+                <div class="reg-val" id="reg-inv1" style="color:var(--text-muted); font-size:0.95rem;">Empty</div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">Thread B Observed</div>
+                <div class="reg-val" id="reg-obs" style="color:var(--text); font-size:0.95rem;">—</div>
+              </div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Click <strong>Step →</strong> or <strong>▶ Play</strong> to trace Core 0 writing and Core 1 reading.
+            </div>
+          </div>
+
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">HARDWARE MEMORY TRACE LOG</div>
+            <div class="trace-log" id="sim-log" style="height:360px;"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; Android</div>
+      <h2>Junior Traps vs. Senior Patterns in Kotlin</h2>
+      <p class="section-lead">
+        These three visibility and reordering bugs pass unit tests on your laptop and fail silently on multi-core ARM Android devices.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Stop-Flag Infinite Loop Without <code>@Volatile</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Plain Boolean Hoisted / Stale L1</span></div>
+<pre>class Worker {
+    private var stopped = false // No happens-before!
+
+    fun start() = Thread {
+        // JIT may hoist !stopped -> if (!stopped) while (true)
+        while (!stopped) { processNextBatch() }
+    }.start()
+
+    fun stop() { stopped = true } // May never become visible
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: @Volatile / AtomicBoolean</span></div>
+<pre>class Worker {
+    @Volatile
+    private var stopped = false // Release on write, Acquire on read
+
+    fun start() = Thread {
+        while (!stopped) { processNextBatch() }
+    }.start()
+
+    fun stop() { stopped = true } // Drains Store Buffer -> visible
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: Unsafe Publication of Mutable Fields vs. Immutable <code>val</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Publishing Non-Final Fields</span></div>
+<pre>class EndpointConfig {
+    var baseUrl: String = "" // Mutable, NOT final!
+    var timeoutMs: Int = 0
+}
+var activeConfig: EndpointConfig? = null
+
+// Writer on IO thread:
+val cfg = EndpointConfig()
+cfg.baseUrl = "https://api.prod"
+cfg.timeoutMs = 5000
+activeConfig = cfg // Reader can see baseUrl == "" / timeoutMs == 0!</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Immutable val + Safe Publication</span></div>
+<pre>data class EndpointConfig(
+    val baseUrl: String, // JVM final: frozen before ctor returns
+    val timeoutMs: Int
+)
+@Volatile var activeConfig: EndpointConfig? = null
+
+// Writer on IO thread:
+activeConfig = EndpointConfig("https://api.prod", 5000)
+// Any reader observing non-null activeConfig sees frozen vals</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: Double-Checked Locking (DCL) Missing <code>@Volatile</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: DCL Without @Volatile</span></div>
+<pre>class AnalyticsClient private constructor() {
+    private val queue = ArrayDeque&lt;Event&gt;()
+    companion object {
+        private var instance: AnalyticsClient? = null // BUG!
+        fun get(): AnalyticsClient {
+            return instance ?: synchronized(this) {
+                // Reordering can publish non-null ref BEFORE queue init!
+                instance ?: AnalyticsClient().also { instance = it }
+            }
+        }
+    }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: @Volatile DCL (or Kotlin lazy)</span></div>
+<pre>class AnalyticsClient private constructor() {
+    private val queue = ArrayDeque&lt;Event&gt;()
+    companion object {
+        @Volatile private var instance: AnalyticsClient? = null
+        fun get(): AnalyticsClient {
+            return instance ?: synchronized(this) {
+                instance ?: AnalyticsClient().also { instance = it }
+            }
+        }
+        // Or idiomatic Kotlin: val instance by lazy { AnalyticsClient() }
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Fix the starter concurrency defects below and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>).</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 2.1 · STORE BUFFER &amp; L1 CACHE COHERENCE</span>
+            <h3 style="margin:8px 0 4px;">Simulate Store Buffers and Volatile Barriers</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Implement <code>simulateStoreBufferVisibility(initialVal = false)</code> returning <code>{ writeFlag, readFlag, flushStoreBuffer, snapshot }</code>.
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>writeFlag(core, val, isVolatile)</code>: Buffer locally on <code>core</code> (<code>0</code> or <code>1</code>) and update own L1. If <code>isVolatile</code> is true, flush buffer to shared <code>ram</code>.<br/>
+          • <code>readFlag(core, isVolatile)</code>: Check own store buffer first (store-buffer forwarding). If <code>isVolatile</code> is true, invalidate own L1 and refresh from <code>ram</code>; otherwise return cached L1 if valid (else load from <code>ram</code>).<br/>
+          • <code>flushStoreBuffer(core)</code>: Hardware drain of any buffered write on <code>core</code> to <code>ram</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_2_1_store_buffer.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 2.2 · STORE-LOAD REORDERING</span>
+            <h3 style="margin:8px 0 4px;">Detect Reachable <code>(r1, r2)</code> Outcomes With &amp; Without Fences</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Implement <code>detectStoreLoadReordering(useFence)</code> for Core A (<code>x = 1; r1 = y</code>) and Core B (<code>y = 1; r2 = x</code>).
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Model each core's local store buffer + <code>memoryFence()</code>. Initially <code>x = 0, y = 0</code>.<br/>
+          • Without fences (<code>useFence = false</code>), a core's store may stay buffered while its subsequent load reads RAM (allowing Store-Load reordering and producing <code>[0, 0]</code>!).<br/>
+          • With fences (<code>useFence = true</code>), <code>memoryFence()</code> drains the store buffer before the load, preventing <code>[0, 0]</code>.<br/>
+          • Return all unique reachable <code>[r1, r2]</code> pairs sorted lexicographically.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_2_2_store_load_reordering.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 2.3 · SAFE PUBLICATION (DCL)</span>
+            <h3 style="margin:8px 0 4px;">Thread-Safe Double-Checked Locking Lazy Publisher</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Fix <code>safePublishConfig(mem, mutex, buildData)</code> so concurrent readers never observe partially initialized objects.
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          APIs: <code>await mem.readVolatileRef()</code>, <code>mem.allocRaw()</code>, <code>await mem.initFields(obj, data)</code>, <code>await mem.writeVolatileRef(obj)</code>, <code>await mutex.acquire()</code>, <code>mutex.release()</code> (must run in <code>finally</code>!).<br/>
+          Avoid <code>mem.readRef()</code> / <code>mem.writeRef()</code>—they lack volatile release/acquire barriers and expose partial state!
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_2_3_safe_publish.js</span><span>Concurrent DCL + exception safety</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in length so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Read <a href="https://jcp.org/en/jsr/detail?id=133" target="_blank" rel="noopener">JSR-133: Java Memory Model Specification</a> for formal happens-before rules, volatile semantics, and <code>final</code> field safe publication, and keep the <a href="../reference/concurrency-cheat-sheet.html">Core Concurrency Cheat Sheet</a> handy.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"Why can (r1 = 0, r2 = 0) happen on ARM/x86?"</em> or <em>"How does happens-before transitivity make non-volatile fields visible?"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0001-concurrency-parallelism-races.html">← Lesson 01</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0003-mutexes-deadlocks-cas-atomics.html">Lesson 03 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_SCENARIOS = {
+      none: {
+        steps: [
+          {
+            core0: { cls: 'ta', txt: 'A: LOAD stop' }, core1: { cls: 'tb', txt: 'B: LOAD stop' }, bus: { cls: 'idle', txt: 'IDLE' },
+            sb0: 'Empty', ram: 'stop=false', l1a: 'stop=false', l1b: 'stop=false', inv1: 'Empty', obs: 'stop=false',
+            type: '', msg: 'Both cores load stop=false into their local L1 caches from Shared RAM.'
+          },
+          {
+            core0: { cls: 'ta', txt: 'A: STORE true' }, core1: { cls: 'tb', txt: 'B: LOOP (!stop)' }, bus: { cls: 'sw', txt: 'BUFFERED' },
+            sb0: 'stop=true', ram: 'stop=false', l1a: 'stop=true', l1b: 'stop=false', inv1: 'Empty', obs: 'false (loop)',
+            type: 'warn', msg: 'Core 0 writes stop=true into its Store Buffer; Main RAM still holds false!'
+          },
+          {
+            core0: { cls: 'ta', txt: 'A: CONTINUE' }, core1: { cls: 'bad', txt: 'B: STALE L1' }, bus: { cls: 'bad', txt: 'NO FENCE' },
+            sb0: 'stop=true', ram: 'stop=false', l1a: 'stop=true', l1b: 'stop=false', inv1: 'Empty', obs: 'false (STALE)',
+            type: 'bad', msg: 'No barrier! Core 1 reads stale L1 cache (or hoisted register) and never stops.'
+          },
+          {
+            core0: { cls: 'idle', txt: 'A: DRAIN LATER' }, core1: { cls: 'bad', txt: 'B: STILL STALE' }, bus: { cls: 'bad', txt: 'NO ACQUIRE' },
+            sb0: 'Empty', ram: 'stop=true', l1a: 'stop=true', l1b: 'stop=false', inv1: 'INV(stop)', obs: 'false (HANG!)',
+            type: 'bad', msg: 'Even after Core 0 flushes to RAM, Core 1 has no acquire fence—it can still read stale L1 or hoisted register!'
+          }
+        ],
+        finalVerdict: { cls: 'callout danger', html: '<strong>Visibility Failure:</strong> Without synchronization, Core 0 buffers writes and Core 1 reads stale L1 / hoisted registers indefinitely.' }
+      },
+      volatile: {
+        steps: [
+          {
+            core0: { cls: 'ta', txt: 'A: LOAD stop' }, core1: { cls: 'tb', txt: 'B: LOAD stop' }, bus: { cls: 'idle', txt: 'IDLE' },
+            sb0: 'Empty', ram: 'stop=false', l1a: 'stop=false', l1b: 'stop=false', inv1: 'Empty', obs: 'stop=false',
+            type: '', msg: 'Both cores start with stop=false cached in L1.'
+          },
+          {
+            core0: { cls: 'ta', txt: 'A: VOL WRITE' }, core1: { cls: 'tb', txt: 'B: LOOP' }, bus: { cls: 'sw', txt: 'REL FENCE' },
+            sb0: 'Draining...', ram: 'stop=true', l1a: 'stop=true', l1b: 'stop=false', inv1: 'INV(stop)', obs: 'stop=false',
+            type: 'warn', msg: '@Volatile write triggers a Release Fence: Store Buffer drains to RAM and broadcasts INV(stop) to Core 1.'
+          },
+          {
+            core0: { cls: 'ta', txt: 'A: DONE' }, core1: { cls: 'tb', txt: 'B: VOL READ' }, bus: { cls: 'io', txt: 'ACQ FENCE' },
+            sb0: 'Empty', ram: 'stop=true', l1a: 'stop=true', l1b: 'INVALID', inv1: 'Drained', obs: 'Fetching RAM...',
+            type: 'good', msg: '@Volatile read on Core 1 executes Acquire Fence: processes invalidation and drops stale L1.'
+          },
+          {
+            core0: { cls: 'idle', txt: 'A: IDLE' }, core1: { cls: 'tb', txt: 'B: EXIT LOOP' }, bus: { cls: 'io', txt: 'HB EDGE' },
+            sb0: 'Empty', ram: 'stop=true', l1a: 'stop=true', l1b: 'stop=true', inv1: 'Empty', obs: 'stop=true (EXIT)',
+            type: 'good', msg: 'Core 1 loads fresh stop=true from coherence/RAM and exits the loop cleanly!'
+          }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Volatile Sync:</strong> Release fence drained Core 0\'s Store Buffer; Acquire fence invalidated Core 1\'s stale L1 cache.' }
+      },
+      hb: {
+        steps: [
+          {
+            core0: { cls: 'ta', txt: 'A: data=99' }, core1: { cls: 'tb', txt: 'B: WAIT ready' }, bus: { cls: 'sw', txt: 'BUFFERED' },
+            sb0: 'data=99', ram: 'data=0,rdy=0', l1a: 'data=99', l1b: 'data=0,rdy=0', inv1: 'Empty', obs: 'ready=0',
+            type: '', msg: 'Core 0 writes plain field data=99 (stays in Store Buffer). Core 1 polls @Volatile ready.'
+          },
+          {
+            core0: { cls: 'ta', txt: 'A: ready=1' }, core1: { cls: 'tb', txt: 'B: POLL ready' }, bus: { cls: 'io', txt: 'REL FENCE' },
+            sb0: 'Empty', ram: 'data=99,rdy=1', l1a: 'data=99,rdy=1', l1b: 'data=0,rdy=0', inv1: 'INV(all)', obs: 'Acquiring...',
+            type: 'good', msg: 'Core 0 writes @Volatile ready=1: Release Fence drains BOTH data=99 and ready=1 in order!'
+          },
+          {
+            core0: { cls: 'idle', txt: 'A: DONE' }, core1: { cls: 'tb', txt: 'B: ACQ ready=1' }, bus: { cls: 'io', txt: 'ACQ FENCE' },
+            sb0: 'Empty', ram: 'data=99,rdy=1', l1a: 'data=99,rdy=1', l1b: 'INVALID', inv1: 'Drained', obs: 'ready=1!',
+            type: 'good', msg: 'Core 1 reads @Volatile ready=1: Acquire Fence invalidates stale L1 entries including data=0.'
+          },
+          {
+            core0: { cls: 'idle', txt: 'A: DONE' }, core1: { cls: 'tb', txt: 'B: READ data' }, bus: { cls: 'io', txt: 'HB TRANSITIVE' },
+            sb0: 'Empty', ram: 'data=99,rdy=1', l1a: 'data=99,rdy=1', l1b: 'data=99,rdy=1', inv1: 'Empty', obs: 'data=99 (SAFE)',
+            type: 'good', msg: 'Transitive Happens-Before! Core 1 is guaranteed by JMM to read data=99 even though data is non-volatile.'
+          }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Happens-Before Transitivity:</strong> <code>data=99</code> → <code>ready=1</code> (volatile write) → <code>ready==1</code> (volatile read) → <code>use(data)</code> guarantees <code>data=99</code>.' }
+      }
+    };
+
+    let currentSimMode = 'none';
+    let simStepIdx = 0;
+    let simTimer = null;
+
+    function resetSim() {
+      if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+      simStepIdx = 0;
+      const sc = SIM_SCENARIOS[currentSimMode];
+      document.getElementById('lane-core0').innerHTML = '';
+      document.getElementById('lane-core1').innerHTML = '';
+      document.getElementById('lane-bus').innerHTML = '';
+      document.getElementById('reg-sb0').textContent = 'Empty';
+      document.getElementById('reg-ram').textContent = currentSimMode === 'hb' ? 'data=0,rdy=0' : 'stop=false';
+      document.getElementById('reg-l1a').textContent = currentSimMode === 'hb' ? 'data=0,rdy=0' : 'stop=false';
+      document.getElementById('reg-l1b').textContent = currentSimMode === 'hb' ? 'data=0,rdy=0' : 'stop=false';
+      document.getElementById('reg-inv1').textContent = 'Empty';
+      document.getElementById('reg-obs').textContent = '—';
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${sc.steps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step → or ▶ Play.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through to compare local Store Buffers, Main RAM, and L1 Cache coherence.';
+    }
+
+    function stepSim() {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      const appendSlot = (id, slot) => {
+        if (!slot) return;
+        const d = document.createElement('div');
+        d.className = `slot ${slot.cls}`;
+        d.textContent = slot.txt;
+        document.getElementById(id).appendChild(d);
+      };
+      appendSlot('lane-core0', s.core0);
+      appendSlot('lane-core1', s.core1);
+      appendSlot('lane-bus', s.bus);
+
+      document.getElementById('reg-sb0').textContent = s.sb0;
+      document.getElementById('reg-ram').textContent = s.ram;
+      document.getElementById('reg-l1a').textContent = s.l1a;
+      document.getElementById('reg-l1b').textContent = s.l1b;
+      document.getElementById('reg-inv1').textContent = s.inv1;
+      document.getElementById('reg-obs').textContent = s.obs;
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${sc.steps.length}`;
+
+      const logEl = document.getElementById('sim-log');
+      if (simStepIdx === 1) logEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.className = `trace-line ${s.type}`;
+      line.textContent = `[${simStepIdx}] ${s.msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+      }
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) { clearInterval(simTimer); simTimer = null; btn.textContent = '▶ Play'; }
+      else { if (simStepIdx >= SIM_SCENARIOS[currentSimMode].steps.length) resetSim(); btn.textContent = '⏸ Pause'; simTimer = setInterval(stepSim, 800); }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'simulateStoreBufferVisibility',
+        starter: `function simulateStoreBufferVisibility(initialVal = false) {
+  let ram = initialVal;
+  const cores = {
+    0: { storeBuffer: null, hasBuffered: false, l1: initialVal, l1Valid: true },
+    1: { storeBuffer: null, hasBuffered: false, l1: initialVal, l1Valid: true }
+  };
+
+  function writeFlag(core, val, isVolatile) {
+    // BUG: Never flushes to RAM on volatile write!
+    cores[core].storeBuffer = val;
+    cores[core].hasBuffered = true;
+    cores[core].l1 = val;
+    cores[core].l1Valid = true;
+  }
+
+  function readFlag(core, isVolatile) {
+    // BUG: Never checks store buffer forwarding or invalidates stale L1 on volatile read!
+    return cores[core].l1;
+  }
+
+  function flushStoreBuffer(core) {
+    const c = cores[core];
+    if (c.hasBuffered) {
+      ram = c.storeBuffer;
+      c.l1 = ram;
+      c.l1Valid = true;
+      c.storeBuffer = null;
+      c.hasBuffered = false;
+    }
+  }
+
+  function snapshot() {
+    return { ram, core0: { ...cores[0] }, core1: { ...cores[1] } };
+  }
+
+  return { writeFlag, readFlag, flushStoreBuffer, snapshot };
+}`,
+        hints: [
+          'In writeFlag(core, val, isVolatile): always buffer locally first; if isVolatile is true, call flushStoreBuffer(core) to drain the buffer to ram.',
+          'In readFlag(core, isVolatile): if cores[core].hasBuffered is true, return cores[core].storeBuffer immediately (store-buffer forwarding).',
+          'Otherwise, if isVolatile is true, set cores[core].l1Valid = false first; then if !cores[core].l1Valid, reload cores[core].l1 = ram and set l1Valid = true before returning cores[core].l1.'
+        ],
+        solution: `function simulateStoreBufferVisibility(initialVal = false) {
+  let ram = initialVal;
+  const cores = {
+    0: { storeBuffer: null, hasBuffered: false, l1: initialVal, l1Valid: true },
+    1: { storeBuffer: null, hasBuffered: false, l1: initialVal, l1Valid: true }
+  };
+
+  function flushStoreBuffer(core) {
+    const c = cores[core];
+    if (c.hasBuffered) {
+      ram = c.storeBuffer;
+      c.l1 = ram;
+      c.l1Valid = true;
+      c.storeBuffer = null;
+      c.hasBuffered = false;
+    }
+  }
+
+  function writeFlag(core, val, isVolatile) {
+    const c = cores[core];
+    c.storeBuffer = val;
+    c.hasBuffered = true;
+    c.l1 = val;
+    c.l1Valid = true;
+    if (isVolatile) {
+      flushStoreBuffer(core);
+    }
+  }
+
+  function readFlag(core, isVolatile) {
+    const c = cores[core];
+    if (c.hasBuffered) {
+      return c.storeBuffer;
+    }
+    if (isVolatile) {
+      c.l1Valid = false;
+    }
+    if (!c.l1Valid) {
+      c.l1 = ram;
+      c.l1Valid = true;
+    }
+    return c.l1;
+  }
+
+  function snapshot() {
+    return { ram, core0: { ...cores[0] }, core1: { ...cores[1] } };
+  }
+
+  return { writeFlag, readFlag, flushStoreBuffer, snapshot };
+}`,
+        kotlinEquivalent: `class StopFlagHolder {
+    @Volatile
+    private var stop: Boolean = false // Store-buffer drain + L1 invalidate
+
+    fun signalStop() {
+        stop = true // Release barrier
+    }
+
+    fun shouldStop(): Boolean {
+        return stop // Acquire barrier
+    }
+}`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Non-volatile write stays in Core 0 store buffer (Core 0 sees it, RAM & Core 1 stay false)',
+            run: () => {
+              const sim = fn(false);
+              sim.writeFlag(0, true, false);
+              assertEq(sim.readFlag(0, false), true, 'Core 0 should see own buffered write');
+              assertEq(sim.snapshot().ram, false, 'Non-volatile write must stay buffered locally');
+              assertEq(sim.readFlag(1, false), false, 'Core 1 reads stale L1');
+              assertEq(sim.readFlag(1, true), false, 'Even volatile read sees false until Core 0 flushes');
+            }
+          },
+          {
+            name: 'Volatile write flushes store buffer to RAM, while non-volatile read on Core 1 stays stale',
+            run: () => {
+              const sim = fn(false);
+              sim.writeFlag(0, true, true);
+              assertEq(sim.snapshot().ram, true, 'Volatile write must flush to RAM');
+              assertEq(sim.snapshot().core0.hasBuffered, false, 'Store buffer should be empty after flush');
+              assertEq(sim.readFlag(1, false), false, 'Plain read without acquire fence uses stale L1');
+            }
+          },
+          {
+            name: 'Volatile write + volatile read establishes visibility across cores',
+            run: () => {
+              const sim = fn(false);
+              sim.writeFlag(0, true, true);
+              assertEq(sim.readFlag(1, true), true, 'Volatile read must invalidate stale L1 and read RAM');
+              assertEq(sim.readFlag(1, false), true, 'Subsequent Core 1 L1 read now sees refreshed value');
+            }
+          },
+          {
+            name: 'Manual flushStoreBuffer drains delayed non-volatile write for subsequent volatile read',
+            run: () => {
+              const sim = fn(false);
+              sim.writeFlag(0, true, false);
+              assertEq(sim.readFlag(1, true), false);
+              sim.flushStoreBuffer(0);
+              assertEq(sim.snapshot().ram, true);
+              assertEq(sim.readFlag(1, true), true);
+            }
+          }
+        ])
+      },
+      2: {
+        fnName: 'detectStoreLoadReordering',
+        starter: `function detectStoreLoadReordering(useFence) {
+  // BUG: Only simulates sequential interleavings and ignores Store-Load reordering when !useFence!
+  const seen = new Set();
+  const seqA = ['A_STORE', 'A_LOAD'];
+  const seqB = ['B_STORE', 'B_LOAD'];
+
+  function runInterleavings(i, j, x, y, r1, r2) {
+    if (i === seqA.length && j === seqB.length) {
+      seen.add(r1 + ',' + r2);
+      return;
+    }
+    if (i < seqA.length) {
+      const op = seqA[i];
+      if (op === 'A_STORE') runInterleavings(i + 1, j, 1, y, r1, r2);
+      else runInterleavings(i + 1, j, x, y, y, r2);
+    }
+    if (j < seqB.length) {
+      const op = seqB[j];
+      if (op === 'B_STORE') runInterleavings(i, j + 1, x, 1, r1, r2);
+      else runInterleavings(i, j + 1, x, y, r1, x);
+    }
+  }
+
+  runInterleavings(0, 0, 0, 0, null, null);
+  return Array.from(seen).sort().map((s) => s.split(',').map(Number));
+}`,
+        hints: [
+          'Model each core as 3 micro-ops: STORE (buffers write), DRAIN (memoryFence flushes store buffer to RAM), and LOAD (reads RAM).',
+          'If useFence is true, only [STORE, DRAIN, LOAD] is allowed; if useFence is false, [STORE, LOAD, DRAIN] is also allowed (load bypasses buffered store).',
+          'Enumerate all interleavings of Core A and Core B sequences, collect unique [r1, r2] outcomes, and sort lexicographically.'
+        ],
+        solution: `function detectStoreLoadReordering(useFence) {
+  const seen = new Set();
+  const ordersA = useFence
+    ? [['A_STORE', 'A_DRAIN', 'A_LOAD']]
+    : [['A_STORE', 'A_DRAIN', 'A_LOAD'], ['A_STORE', 'A_LOAD', 'A_DRAIN']];
+  const ordersB = useFence
+    ? [['B_STORE', 'B_DRAIN', 'B_LOAD']]
+    : [['B_STORE', 'B_DRAIN', 'B_LOAD'], ['B_STORE', 'B_LOAD', 'B_DRAIN']];
+
+  function memoryFence(sb, ram, core) {
+    if (core === 'A' && sb.x !== null) return { ram: { ...ram, x: sb.x }, sb: { ...sb, x: null } };
+    if (core === 'B' && sb.y !== null) return { ram: { ...ram, y: sb.y }, sb: { ...sb, y: null } };
+    return { ram, sb };
+  }
+
+  function step(seqA, seqB, i, j, ram, sb, r1, r2) {
+    if (i === seqA.length && j === seqB.length) {
+      seen.add(r1 + ',' + r2);
+      return;
+    }
+    if (i < seqA.length) {
+      const op = seqA[i];
+      if (op === 'A_STORE') {
+        step(seqA, seqB, i + 1, j, ram, { ...sb, x: 1 }, r1, r2);
+      } else if (op === 'A_DRAIN') {
+        const next = memoryFence(sb, ram, 'A');
+        step(seqA, seqB, i + 1, j, next.ram, next.sb, r1, r2);
+      } else {
+        step(seqA, seqB, i + 1, j, ram, sb, ram.y, r2);
+      }
+    }
+    if (j < seqB.length) {
+      const op = seqB[j];
+      if (op === 'B_STORE') {
+        step(seqA, seqB, i, j + 1, ram, { ...sb, y: 1 }, r1, r2);
+      } else if (op === 'B_DRAIN') {
+        const next = memoryFence(sb, ram, 'B');
+        step(seqA, seqB, i, j + 1, next.ram, next.sb, r1, r2);
+      } else {
+        step(seqA, seqB, i, j + 1, ram, sb, r1, ram.x);
+      }
+    }
+  }
+
+  for (const seqA of ordersA) {
+    for (const seqB of ordersB) {
+      step(seqA, seqB, 0, 0, { x: 0, y: 0 }, { x: null, y: null }, null, null);
+    }
+  }
+
+  return Array.from(seen).sort().map((s) => s.split(',').map(Number));
+}`,
+        kotlinEquivalent: `// Without @Volatile: (r1 = 0, r2 = 0) IS possible on ARM/x86!
+@Volatile var x = 0
+@Volatile var y = 0
+
+// Thread A: x = 1; val r1 = y  (full barrier between store & load)
+// Thread B: y = 1; val r2 = x  (full barrier prevents (0, 0))`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Without fence (useFence = false): returns all 4 outcomes including [0, 0]',
+            run: () => assertDeepEq(fn(false), [[0, 0], [0, 1], [1, 0], [1, 1]])
+          },
+          {
+            name: 'With memoryFence (useFence = true): excludes [0, 0], returns 3 outcomes',
+            run: () => assertDeepEq(fn(true), [[0, 1], [1, 0], [1, 1]])
+          },
+          {
+            name: 'Deterministic across repeated runs',
+            run: () => {
+              assertDeepEq(fn(false), fn(false));
+              assertDeepEq(fn(true), fn(true));
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'safePublishConfig',
+        starter: `async function safePublishConfig(mem, mutex, buildData) {
+  // BUG: Non-volatile read + publishes raw reference BEFORE initFields!
+  let cfg = await mem.readRef();
+  if (cfg !== null) return cfg;
+
+  await mutex.acquire();
+  try {
+    cfg = await mem.readRef();
+    if (cfg === null) {
+      cfg = mem.allocRaw();
+      await mem.writeRef(cfg); // BUG: Reordered publication before field writes!
+      await mem.initFields(cfg, buildData());
+    }
+    return cfg;
+  } finally {
+    mutex.release();
+  }
+}`,
+        hints: [
+          'Use await mem.readVolatileRef() on BOTH the fast path (outside mutex) and the second check (inside mutex).',
+          'Initialize the object completely via await mem.initFields(cfg, buildData()) BEFORE calling await mem.writeVolatileRef(cfg).',
+          'Keep mutex.release() inside a finally block so failed initializations never leak the lock.'
+        ],
+        solution: `async function safePublishConfig(mem, mutex, buildData) {
+  let cfg = await mem.readVolatileRef();
+  if (cfg !== null) return cfg;
+
+  await mutex.acquire();
+  try {
+    cfg = await mem.readVolatileRef();
+    if (cfg === null) {
+      cfg = mem.allocRaw();
+      await mem.initFields(cfg, buildData());
+      await mem.writeVolatileRef(cfg);
+    }
+    return cfg;
+  } finally {
+    mutex.release();
+  }
+}`,
+        kotlinEquivalent: `class ConfigHolder {
+    @Volatile
+    private var config: EndpointConfig? = null
+
+    fun getOrInit(factory: () -> EndpointConfig): EndpointConfig {
+        return config ?: synchronized(this) {
+            config ?: factory().also { config = it }
+        }
+    }
+}`,
+        tests: async (fn) => {
+          function createMemEnv(delayMs = 5) {
+            let ref = null;
+            let volatilePublished = false;
+            let locked = false;
+            let acquireCount = 0;
+            const waiters = [];
+            const tick = () => new Promise((r) => setTimeout(r, delayMs));
+            const mutex = {
+              acquire: () => new Promise((r) => {
+                acquireCount++;
+                if (!locked) { locked = true; r(); }
+                else waiters.push(r);
+              }),
+              release: () => {
+                if (!locked) return;
+                if (waiters.length) waiters.shift()();
+                else locked = false;
+              },
+              isLocked: () => locked,
+              acquireCount: () => acquireCount
+            };
+            const mem = {
+              allocRaw: () => ({ host: undefined, port: undefined, ready: false }),
+              initFields: async (obj, data) => {
+                await tick();
+                obj.host = data.host;
+                obj.port = data.port;
+                obj.ready = true;
+              },
+              writeRef: async (obj) => {
+                volatilePublished = false;
+                ref = obj;
+                await tick();
+              },
+              writeVolatileRef: async (obj) => {
+                await tick();
+                if (!obj.ready) throw new Error('Published before initFields completed!');
+                volatilePublished = true;
+                ref = obj;
+              },
+              readRef: async () => {
+                await tick();
+                if (ref === null) return null;
+                if (!volatilePublished) return { host: undefined, port: undefined, ready: false };
+                return ref;
+              },
+              readVolatileRef: async () => {
+                await tick();
+                if (ref === null) return null;
+                if (!volatilePublished) return { host: undefined, port: undefined, ready: false };
+                return ref;
+              }
+            };
+            return { mem, mutex };
+          }
+
+          return runTestCases([
+            {
+              name: '8 concurrent callers initialize exactly once and observe ready=true',
+              run: async () => {
+                const { mem, mutex } = createMemEnv(6);
+                let buildCalls = 0;
+                const build = () => { buildCalls++; return { host: 'api.internal', port: 8443 }; };
+                const results = await Promise.all(Array.from({ length: 8 }, () => fn(mem, mutex, build)));
+                assertEq(buildCalls, 1, `Expected 1 buildData() call, got ${buildCalls}`);
+                for (const cfg of results) {
+                  assertEq(cfg.ready, true, 'Reader saw partially initialized config!');
+                  assertEq(cfg.host, 'api.internal');
+                  assertEq(cfg.port, 8443);
+                }
+                assertEq(mutex.isLocked(), false, 'Mutex left locked!');
+              }
+            },
+            {
+              name: 'Fast path avoids mutex acquisition after safe publication',
+              run: async () => {
+                const { mem, mutex } = createMemEnv(2);
+                const build = () => ({ host: 'cdn.internal', port: 443 });
+                await fn(mem, mutex, build);
+                const before = mutex.acquireCount();
+                const fastResults = await Promise.all(Array.from({ length: 10 }, () => fn(mem, mutex, build)));
+                assertEq(mutex.acquireCount(), before, 'Fast path must not acquire mutex after init');
+                for (const cfg of fastResults) {
+                  assertEq(cfg.ready, true);
+                  assertEq(cfg.host, 'cdn.internal');
+                }
+              }
+            },
+            {
+              name: 'Exception safety: releases mutex if buildData throws, allowing recovery',
+              run: async () => {
+                const { mem, mutex } = createMemEnv(2);
+                let fail = true;
+                let threw = false;
+                try {
+                  await fn(mem, mutex, () => {
+                    if (fail) { fail = false; throw new Error('Config load failed'); }
+                    return { host: 'ok.internal', port: 8080 };
+                  });
+                } catch (e) {
+                  threw = true;
+                }
+                assertEq(threw, true, 'Expected exception to propagate');
+                assertEq(mutex.isLocked(), false, 'Mutex leaked locked after exception!');
+                const recovered = await fn(mem, mutex, () => ({ host: 'ok.internal', port: 8080 }));
+                assertEq(recovered.ready, true);
+                assertEq(recovered.host, 'ok.internal');
+              }
+            }
+          ]);
+        }
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. Thread A sets stop = true on Core 0, yet Thread B on Core 1 loops forever. What hardware layer explains this?',
+        code: `var stop = false // no @Volatile\n// Core 0: stop = true\n// Core 1: while (!stop) { work() }`,
+        options: [
+          'Core 0 deletes the variable from shared heap immediately after the write completes.',
+          'Core 0 buffers the write locally while Core 1 reads stale L1 cache.',
+          'The JVM garbage collector pauses Core 1 indefinitely before flushing the CPU registers.',
+          'Thread B allocates a private stack copy whenever a boolean field becomes true.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Object and static fields live on the shared heap; Core 0 does not delete variables when mutating them.',
+          'CORRECT (B): Core 0 places non-volatile writes into its Store Buffer, and Core 1 keeps reading its cached L1 (or hoisted register).',
+          'WRONG (C): A GC pause stops mutator threads briefly and restores coherence; it does not cause an infinite stale loop.',
+          'WRONG (D): Primitives on heap objects are not auto-copied onto Thread B stack frames on mutation.'
+        ]
+      },
+      {
+        stem: '2. Marking a flag @Volatile fixes the stop-loop hang, yet @Volatile var total = 0 still loses increments. Why?',
+        code: `@Volatile var total = 0\n// 4 threads on Dispatchers.Default each execute:\nrepeat(1000) { total += 1 }`,
+        options: [
+          '@Volatile guarantees single-read visibility across cores, but total += 1 still interleaves Read-Add-Write.',
+          '@Volatile flushes writes only after the thread exits, causing every intermediate increment to vanish.',
+          'Kotlin ignores @Volatile inside Dispatchers.Default pools unless you wrap the counter in runBlocking.',
+          '@Volatile locks the CPU bus for reads, which deadlocks concurrent additions into dropping updates.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): @Volatile ensures each individual read/write crosses memory barriers, but two threads can still both read 10 and store 11.',
+          'WRONG (B): A volatile write flushes the Store Buffer immediately at the write instruction, not at thread exit.',
+          'WRONG (C): @Volatile compiles directly to JVM volatile field bytecode and works identically across all thread pools.',
+          'WRONG (D): @Volatile uses memory fences/coherence, not mutual-exclusion locks, so it neither deadlocks nor serializes Read-Add-Write.'
+        ]
+      },
+      {
+        stem: '3. Starting with x = 0 and y = 0 (non-volatile), Thread A runs x = 1; r1 = y and Thread B runs y = 1; r2 = x. Why can (r1 = 0, r2 = 0) happen?',
+        code: `// Initially x = 0, y = 0\n// Thread A: x = 1; r1 = y\n// Thread B: y = 1; r2 = x`,
+        options: [
+          'The JVM resets unreferenced primitive integers back to zero between consecutive thread context switches.',
+          'CPU cores execute two independent threads inside the same pipeline, zeroing local register state.',
+          'Store buffers delay each write so both loads read shared zero before stores drain.',
+          'Non-volatile integer assignments skip main RAM forever unless the thread calls System.gc() explicitly.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): Context switches preserve registers and never zero out live heap or local variables.',
+          'WRONG (B): Two threads on separate cores run in independent hardware pipelines and preserve their own architectural registers.',
+          'CORRECT (C): Hardware Store-Load reordering lets each core buffer its store and execute its load against RAM while both x and y are still 0.',
+          'WRONG (D): Store buffers drain eventually without GC, though without barriers the loads can still execute ahead of the drains.'
+        ]
+      },
+      {
+        stem: '4. Why can a reader observe host = null on a shared Config object published without synchronization unless host is a val?',
+        code: `class Config(var host: String) // vs class Config(val host: String)\nvar shared: Config? = null`,
+        options: [
+          'Kotlin automatically wraps every var property inside an asynchronous mutex lock during object construction.',
+          'Mutable var fields force every reader thread to allocate an uninitialized duplicate instance locally.',
+          'The garbage collector compacts mutable var references first, temporarily nulling fields during thread handoff.',
+          'A val (JVM final) freezes field writes before reference publication, preventing partially constructed views.'
+        ],
+        correct: 3,
+        why: [
+          'WRONG (A): Kotlin var properties are plain fields with getters/setters and carry no implicit synchronization.',
+          'WRONG (B): Readers read the shared reference on the heap; they do not duplicate instances locally.',
+          'WRONG (C): Garbage collectors relocate objects safely behind safepoints/barriers and never expose half-nulled fields.',
+          'CORRECT (D): JSR-133 guarantees a freeze barrier at constructor exit for final (val) fields so safe values are visible without locks.'
+        ]
+      },
+      {
+        stem: '5. Thread A writes non-volatile payload = 99 and then @Volatile ready = true. Thread B sees ready == true and reads payload. What does JMM guarantee?',
+        code: `var payload = 0; @Volatile var ready = false\n// A: payload = 99; ready = true\n// B: if (ready) use(payload)`,
+        options: [
+          'Thread B may still read zero because payload itself was not marked with @Volatile.',
+          'Thread B is guaranteed to read 99 via the transitive happens-before edge through ready.',
+          'Thread B throws an exception unless payload and ready share the exact same lock.',
+          'Thread B reads 99 only when both threads remain pinned to the same core.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Piggybacking on a single volatile flag works specifically because JMM happens-before edges compose transitively.',
+          'CORRECT (B): Program order (payload=99 -> ready=true) + volatile sync (A ready=true -> B ready==true) + program order (ready -> use(payload)) guarantees 99.',
+          'WRONG (C): Volatile release/acquire provides visibility across threads without requiring a monitor lock or throwing exceptions.',
+          'WRONG (D): Memory barriers ensure cross-core visibility regardless of which physical CPU cores Threads A and B run on.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_02',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

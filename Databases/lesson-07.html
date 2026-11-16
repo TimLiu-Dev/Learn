@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 7: Reading Query Plans: EXPLAIN ANALYZE, Join Algorithms &amp; Tuning</title>
+  <link rel="stylesheet" href="assets/course.css" />
+</head>
+<body data-lesson-id="lesson-07">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="master-plan.html">
+        <span class="brand-mark">DB</span>
+        <span>
+          Lesson 7 &bull; Query Plans &amp; Tuning
+          <span class="brand-sub">Phase 2 &bull; <span style="color:var(--accent);">&larr; Back to Master Plan</span></span>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <div id="engine-status" class="engine-pill">
+          <span class="engine-dot"></span>
+          <span class="engine-label">Loading SQLite...</span>
+        </div>
+        <a class="btn btn-sm" href="lesson-06.html">&larr; Lesson 6</a>
+        <a class="btn btn-sm" href="master-plan.html">Master Plan</a>
+        <a class="btn btn-primary btn-sm" href="lesson-08.html">Lesson 8 &rarr;</a>
+        <button id="theme-toggle" class="btn btn-sm" type="button">Light Mode</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar">
+      <div class="sidebar-title">Lesson 7 Contents</div>
+      <ul class="toc-list">
+        <li><a href="#room-bridge">1. Room N+1 &amp; OFFSET Traps</a></li>
+        <li><a href="#explain-plans">2. Reading EXPLAIN &amp; Scan Types</a></li>
+        <li><a href="#join-algos">3. Join Algorithms (Loop, Hash, Merge)</a></li>
+        <li><a href="#sargable">4. SARGable Predicates</a></li>
+        <li><a href="#pagination-n1">5. Keyset Pagination &amp; N+1 Elimination</a></li>
+        <li><a href="#sandbox">6. Free Query Tuning Sandbox</a></li>
+        <li><a href="#labs">7. Coding Labs (4 Auto-Checked)</a></li>
+        <li><a href="#quizzes">8. Senior Quizzes (6 MCQs)</a></li>
+        <li><a href="#cheatsheet">9. Senior Checklist</a></li>
+      </ul>
+
+      <div class="progress-box">
+        <div class="sidebar-title" style="margin-bottom:0.35rem;">Lesson 7 Progress</div>
+        <div class="progress-bar-track">
+          <div id="lesson-progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <div class="progress-meta">
+          <span id="lesson-progress-text">0/10 completed (0%)</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section class="hero">
+        <div class="meta-row">
+          <span class="badge badge-purple">Phase 2 &bull; Lesson 7</span>
+          <span class="badge badge-blue">Cost-Based Planner &amp; Tuning</span>
+          <span class="badge badge-green">EXPLAIN ANALYZE &amp; SARGability</span>
+        </div>
+        <h1>Reading Query Plans: <code>EXPLAIN ANALYZE</code>, Join Algorithms &amp; Tuning</h1>
+        <p class="lead">
+          Guessing why a query is slow wastes hours. Senior engineers read the query planner&rsquo;s execution tree directly&mdash;spotting full scans, misestimated row counts, spilled hash joins, non-SARGable predicates, <code>OFFSET</code> cliffs, and N+1 round-trip storms.
+        </p>
+        <div class="meta-row">
+          <span class="topic-chip">4 Interactive Demos</span>
+          <span class="topic-chip">1 Open Sandbox</span>
+          <span class="topic-chip">4 Coding Labs (Auto-Verified)</span>
+          <span class="topic-chip">6 Diagnostic Quizzes</span>
+        </div>
+      </section>
+
+      <!-- SECTION 1: ROOM BRIDGE -->
+      <section id="room-bridge" class="section-card">
+        <h2><span class="badge badge-purple">Room Bridge</span> 1. Eliminating Room N+1 Queries &amp; Slow <code>OFFSET</code> Pagination</h2>
+        <p>
+          Two classic mobile/ORM patterns silently destroy backend APIs at scale:
+        </p>
+        <pre><code>// Anti-Pattern 1: N+1 Queries in a Kotlin / Service Loop
+val customers = customerDao.getTopCustomers()      // 1 query -> 200 rows
+for (c in customers) {
+    c.totalPaid = orderDao.sumPaidForCustomer(c.id) // +200 network round-trips!
+}
+
+// Anti-Pattern 2: Deep OFFSET Pagination
+// Page 2,500 -> scans and discards 50,000 rows BEFORE returning 20!
+@Query("SELECT * FROM feed ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET :offset")
+suspend fun getFeedPage(offset: Int): List&lt;FeedItem&gt;</code></pre>
+
+        <div class="callout room">
+          <div class="callout-title">Why Local Flash Hides Both Bugs</div>
+          <p style="margin:0;">
+            In Room on a phone, 200 local function calls take ~10 ms total. Over a microservice network hop (0.5&ndash;2 ms per query), 200 sequential queries add <strong>400 ms of pure network wait</strong> and saturate connection pools!
+            And <code>OFFSET 50000</code> doesn&rsquo;t jump to row 50,001&mdash;the engine still walks and throws away all 50,000 rows, getting linearly slower on every page.
+          </p>
+        </div>
+      </section>
+
+      <!-- SECTION 2: READING EXPLAIN & SCAN TYPES -->
+      <section id="explain-plans" class="section-card">
+        <h2><span class="badge badge-blue">Planner Anatomy</span> 2. SQLite <code>EXPLAIN QUERY PLAN</code> vs PostgreSQL <code>EXPLAIN (ANALYZE, BUFFERS)</code></h2>
+        <p>
+          In SQLite, <code>EXPLAIN QUERY PLAN</code> reveals how tables are accessed:
+        </p>
+        <ul>
+          <li><code>SCAN table</code>: Full table scan (reads every row).</li>
+          <li><code>SEARCH table USING INDEX idx (...)</code>: B+Tree seek + table rowid lookup.</li>
+          <li><code>SEARCH table USING COVERING INDEX idx (...)</code>: Index-Only Scan (no table lookup!).</li>
+          <li><code>USE TEMP B-TREE FOR ORDER BY</code>: Index order didn&rsquo;t match <code>ORDER BY</code>, forcing an in-memory/temp sort.</li>
+        </ul>
+
+        <div class="callout postgres">
+          <div class="callout-title">PostgreSQL Parity: Reading <code>EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)</code></div>
+          <pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, total_cents FROM orders WHERE customer_id = 42 AND status = 'paid';
+
+-- Sample Output (read bottom-up / inner-to-outer!):
+Index Scan using idx_orders_cust_status on orders  (cost=0.43..12.85 rows=8 width=12) (actual time=0.041..0.055 rows=9 loops=1)
+  Index Cond: ((customer_id = 42) AND (status = 'paid'::text))
+  Buffers: shared hit=5 read=1
+Planning Time: 0.18 ms
+Execution Time: 0.08 ms</code></pre>
+          <p style="margin:0.5rem 0 0;font-size:0.9rem;">
+            <strong>What to check first:</strong> (1) <code>EXPLAIN</code> alone only estimates; <code>EXPLAIN ANALYZE</code> actually runs the query (wrap DML in <code>BEGIN; EXPLAIN ANALYZE ...; ROLLBACK;</code>!).
+            (2) Compare estimated <code>rows=8</code> vs <code>actual rows=9</code>&mdash;a 100&times; mismatch means stale statistics (run <code>ANALYZE table;</code>!).
+            (3) Check <code>Buffers: shared hit</code> (RAM) vs <code>read</code> (disk/OS cache) vs <code>temp read/written</code> (disk spill!).
+          </p>
+        </div>
+
+        <h3>The 4 Scan Types in PostgreSQL</h3>
+        <div class="grid-2">
+          <div class="mini-card">
+            <h4>Seq Scan &amp; Index Scan</h4>
+            <p style="font-size:0.88rem;color:var(--text-muted);margin:0;">
+              <strong>Seq Scan</strong> reads heap pages sequentially (fastest when returning &gt;15&ndash;20% of a table or tiny tables).
+              <strong>Index Scan</strong> walks the B+Tree and fetches matching heap pages one by one.
+            </p>
+          </div>
+          <div class="mini-card">
+            <h4>Index-Only Scan &amp; Bitmap Heap Scan</h4>
+            <p style="font-size:0.88rem;color:var(--text-muted);margin:0;">
+              <strong>Index-Only Scan</strong> skips the heap when all columns are in the index and Visibility Map bits are set (check <code>Heap Fetches: 0</code> in <code>EXPLAIN ANALYZE</code>&mdash;high Heap Fetches means <code>AUTOVACUUM</code> is lagging!).
+              <strong>Bitmap Heap Scan</strong> collects matching <code>ctid</code>s into a page bitmap first, sorts by physical page ID, then reads heap pages sequentially&mdash;great for medium selectivity or combining <code>AND</code>/<code>OR</code> indexes!
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 3: JOIN ALGORITHMS -->
+      <section id="join-algos" class="section-card">
+        <h2><span class="badge badge-amber">Join Execution</span> 3. Nested Loop vs Hash Join vs Merge Join</h2>
+        <p>
+          PostgreSQL chooses among three join algorithms based on row estimates, indexes, sort order, and <code>work_mem</code> (SQLite primarily uses Nested Loop + automatic transient B-tree indexes, assisted by Bloom filters in SQLite 3.38+):
+        </p>
+        <div class="data-table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Algorithm</th>
+                <th>How It Works</th>
+                <th>When It Wins</th>
+                <th>Watch Out For</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Nested Loop</strong></td>
+                <td>For each outer row, probe the inner table (ideally via an index seek).</td>
+                <td>Small outer result (e.g., 1&ndash;100 rows) + indexed inner join key. Lowest startup cost for <code>LIMIT</code>!</td>
+                <td>Planner misestimates outer as 1 row when it&rsquo;s 500,000 rows &rarr; O(N&middot;M) catastrophe!</td>
+              </tr>
+              <tr>
+                <td><strong>Hash Join</strong></td>
+                <td>Build an in-memory hash table on the smaller input&rsquo;s join key, then stream the larger input probing the hash table.</td>
+                <td>Large unsorted equi-joins (<code>=</code>) where no useful index exists.</td>
+                <td>Exceeding <code>work_mem</code> spills hash batches to temp disk (<code>Batches: 16</code>, <code>temp written</code>).</td>
+              </tr>
+              <tr>
+                <td><strong>Merge Join</strong></td>
+                <td>Zip two inputs already sorted by the join key in a single streaming pass.</td>
+                <td>Very large tables already sorted via B+Tree index scans or tight memory budgets.</td>
+                <td>Requires an explicit <code>Sort</code> step if inputs aren&rsquo;t pre-sorted.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- SECTION 4: SARGABLE PREDICATES -->
+      <section id="sargable" class="section-card">
+        <h2><span class="badge badge-red">SARGability</span> 4. SARGable Predicates: Don&rsquo;t Blind Your Index</h2>
+        <p>
+          <strong>SARGable</strong> means <em>Search ARGument-able</em>: the predicate lets the engine seek directly into a B+Tree range.
+          Wrapping an indexed column in a function, arithmetic, or leading wildcard forces a full scan!
+        </p>
+        <div class="grid-2">
+          <div class="mini-card">
+            <h4 style="color:var(--red);">Non-SARGable (Breaks B+Tree)</h4>
+            <pre><code>WHERE strftime('%Y', created_at) = '2026'
+WHERE amount_cents + 500 &gt;= 25000
+WHERE COALESCE(status, 'open') = 'open'
+WHERE email LIKE '%@acme.io'</code></pre>
+          </div>
+          <div class="mini-card">
+            <h4 style="color:var(--green);">SARGable (Uses B+Tree Seek)</h4>
+            <pre><code>WHERE created_at &gt;= '2026-01-01' AND created_at &lt; '2027-01-01'
+WHERE amount_cents &gt;= 24500
+WHERE status = 'open' OR status IS NULL
+WHERE domain = 'acme.io' -- extracted/indexed</code></pre>
+          </div>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-sargable">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 1</span> Non-SARGable <code>SCAN</code> vs SARGable <code>SEARCH</code></span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE events (
+              id INTEGER PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              amount_cents INTEGER NOT NULL
+            ) STRICT;
+            WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 300)
+            INSERT INTO events SELECT x, printf('2026-%02d-%02dT10:00:00Z', (x % 12) + 1, (x % 28) + 1), x * 100 FROM cnt;
+            CREATE INDEX idx_events_created ON events(created_at);
+            CREATE INDEX idx_events_amount ON events(amount_cents);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- 1. Non-SARGable date function -> SCAN events (ignores idx_events_created!):
+EXPLAIN QUERY PLAN
+SELECT id FROM events WHERE strftime('%Y-%m', created_at) = '2026-05';
+
+-- 2. SARGable half-open range -> SEARCH events USING INDEX idx_events_created!
+EXPLAIN QUERY PLAN
+SELECT id FROM events WHERE created_at >= '2026-05-01' AND created_at < '2026-06-01';
+
+-- 3. Non-SARGable arithmetic -> SCAN events:
+EXPLAIN QUERY PLAN
+SELECT id FROM events WHERE amount_cents + 500 >= 25000;
+
+-- 4. SARGable arithmetic moved to constant side -> SEARCH events USING INDEX idx_events_amount:
+EXPLAIN QUERY PLAN
+SELECT id FROM events WHERE amount_cents >= 24500;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 5: KEYSET PAGINATION & N+1 ELIMINATION -->
+      <section id="pagination-n1" class="section-card">
+        <h2><span class="badge badge-green">Production Patterns</span> 5. Keyset (Cursor) Pagination &amp; Eliminating N+1 Queries</h2>
+        <p>
+          Instead of <code>OFFSET 50000</code>, pass the last row&rsquo;s <strong><code>(created_at, id)</code></strong> tuple as a cursor and use a composite index <code>(created_at DESC, id DESC)</code>.
+          Keyset pagination runs in <code>O(log N)</code> at page 1 AND at page 100,000&mdash;and never skips or duplicates rows when new items arrive!
+        </p>
+
+        <div class="code-demo" data-demo-id="demo-keyset">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 2</span> Tuple Keyset Pagination vs <code>OFFSET</code></span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE feed (
+              id INTEGER PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              title TEXT NOT NULL
+            ) STRICT;
+            INSERT INTO feed VALUES
+              (101, '2026-05-10T09:00:00Z', 'Post A'),
+              (102, '2026-05-10T10:00:00Z', 'Post B'),
+              (103, '2026-05-10T10:00:00Z', 'Post C (tie ts)'),
+              (104, '2026-05-10T11:00:00Z', 'Post D'),
+              (105, '2026-05-10T12:00:00Z', 'Post E');
+            CREATE INDEX idx_feed_cursor ON feed(created_at DESC, id DESC);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- Page 1 (top 2): returns (105, 12:00) and (104, 11:00)
+SELECT id, created_at, title FROM feed
+ORDER BY created_at DESC, id DESC LIMIT 2;
+
+-- Page 2 using tuple cursor ('2026-05-10T11:00:00Z', 104):
+-- Breaks ties cleanly by id DESC without skipping Post B (102) or Post C (103)!
+EXPLAIN QUERY PLAN
+SELECT id, created_at, title FROM feed
+WHERE (created_at, id) < ('2026-05-10T11:00:00Z', 104)
+ORDER BY created_at DESC, id DESC
+LIMIT 2;
+
+SELECT id, created_at, title FROM feed
+WHERE (created_at, id) < ('2026-05-10T11:00:00Z', 104)
+ORDER BY created_at DESC, id DESC
+LIMIT 2;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-n-plus-1">
+          <div class="code-demo-header">
+            <span class="badge badge-blue">Runnable Demo 3</span> Replacing N+1 Loops with One <code>LEFT JOIN</code> Aggregation</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL) STRICT;
+            CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, status TEXT NOT NULL, amount_cents INTEGER NOT NULL) STRICT;
+            CREATE INDEX idx_orders_cust ON orders(customer_id, status);
+            INSERT INTO customers VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace');
+            INSERT INTO orders VALUES
+              (10, 1, 'paid', 4000),
+              (11, 1, 'paid', 1500),
+              (12, 1, 'refunded', 9000),
+              (13, 2, 'refunded', 2000);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- TRAP: Putting "o.status = 'paid'" in WHERE turns LEFT JOIN into INNER JOIN and drops Linus & Grace!
+-- SENIOR FIX: Put the filter inside the LEFT JOIN ... ON clause (or use FILTER (WHERE ...)):
+SELECT
+  c.id,
+  c.name,
+  COUNT(o.id) AS paid_count,
+  COALESCE(SUM(o.amount_cents), 0) AS total_paid_cents
+FROM customers c
+LEFT JOIN orders o
+  ON o.customer_id = c.id
+ AND o.status = 'paid'
+GROUP BY c.id, c.name
+ORDER BY c.id;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-sort-elim">
+          <div class="code-demo-header">
+            <span class="badge badge-blue">Runnable Demo 4</span> Killing <code>USE TEMP B-TREE FOR ORDER BY</code></span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE txns (
+              id INTEGER PRIMARY KEY,
+              merchant_id INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              amount_cents INTEGER NOT NULL
+            ) STRICT;
+            INSERT INTO txns VALUES (1, 7, 'settled', '2026-05-01', 1000), (2, 7, 'settled', '2026-05-02', 2000);
+            CREATE INDEX idx_bad ON txns(merchant_id, created_at DESC);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- idx_bad lacks 'status' between merchant_id and created_at -> triggers TEMP B-TREE sort!
+EXPLAIN QUERY PLAN
+SELECT id, created_at, amount_cents
+FROM txns
+WHERE merchant_id = 7 AND status = 'settled'
+ORDER BY created_at DESC LIMIT 10;
+
+-- Add the aligned index -> kills USE TEMP B-TREE FOR ORDER BY:
+CREATE INDEX idx_aligned ON txns(merchant_id, status, created_at DESC);
+EXPLAIN QUERY PLAN
+SELECT id, created_at, amount_cents
+FROM txns
+WHERE merchant_id = 7 AND status = 'settled'
+ORDER BY created_at DESC LIMIT 10;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+
+        <div class="callout postgres">
+          <div class="callout-title">Reading Production <code>EXPLAIN ANALYZE</code> &amp; Bridging Room <code>@Relation</code></div>
+          <ul style="margin:0.35rem 0 0;padding-left:1.25rem;">
+            <li><strong>Tree Math (<code>loops=N</code>):</strong> PostgreSQL reports <code>actual time</code> <em>per loop</em>. A child Nested Loop index scan showing <code>actual time=0.05..0.08 rows=2 loops=50000</code> actually took <code>0.08 &times; 50,000 = 4,000 ms</code>! Watch <code>Rows Removed by Filter</code> and <code>never executed</code> too.</li>
+            <li><strong>Correlated Columns &amp; Skewed Tenants:</strong> If <code>WHERE country = 'US' AND currency = 'USD'</code> misestimates rows, run <code>CREATE STATISTICS ... ON country, currency FROM orders; ANALYZE;</code>. If a prepared plan gets stuck on a bad generic plan for a huge tenant, check <code>plan_cache_mode</code>.</li>
+            <li><strong>Room <code>@Relation</code> Reality:</strong> Room avoids classic N+1 by running 2 batched <code>IN (...)</code> queries—which works locally until >999 parent IDs hit SQLite&rsquo;s bind-parameter limit! On servers, replace N+1 loops with a single <code>JOIN</code> or batched query.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- SECTION 6: SANDBOX -->
+      <section id="sandbox" class="section-card">
+        <h2><span class="badge badge-blue">Playground</span> 6. Free Query Plan &amp; Tuning Sandbox</h2>
+        <p>
+          Experiment with <code>EXPLAIN QUERY PLAN</code>, <code>ANALYZE</code>, SARGable range rewrites, tuple cursors, and multi-table joins.
+        </p>
+        <div class="code-demo" data-demo-id="demo-sandbox">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-green">Live Sandbox</span> Query Tuning Lab</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Query (&#8984;/Ctrl+Enter)</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE users (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL) STRICT;
+            CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, total_cents INTEGER NOT NULL) STRICT;
+            INSERT INTO users VALUES (1, 10, 'Maya'), (2, 10, 'Devon'), (3, 20, 'Samir');
+            INSERT INTO orders VALUES
+              (1, 1, 'paid', '2026-05-01T10:00:00Z', 5000),
+              (2, 1, 'paid', '2026-05-02T10:00:00Z', 7500),
+              (3, 2, 'pending', '2026-05-03T10:00:00Z', 3000);
+            CREATE INDEX idx_orders_user_status ON orders(user_id, status, created_at DESC);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">EXPLAIN QUERY PLAN
+SELECT u.name, COUNT(o.id) AS paid_orders, COALESCE(SUM(o.total_cents), 0) AS paid_cents
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id AND o.status = 'paid'
+WHERE u.org_id = 10
+GROUP BY u.id, u.name;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 7: LABS -->
+      <section id="labs" class="section-card">
+        <h2><span class="badge badge-green">Hands-On Labs</span> 7. Coding Practice (4 Auto-Checked Labs)</h2>
+        <p>
+          Reclaim index scans from non-SARGable queries, build cursor pagination, eliminate N+1 loops, and kill temporary sort trees.
+        </p>
+        <div class="lab-card" data-lab-id="lab-1"></div>
+        <div class="lab-card" data-lab-id="lab-2"></div>
+        <div class="lab-card" data-lab-id="lab-3"></div>
+        <div class="lab-card" data-lab-id="lab-4"></div>
+      </section>
+
+      <!-- SECTION 8: QUIZZES -->
+      <section id="quizzes" class="section-card">
+        <h2><span class="badge badge-pink">Knowledge Checks</span> 8. Senior Query Planning Quizzes (6 MCQs)</h2>
+        <p>
+          Sharpen your instincts on <code>EXPLAIN ANALYZE</code> diagnostics, join algorithms, SARGability, and pagination.
+        </p>
+        <div class="quiz-card" data-quiz-id="quiz-1"></div>
+        <div class="quiz-card" data-quiz-id="quiz-2"></div>
+        <div class="quiz-card" data-quiz-id="quiz-3"></div>
+        <div class="quiz-card" data-quiz-id="quiz-4"></div>
+        <div class="quiz-card" data-quiz-id="quiz-5"></div>
+        <div class="quiz-card" data-quiz-id="quiz-6"></div>
+      </section>
+
+      <!-- SECTION 9: CHEATSHEET -->
+      <section id="cheatsheet" class="section-card">
+        <h2><span class="badge badge-blue">Summary</span> 9. Lesson 7 Senior Engineering Checklist</h2>
+        <ul>
+          <li>Always run <code>EXPLAIN (ANALYZE, BUFFERS)</code> (Postgres) or <code>EXPLAIN QUERY PLAN</code> (SQLite) before guessing.</li>
+          <li>Watch for estimated vs actual row count gaps (run <code>ANALYZE</code>) and disk spills (<code>temp written</code> &rarr; tune <code>work_mem</code> or indexes).</li>
+          <li>Keep predicates <strong>SARGable</strong>: never wrap indexed columns in date formatting functions or arithmetic.</li>
+          <li>Replace <code>OFFSET</code> pagination with tuple <strong>keyset pagination</strong> <code>WHERE (created_at, id) &lt; (?, ?)</code> backed by <code>(created_at DESC, id DESC)</code>.</li>
+          <li>Eliminate N+1 loops using single-round-trip <code>LEFT JOIN</code> + <code>GROUP BY</code> (putting child filters in <code>ON</code>, not <code>WHERE</code>!).</li>
+        </ul>
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem;flex-wrap:wrap;">
+          <a class="btn" href="lesson-06.html">&larr; Previous: Lesson 6</a>
+          <a class="btn" href="master-plan.html">Master Plan</a>
+          <a class="btn btn-primary" href="lesson-08.html">Next: Lesson 8 (WAL, MVCC &amp; Vacuum) &rarr;</a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.COURSE_LABS = {
+      "lab-1": {
+        title: "Lab 1: Remediate Non-SARGable Predicates",
+        difficulty: "Lab 1 of 4 \u2022 SARGability",
+        promptHtml: `
+          <p>The pre-seeded <code>invoices</code> table has indexes on <code>created_at</code> and <code>amount_cents</code>, yet the starter query below forces a full <code>SCAN invoices</code> because of two non-SARGable expressions.</p>
+          <ul>
+            <li>Rewrite the query (without altering indexes!) so it returns the exact same <code>id, created_at, amount_cents</code> rows ordered by <code>id ASC</code>:</li>
+            <li>Condition 1: May 2026 (<code>'2026-05-...'</code>) rewritten as a half-open SARGable range <code>created_at &gt;= '2026-05-01' AND created_at &lt; '2026-06-01'</code>.</li>
+            <li>Condition 2: <code>amount_cents + 100 &gt;= 5100</code> rewritten so <code>amount_cents</code> stands alone on the left side.</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE invoices (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL
+          ) STRICT;
+          CREATE INDEX idx_inv_created ON invoices(created_at);
+          CREATE INDEX idx_inv_amount ON invoices(amount_cents);
+          INSERT INTO invoices VALUES
+            (1, '2026-04-30T23:59:59Z', 9000),
+            (2, '2026-05-01T00:00:00Z', 5000),
+            (3, '2026-05-15T12:00:00Z', 4900),
+            (4, '2026-05-20T08:00:00Z', 7200),
+            (5, '2026-06-01T00:00:00Z', 8000);
+        `,
+        starterSql: `-- BUGGY (non-SARGable): triggers SCAN invoices!\nSELECT id, created_at, amount_cents\nFROM invoices\nWHERE substr(created_at, 1, 7) = '2026-05'\n  AND amount_cents + 100 >= 5100\nORDER BY id ASC;\n`,
+        hints: [
+          "Replace <code>substr(created_at, 1, 7) = '2026-05'</code> with <code>created_at >= '2026-05-01' AND created_at < '2026-06-01'</code>.",
+          "Move <code>+ 100</code> to the right-hand constant: <code>amount_cents >= 5000</code>.",
+          "Keep <code>SELECT id, created_at, amount_cents</code> and <code>ORDER BY id ASC</code>."
+        ],
+        solutionSql: `SELECT id, created_at, amount_cents
+FROM invoices
+WHERE created_at >= '2026-05-01'
+  AND created_at < '2026-06-01'
+  AND amount_cents >= 5000
+ORDER BY id ASC;`,
+        solutionExplanationHtml: `
+          <p>Removing <code>substr()</code> and moving arithmetic off <code>amount_cents</code> allows SQLite to use <code>SEARCH invoices USING INDEX</code> instead of scanning every row in the table.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            const last = res.length ? res[res.length - 1] : null;
+
+            const expected = [
+              [2, "2026-05-01T00:00:00Z", 5000],
+              [4, "2026-05-20T08:00:00Z", 7200]
+            ];
+            const rowsOk = Boolean(last && JSON.stringify(last.values) === JSON.stringify(expected));
+            checks.push({
+              label: "Returns exact qualifying rows (id=2 and id=4)",
+              passed: rowsOk,
+              detail: last ? `Got: ${JSON.stringify(last.values)}` : "No SELECT output returned."
+            });
+
+            const cleanSql = userSql.trim().replace(/;+\s*$/, "");
+            const eqp = db.exec(`EXPLAIN QUERY PLAN ${cleanSql}`);
+            const plan = eqp.length ? eqp[0].values.map((r) => r[3]).join(" | ") : "";
+            const noNonSargableDate = !/\bsubstr\s*\(/i.test(userSql) && !/\bstrftime\s*\(/i.test(userSql);
+            const usesSearch = /SEARCH\s+invoices\s+USING\s+(COVERING\s+)?INDEX/i.test(plan) && !/\bSCAN\s+invoices\b/i.test(plan);
+            checks.push({
+              label: "Both created_at and amount_cents predicates are SARGable (no substr/strftime)",
+              passed: noNonSargableDate
+            });
+            checks.push({
+              label: "EXPLAIN QUERY PLAN uses SEARCH ... USING INDEX (no SCAN)",
+              passed: usesSearch,
+              detail: `Plan: ${plan}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-2": {
+        title: "Lab 2: Implement Keyset (Cursor) Pagination Query",
+        difficulty: "Lab 2 of 4 \u2022 Cursor Pagination",
+        promptHtml: `
+          <p>The pre-seeded <code>posts</code> table has <code>CREATE INDEX idx_posts_cursor ON posts(created_at DESC, id DESC);</code>.</p>
+          <p>The user already viewed Page 1, ending at cursor <code>created_at = '2026-05-10T10:00:00Z', id = 105</code>. Write a <strong>keyset pagination query</strong> (NO <code>OFFSET</code>!) that:</p>
+          <ul>
+            <li>Selects <code>id, created_at, title</code> from <code>posts</code>.</li>
+            <li>Fetches rows strictly older than the cursor <code>('2026-05-10T10:00:00Z', 105)</code> in descending <code>(created_at DESC, id DESC)</code> order (remember: ties on <code>created_at = '2026-05-10T10:00:00Z'</code> with <code>id &lt; 105</code> MUST be included!).</li>
+            <li>Limits output to <strong>3 rows</strong>.</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE posts (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            title TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX idx_posts_cursor ON posts(created_at DESC, id DESC);
+          INSERT INTO posts VALUES
+            (101, '2026-05-08T10:00:00Z', 'Oldest'),
+            (102, '2026-05-09T10:00:00Z', 'Yesterday'),
+            (103, '2026-05-10T10:00:00Z', 'Tie Lower ID 103'),
+            (104, '2026-05-10T10:00:00Z', 'Tie Lower ID 104'),
+            (105, '2026-05-10T10:00:00Z', 'Cursor Item 105'),
+            (106, '2026-05-10T10:00:00Z', 'Tie Higher ID 106'),
+            (107, '2026-05-11T10:00:00Z', 'Newest'),
+            (200, '2026-05-09T12:00:00Z', 'Out-of-Order Earlier Post 200');
+        `,
+        starterSql: `-- Write a keyset pagination query (NO OFFSET) for Page 2 after cursor ('2026-05-10T10:00:00Z', 105):\n`,
+        hints: [
+          "Use SQLite/PostgreSQL row-value tuple comparison: <code>WHERE (created_at, id) < ('2026-05-10T10:00:00Z', 105)</code>.",
+          "Sort with <code>ORDER BY created_at DESC, id DESC</code> to match <code>idx_posts_cursor</code>.",
+          "End with <code>LIMIT 3;</code> and do not use <code>OFFSET</code>."
+        ],
+        solutionSql: `SELECT id, created_at, title
+FROM posts
+WHERE (created_at, id) < ('2026-05-10T10:00:00Z', 105)
+ORDER BY created_at DESC, id DESC
+LIMIT 3;`,
+        solutionExplanationHtml: `
+          <p>Row-value comparison <code>(created_at, id) &lt; ('2026-05-10T10:00:00Z', 105)</code> cleanly handles duplicate timestamps (returning <code>104</code>, <code>103</code>, then <code>200</code>&mdash;notice a naive <code>created_at &lt;= ... AND id &lt; 105</code> filter would wrongly drop post <code>200</code>!) while seeking straight into <code>idx_posts_cursor</code>.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const noOffset = !/\bOFFSET\b/i.test(userSql);
+            checks.push({
+              label: "Does not use OFFSET",
+              passed: noOffset,
+              detail: noOffset ? "Clean keyset predicate." : "Remove OFFSET and use cursor comparison."
+            });
+
+            const res = db.exec(userSql);
+            const last = res.length ? res[res.length - 1] : null;
+            const colsOk =
+              last &&
+              last.columns.length === 3 &&
+              last.columns[0].toLowerCase() === "id" &&
+              last.columns[1].toLowerCase() === "created_at" &&
+              last.columns[2].toLowerCase() === "title";
+            checks.push({
+              label: "Columns are (id, created_at, title)",
+              passed: Boolean(colsOk),
+              detail: last ? `Got: ${last.columns.join(", ")}` : "No result."
+            });
+
+            const expectedIds = [104, 103, 200];
+            const gotIds = last ? last.values.map((r) => r[0]) : [];
+            const idsOk = JSON.stringify(gotIds) === JSON.stringify(expectedIds);
+            checks.push({
+              label: "Returns exact Page 2 IDs [104, 103, 200] in DESC order",
+              passed: idsOk,
+              detail: `Got IDs: ${JSON.stringify(gotIds)}`
+            });
+
+            const cleanSql = userSql.trim().replace(/;+\s*$/, "");
+            const eqp = db.exec(`EXPLAIN QUERY PLAN ${cleanSql}`);
+            const plan = eqp.length ? eqp[0].values.map((r) => r[3]).join(" | ") : "";
+            const usesIdx = /idx_posts_cursor/i.test(plan) && !/TEMP B-TREE/i.test(plan);
+            checks.push({
+              label: "Uses idx_posts_cursor without TEMP B-TREE sort",
+              passed: usesIdx,
+              detail: `Plan: ${plan}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-3": {
+        title: "Lab 3: Collapse an N+1 Loop into a Single LEFT JOIN Aggregation",
+        difficulty: "Lab 3 of 4 \u2022 N+1 Elimination",
+        promptHtml: `
+          <p>Replace an application N+1 loop with <strong>one SQL query</strong> over <code>customers</code> and <code>orders</code>:</p>
+          <ul>
+            <li>Return <strong>ALL</strong> customers (even customers with zero paid orders!), ordered by <code>c.id ASC</code>.</li>
+            <li>Columns: <code>id</code>, <code>name</code>, <code>paid_count</code> (integer count of <code>'paid'</code> orders), <code>total_paid_cents</code> (sum of <code>amount_cents</code> for <code>'paid'</code> orders, or <code>0</code> if none&mdash;never <code>NULL</code>!).</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL) STRICT;
+          CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, status TEXT NOT NULL, amount_cents INTEGER NOT NULL) STRICT;
+          INSERT INTO customers VALUES (1, 'Maya'), (2, 'Devon'), (3, 'Samir');
+          INSERT INTO orders VALUES
+            (10, 1, 'paid', 3000),
+            (11, 1, 'paid', 2000),
+            (12, 1, 'refunded', 9000),
+            (13, 2, 'pending', 4500);
+        `,
+        starterSql: `-- Write ONE query returning (id, name, paid_count, total_paid_cents) for ALL customers:\n`,
+        hints: [
+          "Use <code>LEFT JOIN orders o ON o.customer_id = c.id AND o.status = 'paid'</code> (keep <code>o.status = 'paid'</code> in <code>ON</code>, NOT in <code>WHERE</code>!).",
+          "Count matched orders with <code>COUNT(o.id)</code> (not <code>COUNT(*)</code>, which counts 1 for unmatched NULL-padded rows!).",
+          "Wrap <code>SUM(o.amount_cents)</code> in <code>COALESCE(SUM(o.amount_cents), 0)</code> so Devon and Samir show <code>0</code> instead of <code>NULL</code>."
+        ],
+        solutionSql: `SELECT
+  c.id,
+  c.name,
+  COUNT(o.id) AS paid_count,
+  COALESCE(SUM(o.amount_cents), 0) AS total_paid_cents
+FROM customers c
+LEFT JOIN orders o
+  ON o.customer_id = c.id
+ AND o.status = 'paid'
+GROUP BY c.id, c.name
+ORDER BY c.id ASC;`,
+        solutionExplanationHtml: `
+          <p>Putting <code>o.status = 'paid'</code> in the <code>LEFT JOIN ... ON</code> clause filters child rows before joining, preserving Devon (only pending order) and Samir (no orders) with <code>paid_count = 0</code> and <code>total_paid_cents = 0</code>.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            checks.push({ label: "Single query returns 1 result set", passed: res.length === 1 });
+            if (res.length !== 1) return { passed: false, checks };
+
+            const last = res[0];
+            const colsOk =
+              last.columns.length === 4 &&
+              last.columns[2].toLowerCase() === "paid_count" &&
+              last.columns[3].toLowerCase() === "total_paid_cents";
+            checks.push({
+              label: "Returns 4 columns (id, name, paid_count, total_paid_cents)",
+              passed: colsOk,
+              detail: `Columns: ${last.columns.join(", ")}`
+            });
+
+            const expected = [
+              [1, "Maya", 2, 5000],
+              [2, "Devon", 0, 0],
+              [3, "Samir", 0, 0]
+            ];
+            const rowsOk = JSON.stringify(last.values) === JSON.stringify(expected);
+            checks.push({
+              label: "All 3 customers returned with exact paid counts & zero-coalesced totals",
+              passed: rowsOk,
+              detail: `Got: ${JSON.stringify(last.values)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-4": {
+        title: "Lab 4: Tune Composite Index for Multi-Filter Sort & Covering Scan",
+        difficulty: "Lab 4 of 4 \u2022 Plan Tuning",
+        promptHtml: `
+          <p>This hot endpoint on <code>transactions</code> currently performs a full table scan + temporary B-tree sort:</p>
+          <pre><code>SELECT id, created_at, amount_cents
+FROM transactions
+WHERE merchant_id = 7 AND status = 'settled' AND created_at &gt;= '2026-05-01'
+ORDER BY created_at DESC
+LIMIT 10;</code></pre>
+          <p>Create a single index named <code>idx_txns_tuned</code> on <code>transactions</code> so <code>EXPLAIN QUERY PLAN</code> reports <code>USING COVERING INDEX idx_txns_tuned</code> and <strong>zero <code>USE TEMP B-TREE</code></strong>.</p>
+        `,
+        setupSql: `
+          CREATE TABLE transactions (
+            id INTEGER PRIMARY KEY,
+            merchant_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            notes TEXT NOT NULL
+          ) STRICT;
+          WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 300)
+          INSERT INTO transactions SELECT
+            x,
+            (x % 12) + 1,
+            CASE x % 3 WHEN 0 THEN 'settled' ELSE 'pending' END,
+            printf('2026-05-%02dT10:00:00Z', (x % 28) + 1),
+            x * 150,
+            'memo'
+          FROM cnt;
+        `,
+        starterSql: `-- Create idx_txns_tuned on transactions to achieve USING COVERING INDEX and kill TEMP B-TREE:\n`,
+        hints: [
+          "Notice <code>id</code> is the <code>INTEGER PRIMARY KEY</code> (<code>rowid</code>), which SQLite automatically stores inside every secondary index leaf! So you only need to list <code>amount_cents</code> explicitly as the trailing covering column.",
+          "Equality first (<code>merchant_id, status</code>), range/sort next (<code>created_at DESC</code>), covering payload last (<code>amount_cents</code>).",
+          "DDL: <code>CREATE INDEX idx_txns_tuned ON transactions(merchant_id, status, created_at DESC, amount_cents);</code>"
+        ],
+        solutionSql: `CREATE INDEX idx_txns_tuned
+  ON transactions(merchant_id, status, created_at DESC, amount_cents);
+
+EXPLAIN QUERY PLAN
+SELECT id, created_at, amount_cents
+FROM transactions
+WHERE merchant_id = 7 AND status = 'settled' AND created_at >= '2026-05-01'
+ORDER BY created_at DESC
+LIMIT 10;`,
+        solutionExplanationHtml: `
+          <p><code>(merchant_id, status, created_at DESC, amount_cents)</code> checks both equality filters, scans backwards/forwards in <code>created_at DESC</code> order without sorting, and covers <code>id</code> (implicit rowid), <code>created_at</code>, and <code>amount_cents</code> cleanly.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            db.run(userSql);
+
+            const idx = db.exec("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_txns_tuned';");
+            const exists = idx.length > 0 && idx[0].values.length === 1;
+            checks.push({ label: "Index 'idx_txns_tuned' created", passed: exists });
+            if (!exists) return { passed: false, checks };
+
+            const eqp = db.exec("EXPLAIN QUERY PLAN SELECT id, created_at, amount_cents FROM transactions WHERE merchant_id = 7 AND status = 'settled' AND created_at >= '2026-05-01' ORDER BY created_at DESC LIMIT 10;");
+            const plan = eqp.length ? eqp[0].values.map((r) => r[3]).join(" | ") : "";
+            const covering = /USING\s+COVERING\s+INDEX\s+idx_txns_tuned/i.test(plan);
+            const noSort = !/TEMP B-TREE/i.test(plan);
+
+            checks.push({
+              label: "EXPLAIN QUERY PLAN uses USING COVERING INDEX idx_txns_tuned",
+              passed: covering,
+              detail: `Plan: ${plan}`
+            });
+            checks.push({
+              label: "No USE TEMP B-TREE FOR ORDER BY",
+              passed: noSort
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      }
+    };
+
+    window.COURSE_QUIZZES = {
+      "quiz-1": {
+        tag: "EXPLAIN ANALYZE",
+        questionHtml: "In PostgreSQL <code>EXPLAIN (ANALYZE, BUFFERS)</code>, you see: <code>Nested Loop ... (cost=0.43..420.1 rows=12) (actual time=1.2..4820.5 rows=480000 loops=1)</code>. What happened?",
+        options: [
+          {
+            labelHtml: "Stale stats made the planner estimate 12 rows, picking Nested Loop over Hash Join.",
+            correct: true,
+            whyHtml: "A huge gap between estimated <code>rows=12</code> and <code>actual rows=480000</code> (often after a bulk load before autovacuum/autoanalyze ran) tricks the planner into choosing a Nested Loop that fires 480k inner probes. Refreshing stats with <code>ANALYZE</code> lets it switch to a Hash Join."
+          },
+          {
+            labelHtml: "Low <code>work_mem</code> forced PostgreSQL to spill 480,000 join rows into temporary disk files.",
+            correct: false,
+            whyHtml: "<code>work_mem</code> spills affect Hash or Sort nodes, not Nested Loop row misestimates."
+          },
+          {
+            labelHtml: "<code>Nested Loop</code> is always faster than <code>Hash Join</code> for 480,000 matching rows.",
+            correct: false,
+            whyHtml: "For 480,000 rows, Hash Join or Merge Join is orders of magnitude faster than 480,000 separate Nested Loop probes."
+          },
+          {
+            labelHtml: "Enabling <code>BUFFERS</code> added 4,820 ms of per-page timing overhead to the scan.",
+            correct: false,
+            whyHtml: "<code>BUFFERS</code> adds negligible timing overhead (~microseconds); the 4.8 seconds came from 480k loop iterations."
+          }
+        ]
+      },
+
+      "quiz-2": {
+        tag: "Scan Algorithms",
+        questionHtml: "When does PostgreSQL deliberately choose a <strong>Bitmap Heap Scan</strong> over a regular <strong>Index Scan</strong>?",
+        options: [
+          {
+            labelHtml: "When fetching a single row by primary key from an uncached heap page.",
+            correct: false,
+            whyHtml: "A 1-row PK lookup uses a direct Index Scan (or Index-Only Scan), without needing a bitmap step."
+          },
+          {
+            labelHtml: "When a table lacks a primary key or any usable B-tree index entries.",
+            correct: false,
+            whyHtml: "Bitmap Heap Scan still requires at least one index (B-tree, GIN, or GiST); tables without usable indexes fall back to Sequential Scan."
+          },
+          {
+            labelHtml: "When running an unfiltered <code>CROSS JOIN</code> across two large unindexed tables.",
+            correct: false,
+            whyHtml: "A <code>CROSS JOIN</code> with no predicates uses Sequential Scans, not index bitmaps."
+          },
+          {
+            labelHtml: "When medium selectivity or combined <code>AND</code>/<code>OR</code> indexes would thrash random I/O.",
+            correct: true,
+            whyHtml: "A Bitmap Index Scan collects all matching <code>ctid</code>s into a bitmap sorted by physical page number, then Bitmap Heap Scan reads each target heap page once in sequential physical order."
+          }
+        ]
+      },
+
+      "quiz-3": {
+        tag: "Join Algorithms & work_mem",
+        questionHtml: "In PostgreSQL <code>EXPLAIN (ANALYZE, BUFFERS)</code>, a <code>Hash Join</code> shows <code>Batches: 32 Memory Usage: 4096kB</code> and <code>Buffers: temp read=12400 written=12450</code>. What is the direct fix?",
+        options: [
+          {
+            labelHtml: "Run <code>VACUUM FULL</code> on both joined tables to reclaim dead tuple space.",
+            correct: false,
+            whyHtml: "<code>VACUUM FULL</code> compacts table heap files; it does not raise the per-query hash table memory limit."
+          },
+          {
+            labelHtml: "Convert join columns from <code>TEXT</code> to <code>VARCHAR(50)</code> to cut memory use.",
+            correct: false,
+            whyHtml: "<code>TEXT</code> and <code>VARCHAR</code> have identical runtime memory representation in PostgreSQL."
+          },
+          {
+            labelHtml: "Raise <code>work_mem</code> carefully or shrink the hashed build side with filters.",
+            correct: true,
+            whyHtml: "Each Hash/Sort node gets up to <code>work_mem</code> before spilling temporary files to disk. Raising <code>work_mem</code> (carefully, since complex queries can allocate multiple buffers concurrently) keeps the hash table in RAM."
+          },
+          {
+            labelHtml: "Drop foreign key constraints on the joined tables to skip checks.",
+            correct: false,
+            whyHtml: "Foreign keys are not checked during <code>SELECT</code> joins and do not cause Hash Join temp disk spills."
+          }
+        ]
+      },
+
+      "quiz-4": {
+        tag: "SARGability",
+        questionHtml: "Which predicate is <strong>SARGable</strong> and can directly use a standard B+Tree index on <code>created_at</code> (ISO-8601 UTC text or <code>TIMESTAMPTZ</code>)?",
+        options: [
+          {
+            labelHtml: "<code>WHERE EXTRACT(YEAR FROM created_at) BETWEEN 2026 AND 2026</code>",
+            correct: false,
+            whyHtml: "Wrapping <code>created_at</code> in <code>EXTRACT()</code> prevents a plain B+Tree seek."
+          },
+          {
+            labelHtml: "<code>WHERE created_at &gt;= '2026-01-01' AND created_at &lt; '2027-01-01'</code>",
+            correct: true,
+            whyHtml: "<code>created_at</code> sits bare on the left-hand side bounded by half-open range constants, letting the B+Tree seek straight to the start bound and scan until the end bound."
+          },
+          {
+            labelHtml: "<code>WHERE DATE(created_at) BETWEEN '2026-01-01' AND '2026-12-31'</code>",
+            correct: false,
+            whyHtml: "Applying <code>DATE(...)</code> to the indexed column hides raw values from a standard B+Tree on <code>created_at</code>."
+          },
+          {
+            labelHtml: "<code>WHERE created_at || '' BETWEEN '2026-01-01' AND '2026-12-31'</code>",
+            correct: false,
+            whyHtml: "Concatenating an empty string turns the column into an expression, defeating a plain index."
+          }
+        ]
+      },
+
+      "quiz-5": {
+        tag: "Keyset vs OFFSET Pagination",
+        questionHtml: "Beyond slow <code>O(N)</code> performance at page 5,000, what correctness bug happens when a social feed uses <code>LIMIT 20 OFFSET 20</code> while new posts are inserted?",
+        options: [
+          {
+            labelHtml: "The database aborts Page 2 immediately with a <code>40001</code> serialization conflict error.",
+            correct: false,
+            whyHtml: "<code>OFFSET</code> does not throw serialization errors when new rows arrive."
+          },
+          {
+            labelHtml: "<code>OFFSET 20</code> permanently evicts the skipped posts from the server's buffer pool.",
+            correct: false,
+            whyHtml: "<code>OFFSET</code> never evicts or deletes rows; it simply reads and discards them from the query result."
+          },
+          {
+            labelHtml: "The query planner switches to <code>Merge Join</code> and drops newly committed posts.",
+            correct: false,
+            whyHtml: "<code>OFFSET</code> has nothing to do with join algorithms."
+          },
+          {
+            labelHtml: "New inserts shift row offsets down, duplicating Page 1 items onto Page 2.",
+            correct: true,
+            whyHtml: "<code>OFFSET 20</code> counts positions at the moment Page 2 executes, not relative to the last item seen. Keyset pagination anchors strictly on <code>(created_at, id) &lt; (last_ts, last_id)</code>, guaranteeing stable, duplicate-free paging."
+          }
+        ]
+      },
+
+      "quiz-6": {
+        tag: "N+1 Elimination & LEFT JOIN Trap",
+        questionHtml: "You eliminate an N+1 query by joining <code>customers c LEFT JOIN orders o ON o.customer_id = c.id</code>, then add <code>WHERE o.status = 'paid'</code>. Why do customers with zero paid orders disappear?",
+        options: [
+          {
+            labelHtml: "Because <code>LEFT JOIN</code> automatically drops any left row whose order count equals zero.",
+            correct: false,
+            whyHtml: "<code>LEFT JOIN</code> preserves all left rows; it is the <code>WHERE</code> clause afterwards that filters them out."
+          },
+          {
+            labelHtml: "Because <code>GROUP BY c.id</code> discards customer groups that contain <code>NULL</code> order values.",
+            correct: false,
+            whyHtml: "<code>GROUP BY</code> keeps every surviving customer group; rows were already dropped in <code>WHERE</code>."
+          },
+          {
+            labelHtml: "Because unmatched <code>o.status</code> is <code>NULL</code>, so <code>WHERE</code> forces an <code>INNER JOIN</code>.",
+            correct: true,
+            whyHtml: "Logical SQL runs <code>FROM/JOIN</code> before <code>WHERE</code>. Filtering the right table inside <code>WHERE</code> rejects the NULL-extended rows produced by <code>LEFT JOIN</code>. Filtering inside <code>ON</code> keeps all customers."
+          },
+          {
+            labelHtml: "Because SQLite and PostgreSQL disallow combining <code>LEFT JOIN</code> with <code>GROUP BY</code> clauses.",
+            correct: false,
+            whyHtml: "SQLite and PostgreSQL both support <code>LEFT JOIN</code> with <code>GROUP BY</code> fully."
+          }
+        ]
+      }
+    };
+  </script>
+  <script src="assets/sql-asm.js"></script>
+  <script src="assets/course-engine.js"></script>
+</body>
+</html>

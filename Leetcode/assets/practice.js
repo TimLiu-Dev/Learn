@@ -301,6 +301,7 @@ print("__PRACTICE_PAYLOAD__" + json.dumps({"passed": __all_passed, "results": __
             stdoutCaptured += text;
           },
           read: builtinRead,
+          __future__: Sk.python3,
           execLimit: 6000 // 6 seconds timeout limit
         });
 

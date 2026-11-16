@@ -18,10 +18,10 @@
 
 ## Course Version History
 - **v1–v2:** Initial 72-session syllabus (`0001`–`0072`) + 7 permanent reference sheets + Java lab validation (`LabRunner.java`).
-- **v3 (2026-11-15 Two-Part 2027 Senior NetEng Overhaul):**
-  - Audited against `roadmap.sh/network-engineer` for transitioning from Junior Android Developer to Senior Software Dev (Part 1) + Senior Network Engineer (Part 2).
+- **v3 (2026-11-15 Two-Part 2027 Senior NetEng Overhaul — 89 Sessions):**
+  - Audited against `roadmap.sh/network-engineer` for transitioning from Junior Android Developer to Senior Software Dev (Part 1, 41 sessions) + Senior Network Engineer (Part 2, 48 sessions).
   - Removed all `◇ Optional Deep-Dive` badges from `0036`, `0039`, `0040`, `0041`, `0048`, `0049` — elevated all 6 to **★ Core NetEng** inside Part 2.
-  - Added 15 new sessions (`0073`–`0087`) covering Android/Mobile edge (`0073`), Reverse Proxies &amp; Graceful Draining (`0074`), Linux `iproute2`/`netns`/`nftables` (`0075`), Containerlab/FRR (`0076`), FHRP/Anycast GW (`0077`), IS-IS/BFD/ECMP/SR (`0078`), MP-BGP EVPN Spine-Leaf (`0079`), 802.1X/RADIUS/TACACS+/DAI/ZTNA (`0080`), IP Multicast (`0081`), YANG/NETCONF/RESTCONF/gNMI (`0082`), Python NetDevOps (`0083`), Ansible (`0084`), Terraform/Batfish GitOps (`0085`), Automation Outage Autopsy (`0086`), and **Capstone 2 (`0087`)**.
+  - Added 17 new sessions (`0073`–`0089`) covering Android/Mobile edge (`0073`), Reverse Proxies &amp; Graceful Draining (`0074`), Linux `iproute2`/`netns`/`nftables` (`0075`), Containerlab/FRR (`0076`), FHRP/Anycast GW (`0077`), IS-IS/BFD/ECMP/SR (`0078`), MP-BGP EVPN Spine-Leaf (`0079`), 802.1X/RADIUS/TACACS+/DAI/ZTNA (`0080`), IP Multicast (`0081`), YANG/NETCONF/RESTCONF/gNMI (`0082`), Python NetDevOps (`0083`), Ansible (`0084`), Terraform/Batfish GitOps (`0085`), Automation Outage Autopsy (`0086`), **Capstone 2 (`0087`)**, Enterprise Wireless 802.11 (`0088`), and NGFW/IDS-IPS/SD-WAN (`0089`).
   - Upgraded Capstone 1 (`0069`) with reverse-proxy `/api/*` forwarding, `/healthz`, and `SIGTERM` graceful draining.
   - Added permanent reference sheet `reference/netdevops-and-automation.html`.
   - Audited and fixed 129 scrambled/mismatched `data-why` quiz explanations across 49 legacy lessons plus HTML cleanup.

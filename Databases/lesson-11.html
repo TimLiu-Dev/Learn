@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 11: Zero-Downtime Migrations &amp; Safe Schema Evolution</title>
+  <link rel="stylesheet" href="assets/course.css" />
+</head>
+<body data-lesson-id="lesson-11">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="master-plan.html">
+        <span class="brand-mark">DB</span>
+        <span>
+          Lesson 11 &bull; Zero-Downtime Migrations
+          <span class="brand-sub">Phase 3 &bull; Correctness Under Load</span>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <div id="engine-status" class="engine-pill">
+          <span class="engine-dot"></span>
+          <span class="engine-label">Loading SQLite...</span>
+        </div>
+        <a class="btn btn-sm" href="lesson-10.html">&larr; Prev</a>
+        <a class="btn btn-sm" href="master-plan.html">Master Plan</a>
+        <a class="btn btn-sm" href="lesson-12.html">Next &rarr;</a>
+        <button id="theme-toggle" class="btn btn-sm" type="button">Light Mode</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar">
+      <div class="sidebar-title">Lesson 11 Contents</div>
+      <ul class="toc-list">
+        <li><a href="#room-bridge">1. Room Migration &rarr; Rolling Deploys</a></li>
+        <li><a href="#lock-queues">2. Lock Queues &amp; <code>lock_timeout</code></a></li>
+        <li><a href="#safe-ddl">3. <code>CONCURRENTLY</code> &amp; <code>NOT VALID</code></a></li>
+        <li><a href="#expand-contract">4. Expand &amp; Contract + Backfills</a></li>
+        <li><a href="#sandbox">5. Free SQL Sandbox</a></li>
+        <li><a href="#labs">6. Coding Labs (4 Auto-Checked)</a></li>
+        <li><a href="#quizzes">7. Senior Quizzes (6 MCQs)</a></li>
+        <li><a href="#cheatsheet">8. Senior Checklist</a></li>
+      </ul>
+
+      <div class="progress-box">
+        <div class="sidebar-title" style="margin-bottom:0.35rem;">Lesson 11 Progress</div>
+        <div class="progress-bar-track">
+          <div id="lesson-progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <div class="progress-meta">
+          <span id="lesson-progress-text">0/10 completed (0%)</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section class="hero">
+        <div class="meta-row">
+          <span class="badge badge-amber">Phase 3 &bull; Lesson 11</span>
+          <span class="badge badge-red">Outage Prevention</span>
+          <span class="badge badge-purple">Room &rarr; SQLite 3.45 &amp; PostgreSQL</span>
+        </div>
+        <h1>Zero-Downtime Migrations &amp; Safe Schema Evolution</h1>
+        <p class="lead">
+          More production outages are caused by &ldquo;harmless&rdquo; <code>ALTER TABLE</code> migrations than by application logic bugs.
+          Learn how PostgreSQL&rsquo;s lock queue freezes your entire API in seconds, why <code>lock_timeout</code> is non-negotiable, and how to rename or constrain 500M-row tables with zero downtime using <strong>Expand-and-Contract</strong>.
+        </p>
+        <div class="meta-row">
+          <span class="topic-chip">4 Interactive Demos</span>
+          <span class="topic-chip">1 Open Sandbox</span>
+          <span class="topic-chip">4 Coding Labs (Auto-Graded)</span>
+          <span class="topic-chip">6 Diagnostic Quizzes</span>
+        </div>
+      </section>
+
+      <!-- SECTION 1: ROOM BRIDGE -->
+      <section id="room-bridge" class="section-card">
+        <h2><span class="badge badge-purple">Room Bridge</span> 1. Leaving Room&rsquo;s Blocking <code>Migration(1, 2)</code> Behind</h2>
+        <p>
+          In Android Room, you write a <code>Migration(1, 2)</code> object that runs when the user launches the updated app. Only one binary version talks to that local SQLite file, and no web traffic hits it while <code>ALTER TABLE</code> executes.
+        </p>
+        <pre><code>// Android Room: Only v2 app code runs after Migration(1, 2) finishes
+val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE users RENAME COLUMN full_name TO display_name")
+    }
+}</code></pre>
+
+        <div class="callout room">
+          <div class="callout-title">Why <code>RENAME COLUMN</code> &amp; Direct <code>ALTER TABLE</code> Break Rolling Production Deploys</div>
+          <p style="margin:0;">
+            During a rolling Kubernetes deploy, <strong>v1 pods and v2 pods run simultaneously</strong> against the exact same database for several minutes!
+            If you run <code>RENAME COLUMN full_name TO display_name</code> before deploying v2, every running v1 pod immediately crashes with <code>column "full_name" does not exist</code>.
+            Even worse, if your <code>ALTER TABLE</code> waits behind a single slow analytics query, PostgreSQL&rsquo;s lock queue blocks <em>all</em> incoming <code>SELECT</code> traffic behind it!
+          </p>
+        </div>
+      </section>
+
+      <!-- SECTION 2: LOCK QUEUES & LOCK_TIMEOUT -->
+      <section id="lock-queues" class="section-card">
+        <h2><span class="badge badge-red">Outage Mechanics</span> 2. PostgreSQL Lock Queues &amp; Mandatory <code>lock_timeout</code></h2>
+        <p>
+          Every query in PostgreSQL acquires a table-level lock mode. Normal <code>SELECT</code> queries take <code>ACCESS SHARE</code> (compatible with reads/writes), while <code>ALTER TABLE</code> requests <code>ACCESS EXCLUSIVE</code> (incompatible with <em>everything</em>, including <code>SELECT</code>!).
+        </p>
+        <p>
+          <strong>Here is the trap:</strong> PostgreSQL grants locks in strict FIFO queue order to prevent writer starvation. If one 30-second reporting <code>SELECT</code> holds <code>ACCESS SHARE</code>, your 2-millisecond <code>ALTER TABLE</code> waits in the queue&mdash;and <strong>every new incoming checkout <code>SELECT</code> queues behind the waiting <code>ALTER TABLE</code></strong>! Within 3 seconds, your connection pool saturates and the entire site goes down.
+        </p>
+
+        <div class="code-demo" data-demo-id="demo-lock-queue">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-red">Runnable Demo 1</span> Simulating PostgreSQL Lock-Queue Starvation</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE pg_locks_sim (
+              arrival_seq INTEGER PRIMARY KEY,
+              pid INTEGER NOT NULL,
+              query_type TEXT NOT NULL,
+              lock_mode TEXT NOT NULL,
+              status TEXT NOT NULL,
+              blocked_by_pid INTEGER
+            ) STRICT;
+            INSERT INTO pg_locks_sim VALUES
+              (1, 1001, 'BI Report SELECT (runs 45s)',  'ACCESS SHARE',      'RUNNING', NULL),
+              (2, 1002, 'ALTER TABLE orders ADD COL',   'ACCESS EXCLUSIVE',  'WAITING', 1001),
+              (3, 1003, 'API Checkout SELECT /orders',  'ACCESS SHARE',      'WAITING', 1002),
+              (4, 1004, 'API Checkout INSERT /orders',  'ROW EXCLUSIVE',     'WAITING', 1002),
+              (5, 1005, 'API Login SELECT /orders',     'ACCESS SHARE',      'WAITING', 1002);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- Inspect the FIFO lock queue disaster when ALTER TABLE runs WITHOUT lock_timeout:
+SELECT
+  arrival_seq,
+  pid,
+  query_type,
+  lock_mode,
+  status,
+  blocked_by_pid,
+  CASE
+    WHEN blocked_by_pid = 1002 THEN 'OUTAGE: API traffic frozen behind waiting DDL!'
+    WHEN status = 'WAITING' THEN 'Waiting on slow report (holds queue hostage!)'
+    ELSE 'Holding ACCESS SHARE'
+  END AS impact
+FROM pg_locks_sim
+ORDER BY arrival_seq;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+
+        <pre><code>-- PostgreSQL Senior Migration Wrapper (ALWAYS set lock_timeout + retry loop!):
+SET lock_timeout = '2s';
+-- For short metadata DDL, keep statement_timeout tight; for CREATE INDEX CONCURRENTLY or VALIDATE CONSTRAINT,
+-- set statement_timeout = '0' so long online scans aren't killed mid-build!
+SET statement_timeout = '5s';
+
+-- If a slow BI query blocks ALTER TABLE for >2s, Postgres aborts ONLY the migration,
+-- clearing the lock queue immediately so live API SELECTs continue unharmed!
+ALTER TABLE orders ADD COLUMN coupon_code TEXT;</code></pre>
+      </section>
+
+      <!-- SECTION 3: CONCURRENTLY & NOT VALID -->
+      <section id="safe-ddl" class="section-card">
+        <h2><span class="badge badge-blue">PostgreSQL Parity</span> 3. <code>CREATE INDEX CONCURRENTLY</code> &amp; Safe <code>NOT NULL</code> / <code>CHECK</code></h2>
+
+        <div class="grid-2">
+          <div class="mini-card">
+            <h4>Index Builds Without Blocking Writes</h4>
+            <p style="font-size:0.88rem;color:var(--text-muted);margin:0;">
+              Standard <code>CREATE INDEX</code> takes a <code>SHARE</code> lock (blocks all <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> for minutes). Always use <code>CREATE INDEX CONCURRENTLY</code> in production! Note: it cannot run inside an explicit <code>BEGIN ... COMMIT</code> transaction, and if it fails you must check <code>pg_index.indisvalid</code> and <code>DROP INDEX CONCURRENTLY</code> before retrying.
+            </p>
+          </div>
+          <div class="mini-card">
+            <h4>2-Step <code>NOT NULL</code> / <code>CHECK</code> Without Full Lock</h4>
+            <p style="font-size:0.88rem;color:var(--text-muted);margin:0;">
+              Naive <code>SET NOT NULL</code> scans the whole table under <code>ACCESS EXCLUSIVE</code>. Instead:
+              (1) <code>ADD CONSTRAINT ... CHECK (col IS NOT NULL) NOT VALID;</code> (instant metadata lock, enforces on new writes);
+              (2) <code>VALIDATE CONSTRAINT ...;</code> (uses <code>SHARE UPDATE EXCLUSIVE</code>&mdash;does NOT block reads or writes!);
+              (3) <code>ALTER COLUMN col SET NOT NULL;</code> (instant in PG 12+ because validated <code>CHECK</code> proves zero nulls!).
+            </p>
+          </div>
+        </div>
+
+        <pre><code>-- PostgreSQL Safe 3-Step NOT NULL &amp; Concurrent Index Pattern:
+-- Step 1: Instant metadata lock (protects new writes immediately)
+SET lock_timeout = '2s';
+ALTER TABLE users ADD CONSTRAINT users_email_nn CHECK (email IS NOT NULL) NOT VALID;
+
+-- Step 2: Online table scan (allows concurrent SELECT / INSERT / UPDATE / DELETE!)
+ALTER TABLE users VALIDATE CONSTRAINT users_email_nn;
+
+-- Step 3 (PG 12+): Instant metadata promotion, then drop redundant CHECK
+ALTER TABLE users ALTER COLUMN email SET NOT NULL;
+ALTER TABLE users DROP CONSTRAINT users_email_nn;
+
+-- Non-blocking index build (MUST run outside BEGIN...COMMIT):
+CREATE INDEX CONCURRENTLY idx_users_created_at ON users (created_at);</code></pre>
+
+        <div class="callout postgres">
+          <div class="callout-title">Good News Since PostgreSQL 11: <code>ADD COLUMN ... DEFAULT</code> &amp; PG 18 <code>NOT NULL NOT VALID</code></div>
+          <p style="margin:0;">
+            Since <strong>PostgreSQL 11+</strong>, adding a column with a <em>non-volatile constant</em> <code>DEFAULT</code> (like <code>'active'</code>, <code>0</code>, or <code>false</code>) is an instant metadata-only operation (though you still need <code>lock_timeout</code> to enter the lock queue safely, while volatile defaults like <code>DEFAULT random()</code> still rewrite the table!). In <strong>PostgreSQL 18+</strong>, you can even run <code>ALTER TABLE ... ADD CONSTRAINT ... NOT NULL ... NOT VALID</code> directly without the temporary <code>CHECK</code> workaround. Also remember: in SQLite/Room, many schema changes require SQLite&rsquo;s 12-step table rebuild (create new table &rarr; copy &rarr; drop old &rarr; rename).
+          </p>
+        </div>
+
+        <div class="callout trap">
+          <div class="callout-title">Three More Zero-Downtime Hazards: <code>INT &rarr; BIGINT</code>, FKs, and <code>DROP COLUMN</code></div>
+          <ul style="margin:0.35rem 0 0;padding-left:1.25rem;">
+            <li><strong>Changing <code>INT</code> to <code>BIGINT</code> PK:</strong> Direct <code>ALTER COLUMN TYPE BIGINT</code> rewrites the entire table under <code>ACCESS EXCLUSIVE</code>! Instead, use Expand-and-Contract (shadow <code>id_v2 BIGINT</code> column + backfill + swap or logical replication cutover).</li>
+            <li><strong>Safe Foreign Keys:</strong> Use <code>ALTER TABLE orders ADD CONSTRAINT fk_cust FOREIGN KEY (customer_id) REFERENCES customers(id) NOT VALID;</code> followed by <code>VALIDATE CONSTRAINT fk_cust;</code>.</li>
+            <li><strong><code>DROP COLUMN</code> &amp; <code>SELECT *</code>:</strong> Never run <code>DROP COLUMN</code> until zero running app pods use <code>SELECT *</code> or ORM entities mapping the old column; lint every PR with CI tools like <code>squawk</code>.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- SECTION 4: EXPAND AND CONTRACT + BATCHED BACKFILLS -->
+      <section id="expand-contract" class="section-card">
+        <h2><span class="badge badge-green">Zero-Downtime Pattern</span> 4. Expand-and-Contract &amp; Batched Backfills</h2>
+        <p>
+          Suppose you need to rename <code>full_name</code> &rarr; <code>display_name</code> (or split a column, or change a type) while <strong>v1 and v2 app servers coexist</strong>. You split the change into 4 safe deployments:
+        </p>
+        <div class="exec-pipeline">
+          <div class="exec-step"><div class="step-num">PHASE 1</div><div class="step-kw">EXPAND</div><div class="step-desc">Add nullable <code>display_name</code> + dual-write trigger</div></div>
+          <span class="exec-arrow">&rarr;</span>
+          <div class="exec-step"><div class="step-num">PHASE 2</div><div class="step-kw">BACKFILL</div><div class="step-desc">Chunked keyset updates of historical rows</div></div>
+          <span class="exec-arrow">&rarr;</span>
+          <div class="exec-step"><div class="step-num">PHASE 3</div><div class="step-kw">SWITCH</div><div class="step-desc">Deploy v2 reading/writing new column; validate <code>NOT NULL</code></div></div>
+          <span class="exec-arrow">&rarr;</span>
+          <div class="exec-step"><div class="step-num">PHASE 4</div><div class="step-kw">CONTRACT</div><div class="step-desc">Once v1 pods are gone, drop trigger &amp; <code>full_name</code></div></div>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-expand-contract">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 2</span> Live Expand-and-Contract Dual-Write Trigger + Backfill</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE users (
+              id INTEGER PRIMARY KEY,
+              full_name TEXT NOT NULL
+            ) STRICT;
+            INSERT INTO users VALUES (1, 'Ada Lovelace'), (2, 'Grace Hopper');
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- PHASE 1 (EXPAND): Add nullable new column (instant metadata change) + dual-write triggers
+ALTER TABLE users ADD COLUMN display_name TEXT;
+
+CREATE TRIGGER trg_users_v1_to_v2_ins
+AFTER INSERT ON users
+WHEN NEW.display_name IS NULL
+BEGIN
+  UPDATE users SET display_name = NEW.full_name WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER trg_users_v1_to_v2_upd
+AFTER UPDATE OF full_name ON users
+BEGIN
+  UPDATE users SET display_name = NEW.full_name WHERE id = NEW.id;
+END;
+
+-- Simulate a v1 pod still writing ONLY full_name while rollout is in flight:
+INSERT INTO users (id, full_name) VALUES (3, 'Alan Turing');
+
+-- PHASE 2 (BACKFILL): Copy historical rows where display_name IS NULL
+UPDATE users SET display_name = full_name WHERE display_name IS NULL;
+
+-- PHASE 3/4 (VERIFY CUTOVER): All rows have non-null synchronized display_name!
+SELECT id, full_name, display_name FROM users ORDER BY id;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+
+        <h3>Why Bounded Batched Backfills Beat One Giant <code>UPDATE</code></h3>
+        <p>
+          Running <code>UPDATE orders SET new_col = old_col;</code> on 100 million rows holds row locks for minutes, creates 100 million dead tuples (bloat!), saturates WAL replication bandwidth, and can stall autovacuum. Always backfill in bounded chunks (1,000&ndash;10,000 rows per transaction with short pauses): either via a <strong>keyset cursor loop</strong> (<code>WHERE id &gt; :last_id AND id &lt;= :last_id + 5000</code>, which never re-scans skipped rows!) or a partial-indexed <code>NULL</code> queue. Note also: in PostgreSQL, write dual-write triggers as <code>BEFORE INSERT OR UPDATE</code> mutating <code>NEW.col := ...</code> in-memory to avoid double MVCC row versions (in SQLite, <code>AFTER</code> triggers are used below because SQLite doesn&rsquo;t support mutating <code>NEW.*</code> in <code>BEFORE</code> triggers).
+        </p>
+
+        <div class="code-demo" data-demo-id="demo-batched-backfill">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 3</span> Bounded Batched Backfill (3 Rows Per Batch)</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE ledger (
+              id INTEGER PRIMARY KEY,
+              amount_cents INTEGER NOT NULL,
+              currency TEXT
+            ) STRICT;
+            INSERT INTO ledger VALUES
+              (1, 500, NULL), (2, 1200, NULL), (3, 900, NULL),
+              (4, 300, NULL), (5, 700, NULL),  (6, 450, NULL);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- Batch 1: Backfill ONLY the next 3 rows (bounded lock & WAL footprint!)
+UPDATE ledger
+SET currency = 'USD'
+WHERE id IN (
+  SELECT id FROM ledger
+  WHERE currency IS NULL
+  ORDER BY id ASC
+  LIMIT 3
+);
+
+-- Inspect progress: 3 done, 3 left for Batch 2!
+SELECT
+  COUNT(*) FILTER (WHERE currency IS NOT NULL) AS backfilled,
+  COUNT(*) FILTER (WHERE currency IS NULL) AS remaining
+FROM ledger;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-readiness-audit">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-green">Runnable Demo 4</span> Pre-Contract Readiness Check Before Dropping Old Column</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE users_mig (
+              id INTEGER PRIMARY KEY,
+              full_name TEXT NOT NULL,
+              display_name TEXT
+            ) STRICT;
+            INSERT INTO users_mig VALUES
+              (1, 'Ada Lovelace', 'Ada Lovelace'),
+              (2, 'Grace Hopper', 'Grace Hopper'),
+              (3, 'Alan Turing', NULL);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- Never run Phase 4 (DROP COLUMN full_name) until null_count = 0 AND drift_count = 0!
+SELECT
+  COUNT(*) AS total_rows,
+  COUNT(*) FILTER (WHERE display_name IS NULL) AS null_count,
+  COUNT(*) FILTER (WHERE display_name IS NOT NULL AND display_name != full_name) AS drift_count,
+  CASE
+    WHEN COUNT(*) FILTER (WHERE display_name IS NULL OR display_name != full_name) = 0
+    THEN 'SAFE TO CONTRACT'
+    ELSE 'HOLD: Backfill / Dual-Write Incomplete'
+  END AS contract_gate
+FROM users_mig;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 5: INTERACTIVE SANDBOX -->
+      <section id="sandbox" class="section-card">
+        <h2><span class="badge badge-blue">Playground</span> 5. Free SQL Sandbox (Migration Staging Lab)</h2>
+        <p>
+          Practice adding columns, creating dual-write triggers, running chunked backfills, and verifying strict v2 cutovers.
+        </p>
+        <div class="code-demo" data-demo-id="demo-sandbox">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-green">Live Sandbox</span> Schema Evolution DB</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Query (&#8984;/Ctrl+Enter)</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE accounts_v1 (
+              id INTEGER PRIMARY KEY,
+              email TEXT NOT NULL,
+              status TEXT
+            ) STRICT;
+            INSERT INTO accounts_v1 VALUES
+              (1, 'a@acme.io', 'active'),
+              (2, 'b@acme.io', NULL),
+              (3, 'c@acme.io', 'paused');
+          </script>
+          <textarea class="sql-editor" spellcheck="false">SELECT id, email, COALESCE(status, 'active') AS normalized_status
+FROM accounts_v1
+ORDER BY id;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 6: HANDS-ON CODING LABS -->
+      <section id="labs" class="section-card">
+        <h2><span class="badge badge-green">Hands-On Labs</span> 6. Coding Practice (Run, Auto-Verify, Hints &amp; Final Answers)</h2>
+        <p>
+          Execute zero-downtime migration patterns below and click <strong>Check Answer</strong>.
+        </p>
+
+        <div class="lab-card" data-lab-id="lab-1"></div>
+        <div class="lab-card" data-lab-id="lab-2"></div>
+        <div class="lab-card" data-lab-id="lab-3"></div>
+        <div class="lab-card" data-lab-id="lab-4"></div>
+      </section>
+
+      <!-- SECTION 7: QUIZZES -->
+      <section id="quizzes" class="section-card">
+        <h2><span class="badge badge-pink">Knowledge Checks</span> 7. Senior-Level Zero-Downtime Migration Quizzes</h2>
+        <p>
+          Test your reflexes on PostgreSQL lock queues, online indexing, constraints, and Expand-and-Contract rollouts.
+        </p>
+
+        <div class="quiz-card" data-quiz-id="quiz-1"></div>
+        <div class="quiz-card" data-quiz-id="quiz-2"></div>
+        <div class="quiz-card" data-quiz-id="quiz-3"></div>
+        <div class="quiz-card" data-quiz-id="quiz-4"></div>
+        <div class="quiz-card" data-quiz-id="quiz-5"></div>
+        <div class="quiz-card" data-quiz-id="quiz-6"></div>
+      </section>
+
+      <!-- SECTION 8: CHEATSHEET -->
+      <section id="cheatsheet" class="section-card">
+        <h2><span class="badge badge-blue">Summary</span> 8. Lesson 11 Senior Engineering Checklist</h2>
+        <ul>
+          <li>ALWAYS run DDL migrations with <code>SET lock_timeout = '2s'</code> + retry loop so a slow reader never causes an API-wide lock queue outage.</li>
+          <li>Always use <code>CREATE INDEX CONCURRENTLY</code> in production (outside a transaction block) and verify <code>indisvalid = true</code>.</li>
+          <li>Use the 2-step <code>ADD CONSTRAINT ... CHECK (...) NOT VALID</code> &rarr; <code>VALIDATE CONSTRAINT</code> pattern before <code>SET NOT NULL</code>.</li>
+          <li>Use Expand-and-Contract (4 phases: Expand + dual-write &rarr; Batched backfill &rarr; Switch reads &rarr; Contract) whenever v1 and v2 app servers overlap.</li>
+          <li>Chunk historical backfills in bounded keyset batches instead of updating millions of rows in one transaction.</li>
+        </ul>
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem;flex-wrap:wrap;">
+          <a class="btn" href="lesson-10.html">&larr; Lesson 10</a>
+          <a class="btn" href="master-plan.html">Master Plan</a>
+          <a class="btn btn-primary" href="lesson-12.html">Next: Lesson 12 (PgBouncer, Timeouts &amp; App Integration) &rarr;</a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.COURSE_LABS = {
+      "lab-1": {
+        title: "Lab 1: Expand-and-Contract Dual-Write Triggers + Historical Backfill",
+        difficulty: "Lab 1 of 4 \u2022 Expand & Backfill",
+        promptHtml: `
+          <p>The pre-seeded <code>customers(id, full_name, display_name)</code> table is in <strong>Phase 1 (Expand)</strong>: <code>display_name</code> was just added as nullable, and 3 existing rows have <code>display_name = NULL</code>.</p>
+          <p>Complete Phases 1 &amp; 2 cleanly:</p>
+          <ol>
+            <li>Create an <code>AFTER INSERT</code> trigger (<code>WHEN NEW.display_name IS NULL</code>) that copies <code>NEW.full_name</code> into <code>display_name</code> for v1 pods still inserting only <code>full_name</code>.</li>
+            <li>Create an <code>AFTER UPDATE OF full_name</code> trigger that syncs <code>display_name = NEW.full_name</code> when v1 pods update <code>full_name</code>.</li>
+            <li>Backfill all existing rows where <code>display_name IS NULL</code>.</li>
+          </ol>
+        `,
+        setupSql: `
+          CREATE TABLE customers (
+            id INTEGER PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            display_name TEXT
+          ) STRICT;
+          INSERT INTO customers VALUES
+            (1, 'Ada Lovelace', NULL),
+            (2, 'Grace Hopper', NULL),
+            (3, 'Margaret Hamilton', NULL);
+        `,
+        starterSql: `-- 1. Create AFTER INSERT trigger (WHEN NEW.display_name IS NULL)\n-- 2. Create AFTER UPDATE OF full_name trigger\n-- 3. Backfill existing NULL display_name rows\n`,
+        hints: [
+          "Insert trigger syntax: <code>CREATE TRIGGER trg_cust_ins AFTER INSERT ON customers WHEN NEW.display_name IS NULL BEGIN UPDATE customers SET display_name = NEW.full_name WHERE id = NEW.id; END;</code>",
+          "Update trigger syntax: <code>CREATE TRIGGER trg_cust_upd AFTER UPDATE OF full_name ON customers BEGIN UPDATE customers SET display_name = NEW.full_name WHERE id = NEW.id; END;</code>",
+          "Backfill existing rows with: <code>UPDATE customers SET display_name = full_name WHERE display_name IS NULL;</code>"
+        ],
+        solutionSql: `CREATE TRIGGER trg_cust_ins
+AFTER INSERT ON customers
+WHEN NEW.display_name IS NULL
+BEGIN
+  UPDATE customers SET display_name = NEW.full_name WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER trg_cust_upd
+AFTER UPDATE OF full_name ON customers
+BEGIN
+  UPDATE customers SET display_name = NEW.full_name WHERE id = NEW.id;
+END;
+
+UPDATE customers
+SET display_name = full_name
+WHERE display_name IS NULL;`,
+        solutionExplanationHtml: `
+          <p>These two triggers keep v1 writers synchronized with <code>display_name</code> in real time, while the backfill repairs rows created prior to the trigger deployment. Remember to also guard v2 writes if v2 updates <code>display_name</code> directly!</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            db.run(userSql);
+
+            const nulls = db.exec("SELECT COUNT(*) FROM customers WHERE display_name IS NULL OR display_name != full_name;")[0].values[0][0];
+            checks.push({
+              label: "All 3 existing historical rows backfilled cleanly",
+              passed: nulls === 0,
+              detail: nulls === 0 ? "All existing rows synced." : `${nulls} row(s) still NULL or mismatched.`
+            });
+
+            // Simulate v1 pod INSERT without display_name
+            db.run("INSERT INTO customers (id, full_name) VALUES (4, 'Barbara Liskov');");
+            const insVal = db.exec("SELECT display_name FROM customers WHERE id = 4;")[0].values[0][0];
+            checks.push({
+              label: "Trigger syncs new v1 INSERT (full_name -> display_name)",
+              passed: insVal === "Barbara Liskov",
+              detail: `Inserted id=4 display_name: ${insVal}`
+            });
+
+            // Simulate v1 pod UPDATE of full_name
+            db.run("UPDATE customers SET full_name = 'Ada King' WHERE id = 1;");
+            const updVal = db.exec("SELECT display_name FROM customers WHERE id = 1;")[0].values[0][0];
+            checks.push({
+              label: "Trigger syncs v1 UPDATE OF full_name -> display_name",
+              passed: updVal === "Ada King",
+              detail: `Updated id=1 display_name: ${updVal}`
+            });
+
+            // Simulate v2 pod INSERT explicitly providing display_name (must not overwrite with full_name!)
+            db.run("INSERT INTO customers (id, full_name, display_name) VALUES (5, 'Tim Berners-Lee', 'TimBL');");
+            const v2Val = db.exec("SELECT display_name FROM customers WHERE id = 5;")[0].values[0][0];
+            checks.push({
+              label: "WHEN NEW.display_name IS NULL guard preserves explicit v2 display_name",
+              passed: v2Val === "TimBL",
+              detail: `Inserted id=5 display_name: ${v2Val}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-2": {
+        title: "Lab 2: Safe Nullable-to-STRICT Cutover Without Dropping Live Orders",
+        difficulty: "Lab 2 of 4 \u2022 Safe Constraint Cutover",
+        promptHtml: `
+          <p>The pre-seeded <code>orders_legacy(id, customer_email, total_cents, currency)</code> table has 4 live customer orders, including rows with <code>currency = NULL</code> (legacy USD default) and lowercase <code>'eur'</code>.</p>
+          <p>Your task: promote this schema to a hardened <code>STRICT</code> table without dropping a single order:</p>
+          <ol>
+            <li>Create <code>orders_strict</code> with <code>STRICT</code> enabled:
+              <code>id INTEGER PRIMARY KEY</code>,
+              <code>customer_email TEXT NOT NULL</code>,
+              <code>total_cents INTEGER NOT NULL CHECK (total_cents &gt; 0)</code>,
+              <code>currency TEXT NOT NULL CHECK (currency IN ('USD', 'EUR', 'GBP'))</code>.
+            </li>
+            <li>Migrate <strong>all 4 rows</strong> into <code>orders_strict</code>, normalizing <code>NULL</code> currency to <code>'USD'</code> and uppercasing values like <code>'eur'</code> &rarr; <code>'EUR'</code>.</li>
+          </ol>
+        `,
+        setupSql: `
+          CREATE TABLE orders_legacy (
+            id INTEGER PRIMARY KEY,
+            customer_email TEXT NOT NULL,
+            total_cents INTEGER NOT NULL,
+            currency TEXT
+          );
+          INSERT INTO orders_legacy VALUES
+            (1, 'a@shop.io', 2500, 'USD'),
+            (2, 'b@shop.io', 4900, NULL),
+            (3, 'c@shop.io', 1500, 'eur'),
+            (4, 'd@shop.io', 8000, 'GBP');
+        `,
+        starterSql: `-- 1. CREATE TABLE orders_strict (...) STRICT;\n-- 2. INSERT INTO orders_strict (...) SELECT ... FROM orders_legacy;\n`,
+        hints: [
+          "Use <code>UPPER(COALESCE(currency, 'USD'))</code> during the <code>INSERT ... SELECT</code> backfill.",
+          "Include <code>CHECK (currency IN ('USD', 'EUR', 'GBP'))</code> and <code>CHECK (total_cents > 0)</code> on <code>orders_strict</code>.",
+          "Verify all 4 IDs (1, 2, 3, 4) are preserved in <code>orders_strict</code>."
+        ],
+        solutionSql: `CREATE TABLE orders_strict (
+  id INTEGER PRIMARY KEY,
+  customer_email TEXT NOT NULL,
+  total_cents INTEGER NOT NULL CHECK (total_cents > 0),
+  currency TEXT NOT NULL CHECK (currency IN ('USD', 'EUR', 'GBP'))
+) STRICT;
+
+INSERT INTO orders_strict (id, customer_email, total_cents, currency)
+SELECT
+  id,
+  customer_email,
+  total_cents,
+  UPPER(COALESCE(currency, 'USD'))
+FROM orders_legacy;`,
+        solutionExplanationHtml: `
+          <p>Coalescing legacy <code>NULL</code> defaults and normalizing casing during backfill lets you enforce strict non-null <code>CHECK</code> constraints without discarding live customer orders.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            db.run(userSql);
+
+            const ddlRes = db.exec("SELECT sql FROM sqlite_master WHERE type='table' AND name='orders_strict';");
+            const exists = ddlRes.length > 0 && ddlRes[0].values.length > 0;
+            checks.push({ label: "Table 'orders_strict' exists", passed: exists });
+            if (!exists) return { passed: false, checks };
+
+            const isStrict = /\bSTRICT\b/i.test(ddlRes[0].values[0][0]);
+            checks.push({ label: "STRICT mode enabled", passed: isStrict });
+
+            const rows = db.exec("SELECT id, currency FROM orders_strict ORDER BY id;")[0].values;
+            const expected = [[1, "USD"], [2, "USD"], [3, "EUR"], [4, "GBP"]];
+            const rowsOk =
+              rows.length === 4 &&
+              expected.every((r, i) => r[0] === rows[i][0] && r[1] === rows[i][1]);
+            checks.push({
+              label: "All 4 live orders preserved and normalized (NULL->USD, 'eur'->'EUR')",
+              passed: rowsOk,
+              detail: `Found: ${JSON.stringify(rows)}`
+            });
+
+            let badRejected = false;
+            try {
+              db.run("INSERT INTO orders_strict (id, customer_email, total_cents, currency) VALUES (99, 'x@y.com', 100, NULL);");
+            } catch (_) {
+              badRejected = true;
+            }
+            checks.push({ label: "Negative test: rejects NULL currency going forward", passed: badRejected });
+
+            let badCurRejected = false;
+            try {
+              db.run("INSERT INTO orders_strict (id, customer_email, total_cents, currency) VALUES (100, 'x@y.com', 100, 'JPY');");
+            } catch (_) {
+              badCurRejected = true;
+            }
+            checks.push({ label: "Negative test: rejects unsupported currency 'JPY'", passed: badCurRejected });
+
+            let badAmtRejected = false;
+            try {
+              db.run("INSERT INTO orders_strict (id, customer_email, total_cents, currency) VALUES (101, 'x@y.com', 0, 'USD');");
+            } catch (_) {
+              badAmtRejected = true;
+            }
+            checks.push({ label: "Negative test: rejects total_cents <= 0", passed: badAmtRejected });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-3": {
+        title: "Lab 3: Bounded Keyset-Batched Backfill (Chunk Size = 3)",
+        difficulty: "Lab 3 of 4 \u2022 Batched Backfill",
+        promptHtml: `
+          <p>The pre-seeded <code>events(id, payload, region_code)</code> table has 8 rows where <code>region_code</code> is <code>NULL</code> (plus 2 rows already set to <code>'eu-west'</code>).</p>
+          <p>Write a <strong>single bounded batch <code>UPDATE</code></strong> that sets <code>region_code = 'us-east'</code> on ONLY the <strong>first 3</strong> rows (lowest <code>id ASC</code>) that currently have <code>region_code IS NULL</code>, leaving the other 5 <code>NULL</code> rows untouched for the next worker batch!</p>
+        `,
+        setupSql: `
+          CREATE TABLE events (
+            id INTEGER PRIMARY KEY,
+            payload TEXT NOT NULL,
+            region_code TEXT
+          ) STRICT;
+          INSERT INTO events VALUES
+            (1, 'e1', 'eu-west'),
+            (2, 'e2', NULL),
+            (3, 'e3', NULL),
+            (4, 'e4', 'eu-west'),
+            (5, 'e5', NULL),
+            (6, 'e6', NULL),
+            (7, 'e7', NULL),
+            (8, 'e8', NULL),
+            (9, 'e9', NULL),
+            (10, 'e10', NULL);
+        `,
+        starterSql: `-- Update ONLY the lowest 3 id rows where region_code IS NULL to 'us-east':\nUPDATE events\nSET region_code = 'us-east'\nWHERE region_code IS NULL;\n`,
+        hints: [
+          "Do NOT run an unbounded <code>UPDATE events SET ... WHERE region_code IS NULL;</code>&mdash;that updates all 8 rows at once!",
+          "Filter by <code>WHERE id IN (SELECT id FROM events WHERE region_code IS NULL ORDER BY id ASC LIMIT 3)</code>.",
+          "With rows 1 and 4 already <code>'eu-west'</code>, the lowest 3 NULL rows are IDs <code>2, 3, 5</code>."
+        ],
+        solutionSql: `UPDATE events
+SET region_code = 'us-east'
+WHERE id IN (
+  SELECT id
+  FROM events
+  WHERE region_code IS NULL
+  ORDER BY id ASC
+  LIMIT 3
+);`,
+        solutionExplanationHtml: `
+          <p>Using <code>WHERE id IN (SELECT id ... WHERE col IS NULL ORDER BY id ASC LIMIT N)</code> bounds each transaction&rsquo;s lock footprint and WAL generation so production traffic stays fast while backfilling millions of rows.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            db.run(userSql);
+
+            const usEastIds = db.exec("SELECT id FROM events WHERE region_code = 'us-east' ORDER BY id;")[0]?.values.map((r) => r[0]) || [];
+            const nullCount = db.exec("SELECT COUNT(*) FROM events WHERE region_code IS NULL;")[0].values[0][0];
+            const euCount = db.exec("SELECT COUNT(*) FROM events WHERE region_code = 'eu-west';")[0].values[0][0];
+
+            checks.push({
+              label: "Backfilled exactly the lowest 3 NULL IDs [2, 3, 5] to 'us-east'",
+              passed: JSON.stringify(usEastIds) === JSON.stringify([2, 3, 5]),
+              detail: `Updated IDs: ${JSON.stringify(usEastIds)}`
+            });
+            checks.push({
+              label: "Remaining 5 NULL rows left untouched for next batch",
+              passed: nullCount === 5,
+              detail: `Remaining NULL rows: ${nullCount}`
+            });
+            checks.push({
+              label: "Existing 2 'eu-west' rows preserved",
+              passed: euCount === 2
+            });
+
+            // Re-run batch 2 dynamically to ensure query isn't hardcoded to IDs (2,3,5)
+            db.run(userSql);
+            const batch2Ids = db.exec("SELECT id FROM events WHERE region_code = 'us-east' ORDER BY id;")[0]?.values.map((r) => r[0]) || [];
+            checks.push({
+              label: "Batch 2 re-run dynamically updates next 3 NULL IDs [6, 7, 8]",
+              passed: JSON.stringify(batch2Ids) === JSON.stringify([2, 3, 5, 6, 7, 8]),
+              detail: `After 2nd batch: ${JSON.stringify(batch2Ids)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-4": {
+        title: "Lab 4: Pre-Contract Readiness Gate Query",
+        difficulty: "Lab 4 of 4 \u2022 Safe Cutover Audit",
+        promptHtml: `
+          <p>Before running Phase 4 (Contract: dropping the old <code>legacy_tier</code> column), you must verify that <code>plan_code</code> has zero <code>NULL</code>s and zero mismatches against <code>legacy_tier</code> in <code>accounts_migration(id, legacy_tier, plan_code)</code>.</p>
+          <p>Write a single-row audit <code>SELECT</code> returning exact columns:</p>
+          <ul>
+            <li><code>total_rows</code></li>
+            <li><code>null_plan_code_rows</code> (rows where <code>plan_code IS NULL</code>)</li>
+            <li><code>mismatched_rows</code> (rows where <code>plan_code IS NOT NULL AND plan_code != legacy_tier</code>)</li>
+            <li><code>ready_to_contract</code> (<code>1</code> if both <code>null_plan_code_rows = 0</code> and <code>mismatched_rows = 0</code>, otherwise <code>0</code>)</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE accounts_migration (
+            id INTEGER PRIMARY KEY,
+            legacy_tier TEXT NOT NULL,
+            plan_code TEXT
+          ) STRICT;
+          INSERT INTO accounts_migration VALUES
+            (1, 'pro', 'pro'),
+            (2, 'free', 'free'),
+            (3, 'enterprise', 'pro'),
+            (4, 'free', NULL),
+            (5, 'pro', 'pro');
+        `,
+        starterSql: `-- Return (total_rows, null_plan_code_rows, mismatched_rows, ready_to_contract):\nSELECT COUNT(*) AS total_rows FROM accounts_migration;\n`,
+        hints: [
+          "Use <code>COUNT(*) FILTER (WHERE plan_code IS NULL)</code> and <code>COUNT(*) FILTER (WHERE plan_code IS NOT NULL AND plan_code != legacy_tier)</code>.",
+          "Compute <code>ready_to_contract</code> with a <code>CASE WHEN ... THEN 1 ELSE 0 END</code> expression.",
+          "In the seed data: <code>total_rows = 5</code>, <code>null_plan_code_rows = 1</code> (id=4), <code>mismatched_rows = 1</code> (id=3), so <code>ready_to_contract = 0</code>."
+        ],
+        solutionSql: `SELECT
+  COUNT(*) AS total_rows,
+  COUNT(*) FILTER (WHERE plan_code IS NULL) AS null_plan_code_rows,
+  COUNT(*) FILTER (WHERE plan_code IS NOT NULL AND plan_code != legacy_tier) AS mismatched_rows,
+  CASE
+    WHEN COUNT(*) FILTER (WHERE plan_code IS NULL OR plan_code != legacy_tier) = 0 THEN 1
+    ELSE 0
+  END AS ready_to_contract
+FROM accounts_migration;`,
+        solutionExplanationHtml: `
+          <p>Automating this readiness gate in CI/CD before Phase 4 prevents dropping an old column while unbackfilled rows or broken dual-writes still exist.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          const dbClean = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            checks.push({ label: "Query returns a result set", passed: res.length > 0 });
+            if (res.length === 0) return { passed: false, checks };
+
+            const last = res[res.length - 1];
+            const cols = last.columns.map((c) => c.toLowerCase());
+            const colsOk =
+              cols.length === 4 &&
+              cols[0] === "total_rows" &&
+              cols[1] === "null_plan_code_rows" &&
+              cols[2] === "mismatched_rows" &&
+              cols[3] === "ready_to_contract";
+            checks.push({
+              label: "Columns match (total_rows, null_plan_code_rows, mismatched_rows, ready_to_contract)",
+              passed: colsOk,
+              detail: `Got: ${last.columns.join(", ")}`
+            });
+
+            const row = last.values[0];
+            const dirtyOk = row && row[0] === 5 && row[1] === 1 && row[2] === 1 && row[3] === 0;
+            checks.push({
+              label: "Reports (5, 1, 1, 0) on dirty migration data",
+              passed: Boolean(dirtyOk),
+              detail: `Got: ${JSON.stringify(row)}`
+            });
+
+            // Fix data and re-run to verify ready_to_contract flips to 1
+            dbClean.run(setupSql);
+            dbClean.run("UPDATE accounts_migration SET plan_code = legacy_tier;");
+            const cleanRes = dbClean.exec(userSql);
+            const cleanRow = cleanRes[cleanRes.length - 1].values[0];
+            const cleanOk = cleanRow && cleanRow[0] === 5 && cleanRow[1] === 0 && cleanRow[2] === 0 && cleanRow[3] === 1;
+            checks.push({
+              label: "Flips ready_to_contract to 1 when all rows match cleanly",
+              passed: Boolean(cleanOk),
+              detail: `Clean state result: ${JSON.stringify(cleanRow)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+            dbClean.close();
+          }
+        }
+      }
+    };
+
+    window.COURSE_QUIZZES = {
+      "quiz-1": {
+        tag: "PostgreSQL Lock Queues",
+        questionHtml: "An engineer runs <code>ALTER TABLE orders ADD COLUMN promo_id INT;</code> (which only takes 2ms of metadata work) WITHOUT setting <code>lock_timeout</code>. A 60-second analytics <code>SELECT</code> happens to be scanning <code>orders</code>. What happens to incoming API <code>SELECT</code> requests?",
+        options: [
+          {
+            labelHtml: "<code>ALTER TABLE</code> stalls 60s while incoming API queries queue behind it, causing an outage.",
+            correct: true,
+            whyHtml: "Because <code>ACCESS EXCLUSIVE</code> conflicts with every lock mode, any query arriving after <code>ALTER TABLE</code> enters the wait queue behind it. Always set <code>lock_timeout = '2s'</code> + retry loop so the DDL aborts cleanly instead of taking down traffic!"
+          },
+          {
+            labelHtml: "New API <code>SELECT</code> queries jump ahead of the waiting <code>ALTER TABLE</code> and run normally.",
+            correct: false,
+            whyHtml: "PostgreSQL grants locks in strict FIFO queue order. New <code>SELECT</code>s cannot jump ahead of a waiting <code>ACCESS EXCLUSIVE</code> request!"
+          },
+          {
+            labelHtml: "PostgreSQL automatically terminates the long analytics query so the quick DDL can proceed.",
+            correct: false,
+            whyHtml: "PostgreSQL never kills an already-running query to let DDL proceed unless you explicitly terminate it or configure <code>statement_timeout</code>."
+          },
+          {
+            labelHtml: "<code>ALTER TABLE</code> automatically downgrades its lock mode to run online with <code>CONCURRENTLY</code>.",
+            correct: false,
+            whyHtml: "<code>ALTER TABLE</code> never downgrades its lock mode automatically."
+          }
+        ]
+      },
+
+      "quiz-2": {
+        tag: "Online Index Creation",
+        questionHtml: "Which statement about <code>CREATE INDEX CONCURRENTLY</code> in PostgreSQL is TRUE?",
+        options: [
+          {
+            labelHtml: "It must run inside an explicit <code>BEGIN; ... COMMIT;</code> migration transaction block.",
+            correct: false,
+            whyHtml: "PostgreSQL explicitly forbids running <code>CREATE INDEX CONCURRENTLY</code> inside a transaction block (<code>CREATE INDEX CONCURRENTLY cannot run inside a transaction block</code>)."
+          },
+          {
+            labelHtml: "It builds roughly twice as fast as a standard blocking <code>CREATE INDEX</code>.",
+            correct: false,
+            whyHtml: "Because it makes two table passes and waits for active transactions, <code>CONCURRENTLY</code> actually takes longer and uses more total I/O&mdash;in exchange for zero write downtime."
+          },
+          {
+            labelHtml: "It acquires an <code>ACCESS EXCLUSIVE</code> lock during its final catalog swap.",
+            correct: false,
+            whyHtml: "<code>CONCURRENTLY</code> only needs <code>SHARE UPDATE EXCLUSIVE</code>, never <code>ACCESS EXCLUSIVE</code>."
+          },
+          {
+            labelHtml: "It avoids blocking writes, though failures can leave an <code>INVALID</code> index behind.",
+            correct: true,
+            whyHtml: "<code>CONCURRENTLY</code> performs two table scans with <code>SHARE UPDATE EXCLUSIVE</code> so normal writes keep flowing. If a unique violation or timeout aborts phase 2, Postgres leaves an unusable <code>indisvalid = false</code> index that you should drop with <code>DROP INDEX CONCURRENTLY</code>."
+          }
+        ]
+      },
+
+      "quiz-3": {
+        tag: "Safe NOT NULL Pattern",
+        questionHtml: "You need to add <code>NOT NULL</code> to an existing nullable column <code>email</code> on a 300-million-row PostgreSQL 17 table without blocking writes during the table scan. Which sequence is best?",
+        options: [
+          {
+            labelHtml: "Run <code>ALTER TABLE users ALTER COLUMN email SET NOT NULL</code> with <code>lock_timeout = '2s'</code>.",
+            correct: false,
+            whyHtml: "<code>lock_timeout</code> only caps how long you wait to <em>acquire</em> the lock; once acquired, direct <code>SET NOT NULL</code> holds <code>ACCESS EXCLUSIVE</code> for the entire 300M-row scan!"
+          },
+          {
+            labelHtml: "Add <code>CHECK (email IS NOT NULL) NOT VALID</code>, run <code>VALIDATE CONSTRAINT</code>, then <code>SET NOT NULL</code>.",
+            correct: true,
+            whyHtml: "<code>NOT VALID</code> enforces the rule for new writes instantly; <code>VALIDATE CONSTRAINT</code> scans existing rows under <code>SHARE UPDATE EXCLUSIVE</code> (reads &amp; writes stay online!); and in PG 12+, <code>SET NOT NULL</code> sees the validated constraint and completes instantly without rescanning!"
+          },
+          {
+            labelHtml: "Create a new table, copy all 300 million rows inside one transaction, and swap names.",
+            correct: false,
+            whyHtml: "Rebuilding a 300M-row table causes massive downtime and breaks foreign keys."
+          },
+          {
+            labelHtml: "Disable autovacuum on the table and run <code>VACUUM FULL</code> before setting <code>NOT NULL</code>.",
+            correct: false,
+            whyHtml: "<code>VACUUM FULL</code> itself takes an <code>ACCESS EXCLUSIVE</code> lock and rewrites the entire table!"
+          }
+        ]
+      },
+
+      "quiz-4": {
+        tag: "Expand-and-Contract",
+        questionHtml: "During a rolling Kubernetes deployment, v1 pods read/write <code>full_name</code> while new v2 pods read/write <code>display_name</code>. When is it finally safe to execute Phase 4 (<code>ALTER TABLE users DROP COLUMN full_name</code>)?",
+        options: [
+          {
+            labelHtml: "Immediately after adding the nullable <code>display_name</code> column during Phase 1.",
+            correct: false,
+            whyHtml: "At Phase 1, v1 pods are still live and querying <code>full_name</code>, and historical rows haven't been backfilled yet."
+          },
+          {
+            labelHtml: "Before deploying v2 pods so missing column errors surface during rollout.",
+            correct: false,
+            whyHtml: "Dropping <code>full_name</code> before v2 rolls out breaks 100% of live v1 traffic."
+          },
+          {
+            labelHtml: "Only after all v1 pods terminate, backfills finish, and nothing references <code>full_name</code>.",
+            correct: true,
+            whyHtml: "Contracting too early crashes straggler v1 pods or loses un-migrated historical data. Verify 0 v1 pods remain and run a readiness audit before dropping triggers and the old column."
+          },
+          {
+            labelHtml: "Immediately after starting the batched backfill job, before all rows finish.",
+            correct: false,
+            whyHtml: "Dropping <code>full_name</code> mid-backfill permanently destroys the unbackfilled values!"
+          }
+        ]
+      },
+
+      "quiz-5": {
+        tag: "PG 11+ ADD COLUMN DEFAULT",
+        questionHtml: "In PostgreSQL 17, which <code>ADD COLUMN</code> statement still forces a full-table rewrite under <code>ACCESS EXCLUSIVE</code>?",
+        options: [
+          {
+            labelHtml: "<code>ALTER TABLE orders ADD COLUMN token UUID NOT NULL DEFAULT gen_random_uuid();</code>",
+            correct: true,
+            whyHtml: "Because <code>gen_random_uuid()</code> is <code>VOLATILE</code> (each existing row needs a distinct generated value), PostgreSQL cannot store one shared missing-value constant and MUST rewrite every row on disk under <code>ACCESS EXCLUSIVE</code>! Add it nullable first, backfill in batches, then constrain."
+          },
+          {
+            labelHtml: "<code>ALTER TABLE orders ADD COLUMN is_vip BOOLEAN NOT NULL DEFAULT false;</code>",
+            correct: false,
+            whyHtml: "Since PostgreSQL 11, constant/non-volatile defaults like <code>false</code>, <code>0</code>, or <code>'pending'</code> are stored in <code>pg_attribute.attmissingval</code> instantaneously with zero table rewrite."
+          },
+          {
+            labelHtml: "<code>ALTER TABLE orders ADD COLUMN retries INT NOT NULL DEFAULT 0;</code>",
+            correct: false,
+            whyHtml: "<code>0</code> is a constant immutable default, so PG 11+ adds it instantaneously without rewriting heap pages."
+          },
+          {
+            labelHtml: "<code>ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';</code>",
+            correct: false,
+            whyHtml: "<code>'pending'</code> is a constant immutable string default, so PostgreSQL 11+ stores it in catalog metadata with zero table rewrite."
+          }
+        ]
+      },
+
+      "quiz-6": {
+        tag: "Batched Backfills",
+        questionHtml: "Why should a 50-million-row column backfill be executed as 10,000-row keyset batches with short pauses rather than one single <code>UPDATE big_table SET new_col = old_col;</code>?",
+        options: [
+          {
+            labelHtml: "Because PostgreSQL enforces a hard limit of one million modified rows per <code>UPDATE</code>.",
+            correct: false,
+            whyHtml: "PostgreSQL has no 1M-row limit on <code>UPDATE</code>; the problem is operational impact."
+          },
+          {
+            labelHtml: "One huge <code>UPDATE</code> holds locks, floods WAL replication, and bloats dead tuples.",
+            correct: true,
+            whyHtml: "In Postgres MVCC, updating 50M rows in one transaction writes 50M new tuple versions and leaves 50M dead tuples that autovacuum cannot clean until the transaction commits&mdash;causing massive table bloat, replication lag, and lock contention."
+          },
+          {
+            labelHtml: "Because batched <code>UPDATE</code> statements automatically skip <code>CHECK</code> constraints and table triggers.",
+            correct: false,
+            whyHtml: "Every batch still enforces all active constraints and triggers."
+          },
+          {
+            labelHtml: "Because single-statement updates skip WAL logging and risk losing backfilled data.",
+            correct: false,
+            whyHtml: "Single-statement updates write massive bursts to the WAL, which is exactly why they spike replica lag!"
+          }
+        ]
+      }
+    };
+  </script>
+  <script src="assets/sql-asm.js"></script>
+  <script src="assets/course-engine.js"></script>
+</body>
+</html>

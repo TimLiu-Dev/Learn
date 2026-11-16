@@ -1,8 +1,8 @@
-# Course Curriculum — Two-Part Roadmap (87 Core Sessions)
+# Course Curriculum — Two-Part Roadmap (89 Core Sessions)
 
 Designed to take a **Junior Android Developer** to **Senior Software Developer (Part 1)** and **Senior Network Engineer (Part 2)** in **2027**, benchmarked against `roadmap.sh/network-engineer`.
 
-**Key Upgrade:** Zero lessons are marked optional. Previous optional tags on `0036`, `0039`, `0040`, `0041`, `0048`, and `0049` have been promoted to **Core NetEng** in Part 2, paired with 15 new sessions (`0073`–`0087`) covering Mobile/Android edge, L7 reverse proxies, Linux `iproute2`/`netns`/`nftables`, Containerlab/FRR, FHRP, IS-IS/BFD/ECMP, MP-BGP EVPN, 802.1X/AAA, Multicast, YANG/NETCONF/gNMI, Python/Ansible/Terraform NetDevOps, and Capstone 2.
+**Key Upgrade:** Zero lessons are marked optional. Previous optional tags on `0036`, `0039`, `0040`, `0041`, `0048`, and `0049` have been promoted to **Core NetEng** in Part 2, paired with 17 new sessions (`0073`–`0089`) covering Mobile/Android edge, L7 reverse proxies, Linux `iproute2`/`netns`/`nftables`, Containerlab/FRR, FHRP, IS-IS/BFD/ECMP, MP-BGP EVPN, 802.1X/AAA, Enterprise Wi-Fi 802.11, NGFW/IDS-IPS/SD-WAN, Multicast, YANG/NETCONF/gNMI, Python/Ansible/Terraform NetDevOps, and Capstone 2.
 
 ---
 
@@ -75,7 +75,7 @@ Designed to take a **Junior Android Developer** to **Senior Software Developer (
 
 ---
 
-## PART 2: Senior Network Engineer, Cloud &amp; NetDevOps (46 Sessions)
+## PART 2: Senior Network Engineer, Cloud &amp; NetDevOps (48 Sessions)
 
 ### Module 4A: Linux Stack &amp; Lab Foundation (Sessions 0075–0076, 0036)
 | # | Session | Core Focus |
@@ -104,14 +104,16 @@ Designed to take a **Junior Android Developer** to **Senior Software Developer (
 | 0047 | [Overlay Encapsulation: VXLAN](lessons/0047-overlay-encapsulation-vxlan.html) | MAC-in-UDP 4789, VTEPs, VNI scaling &amp; jumbo MTU headroom |
 | 0079 | [MP-BGP EVPN &amp; Spine-Leaf Clos Fabrics](lessons/0079-bgp-evpn-and-spine-leaf-fabrics.html) | Clos ECMP, EVPN Type-2/3/5 routes, ARP suppression, Symmetric IRB |
 
-### Module 4D: Firewalls, VPNs, QoS, Telemetry, Campus Security &amp; Multicast (Sessions 0045–0046, 0048–0049, 0080–0081, 0050)
+### Module 4D: Security, VPNs, Wireless, SD-WAN, QoS, Telemetry &amp; Multicast (Sessions 0045–0046, 0089, 0048–0049, 0080, 0088, 0081, 0050)
 | # | Session | Core Focus |
 |---|---|---|
 | 0045 | [Perimeter Firewalls &amp; Stateful ACLs](lessons/0045-perimeter-firewalls.html) | Conntrack state, DMZ zones, asymmetric drop pathology |
 | 0046 | [Enterprise VPNs: IPsec &amp; WireGuard](lessons/0046-enterprise-vpns.html) | IKEv2/ESP transport vs tunnel, WireGuard Cryptokey Routing, MSS clamping |
+| 0089 | [NGFW, IDS/IPS &amp; Enterprise SD-WAN](lessons/0089-ngfw-ids-ips-and-sdwan.html) | L7 App-ID, TLS inspection bypass, SPAN/TAP IDS vs inline IPS, SD-WAN SLA steering |
 | 0048 | [Quality of Service (QoS) ★ Core NetEng](lessons/0048-quality-of-service.html) | DSCP markings, shaping vs policing, Priority Queuing + WFQ |
 | 0049 | [Network Telemetry (SNMP &amp; gNMI) ★ Core NetEng](lessons/0049-network-telemetry.html) | SNMPv3 vs streaming gNMI, NetFlow/IPFIX, active synthetic probing |
 | 0080 | [802.1X, AAA (RADIUS/TACACS+) &amp; ZTNA](lessons/0080-campus-access-security-8021x-aaa.html) | EAPOL port NAC, TACACS+ RBAC, DHCP Snooping + DAI, NTP/NTS, ZTNA/SASE |
+| 0088 | [Enterprise Wireless: 802.11 RF, WPA3 &amp; Roaming](lessons/0088-enterprise-wireless-wifi-and-rf.html) | 2.4/5/6 GHz channels, CSMA/CA hidden node, WPA3-SAE/Enterprise, 802.11k/v/r |
 | 0081 | [IP Multicast Essentials](lessons/0081-ip-multicast-essentials.html) | Class D `224.0.0.0/4`, 32:1 MAC aliasing, IGMP Snooping, PIM-SM &amp; RPF |
 | 0050 | [Review: Core Network Engineering](lessons/0050-review-network-engineering.html) | Enterprise L1–L4 switching, routing &amp; security integration |
 

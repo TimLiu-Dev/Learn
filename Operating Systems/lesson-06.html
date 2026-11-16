@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 06: IPC &amp; Android Binder Kernel Architecture — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <script src="assets/os-course.js"></script>
+  <style>
+    .ipc-flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 0.7rem; margin: 0.9rem 0; }
+    .ipc-stage {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+      padding: 0.8rem; font-family: var(--font-mono); font-size: 0.77rem; transition: border-color 0.15s ease;
+    }
+    .ipc-stage.active { border-color: var(--accent); background: var(--accent-soft); }
+    .ipc-stage.err { border-color: var(--red); background: var(--red-soft); }
+    .ipc-stage-title { font-weight: 700; margin-bottom: 0.35rem; color: var(--text); }
+    .ipc-bar-wrap { height: 10px; background: var(--bg-code); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; margin-top: 0.45rem; }
+    .ipc-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--green)); width: 0%; transition: width 0.2s ease; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 06</span>
+        <span>IPC &amp; Android Binder Kernel Architecture</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-05.html">&larr; Prev Lesson</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C / Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">3 Labs</a>
+        <a href="#quiz">Quiz</a>
+        <a href="lesson-07.html">Next Lesson &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="badge b-concept">PHASE 2 // CONCURRENCY, SYNCHRONIZATION &amp; IPC</span>
+      <h1>Lesson 06: IPC &amp; Android Binder Kernel Architecture</h1>
+      <p>
+        Processes live in isolated virtual address spaces, so passing data requires crossing privilege boundaries.
+        Understand why traditional Unix pipes and sockets incur 2 memory copies, how <code>/dev/binder</code> achieves
+        1-copy RPC via dual-mapped <code>mmap</code> pages, why <code>TransactionTooLargeException</code> happens, and how
+        <code>memfd_create</code> + <code>DMA-BUF</code> enable true 0-copy graphics pipelines.
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button class="btn btn-sm btn-green" id="markLessonComplete" type="button">Mark Lesson 06 Complete</button>
+        <span style="color:var(--text-muted); font-size:0.83rem;">Capstone Link: Single-copy shared-memory IPC broker</span>
+      </div>
+    </section>
+
+    <!-- MODULE 1: MENTAL MODEL + INTERACTIVE SIMULATOR -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>2-Copy Unix Sockets vs 1-Copy Binder <code>mmap</code> vs 0-Copy <code>DMA-BUF</code></h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>Why Traditional IPC Copies Twice</h3>
+          <p><strong>Pipes / Unix Domain Sockets:</strong> Process A writes into a socket FD via <code>write()</code>/<code>sendmsg()</code>:</p>
+          <p><strong>Copy 1 (EL0 &rarr; EL1):</strong> Kernel executes <code>copy_from_user()</code> into an internal kernel <code>sk_buff</code> or pipe page.</p>
+          <p><strong>Copy 2 (EL1 &rarr; EL0):</strong> Process B calls <code>read()</code>/<code>recvmsg()</code>; kernel executes <code>copy_to_user()</code> from <code>sk_buff</code> into Process B's heap buffer.</p>
+          <p>Also: sockets require separate <code>epoll</code> wakeups, carry no native thread-pool management, and do not propagate caller UID/PID credentials or priority inheritance out of the box.</p>
+        </div>
+
+        <div class="card">
+          <h3>How Binder Cuts Copies in Half (1-Copy Kernel <code>mmap</code>)</h3>
+          <p>At startup, each Binder server opens <code>/dev/binder</code> and calls <code>mmap(1MB)</code>. The kernel allocates physical pages and maps them <strong>simultaneously</strong> into:</p>
+          <p><strong>1. Kernel EL1 address space (Read-Write)</strong> and <strong>2. Server EL0 address space (Read-Only)</strong>.</p>
+          <p>When Client sends a Parcel via <code>ioctl(BINDER_WRITE_READ)</code>, the kernel allocates a slice in the Server's pool and calls <code>copy_from_user()</code> <em>once</em> directly into the shared physical page. The Server immediately reads the payload via pointer offset—zero second copy!</p>
+        </div>
+      </div>
+
+      <div class="sim-box">
+        <div class="sim-controls">
+          <button class="btn btn-sm btn-primary" type="button" id="simModeSocket">Unix Socket (2-Copy)</button>
+          <button class="btn btn-sm btn-green" type="button" id="simModeBinder">Binder /dev/binder (1-Copy)</button>
+          <button class="btn btn-sm" type="button" id="simModeDma">DMA-BUF / memfd (0-Copy FD)</button>
+          <select id="simPayloadSelect" class="btn btn-sm" aria-label="Payload size">
+            <option value="65536">Payload: 64 KB (Sync)</option>
+            <option value="614400">Payload: 600 KB (Async Oneway)</option>
+            <option value="1258291">Payload: 1.2 MB (Over 1MB Pool)</option>
+          </select>
+          <button class="btn btn-sm btn-amber" type="button" id="simStepIpc">Step Next &rarr;</button>
+          <button class="btn btn-sm" type="button" id="simResetIpc">Reset</button>
+          <span class="pill" id="ipcStepBadge">Step 0 / 3</span>
+        </div>
+
+        <div class="ipc-flow" id="ipcStages">
+          <div class="ipc-stage" id="ipcSt0">
+            <div class="ipc-stage-title">1. Client EL0 (Sender)</div>
+            <div id="ipcSt0Desc">Parcel serialized in Client user buffer.</div>
+          </div>
+          <div class="ipc-stage" id="ipcSt1">
+            <div class="ipc-stage-title">2. Kernel EL1 Driver</div>
+            <div id="ipcSt1Desc">Waiting for syscall / ioctl trap.</div>
+          </div>
+          <div class="ipc-stage" id="ipcSt2">
+            <div class="ipc-stage-title">3. Target Buffer / mmap Ring</div>
+            <div id="ipcSt2Desc">1MB Binder pool (50% async cap).</div>
+            <div class="ipc-bar-wrap"><div class="ipc-bar-fill" id="ipcPoolBar"></div></div>
+          </div>
+          <div class="ipc-stage" id="ipcSt3">
+            <div class="ipc-stage-title">4. Server EL0 (Receiver)</div>
+            <div id="ipcSt3Desc">Binder worker thread waiting on todo queue.</div>
+          </div>
+        </div>
+
+        <div class="reg-panel">
+          <div class="reg-row"><span>Transport Mode</span><span class="reg-val" id="ipcModeVal">Binder (1-Copy)</span></div>
+          <div class="reg-row"><span>Payload Copies Executed</span><span class="reg-val" id="ipcCopiesVal">0</span></div>
+          <div class="reg-row"><span>Total Bytes Copied by CPU</span><span class="reg-val" id="ipcBytesVal">0 B</span></div>
+          <div class="reg-row"><span>Driver Status</span><span class="reg-val" id="ipcStatusVal">Ready</span></div>
+        </div>
+        <p id="ipcExplain" style="margin:0.75rem 0 0; font-size:0.86rem; color:var(--text-muted);"></p>
+      </div>
+    </section>
+
+    <!-- MODULE 2: C & LINUX KERNEL REALITY -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C &amp; KERNEL REALITY</span>
+          <h2><code>memfd_create</code> + <code>SCM_RIGHTS</code>, <code>BINDER_WRITE_READ</code> &amp; FD Translation</h2>
+        </div>
+      </div>
+
+      <div class="code-wrap">
+        <div class="code-header">
+          <span>1. Zero-Copy Shared Memory FD Passing via memfd_create + SCM_RIGHTS</span>
+          <button class="btn btn-sm copy-btn" type="button" data-copy="code-l6-1">Copy</button>
+        </div>
+        <pre class="code" id="code-l6-1">/* Sender creates an anonymous RAM-backed file and passes its FD over a Unix socket */
+int fd = memfd_create("frame_buf", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+ftruncate(fd, 4 * 1024 * 1024); /* 4 MiB backed by tmpfs/shmem pages */
+
+struct msghdr msg = {0};
+char ctrl_buf[CMSG_SPACE(sizeof(int))];
+struct iovec iov = { .iov_base = "HDR", .iov_len = 3 };
+msg.msg_iov = &amp;iov; msg.msg_iovlen = 1;
+msg.msg_control = ctrl_buf; msg.msg_controllen = sizeof(ctrl_buf);
+
+struct cmsghdr *cmsg = CMSG_FIRSTHDR(&amp;msg);
+cmsg-&gt;cmsg_level = SOL_SOCKET;
+cmsg-&gt;cmsg_type = SCM_RIGHTS; /* Kernel translates FD number into target task's files_struct */
+cmsg-&gt;cmsg_len = CMSG_LEN(sizeof(int));
+memcpy(CMSG_DATA(cmsg), &amp;fd, sizeof(int));
+sendmsg(unix_sock, &amp;msg, 0);</pre>
+      </div>
+
+      <div class="code-wrap">
+        <div class="code-header">
+          <span>2. /dev/binder ioctl(BINDER_WRITE_READ) &amp; binder_transaction_data (UAPI)</span>
+          <button class="btn btn-sm copy-btn" type="button" data-copy="code-l6-2">Copy</button>
+        </div>
+        <pre class="code" id="code-l6-2">struct binder_transaction_data tr = {
+    .target.handle = target_service_handle, /* 0 = servicemanager */
+    .code          = TRANSACTION_renderFrame,
+    .flags         = TF_ONE_WAY,            /* async: capped at 50% of target mmap pool */
+    .data_size     = payload_len,
+    .offsets_size  = num_objects * sizeof(binder_size_t),
+    .data.ptr.buffer  = (uintptr_t)parcel_bytes,
+    .data.ptr.offsets = (uintptr_t)object_offsets, /* locates flat_binder_object / BINDER_TYPE_FD */
+};
+
+struct binder_write_read bwr = {
+    .write_size   = sizeof(uint32_t) + sizeof(tr), /* BC_TRANSACTION command + payload header */
+    .write_buffer = (uintptr_t)&amp;cmd_buf,
+    .read_size    = sizeof(rx_buf),
+    .read_buffer  = (uintptr_t)rx_buf,
+};
+ioctl(binder_fd, BINDER_WRITE_READ, &amp;bwr); /* Single syscall both sends &amp; waits for reply */</pre>
+      </div>
+
+      <div class="code-wrap">
+        <div class="code-header">
+          <span>3. Inside drivers/android/binder_alloc.c &amp; binder.c (Kernel Logic)</span>
+          <button class="btn btn-sm copy-btn" type="button" data-copy="code-l6-3">Copy</button>
+        </div>
+        <pre class="code" id="code-l6-3">/* Conceptual kernel flow in binder_transaction() */
+struct binder_buffer *buf = binder_alloc_new_buf(&amp;target_proc-&gt;alloc,
+    tr-&gt;data_size, tr-&gt;offsets_size, tr-&gt;flags &amp; TF_ONE_WAY);
+if (IS_ERR(buf))
+    return_error = BR_FAILED_REPLY; /* -&gt; Android throws TransactionTooLargeException */
+
+/* Single copy directly from sender EL0 into target's shared physical mmap pages */
+if (copy_from_user(buf-&gt;user_data, (const void __user *)tr-&gt;data.ptr.buffer, tr-&gt;data_size))
+    goto err_copy;
+
+/* For each BINDER_TYPE_FD inside offsets: increment struct file refcount &amp; install in target */
+int target_fd = task_get_unused_fd_flags(target_proc-&gt;tsk, O_CLOEXEC);
+fd_install(target_fd, get_file(src_file));</pre>
+      </div>
+
+      <div class="callout">
+        <strong>Security Invariant:</strong> The Receiver's <code>mmap</code> mapping is <code>PROT_READ</code> (read-only) in EL0! Even a compromised Server process cannot corrupt kernel metadata or forge another caller's <code>sender_euid</code>/<code>sender_pid</code>, because the Binder driver stamps credentials in EL1 and wakes the Server with <code>BC_FREE_BUFFER</code> ownership later.
+      </div>
+    </section>
+
+    <!-- MODULE 3: ANDROID BRIDGE -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2><code>TransactionTooLargeException</code>, 15-Thread Pool Exhaustion &amp; <code>GraphicBuffer</code></h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>Why <code>TransactionTooLargeException</code> Happens Below 1MB</h3>
+          <p><strong>Shared Pool Across All Active Calls:</strong> Every Android app gets roughly a <strong>1 MB</strong> (<code>1024*1024 - 8KB</code> in AOSP <code>ProcessState.cpp</code>) Binder <code>mmap</code> buffer shared across <em>every concurrent incoming transaction</em>—not 1 MB per call!</p>
+          <p><strong>The 50% Async Cap:</strong> <code>oneway</code> (asynchronous) calls are strictly limited to <strong>half</strong> (~512 KB) of the target's pool so a spammy async client cannot starve synchronous replies or system lifecycle callbacks (<code>ActivityThread.scheduleLaunchActivity</code>).</p>
+          <p><strong>Fix:</strong> Never pass large bitmaps or JSON blobs via AIDL/<code>Bundle</code>; pass a <code>ParcelFileDescriptor</code> backed by <code>SharedMemory</code> / <code>memfd</code>.</p>
+        </div>
+
+        <div class="card">
+          <h3>Binder Thread Pool Exhaustion &amp; SurfaceFlinger 0-Copy</h3>
+          <p><strong>15 Worker Threads + Main Binder Thread:</strong> By default <code>ProcessState</code> caps Binder worker threads at <code>15</code> (16 total). If 16 synchronous Binder threads in Process A call Process B, which calls back synchronously into Process A (recursive IPC), all threads block—freezing the app until ANR!</p>
+          <p><strong>SurfaceFlinger &amp; <code>DMA-BUF</code>:</strong> A single 1440p RGBA frame is ~14 MB (33 MB at 4K). Apps render into a <code>GraphicBuffer</code> backed by a kernel <code>DMA-BUF</code> FD, then pass only the tiny FD handle over Binder to SurfaceFlinger, which hands it straight to the GPU/Display Hardware with <strong>0 CPU copies</strong>.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: RUNNABLE CODE PRACTICE LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // RUNNABLE CODE PRACTICE LABS</span>
+          <h2>Hands-On Binder Kernel Labs (Allocator, Thread Pool, FD Translator)</h2>
+        </div>
+      </div>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // SINGLE-COPY MMAP ALLOCATOR</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement Binder <code>mmap</code> Buffer Allocator (<code>binderSend</code>)</h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Enforce 1MB pool limits, 8-byte alignment, 50% async (<code>oneway</code>) reservation, and single-copy offsets.
+            </p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> <code>binderSend(driver, tx)</code> where:<br/>
+          &bull; <code>driver</code>: <code>{ poolSize = 1048576, usedBytes, asyncUsedBytes, nextOffset, transactions }</code>.<br/>
+          &bull; <code>tx</code>: <code>{ id: string, size: number, oneway: boolean }</code>.<br/>
+          &bull; Validate <code>tx.size</code> is a non-negative integer; if not, return <code>{ ok: false, errno: -22 }</code> (<code>-EINVAL</code>).<br/>
+          &bull; Align size up to 8 bytes: <code>alignedSize = Math.ceil(tx.size / 8) * 8</code>.<br/>
+          &bull; If <code>alignedSize &gt; poolSize</code>, return <code>{ ok: false, errno: -7 }</code> (<code>-E2BIG</code>).<br/>
+          &bull; If <code>tx.oneway</code> and <code>driver.asyncUsedBytes + alignedSize &gt; Math.floor(poolSize / 2)</code>, return <code>{ ok: false, errno: -28 }</code> (<code>-ENOSPC</code>).<br/>
+          &bull; If <code>driver.usedBytes + alignedSize &gt; poolSize</code>, return <code>{ ok: false, errno: -28 }</code> (<code>-ENOSPC</code>).<br/>
+          &bull; Otherwise allocate at <code>offset = driver.nextOffset</code>, update <code>usedBytes</code>, <code>asyncUsedBytes</code> (if oneway), <code>nextOffset += alignedSize</code>, push record to <code>driver.transactions</code>, and return <code>{ ok: true, offset, alignedSize, copyCount: 1 }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // THREAD POOL &amp; STARVATION GUARD</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement Binder Thread Pool Dispatcher (<code>dispatchBinderPool</code>)</h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Prevent <code>oneway</code> floods from starving synchronous calls and detect recursive thread-pool deadlock.
+            </p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> <code>dispatchBinderPool(pool, queue)</code> where:<br/>
+          &bull; <code>pool</code>: <code>{ maxThreads, busyThreads, activeSync, activeAsync }</code>.<br/>
+          &bull; <code>queue</code>: array of <code>{ id, oneway, recursiveWait? }</code>.<br/>
+          &bull; Partition into synchronous (<code>!tx.oneway</code>) first, then <code>oneway</code>, preserving FIFO order within each group.<br/>
+          &bull; For each <strong>sync</strong> transaction: if <code>pool.busyThreads &lt; pool.maxThreads</code>, dispatch it (increment <code>busyThreads</code> and <code>activeSync</code>, push <code>tx.id</code> to <code>dispatched</code>). Otherwise, if <code>tx.recursiveWait</code> is true, immediately return <code>{ ok: false, error: "-EDEADLK", dispatched, deferred }</code>; else push <code>tx.id</code> to <code>deferred</code>.<br/>
+          &bull; For each <strong>oneway</strong> transaction: reserve 1 thread for future sync calls whenever <code>pool.maxThreads &gt; 1</code> (so <code>asyncCap = pool.maxThreads &gt; 1 ? pool.maxThreads - 1 : 1</code>). If <code>pool.busyThreads &lt; asyncCap</code>, dispatch it (increment <code>busyThreads</code> and <code>activeAsync</code>, push <code>tx.id</code> to <code>dispatched</code>); else push <code>tx.id</code> to <code>deferred</code>.<br/>
+          &bull; Return <code>{ ok: true, error: null, dispatched, deferred }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // KERNEL FD TRANSLATION</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement Binder FD Translator (<code>translateBinderFds</code>)</h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Remap <code>memfd</code> / <code>DMA-BUF</code> descriptors into the target process's FD table with atomic rollback on error.
+            </p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> <code>translateBinderFds(txOffsets, srcFds, dstFds)</code>:<br/>
+          &bull; <code>txOffsets</code>: array of <code>{ type: string, fd?: number }</code>.<br/>
+          &bull; <code>srcFds</code> / <code>dstFds</code>: plain objects mapping integer FD keys (e.g. <code>0, 1, 2, 5</code>) to descriptor objects <code>{ kind, backingId, flags }</code>.<br/>
+          &bull; Ignore entries where <code>entry.type !== "BINDER_TYPE_FD"</code>.<br/>
+          &bull; For each <code>BINDER_TYPE_FD</code>: look up <code>srcFds[entry.fd]</code>. If missing, <strong>roll back</strong> all FDs installed into <code>dstFds</code> so far during this call and return <code>{ ok: false, errno: -9, translated: [] }</code> (<code>-EBADF</code>).<br/>
+          &bull; Otherwise find the lowest unused non-negative integer FD in <code>dstFds</code> (<code>0, 1, 2, ...</code>), install <code>{ ...srcDesc, cloexec: true }</code> into <code>dstFds[newFd]</code>, and record <code>{ srcFd: entry.fd, dstFd: newFd, backingId: srcDesc.backingId }</code>.<br/>
+          &bull; On success return <code>{ ok: true, translated }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: QUIZZES -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (Why Correct &amp; Why Every Wrong Choice Fails)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Inspecting Binder Pools, DMA-BUF &amp; FDs on a Live Android Device</h2>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>Real Android Binder &amp; DMA-BUF Forensics</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code-l6-cli">Copy</button>
+          </div>
+          <pre class="code" id="code-l6-cli"># 1. Inspect Binder call latency &amp; top callers across Android services
+adb shell dumpsys binder_calls_stats
+
+# 2. Dump live kernel Binder transaction queues, thread pool count &amp; free mmap space
+adb shell cat /sys/kernel/debug/binder/state | head -n 60
+
+# 3. Inspect active zero-copy DMA-BUF allocations (SurfaceFlinger / Camera / GPU)
+adb shell cat /sys/kernel/debug/dma_buf/bufinfo
+
+# 4. Check open memfd / dmabuf file descriptors held by a process
+adb shell lsof -p &lt;pid&gt; | grep -E "memfd|dmabuf|binder"</pre>
+        </div>
+        <div class="card">
+          <h3>Senior Engineer Mastery Checklist</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can trace why Unix sockets perform 2 copies while Binder performs 1 copy via dual-mapped <code>mmap</code> pages.</span></li>
+            <li><input type="checkbox" /> <span>I know why <code>TransactionTooLargeException</code> occurs even for a 600KB <code>oneway</code> call or concurrent smaller Parcels.</span></li>
+            <li><input type="checkbox" /> <span>I can diagnose recursive 16-thread Binder pool exhaustion deadlocks in ANR traces.</span></li>
+            <li><input type="checkbox" /> <span>I can explain how SurfaceFlinger moves 4K frames across processes with 0 CPU copies using <code>DMA-BUF</code> FDs.</span></li>
+          </ul>
+          <div class="callout green" style="margin-top:0.85rem; margin-bottom:0; font-size:0.84rem;">
+            <strong>Next Step:</strong> Continue to <a href="lesson-07.html">Lesson 07: Virtual Memory, Multi-Level Page Tables &amp; TLB</a> or return to <a href="master-plan.html">Master Plan</a>.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a class="btn" href="lesson-05.html">&larr; Lesson 05: Deadlocks, Lock-Free Rings &amp; RCU</a>
+      <a class="btn" href="master-plan.html">Master Plan</a>
+      <a class="btn btn-primary" href="lesson-07.html">Lesson 07: Virtual Memory &amp; Page Tables &rarr;</a>
+    </div>
+  </main>
+
+  <script>
+    window.LESSON_CONFIG = {
+      num: "06",
+      labs: {
+        1: {
+          fnName: "binderSend",
+          starter: `function binderSend(driver, tx) {
+  const poolSize = driver.poolSize || 1048576;
+  // TODO: validate tx.size, align to 8 bytes, enforce -E2BIG, 50% async cap, and -ENOSPC
+  return { ok: false, errno: -22 };
+}`,
+          hints: [
+            "Hint 1: Check `!Number.isInteger(tx.size) || tx.size < 0` first and return `{ ok: false, errno: -22 }`. Align size with `Math.ceil(tx.size / 8) * 8`.",
+            "Hint 2: Check `alignedSize > poolSize` -> `-7` (`-E2BIG`), then if `tx.oneway` check `driver.asyncUsedBytes + alignedSize > Math.floor(poolSize / 2)` -> `-28` (`-ENOSPC`), then `driver.usedBytes + alignedSize > poolSize` -> `-28`.",
+            "Hint 3: On success, record `offset = driver.nextOffset`, update `driver.usedBytes += alignedSize`, `driver.asyncUsedBytes` if oneway, `driver.nextOffset += alignedSize`, push to `driver.transactions`, and return `{ ok: true, offset, alignedSize, copyCount: 1 }`."
+          ],
+          solution: `function binderSend(driver, tx) {
+  const poolSize = driver.poolSize !== undefined ? driver.poolSize : 1048576;
+  if (!tx || !Number.isInteger(tx.size) || tx.size < 0) {
+    return { ok: false, errno: -22 };
+  }
+  const alignedSize = Math.ceil(tx.size / 8) * 8;
+  if (alignedSize > poolSize) {
+    return { ok: false, errno: -7 };
+  }
+  if (tx.oneway && driver.asyncUsedBytes + alignedSize > Math.floor(poolSize / 2)) {
+    return { ok: false, errno: -28 };
+  }
+  if (driver.usedBytes + alignedSize > poolSize) {
+    return { ok: false, errno: -28 };
+  }
+
+  const offset = driver.nextOffset;
+  driver.usedBytes += alignedSize;
+  if (tx.oneway) {
+    driver.asyncUsedBytes += alignedSize;
+  }
+  driver.nextOffset += alignedSize;
+  driver.transactions.push({
+    id: tx.id,
+    offset,
+    size: tx.size,
+    alignedSize,
+    oneway: !!tx.oneway
+  });
+  return { ok: true, offset, alignedSize, copyCount: 1 };
+}`,
+          solutionExplain: "Binder enforces an 8-byte aligned kernel mmap pool (`1MB`), caps asynchronous `oneway` transactions at 50% so sync calls never starve, and copies the user payload once into the target's shared physical buffer.",
+          tests: function (fn) {
+            const d = { poolSize: 1048576, usedBytes: 0, asyncUsedBytes: 0, nextOffset: 0, transactions: [] };
+            const rBad = fn(d, { id: "bad", size: -4, oneway: false });
+            const rHuge = fn(d, { id: "huge", size: 1048577, oneway: false });
+            const r1 = fn(d, { id: "t1", size: 100, oneway: false });
+            const rAsyncOver = fn(d, { id: "a_big", size: 600000, oneway: true });
+            const rAsyncOk = fn(d, { id: "a_ok", size: 500000, oneway: true });
+            const rSyncFill = fn(d, { id: "s_big", size: 548576, oneway: false });
+            return [
+              { name: "Rejects negative size (-EINVAL) and >1MB payload (-E2BIG)", pass: rBad.errno === -22 && rHuge.errno === -7, detail: `bad=${rBad.errno}, huge=${rHuge.errno}` },
+              { name: "Aligns 100B to 104B with 1 copy at offset 0", pass: r1.ok && r1.offset === 0 && r1.alignedSize === 104 && r1.copyCount === 1, detail: JSON.stringify(r1) },
+              { name: "Blocks >50% oneway flood (-ENOSPC) while allowing sync to use remaining pool", pass: !rAsyncOver.ok && rAsyncOver.errno === -28 && rAsyncOk.ok && !rSyncFill.ok, detail: `asyncOver=${rAsyncOver.errno}, asyncOk=${rAsyncOk.ok}, syncFill=${rSyncFill.errno}` }
+            ];
+          }
+        },
+        2: {
+          fnName: "dispatchBinderPool",
+          starter: `function dispatchBinderPool(pool, queue) {
+  // Prioritize sync (!tx.oneway) before oneway, reserve 1 thread when maxThreads > 1,
+  // and return { ok: false, error: "-EDEADLK", dispatched, deferred } if recursiveWait sync fails.
+  return { ok: true, error: null, dispatched: [], deferred: [] };
+}`,
+          hints: [
+            "Hint 1: Split `queue` into `syncList` (`!tx.oneway`) and `asyncList` (`tx.oneway`), keeping original order.",
+            "Hint 2: Process `syncList` first: if `pool.busyThreads < pool.maxThreads`, dispatch; else if `tx.recursiveWait` return `{ ok: false, error: \"-EDEADLK\", dispatched, deferred }` immediately; else defer.",
+            "Hint 3: Process `asyncList`: `const asyncCap = pool.maxThreads > 1 ? pool.maxThreads - 1 : 1;`. Only dispatch while `pool.busyThreads < asyncCap`; defer remaining `oneway` calls."
+          ],
+          solution: `function dispatchBinderPool(pool, queue) {
+  const dispatched = [];
+  const deferred = [];
+  const syncList = [];
+  const asyncList = [];
+
+  for (const tx of queue) {
+    if (tx.oneway) asyncList.push(tx);
+    else syncList.push(tx);
+  }
+
+  for (const tx of syncList) {
+    if (pool.busyThreads < pool.maxThreads) {
+      pool.busyThreads++;
+      pool.activeSync++;
+      dispatched.push(tx.id);
+    } else if (tx.recursiveWait) {
+      return { ok: false, error: "-EDEADLK", dispatched, deferred };
+    } else {
+      deferred.push(tx.id);
+    }
+  }
+
+  const asyncCap = pool.maxThreads > 1 ? pool.maxThreads - 1 : 1;
+  for (const tx of asyncList) {
+    if (pool.busyThreads < asyncCap) {
+      pool.busyThreads++;
+      pool.activeAsync++;
+      dispatched.push(tx.id);
+    } else {
+      deferred.push(tx.id);
+    }
+  }
+
+  return { ok: true, error: null, dispatched, deferred };
+}`,
+          solutionExplain: "Prioritizing sync transactions and capping `oneway` concurrency below `maxThreads` guarantees an async flood cannot occupy the final worker thread needed to unblock synchronous replies.",
+          tests: function (fn) {
+            const p1 = { maxThreads: 4, busyThreads: 0, activeSync: 0, activeAsync: 0 };
+            const q1 = [
+              { id: "a1", oneway: true },
+              { id: "a2", oneway: true },
+              { id: "a3", oneway: true },
+              { id: "a4", oneway: true },
+              { id: "s1", oneway: false }
+            ];
+            const r1 = fn(p1, q1);
+
+            const p2 = { maxThreads: 2, busyThreads: 2, activeSync: 2, activeAsync: 0 };
+            const r2 = fn(p2, [{ id: "s_rec", oneway: false, recursiveWait: true }]);
+
+            const p3 = { maxThreads: 2, busyThreads: 1, activeSync: 1, activeAsync: 0 };
+            const r3 = fn(p3, [{ id: "s_ok", oneway: false, recursiveWait: true }]);
+
+            return [
+              {
+                name: "Prioritizes sync s1 over oneway flood & reserves 1 sync thread",
+                pass: r1.ok && JSON.stringify(r1.dispatched) === JSON.stringify(["s1", "a1", "a2"]) &&
+                      JSON.stringify(r1.deferred) === JSON.stringify(["a3", "a4"]) && p1.busyThreads === 3,
+                detail: JSON.stringify(r1)
+              },
+              {
+                name: "Detects recursive pool exhaustion deadlock (-EDEADLK)",
+                pass: !r2.ok && r2.error === "-EDEADLK",
+                detail: JSON.stringify(r2)
+              },
+              {
+                name: "Allows recursive sync call when reserved thread is free",
+                pass: r3.ok && JSON.stringify(r3.dispatched) === JSON.stringify(["s_ok"]) && p3.busyThreads === 2,
+                detail: JSON.stringify(r3)
+              }
+            ];
+          }
+        },
+        3: {
+          fnName: "translateBinderFds",
+          starter: `function translateBinderFds(txOffsets, srcFds, dstFds) {
+  // Translate BINDER_TYPE_FD entries into lowest unused FDs in dstFds.
+  // Roll back all newly installed FDs if any source FD is invalid (-EBADF = -9).
+  return { ok: true, translated: [] };
+}`,
+          hints: [
+            "Hint 1: Keep an `installedFds = []` list as you allocate new FDs in `dstFds` so you can `delete dstFds[fd]` for every installed FD if a later offset fails.",
+            "Hint 2: Helper `allocLowestFd(table)`: start `let fd = 0; while (Object.prototype.hasOwnProperty.call(table, fd)) fd++; return fd;`.",
+            "Hint 3: Install `{ ...srcDesc, cloexec: true }` into `dstFds[newFd]` and push `{ srcFd: entry.fd, dstFd: newFd, backingId: srcDesc.backingId }` to `translated`."
+          ],
+          solution: `function translateBinderFds(txOffsets, srcFds, dstFds) {
+  const translated = [];
+  const installed = [];
+
+  for (const entry of txOffsets) {
+    if (entry.type !== "BINDER_TYPE_FD") continue;
+    const srcDesc = srcFds[entry.fd];
+    if (!srcDesc) {
+      for (const fd of installed) {
+        delete dstFds[fd];
+      }
+      return { ok: false, errno: -9, translated: [] };
+    }
+    let newFd = 0;
+    while (Object.prototype.hasOwnProperty.call(dstFds, newFd)) {
+      newFd++;
+    }
+    dstFds[newFd] = { ...srcDesc, cloexec: true };
+    installed.push(newFd);
+    translated.push({
+      srcFd: entry.fd,
+      dstFd: newFd,
+      backingId: srcDesc.backingId
+    });
+  }
+  return { ok: true, translated };
+}`,
+          solutionExplain: "Kernel `binder_translate_fd` installs a reference to the same underlying `struct file` into the receiver's `files_struct` at the lowest free FD slot with `O_CLOEXEC`, and rolls back partial translations on error to avoid FD leaks.",
+          tests: function (fn) {
+            const src = {
+              5: { kind: "dmabuf", backingId: "gpu_frame_9", flags: 2 },
+              8: { kind: "memfd", backingId: "audio_pcm_1", flags: 1 }
+            };
+            const dst = {
+              0: { kind: "stdio", backingId: "stdin", flags: 0 },
+              1: { kind: "stdio", backingId: "stdout", flags: 1 },
+              3: { kind: "pipe", backingId: "looper", flags: 0 }
+            };
+            const r1 = fn([
+              { type: "BINDER_TYPE_PTR" },
+              { type: "BINDER_TYPE_FD", fd: 5 },
+              { type: "BINDER_TYPE_FD", fd: 8 }
+            ], src, dst);
+
+            const dst2 = { 0: { kind: "stdio", backingId: "stdin", flags: 0 } };
+            const r2 = fn([
+              { type: "BINDER_TYPE_FD", fd: 5 },
+              { type: "BINDER_TYPE_FD", fd: 99 }
+            ], src, dst2);
+
+            return [
+              {
+                name: "Ignores non-FD offsets & allocates lowest free FDs (2, then 4) with cloexec",
+                pass: r1.ok && r1.translated.length === 2 &&
+                      r1.translated[0].dstFd === 2 && r1.translated[1].dstFd === 4 &&
+                      dst[2].backingId === "gpu_frame_9" && dst[2].cloexec === true,
+                detail: JSON.stringify(r1)
+              },
+              {
+                name: "Rolls back partially installed FDs on invalid source FD (-EBADF)",
+                pass: !r2.ok && r2.errno === -9 && dst2[1] === undefined && Object.keys(dst2).length === 1,
+                detail: `errno=${r2.errno}, dst2Keys=${JSON.stringify(Object.keys(dst2))}`
+              },
+              {
+                name: "Handles transaction with zero FD objects cleanly",
+                pass: fn([{ type: "BINDER_TYPE_PTR" }], src, dst).ok === true,
+                detail: "no-FD transaction ok"
+              }
+            ];
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "Q1. Why does Android Binder perform only 1 payload copy instead of the 2 copies required by Unix domain sockets?",
+          options: [
+            "A. Binder bypasses virtual memory and lets Process A write directly to Process B's heap pointer.",
+            "B. Binder maps the receiver's ~1MB mmap pool physical pages into both Kernel EL1 (RW) and Server EL0 (RO), so the kernel copies directly from Client EL0 into that shared physical page.",
+            "C. Binder compresses payloads in hardware DMA before sending.",
+            "D. Binder runs all Android services in the same virtual address space."
+          ],
+          correct: 1,
+          why: [
+            "A is wrong: Processes still have completely isolated virtual address spaces; Process A cannot dereference Process B's pointers.",
+            "B is correct: Because the kernel holds a RW mapping to the exact same physical pages mapped RO into the receiver's user space, a single `copy_from_user` makes the data visible to the receiver immediately.",
+            "C is wrong: Binder does not perform hardware DMA compression on Parcel payloads.",
+            "D is wrong: Android apps and system services run in separate processes with distinct UIDs, SELinux contexts, and `mm_struct`s."
+          ]
+        },
+        {
+          q: "Q2. Why does the Binder kernel driver map the receiver's `mmap` ring as READ-ONLY (`PROT_READ`) in receiver EL0 user space?",
+          options: [
+            "A. To prevent a buggy or compromised receiver from overwriting kernel-written transaction headers, sender UID/PID, or adjacent pending messages.",
+            "B. Because ARM64 MMUs cannot map physical RAM as writable in user space.",
+            "C. To force the receiver to copy the buffer back to kernel space before reading.",
+            "D. To disable CPU L1 caching on Binder buffers."
+          ],
+          correct: 0,
+          why: [
+            "A is correct: Only EL1 kernel code writes into the shared pool; EL0 receiver code reads the incoming Parcel and later issues `BC_FREE_BUFFER` to return the slice to the kernel.",
+            "B is wrong: Normal user heap/stack pages are mapped RW in EL0; Binder explicitly restricts the pool to RO for integrity.",
+            "C is wrong: The receiver reads directly from its RO user mapping without any kernel copy.",
+            "D is wrong: Binder mmap pages are normal cacheable memory."
+          ]
+        },
+        {
+          q: "Q3. A developer sees `TransactionTooLargeException` even though the failing `oneway` Binder call only sent a 600 KB `Bundle`. Why?",
+          options: [
+            "A. `oneway` calls are limited to 4 KB regardless of buffer size.",
+            "B. Binder's ~1MB mmap pool is shared across all active transactions in the process, AND asynchronous (`oneway`) calls are capped at 50% (~512 KB) of the pool.",
+            "C. `Bundle` serialization always multiplies size by 4x in kernel space.",
+            "D. Android forbids any IPC over 512 KB, including `memfd`."
+          ],
+          correct: 1,
+          why: [
+            "A is wrong: There is no 4 KB limit on `oneway` calls; the limit is half of the shared mmap pool.",
+            "B is correct: `binder_alloc_new_buf` enforces a 50% ceiling (`free_async_space`) on `TF_ONE_WAY` transactions so async floods cannot starve synchronous calls or lifecycle transactions.",
+            "C is wrong: While `Parcel` has modest framing overhead, the failure at 600 KB is specifically the 50% async pool cap.",
+            "D is wrong: `memfd_create` / `SharedMemory` + `ParcelFileDescriptor` is the official way to share multi-megabyte buffers across Binder."
+          ]
+        },
+        {
+          q: "Q4. Process A has 16 active Binder threads, all currently blocked in synchronous `transact()` calls waiting on Process B. Process B makes a synchronous callback into Process A. What happens?",
+          options: [
+            "A. Process A dynamically spawns a 17th Binder thread immediately.",
+            "B. Recursive Binder thread-pool exhaustion deadlock: Process A has no free Binder thread to execute B's callback, so both processes hang.",
+            "C. The kernel promotes the callback to `oneway` automatically.",
+            "D. Binder drops the oldest transaction silently."
+          ],
+          correct: 1,
+          why: [
+            "A is wrong: `ProcessState` caps Binder worker threads (default 15 workers + 1 main = 16); the kernel will not exceed `max_threads`.",
+            "B is correct: All 16 threads in A are blocked waiting for B, while B needs a thread in A to complete before replying to A—classic distributed deadlock.",
+            "C is wrong: Synchronous `transact()` semantics cannot be silently converted to `oneway` by the kernel.",
+            "D is wrong: Binder queues the transaction on Process A's proc todo list indefinitely until a thread frees up or ANR kills the app."
+          ]
+        },
+        {
+          q: "Q5. How does SurfaceFlinger receive a 14 MB `GraphicBuffer` from an app every 8.3ms (120Hz) without hitting `TransactionTooLargeException` or burning CPU bandwidth?",
+          options: [
+            "A. SurfaceFlinger raises its Binder mmap size to 256 MB.",
+            "B. The app allocates the buffer via `DMA-BUF` / Gralloc and sends only a tiny file descriptor (`BINDER_TYPE_FD`) over Binder, achieving 0 CPU payload copies.",
+            "C. Binder switches to UDP sockets for buffers over 1 MB.",
+            "D. Zygote shares the same writable heap across all apps and SurfaceFlinger."
+          ],
+          correct: 1,
+          why: [
+            "A is wrong: Copying 14 MB * 120 Hz = 1.68 GB/s per app would still saturate memory bandwidth and cache even with a larger pool.",
+            "B is correct: `BufferQueue` passes `native_handle_t` containing a `DMA-BUF` FD over Binder; the Binder driver translates the FD into SurfaceFlinger's `files_struct` so GPU/DPU hardware reads the physical pages directly.",
+            "C is wrong: Binder never falls back to UDP sockets.",
+            "D is wrong: Apps never share writable heaps with SurfaceFlinger; that would destroy Android process isolation."
+          ]
+        },
+        {
+          q: "Q6. Why must `binder_translate_fd` install translated FDs with `O_CLOEXEC` and roll back partially translated FDs if a later `BINDER_TYPE_FD` in the same transaction fails?",
+          options: [
+            "A. To prevent leaking open `struct file` references into child processes on `execve()` or leaving orphaned FDs in the target process's table on failed transactions.",
+            "B. Because `O_CLOEXEC` encrypts the file descriptor table.",
+            "C. Because Linux only allows 3 open FDs per process.",
+            "D. To force the receiver to close `stdin` and `stdout`."
+          ],
+          correct: 0,
+          why: [
+            "A is correct: Without rollback, a malformed transaction with `[valid_fd, invalid_fd]` would permanently leak `valid_fd` in the receiver's FD table; `O_CLOEXEC` prevents unrelated `execve()` children from inheriting received IPC FDs.",
+            "B is wrong: `O_CLOEXEC` simply marks the FD to auto-close during `execve()`, not encryption.",
+            "C is wrong: Processes typically allow thousands of open FDs (`RLIMIT_NOFILE`).",
+            "D is wrong: FDs 0, 1, 2 remain untouched because allocation picks the lowest *unused* FD."
+          ]
+        }
+      ]
+    };
+
+    /* ---- Interactive IPC Simulator ---- */
+    let ipcMode = "binder"; // "socket" | "binder" | "dmabuf"
+    let ipcStep = 0;
+
+    function renderIpcSim() {
+      const sizeBytes = Number(document.getElementById("simPayloadSelect").value);
+      const sizeLabel = sizeBytes >= 1048576 ? (sizeBytes / 1048576).toFixed(1) + " MB" : (sizeBytes / 1024).toFixed(0) + " KB";
+      const isOneway = sizeBytes === 614400;
+      const binderFail = ipcMode === "binder" && (sizeBytes > 1048576 || (isOneway && sizeBytes > 524288));
+
+      document.getElementById("ipcStepBadge").textContent = `Step ${ipcStep} / 3`;
+      document.getElementById("ipcModeVal").textContent =
+        ipcMode === "socket" ? "Unix Socket (2-Copy)" : ipcMode === "binder" ? "Binder /dev/binder (1-Copy)" : "DMA-BUF / memfd (0-Copy FD)";
+
+      [0, 1, 2, 3].forEach((i) => {
+        const el = document.getElementById("ipcSt" + i);
+        el.classList.remove("active", "err");
+        if (i === ipcStep) el.classList.add(binderFail && ipcStep >= 1 ? "err" : "active");
+      });
+
+      let copies = 0;
+      let bytesCopied = 0;
+      let status = "Ready in Client EL0";
+      let explain = `Ready to send ${sizeLabel}${isOneway ? " (TF_ONE_WAY)" : ""}. Click Step Next.`;
+      let barPct = 0;
+
+      if (ipcMode === "socket") {
+        if (ipcStep === 1) {
+          copies = 1; bytesCopied = sizeBytes;
+          status = "copy_from_user -> sk_buff";
+          explain = `Step 1: Client calls sendmsg(). Kernel executes Copy #1 (${sizeLabel}) from Client EL0 into a kernel sk_buff.`;
+        } else if (ipcStep === 2) {
+          copies = 1; bytesCopied = sizeBytes;
+          status = "Queued on Server sock";
+          explain = `Step 2: sk_buff sits in Server socket receive queue; epoll wakes Server.`;
+        } else if (ipcStep === 3) {
+          copies = 2; bytesCopied = sizeBytes * 2;
+          status = "Complete (2 Copies!)";
+          explain = `Step 3: Server calls recvmsg(). Kernel executes Copy #2 (${sizeLabel}) from sk_buff into Server EL0 heap. Total CPU copies = 2.`;
+        }
+      } else if (ipcMode === "binder") {
+        barPct = Math.min(100, Math.round((sizeBytes / 1048576) * 100));
+        if (ipcStep >= 1 && binderFail) {
+          copies = 0; bytesCopied = 0;
+          status = isOneway ? "FAILED: >50% Async Cap (-ENOSPC)" : "FAILED: >1MB Pool (-E2BIG)";
+          explain = `TransactionTooLargeException! ${isOneway ? "600 KB oneway exceeds Binder's 50% (512 KB) async pool cap." : "1.2 MB exceeds the entire 1 MB Binder mmap pool."}`;
+        } else if (ipcStep === 1) {
+          copies = 1; bytesCopied = sizeBytes;
+          status = "binder_alloc + 1x copy_from_user";
+          explain = `Step 1: Kernel reserves ${sizeLabel} in Server's 1MB pool and runs copy_from_user() ONCE directly into shared physical pages.`;
+        } else if (ipcStep === 2) {
+          copies = 1; bytesCopied = sizeBytes;
+          status = "Mapped RO in Server EL0";
+          explain = `Step 2: The same physical page is already mapped read-only in Server EL0; kernel queues a tiny offset descriptor.`;
+        } else if (ipcStep === 3) {
+          copies = 1; bytesCopied = sizeBytes;
+          status = "Complete (1 Copy!)";
+          explain = `Step 3: Server Binder worker reads directly from its RO mmap offset—zero second copy!`;
+        }
+      } else {
+        barPct = 1;
+        if (ipcStep === 1) {
+          copies = 0; bytesCopied = 64;
+          status = "BINDER_TYPE_FD (64B header)";
+          explain = `Step 1: Client passes only a tiny FD handle (no ${sizeLabel} pixel/buffer bytes copied!).`;
+        } else if (ipcStep === 2) {
+          copies = 0; bytesCopied = 64;
+          status = "task_fd_install -> dstFds";
+          explain = `Step 2: Kernel increments struct file refcount and installs a new FD in Server's files_struct.`;
+        } else if (ipcStep === 3) {
+          copies = 0; bytesCopied = 64;
+          status = "Complete (0 Payload Copies!)";
+          explain = `Step 3: Server mmaps the DMA-BUF / memfd directly (or passes it to GPU/DPU). Zero CPU payload copies regardless of buffer size!`;
+        }
+      }
+
+      document.getElementById("ipcCopiesVal").textContent = String(copies);
+      document.getElementById("ipcBytesVal").textContent = bytesCopied >= 1048576 ? (bytesCopied / 1048576).toFixed(2) + " MB" : (bytesCopied / 1024).toFixed(1) + " KB";
+      document.getElementById("ipcStatusVal").textContent = status;
+      document.getElementById("ipcPoolBar").style.width = barPct + "%";
+      document.getElementById("ipcExplain").textContent = explain;
+    }
+
+    document.getElementById("simModeSocket").addEventListener("click", () => { ipcMode = "socket"; ipcStep = 0; renderIpcSim(); });
+    document.getElementById("simModeBinder").addEventListener("click", () => { ipcMode = "binder"; ipcStep = 0; renderIpcSim(); });
+    document.getElementById("simModeDma").addEventListener("click", () => { ipcMode = "dmabuf"; ipcStep = 0; renderIpcSim(); });
+    document.getElementById("simPayloadSelect").addEventListener("change", () => { ipcStep = 0; renderIpcSim(); });
+    document.getElementById("simStepIpc").addEventListener("click", () => { ipcStep = (ipcStep + 1) % 4; renderIpcSim(); });
+    document.getElementById("simResetIpc").addEventListener("click", () => { ipcStep = 0; renderIpcSim(); });
+
+    renderIpcSim();
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 15: Kernel Observability, eBPF &amp; Production Profiling — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <style>
+    .verdict-badge {
+      padding: 0.16rem 0.55rem;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 700;
+    }
+    .verdict-ok { background: var(--green-soft); color: var(--green); }
+    .verdict-bad { background: var(--red-soft); color: var(--red); }
+    .verdict-wait { background: var(--amber-soft); color: var(--amber); }
+    .flame-row {
+      margin: 0.35rem 0;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+    }
+    .flame-bar {
+      height: 24px;
+      border-radius: 5px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 0.55rem;
+      color: #fff;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 110px;
+    }
+    .insn-line {
+      padding: 0.25rem 0.45rem;
+      border-radius: 5px;
+      font-family: var(--font-mono);
+      font-size: 0.77rem;
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }
+    .insn-line.active {
+      background: var(--accent-soft);
+      border-left: 3px solid var(--accent);
+      font-weight: 700;
+    }
+    .insn-line.err {
+      background: var(--red-soft);
+      border-left: 3px solid var(--red);
+      color: var(--red);
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 15</span>
+        <span>Kernel Observability, eBPF &amp; Production Profiling</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-14.html">&larr; Prev Lesson</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C &amp; Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">Code Labs (3)</a>
+        <a href="#quiz">Quiz (6)</a>
+        <a href="lesson-16.html">Next Lesson &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="badge b-concept">PHASE 5 // KERNEL OBSERVABILITY &amp; PRODUCTION PROFILING</span>
+      <h1>Lesson 15: Kernel Observability, eBPF &amp; Production Profiling</h1>
+      <p>
+        You cannot run <code>strace</code> on a 120Hz Android UI thread or a high-QPS production fleet—<code>ptrace</code> stalls every syscall twice!
+        Senior OS engineers instrument live kernels in nanoseconds using <strong>tracepoints</strong>, <strong><code>perf_event_open</code></strong>,
+        <strong>eBPF</strong> (statically verified sandboxed bytecode JIT-compiled into native machine code), and <strong>CPU/Off-CPU flamegraphs</strong>.
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button id="markLessonComplete" class="btn btn-green btn-sm" type="button">Mark Lesson 15 Complete</button>
+      </div>
+    </section>
+
+    <!-- MODULE 1: MENTAL MODEL + SIMULATOR -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>Tracing Overhead, the eBPF Static Verifier &amp; Flamegraph Folding</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. Tracing Spectrum: <code>ptrace</code> vs Tracepoints vs eBPF</h3>
+          <p><strong><code>strace</code> (<code>ptrace</code>):</strong> Stops the target process on every syscall entry AND exit, waking the tracer process twice via signals/context switches. Adds ~10&ndash;50&mu;s per syscall (10x&ndash;100x slowdown!).</p>
+          <p><strong><code>ftrace</code> / Static Tracepoints:</strong> Compiled NOP sites patched at runtime to jump to ring-buffer loggers (<code>sched_switch</code>, <code>binder_transaction</code>) with ~50&ndash;150ns overhead.</p>
+          <p><strong><code>kprobes</code> / <code>uprobes</code>:</strong> Breakpoint/fentry hooks on any kernel or userspace symbol without recompiling. Combined with <strong>eBPF</strong>, aggregation happens <em>inside the kernel</em> (maps/histograms) so zero per-event data crosses to userspace!</p>
+        </div>
+
+        <div class="card">
+          <h3>2. eBPF ISA, Register ABI &amp; Static Verifier Proofs</h3>
+          <p>The eBPF virtual machine has eleven 64-bit registers (<code>R0&ndash;R10</code>) and a bounded <strong>512-byte stack</strong>:</p>
+          <p><strong>Registers:</strong> <code>R1</code> holds the context pointer on entry; <code>R1&ndash;R5</code> pass arguments to kernel helpers (and are <strong>clobbered</strong> on return!); <code>R0</code> holds helper/program return values; <code>R6&ndash;R9</code> are callee-saved; <code>R10</code> is the read-only stack frame pointer.</p>
+          <p><strong>The Verifier:</strong> Before JIT compilation, the kernel runs abstract interpretation over the CFG DAG: proving (1) termination (no unbounded backward loops), (2) all read registers/stack slots are initialized, (3) pointers &amp; <code>NULL</code>-nullable map lookups are bounds-checked, and (4) <code>R0</code> is initialized at <code>EXIT</code>.</p>
+        </div>
+      </div>
+
+      <div class="sim-box">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem; margin-bottom:0.85rem;">
+          <strong style="font-size:0.95rem;">Interactive Simulator: eBPF Static Verifier &amp; CPU Flamegraph Folder</strong>
+          <span id="ebpfVerdict" class="verdict-badge verdict-wait">CHECKING...</span>
+        </div>
+
+        <div class="sim-controls">
+          <button class="btn btn-primary btn-sm" id="progValidBtn" type="button">1. Valid Tracepoint Prog</button>
+          <button class="btn btn-sm" id="progUninitBtn" type="button">2. Uninitialized R0</button>
+          <button class="btn btn-sm" id="progLoopBtn" type="button">3. Unbounded Loop</button>
+          <button class="btn btn-amber btn-sm" id="progNullBtn" type="button">4. Unchecked Map Ptr</button>
+          <span style="flex:1;"></span>
+          <button class="btn btn-green btn-sm" id="ebpfStepBtn" type="button">Step Verifier &rarr;</button>
+          <button class="btn btn-sm" id="ebpfResetBtn" type="button">Reset</button>
+        </div>
+
+        <div class="sim-grid">
+          <div class="reg-panel">
+            <div style="color:var(--text-muted); margin-bottom:0.4rem; font-weight:700;">eBPF BYTECODE STREAM</div>
+            <div id="ebpfCodeView"></div>
+          </div>
+
+          <div class="reg-panel">
+            <div style="color:var(--text-muted); margin-bottom:0.4rem; font-weight:700;">VERIFIER ABSTRACT REGISTERS</div>
+            <div id="ebpfRegView"></div>
+          </div>
+
+          <div class="reg-panel">
+            <div style="color:var(--text-muted); margin-bottom:0.4rem; font-weight:700;">CPU FLAMEGRAPH STACK FOLDER</div>
+            <div style="display:flex; flex-wrap:wrap; gap:0.35rem; margin-bottom:0.55rem;">
+              <button class="btn btn-sm" id="fgSyscallBtn" type="button">+ Syscall Log</button>
+              <button class="btn btn-sm" id="fgBinderBtn" type="button">+ Binder IPC</button>
+              <button class="btn btn-sm" id="fgGcBtn" type="button">+ ART GC</button>
+              <button class="btn btn-sm" id="fgClearBtn" type="button">Reset</button>
+            </div>
+            <div id="fgBars"></div>
+          </div>
+        </div>
+
+        <div class="callout" id="ebpfExplain" style="margin-top:0.9rem; margin-bottom:0;"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 2: C & KERNEL -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C, LIBBPF CO-RE, PERF &amp; FLAMEGRAPHS</span>
+          <h2>Production Kernel Tracing with CO-RE eBPF &amp; <code>perf_event_open</code></h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>sched_delay.bpf.c — libbpf CO-RE Runqueue Latency Probe</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code15_1">Copy</button>
+          </div>
+          <pre class="code" id="code15_1">#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 16384);
+  __type(key, u32);    // pid
+  __type(value, u64);  // wakeup timestamp (ns)
+} wakeup_ts SEC(".maps");
+
+SEC("tp_btf/sched_wakeup")
+int BPF_PROG(on_wakeup, struct task_struct *p) {
+  u32 pid = BPF_CORE_READ(p, pid);
+  u64 ts = bpf_ktime_get_ns();
+  bpf_map_update_elem(&amp;wakeup_ts, &amp;pid, &amp;ts, BPF_ANY);
+  return 0;
+}
+
+SEC("tp_btf/sched_switch")
+int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
+             struct task_struct *next) {
+  u32 pid = BPF_CORE_READ(next, pid);
+  u64 *tsp = bpf_map_lookup_elem(&amp;wakeup_ts, &amp;pid);
+  if (!tsp) return 0; // Mandatory NULL check required by eBPF verifier!
+
+  u64 delay_ns = bpf_ktime_get_ns() - *tsp;
+  bpf_map_delete_elem(&amp;wakeup_ts, &amp;pid);
+  if (delay_ns &gt; 5000000ULL) { // &gt; 5ms scheduling delay -&gt; emit ringbuf event
+    bpf_printk("runqueue stall pid=%u delay_ns=%llu", pid, delay_ns);
+  }
+  return 0;
+}</pre>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>perf_sampling.c — perf_event_open() PMU Hardware Sampling</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code15_2">Copy</button>
+          </div>
+          <pre class="code" id="code15_2">// Userspace profiler opening hardware CPU cycle sampling on a PID
+#include &lt;linux/perf_event.h&gt;
+#include &lt;sys/syscall.h&gt;
+
+int open_cpu_sampler(pid_t pid, int cpu, uint64_t sample_freq_hz) {
+  struct perf_event_attr attr = {
+    .type = PERF_TYPE_HARDWARE,
+    .size = sizeof(attr),
+    .config = PERF_COUNT_HW_CPU_CYCLES,
+    .sample_freq = sample_freq_hz, // e.g., 99 Hz (avoids lockstep aliasing!)
+    .freq = 1,
+    .sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+    .exclude_hv = 1,
+  };
+  // Kernel writes IP + stack unwind into an mmap'd ring buffer;
+  // only ~99 interrupts/sec -&gt; &lt; 0.5% production CPU overhead!
+  return syscall(__NR_perf_event_open, &amp;attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+}</pre>
+        </div>
+      </div>
+
+      <div class="callout amber">
+        <strong>CPU Flamegraphs vs Off-CPU Flamegraphs (Don't Miss Blocked Threads!):</strong><br/>
+        A <strong>CPU flamegraph</strong> (<code>perf</code> / <code>simpleperf</code> sampling at 99 Hz) only samples threads currently running on a CPU core.
+        If an Android UI thread freezes for 400ms waiting on a <code>futex</code>, Binder reply, or <code>fsync()</code>, it is sleeping off-CPU—so it completely disappears from a CPU flamegraph!
+        To diagnose ANRs and tail stalls, trace <code>sched_switch</code> off-CPU time (or use <strong>Perfetto</strong> thread-state tracks) to build an <strong>Off-CPU flamegraph</strong> weighted by blocked nanoseconds.
+      </div>
+    </section>
+
+    <!-- MODULE 3: ANDROID BRIDGE -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2>Android <code>bpfloader</code>, <code>simpleperf</code> &amp; Perfetto System Tracing</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>Android <code>bpfloader</code> in Production</h3>
+          <p>At Android boot, <code>bpfloader</code> verifies and loads precompiled eBPF ELF programs into <code>/sys/fs/bpf</code> with strict SELinux policies:</p>
+          <p><strong>1. <code>netd</code> / TrafficStats eBPF:</strong> Hooks cgroup socket filters (<code>sk_filter</code> / <code>cgroup_skb</code>) to count per-UID/per-app foreground &amp; background bytes with zero iptables traversal overhead.</p>
+          <p><strong>2. <code>time_in_state</code> &amp; Power HAL:</strong> Attaches to <code>sched_switch</code> and <code>cpu_frequency</code> tracepoints to attribute per-UID CPU energy across big.LITTLE clusters in real time.</p>
+          <p><strong>3. GPU / DMA-BUF / LMKD Hooks:</strong> Tracks per-process GPU memory and PSI/reclaim triggers without polling <code>/proc</code> files every millisecond.</p>
+        </div>
+
+        <div class="card">
+          <h3>Perfetto: The Staff Android Engineer's Microscope</h3>
+          <p><strong>How Perfetto Works:</strong> Daemon <code>traced</code> collects protobuf trace streams from <code>traced_probes</code> (kernel <code>ftrace</code> ring buffer: <code>sched_switch</code>, <code>sched_waking</code>, <code>binder_transaction</code>, <code>mm_vmscan</code>) + user-space <code>atrace</code>/SDK slices (<code>Choreographer#doFrame</code>) + <code>heapprofd</code> (DWARF/frame-pointer native heap sampling).</p>
+          <p><strong>Diagnosing Jank &amp; ANRs:</strong> When a 120Hz frame misses its 8.33ms budget, Perfetto connects the UI thread's sleeping gap directly via <code>sched_waking</code> to the Binder server thread or lock holder that stalled it—proving root cause in seconds.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: RUNNABLE CODE PRACTICE LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // RUNNABLE CODE PRACTICE LABS</span>
+          <h2>Hands-On Observability Labs (eBPF Verifier, Flamegraphs &amp; Tail Latency)</h2>
+        </div>
+      </div>
+      <p style="color:var(--text-muted); margin-top:0;">
+        Implement real static verification, stack folding, and tail-latency statistics. Press <strong>Run &amp; Check</strong> or <code>Ctrl/Cmd + Enter</code>.
+      </p>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // eBPF STATIC VERIFIER</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>verifyEbpfProgram(insns)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Simulate DAG reachability, register initialization, helper clobbering, and <code>EXIT</code> safety proofs.
+            </p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Entry at <code>pc = 0</code> starts with initialized registers <code>Set(["R1", "R10"])</code>.<br/>
+          &bull; Empty program or falling past <code>insns.length</code> without <code>EXIT</code> &rarr; <code>{ ok: false, reason: "FALLTHROUGH_NO_EXIT", pc }</code>.<br/>
+          &bull; <code>{ op: "MOV", dst, src }</code>: If <code>dst === "R10"</code> &rarr; <code>"R10_READONLY"</code>. If <code>src</code> is a string (register) not in <code>init</code> &rarr; <code>"UNINITIALIZED_REG"</code>. Marks <code>dst</code> initialized.<br/>
+          &bull; <code>{ op: "ALU", dst, src }</code>: If <code>dst === "R10"</code> &rarr; <code>"R10_READONLY"</code>. Both <code>dst</code> and string <code>src</code> must be in <code>init</code> else <code>"UNINITIALIZED_REG"</code>.<br/>
+          &bull; <code>{ op: "CALL", argCount }</code>: Registers <code>R1..R&lt;argCount&gt;</code> must be in <code>init</code> (else <code>"UNINITIALIZED_REG"</code>). Clobbers <code>R1..R5</code> (removes them from <code>init</code>) and marks <code>R0</code> initialized (preserving <code>R6..R10</code>).<br/>
+          &bull; <code>{ op: "JMP", target }</code>: Must be valid index <code>&lt; insns.length</code> (else <code>"OUT_OF_BOUNDS_JUMP"</code>) and strictly forward <code>target &gt; pc</code> (else <code>"BACKWARD_JUMP"</code>).<br/>
+          &bull; <code>{ op: "JCOND", reg, target }</code>: <code>reg</code> must be in <code>init</code>; validate <code>target</code> like <code>JMP</code>; explore <em>both</em> fallthrough (<code>pc + 1</code>) and branch (<code>target</code>)!<br/>
+          &bull; <code>{ op: "EXIT" }</code>: <code>"R0"</code> must be in <code>init</code> (else <code>"R0_UNINITIALIZED"</code>).<br/>
+          &bull; If all reachable paths exit cleanly, return <code>{ ok: true, checkedStates }</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // FLAMEGRAPH STACK FOLDING</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>foldFlamegraph(samples)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Aggregate raw call-stack samples into inclusive &amp; self counts sorted by hottest execution paths.
+            </p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>samples</code> (array of <code>{ stack: string[], count: number }</code>):<br/>
+          &bull; Skip entries with empty <code>stack</code> or <code>count &lt;= 0</code>.<br/>
+          &bull; For each sample, walk prefixes <code>i = 0 .. stack.length - 1</code> with key <code>path = stack.slice(0, i + 1).join(";")</code>:<br/>
+          &nbsp;&nbsp;- Add <code>sample.count</code> to <code>inclusive</code> for every prefix.<br/>
+          &nbsp;&nbsp;- Add <code>sample.count</code> to <code>self</code> only when <code>i === stack.length - 1</code> (the leaf frame on CPU).<br/>
+          &bull; Return an array of <code>{ path, name, depth, inclusive, self }</code> (where <code>name = stack[i]</code>, <code>depth = i</code>) sorted by: <code>inclusive</code> descending, then <code>self</code> descending, then <code>path</code> ascending (ASCII <code>a.path &lt; b.path ? -1 : a.path &gt; b.path ? 1 : 0</code>).
+        </div>
+
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // TAIL LATENCY PERCENTILES</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>computeLatencyStats(latenciesUs)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Compute <code>p50</code>, <code>p95</code>, <code>p99</code>, <code>max</code>, and <code>mean</code> microseconds without mutating input arrays.
+            </p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Given <code>latenciesUs</code> (array of numbers in microseconds):<br/>
+          &bull; If not an array or empty, return <code>null</code>.<br/>
+          &bull; Sort a <em>copy</em> numerically ascending (do not mutate caller's array!).<br/>
+          &bull; Use nearest-rank percentile: <code>pct(p) = sorted[Math.ceil((p / 100) * n) - 1]</code>.<br/>
+          &bull; Return <code>{ count: n, min: sorted[0], p50: pct(50), p95: pct(95), p99: pct(99), max: sorted[n - 1], mean }</code> where <code>mean</code> is rounded to 2 decimal places (<code>Math.round((sum / n) * 100) / 100</code>).
+        </div>
+
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: QUIZ -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (Why Correct &amp; Why Every Wrong Choice Fails)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Production Profiling Commands &amp; Android Perfetto Forensics</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header"><span>Real Linux &amp; Android Profiling Forensics</span></div>
+          <pre class="code"># 1. Sample CPU stacks at 99 Hz in prod &amp; build FlameGraph
+perf record -F 99 -a -g -- sleep 15
+perf script | stackcollapse-perf.pl | flamegraph.pl &gt; cpu.svg
+
+# 2. Inspect loaded eBPF programs and maps on Linux / Android
+bpftool prog list
+adb shell ls -l /sys/fs/bpf
+
+# 3. Record a 10s Perfetto trace on Android (sched + binder + atrace)
+adb shell perfetto -o /data/misc/perfetto-traces/trace.pftrace -t 10s \
+  sched/sched_switch sched/sched_waking binder_driver gfx view
+
+# 4. Android native NDK profiling without root
+simpleperf record -p &lt;pid&gt; -f 1000 -g --duration 10</pre>
+        </div>
+
+        <div class="card">
+          <h3>Senior Engineer Mastery Checklist</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can explain why <code>strace</code> causes orders-of-magnitude more overhead than eBPF tracepoints.</span></li>
+            <li><input type="checkbox" /> <span>I understand eBPF's register ABI (<code>R0</code> return, <code>R1&ndash;R5</code> clobbered, <code>R6&ndash;R9</code> preserved, <code>R10</code> read-only FP) and static DAG verification.</span></li>
+            <li><input type="checkbox" /> <span>I know when to reach for a CPU flamegraph vs an Off-CPU flamegraph / Perfetto thread-state track.</span></li>
+            <li><input type="checkbox" /> <span>I never average away tail stalls—I measure <code>p95</code>, <code>p99</code>, and <code>max</code> latency distributions.</span></li>
+          </ul>
+          <div class="callout green" style="margin-top:0.85rem; margin-bottom:0; font-size:0.84rem;">
+            <strong>Next Step:</strong> Synthesize all 15 lessons for Staff/Senior architecture interviews in <strong>Lesson 16: Senior OS Systems Design &amp; Interview Synthesis</strong>.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a class="btn" href="lesson-14.html">&larr; Lesson 14: KVM &amp; pKVM</a>
+      <a class="btn" href="master-plan.html">Master Plan</a>
+      <a class="btn btn-primary" href="lesson-16.html">Lesson 16: Senior Synthesis &rarr;</a>
+    </div>
+  </main>
+
+  <script src="assets/os-course.js"></script>
+  <script>
+    const EBPF_PROGS = {
+      valid: {
+        insns: [
+          "0: MOV R6, R1       ; save ctx in callee-saved R6",
+          "1: MOV R1, R10      ; stack key ptr",
+          "2: CALL map_lookup  ; clobbers R1..R5, sets R0",
+          "3: JEQ R0, 0 -> 5   ; mandatory NULL check!",
+          "4: MOV R0, 0        ; return 0",
+          "5: EXIT"
+        ],
+        steps: [
+          { pc: 0, regs: { R0: "uninit", R1: "CTX", R2: "uninit", R6: "uninit", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "Verifier starts at PC=0: <code>R1</code> holds tracepoint context, <code>R10</code> holds read-only stack frame pointer." },
+          { pc: 1, regs: { R0: "uninit", R1: "CTX", R2: "uninit", R6: "CTX", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "<code>R6</code> saves context (<code>R6..R9</code> survive helper calls)." },
+          { pc: 2, regs: { R0: "PTR_OR_NULL", R1: "CLOBBERED", R2: "CLOBBERED", R6: "CTX", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "<code>CALL map_lookup</code> clobbers <code>R1..R5</code> and sets <code>R0 = PTR_TO_MAP_VALUE_OR_NULL</code>." },
+          { pc: 3, regs: { R0: "PTR_NON_NULL / 0", R1: "CLOBBERED", R2: "CLOBBERED", R6: "CTX", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "<code>JEQ R0, 0 -&gt; 5</code> splits path: fallthrough proves <code>R0 != NULL</code>; jump proves <code>R0 == 0</code>." },
+          { pc: 4, regs: { R0: "SCALAR(0)", R1: "CLOBBERED", R2: "CLOBBERED", R6: "CTX", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "<code>R0 = 0</code> on fallthrough; on null branch <code>R0</code> is already <code>0</code>." },
+          { pc: 5, regs: { R0: "SCALAR(0)", R1: "CLOBBERED", R2: "CLOBBERED", R6: "CTX", R10: "FP(512B)" }, verdict: ["VERIFIED & JIT'D", "verdict-ok"], msg: "<strong>PASS!</strong> All paths terminate in finite steps with initialized <code>R0</code> and proven-safe pointers. Kernel JITs bytecode to native ARM64/x86." }
+        ]
+      },
+      uninit: {
+        insns: [
+          "0: MOV R2, R1",
+          "1: CALL ktime_get_ns ; clobbers R1..R5!",
+          "2: MOV R0, R2        ; BUG: R2 was clobbered!",
+          "3: EXIT"
+        ],
+        steps: [
+          { pc: 0, regs: { R0: "uninit", R1: "CTX", R2: "CTX", R6: "uninit", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "<code>R2</code> gets context pointer from <code>R1</code>." },
+          { pc: 1, regs: { R0: "SCALAR", R1: "CLOBBERED", R2: "CLOBBERED!", R6: "uninit", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "<code>CALL</code> clobbers scratch registers <code>R1..R5</code>! Only <code>R6..R9</code> are callee-saved." },
+          { pc: 2, regs: { R0: "uninit", R1: "CLOBBERED", R2: "CLOBBERED!", R6: "uninit", R10: "FP(512B)" }, verdict: ["REJECTED (-EACCES)", "verdict-bad"], msg: "<strong>REJECTED at PC=2!</strong> Reading <code>R2</code> after a helper call leaks/reads uninitialized register state. Fix: save in <code>R6..R9</code>." }
+        ]
+      },
+      loop: {
+        insns: [
+          "0: MOV R2, 0",
+          "1: ADD R2, 1",
+          "2: JLT R2, R1 -> 1  ; BACK-EDGE TO PC=1!",
+          "3: MOV R0, R2",
+          "4: EXIT"
+        ],
+        steps: [
+          { pc: 0, regs: { R0: "uninit", R1: "CTX", R2: "SCALAR(0)", R6: "uninit", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "<code>R2</code> initialized to <code>0</code>." },
+          { pc: 1, regs: { R0: "uninit", R1: "CTX", R2: "SCALAR(1)", R6: "uninit", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "Increment <code>R2</code>." },
+          { pc: 2, regs: { R0: "uninit", R1: "CTX", R2: "SCALAR(1)", R6: "uninit", R10: "FP(512B)" }, verdict: ["REJECTED (LOOP)", "verdict-bad"], msg: "<strong>REJECTED at PC=2!</strong> Unbounded backward jump (<code>target 1 &lt;= pc 2</code>) fails termination proof—an infinite loop in a tracepoint would hang the CPU core!" }
+        ]
+      },
+      nullPtr: {
+        insns: [
+          "0: MOV R1, R10",
+          "1: CALL map_lookup  ; returns PTR_OR_NULL",
+          "2: LDX R3, [R0+0]   ; BUG: no NULL check!",
+          "3: MOV R0, R3",
+          "4: EXIT"
+        ],
+        steps: [
+          { pc: 0, regs: { R0: "uninit", R1: "FP(512B)", R3: "uninit", R6: "uninit", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "Setup key pointer in <code>R1</code>." },
+          { pc: 1, regs: { R0: "PTR_OR_NULL", R1: "CLOBBERED", R3: "uninit", R6: "uninit", R10: "FP(512B)" }, verdict: ["CHECKING", "verdict-wait"], msg: "<code>map_lookup</code> can miss and return <code>NULL</code> (<code>0</code>)." },
+          { pc: 2, regs: { R0: "PTR_OR_NULL", R1: "CLOBBERED", R3: "uninit", R6: "uninit", R10: "FP(512B)" }, verdict: ["REJECTED (NULL)", "verdict-bad"], msg: "<strong>REJECTED at PC=2!</strong> Dereferencing <code>R0</code> of type <code>map_value_or_null</code> without a prior <code>JEQ R0, 0</code> check would cause a kernel NULL-pointer Oops!" }
+        ]
+      }
+    };
+
+    let curProg = "valid";
+    let curEbpfStep = 0;
+
+    function renderEbpfSim() {
+      const p = EBPF_PROGS[curProg];
+      const st = p.steps[curEbpfStep];
+      const verdictEl = document.getElementById("ebpfVerdict");
+      verdictEl.textContent = st.verdict[0];
+      verdictEl.className = "verdict-badge " + st.verdict[1];
+
+      document.getElementById("ebpfCodeView").innerHTML = p.insns.map((line, i) => {
+        const isErr = i === st.pc && st.verdict[1] === "verdict-bad";
+        const isCur = i === st.pc && !isErr;
+        return `<div class="insn-line ${isErr ? "err" : isCur ? "active" : ""}"><span>${line}</span></div>`;
+      }).join("");
+
+      document.getElementById("ebpfRegView").innerHTML = Object.entries(st.regs).map(([k, v]) => `
+        <div class="reg-row"><span>${k}</span><span class="reg-val">${v}</span></div>
+      `).join("");
+
+      document.getElementById("ebpfExplain").innerHTML = st.msg;
+    }
+
+    document.getElementById("progValidBtn").addEventListener("click", () => { curProg = "valid"; curEbpfStep = 0; renderEbpfSim(); });
+    document.getElementById("progUninitBtn").addEventListener("click", () => { curProg = "uninit"; curEbpfStep = 0; renderEbpfSim(); });
+    document.getElementById("progLoopBtn").addEventListener("click", () => { curProg = "loop"; curEbpfStep = 0; renderEbpfSim(); });
+    document.getElementById("progNullBtn").addEventListener("click", () => { curProg = "nullPtr"; curEbpfStep = 0; renderEbpfSim(); });
+    document.getElementById("ebpfStepBtn").addEventListener("click", () => {
+      const len = EBPF_PROGS[curProg].steps.length;
+      curEbpfStep = (curEbpfStep + 1) % len;
+      renderEbpfSim();
+    });
+    document.getElementById("ebpfResetBtn").addEventListener("click", () => { curEbpfStep = 0; renderEbpfSim(); });
+    renderEbpfSim();
+
+    // Live Flamegraph Stack Folder widget
+    let fgSamples = [
+      { stack: ["main", "renderFrame", "binderTransact"], count: 35 },
+      { stack: ["main", "renderFrame", "drawText"], count: 25 },
+      { stack: ["main", "logWrite", "vfs_write"], count: 40 }
+    ];
+
+    function renderFlamegraph() {
+      const map = new Map();
+      let total = 0;
+      fgSamples.forEach((s) => {
+        total += s.count;
+        for (let i = 0; i < s.stack.length; i++) {
+          const path = s.stack.slice(0, i + 1).join(";");
+          const cur = map.get(path) || { path, name: s.stack[i], inclusive: 0, self: 0 };
+          cur.inclusive += s.count;
+          if (i === s.stack.length - 1) cur.self += s.count;
+          map.set(path, cur);
+        }
+      });
+      const rows = Array.from(map.values()).sort((a, b) => b.inclusive - a.inclusive || b.self - a.self).slice(0, 6);
+      const colors = ["#0969da", "#8250df", "#bf3989", "#d29922", "#1a7f37", "#0e7c86"];
+      document.getElementById("fgBars").innerHTML = rows.map((r, idx) => {
+        const pct = total ? Math.round((r.inclusive / total) * 100) : 0;
+        return `<div class="flame-row">
+          <div class="flame-bar" style="width:${Math.max(25, pct)}%; background:${colors[idx % colors.length]};">
+            <span>${r.path}</span><span>${pct}% (self ${r.self})</span>
+          </div>
+        </div>`;
+      }).join("");
+    }
+
+    document.getElementById("fgSyscallBtn").addEventListener("click", () => {
+      fgSamples.push({ stack: ["main", "logWrite", "vfs_write"], count: 30 });
+      renderFlamegraph();
+    });
+    document.getElementById("fgBinderBtn").addEventListener("click", () => {
+      fgSamples.push({ stack: ["main", "renderFrame", "binderTransact"], count: 30 });
+      renderFlamegraph();
+    });
+    document.getElementById("fgGcBtn").addEventListener("click", () => {
+      fgSamples.push({ stack: ["art_gc", "markSweep", "madvise_dontneed"], count: 35 });
+      renderFlamegraph();
+    });
+    document.getElementById("fgClearBtn").addEventListener("click", () => {
+      fgSamples = [{ stack: ["main", "renderFrame", "drawText"], count: 20 }];
+      renderFlamegraph();
+    });
+    renderFlamegraph();
+
+    window.LESSON_CONFIG = {
+      num: "15",
+      labs: {
+        1: {
+          fnName: "verifyEbpfProgram",
+          starter: `function verifyEbpfProgram(insns) {
+  // Statically verify all reachable paths from pc = 0:
+  // Initialized at entry: Set(["R1", "R10"])
+  // Error reasons:
+  //   "FALLTHROUGH_NO_EXIT", "R10_READONLY", "UNINITIALIZED_REG",
+  //   "BACKWARD_JUMP", "OUT_OF_BOUNDS_JUMP", "R0_UNINITIALIZED"
+  // Success: return { ok: true, checkedStates }
+}`,
+          hints: [
+            "Hint 1: Use a worklist/queue of `{ pc, init }` states where `init` is a `Set` of currently initialized register names, plus a `visited` `Set` keyed by `pc + ':' + Array.from(init).sort().join(',')` so diamond branches don't duplicate work.",
+            "Hint 2: Remember on `CALL`: check `R1..R<argCount>` are all in `init` BEFORE clobbering `R1..R5`! Then delete `R1`..`R5` from `init` and add `R0`.",
+            "Hint 3: On `JCOND`, check `reg` is in `init`, validate `target` (`target >= 0 && target < insns.length` else `OUT_OF_BOUNDS_JUMP`, `target > pc` else `BACKWARD_JUMP`), and push BOTH `{ pc: pc + 1, init: new Set(init) }` and `{ pc: target, init: new Set(init) }` onto the worklist."
+          ],
+          solution: `function verifyEbpfProgram(insns) {
+  if (!Array.isArray(insns) || insns.length === 0) {
+    return { ok: false, reason: "FALLTHROUGH_NO_EXIT", pc: 0 };
+  }
+  const visited = new Set();
+  const stack = [{ pc: 0, init: new Set(["R1", "R10"]) }];
+  let checkedStates = 0;
+
+  while (stack.length > 0) {
+    const state = stack.pop();
+    const pc = state.pc;
+    const init = state.init;
+
+    if (pc >= insns.length) {
+      return { ok: false, reason: "FALLTHROUGH_NO_EXIT", pc };
+    }
+    const key = pc + ":" + Array.from(init).sort().join(",");
+    if (visited.has(key)) continue;
+    visited.add(key);
+    checkedStates++;
+
+    const insn = insns[pc];
+    if (insn.op === "MOV") {
+      if (insn.dst === "R10") return { ok: false, reason: "R10_READONLY", pc };
+      if (typeof insn.src === "string" && !init.has(insn.src)) {
+        return { ok: false, reason: "UNINITIALIZED_REG", pc };
+      }
+      init.add(insn.dst);
+      stack.push({ pc: pc + 1, init });
+    } else if (insn.op === "ALU") {
+      if (insn.dst === "R10") return { ok: false, reason: "R10_READONLY", pc };
+      if (!init.has(insn.dst) || (typeof insn.src === "string" && !init.has(insn.src))) {
+        return { ok: false, reason: "UNINITIALIZED_REG", pc };
+      }
+      stack.push({ pc: pc + 1, init });
+    } else if (insn.op === "CALL") {
+      const argc = insn.argCount || 0;
+      for (let i = 1; i <= argc; i++) {
+        if (!init.has("R" + i)) {
+          return { ok: false, reason: "UNINITIALIZED_REG", pc };
+        }
+      }
+      for (let i = 1; i <= 5; i++) init.delete("R" + i);
+      init.add("R0");
+      stack.push({ pc: pc + 1, init });
+    } else if (insn.op === "JMP") {
+      if (!Number.isInteger(insn.target) || insn.target < 0 || insn.target >= insns.length) {
+        return { ok: false, reason: "OUT_OF_BOUNDS_JUMP", pc };
+      }
+      if (insn.target <= pc) {
+        return { ok: false, reason: "BACKWARD_JUMP", pc };
+      }
+      stack.push({ pc: insn.target, init });
+    } else if (insn.op === "JCOND") {
+      if (!init.has(insn.reg)) {
+        return { ok: false, reason: "UNINITIALIZED_REG", pc };
+      }
+      if (!Number.isInteger(insn.target) || insn.target < 0 || insn.target >= insns.length) {
+        return { ok: false, reason: "OUT_OF_BOUNDS_JUMP", pc };
+      }
+      if (insn.target <= pc) {
+        return { ok: false, reason: "BACKWARD_JUMP", pc };
+      }
+      stack.push({ pc: pc + 1, init: new Set(init) });
+      stack.push({ pc: insn.target, init: new Set(init) });
+    } else if (insn.op === "EXIT") {
+      if (!init.has("R0")) {
+        return { ok: false, reason: "R0_UNINITIALIZED", pc };
+      }
+    }
+  }
+  return { ok: true, checkedStates };
+}`,
+          solutionExplain: "Exploring all reachable `(pc, initializedSet)` states over a forward-only DAG mirrors how Linux's `bpf_check()` proves finite termination and prevents uninitialized register reads across every branch.",
+          tests(fn) {
+            const validProg = [
+              { op: "MOV", dst: "R6", src: "R1" },
+              { op: "MOV", dst: "R1", src: "R10" },
+              { op: "CALL", argCount: 1 },
+              { op: "JCOND", reg: "R0", target: 5 },
+              { op: "MOV", dst: "R0", src: 0 },
+              { op: "EXIT" }
+            ];
+            const clobberBug = [
+              { op: "MOV", dst: "R2", src: "R1" },
+              { op: "CALL", argCount: 1 },
+              { op: "MOV", dst: "R0", src: "R2" },
+              { op: "EXIT" }
+            ];
+            const loopBug = [
+              { op: "MOV", dst: "R2", src: 0 },
+              { op: "ALU", dst: "R2", src: 1 },
+              { op: "JCOND", reg: "R2", target: 1 },
+              { op: "MOV", dst: "R0", src: 0 },
+              { op: "EXIT" }
+            ];
+            const noR0Exit = [
+              { op: "MOV", dst: "R6", src: "R1" },
+              { op: "EXIT" }
+            ];
+            const branchUninitR0 = [
+              { op: "JCOND", reg: "R1", target: 3 },
+              { op: "MOV", dst: "R0", src: 1 },
+              { op: "EXIT" },
+              { op: "EXIT" }
+            ];
+
+            const t1 = fn(validProg);
+            const t2 = fn(clobberBug);
+            const t3 = fn(loopBug);
+            const t4 = fn(noR0Exit);
+            const t5 = fn(branchUninitR0);
+
+            return [
+              {
+                name: "Valid forward DAG program with callee-saved R6 + JCOND passes",
+                pass: t1.ok === true && t1.checkedStates >= 6,
+                detail: JSON.stringify(t1)
+              },
+              {
+                name: "Reading caller-saved R2 after CALL is rejected as UNINITIALIZED_REG",
+                pass: t2.ok === false && t2.reason === "UNINITIALIZED_REG" && t2.pc === 2,
+                detail: JSON.stringify(t2)
+              },
+              {
+                name: "Backward jump rejected as BACKWARD_JUMP",
+                pass: t3.ok === false && t3.reason === "BACKWARD_JUMP" && t3.pc === 2,
+                detail: JSON.stringify(t3)
+              },
+              {
+                name: "Missing R0 on direct or branched EXIT path rejected as R0_UNINITIALIZED",
+                pass: t4.ok === false && t4.reason === "R0_UNINITIALIZED" && t5.ok === false && t5.reason === "R0_UNINITIALIZED" && t5.pc === 3,
+                detail: `direct=${JSON.stringify(t4)}, branch=${JSON.stringify(t5)}`
+              }
+            ];
+          }
+        },
+        2: {
+          fnName: "foldFlamegraph",
+          starter: `function foldFlamegraph(samples) {
+  // Aggregate each stack prefix into { path, name, depth, inclusive, self }
+  // Ignore empty stacks or count <= 0.
+  // Sort by inclusive desc, then self desc, then path asc.
+}`,
+          hints: [
+            "Hint 1: Use a `Map` keyed by `path = sample.stack.slice(0, i + 1).join(';')`. Initialize `{ path, name: sample.stack[i], depth: i, inclusive: 0, self: 0 }` on first sight.",
+            "Hint 2: Every prefix `0 <= i < stack.length` gets `entry.inclusive += sample.count`. ONLY the final element `i === stack.length - 1` gets `entry.self += sample.count`.",
+            "Hint 3: Sort using `(a, b) => b.inclusive - a.inclusive || b.self - a.self || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)`."
+          ],
+          solution: `function foldFlamegraph(samples) {
+  if (!Array.isArray(samples)) return [];
+  const map = new Map();
+
+  for (const s of samples) {
+    if (!s || !Array.isArray(s.stack) || s.stack.length === 0 || !(s.count > 0)) {
+      continue;
+    }
+    for (let i = 0; i < s.stack.length; i++) {
+      const path = s.stack.slice(0, i + 1).join(";");
+      let node = map.get(path);
+      if (!node) {
+        node = { path, name: s.stack[i], depth: i, inclusive: 0, self: 0 };
+        map.set(path, node);
+      }
+      node.inclusive += s.count;
+      if (i === s.stack.length - 1) {
+        node.self += s.count;
+      }
+    }
+  }
+
+  return Array.from(map.values()).sort(
+    (a, b) => b.inclusive - a.inclusive || b.self - a.self || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
+  );
+}`,
+          solutionExplain: "Prefix-folding turns raw stack unwinds into collapsed flamegraph entries where `inclusive` captures total subtree time and `self` isolates leaf-frame CPU bottlenecks.",
+          tests(fn) {
+            const res = fn([
+              { stack: ["main", "binder", "mutex"], count: 40 },
+              { stack: ["main", "binder", "copy"], count: 10 },
+              { stack: ["main", "binder"], count: 5 },
+              { stack: ["main", "render"], count: 25 },
+              { stack: [], count: 100 },
+              { stack: ["ignored"], count: 0 }
+            ]);
+            const byPath = Object.fromEntries(res.map((r) => [r.path, r]));
+            return [
+              {
+                name: "Root frame 'main' has inclusive=80 and self=0",
+                pass: res.length === 5 && res[0].path === "main" && res[0].inclusive === 80 && res[0].self === 0 && res[0].depth === 0,
+                detail: JSON.stringify(res[0])
+              },
+              {
+                name: "Intermediate frame 'main;binder' accumulates inclusive=55 and self=5",
+                pass: byPath["main;binder"] && byPath["main;binder"].inclusive === 55 && byPath["main;binder"].self === 5,
+                detail: JSON.stringify(byPath["main;binder"])
+              },
+              {
+                name: "Leaf frame 'main;binder;mutex' ranks ahead of 'main;render' by inclusive count",
+                pass: res[1].path === "main;binder" && res[2].path === "main;binder;mutex" && res[3].path === "main;render",
+                detail: res.map((r) => `${r.path}(${r.inclusive}/${r.self})`).join(", ")
+              }
+            ];
+          }
+        },
+        3: {
+          fnName: "computeLatencyStats",
+          starter: `function computeLatencyStats(latenciesUs) {
+  // 1. Return null if !Array.isArray(latenciesUs) || latenciesUs.length === 0
+  // 2. Sort a copy ascending numerically
+  // 3. Nearest-rank percentile: sorted[Math.ceil((p / 100) * n) - 1]
+  // 4. Return { count, min, p50, p95, p99, max, mean } (mean rounded to 2 decimals)
+}`,
+          hints: [
+            "Hint 1: Never call `latenciesUs.sort()` directly—in JavaScript `.sort()` mutates the array in place AND sorts lexicographically (`100 < 20`) unless you pass `(a, b) => a - b`!",
+            "Hint 2: Copy first: `const sorted = [...latenciesUs].sort((a, b) => a - b);`",
+            "Hint 3: For nearest-rank percentile `p`, compute `const idx = Math.max(0, Math.min(n - 1, Math.ceil((p / 100) * n) - 1));`."
+          ],
+          solution: `function computeLatencyStats(latenciesUs) {
+  if (!Array.isArray(latenciesUs) || latenciesUs.length === 0) {
+    return null;
+  }
+  const sorted = [...latenciesUs].sort((a, b) => a - b);
+  const n = sorted.length;
+  const pct = (p) => {
+    const idx = Math.max(0, Math.min(n - 1, Math.ceil((p / 100) * n) - 1));
+    return sorted[idx];
+  };
+  let sum = 0;
+  for (const v of sorted) sum += v;
+  const mean = Math.round((sum / n) * 100) / 100;
+  return {
+    count: n,
+    min: sorted[0],
+    p50: pct(50),
+    p95: pct(95),
+    p99: pct(99),
+    max: sorted[n - 1],
+    mean
+  };
+}`,
+          solutionExplain: "Numeric ascending sort on a shallow copy plus nearest-rank percentiles reveals bimodal tail stalls (p95/p99/max) that arithmetic mean and p50 hide.",
+          tests(fn) {
+            const input = [100, 10, 20, 30, 40, 50, 60, 70, 80, 90, 5000];
+            const copy = [...input];
+            const s1 = fn(input);
+            const big = Array.from({ length: 100 }, (_, i) => i + 1);
+            const s2 = fn(big);
+            const s3 = fn([42]);
+            const s4 = fn([]);
+            return [
+              {
+                name: "Empty array returns null; single element returns all stats equal to 42",
+                pass: s4 === null && s3.count === 1 && s3.p50 === 42 && s3.p99 === 42 && s3.max === 42 && s3.mean === 42,
+                detail: `empty=${s4}, single=${JSON.stringify(s3)}`
+              },
+              {
+                name: "Numeric sort (not lexicographic) & input array is not mutated",
+                pass: JSON.stringify(input) === JSON.stringify(copy) && s1.min === 10 && s1.max === 5000 && s1.p50 === 60 && s1.p99 === 5000,
+                detail: JSON.stringify(s1)
+              },
+              {
+                name: "100-sample distribution computes exact p50=50, p95=95, p99=99, mean=50.5",
+                pass: s2.count === 100 && s2.p50 === 50 && s2.p95 === 95 && s2.p99 === 99 && s2.max === 100 && s2.mean === 50.5,
+                detail: JSON.stringify(s2)
+              }
+            ];
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "1. Why can attaching `strace` to a latency-sensitive Android system service cause an ANR or 20x slowdown in production?",
+          options: [
+            "A. strace recompiles the Linux kernel on every syscall.",
+            "B. strace uses ptrace(), stopping the traced thread on EVERY syscall entry and exit and forcing two extra context switches to/from the tracer process per syscall.",
+            "C. strace disables the CPU's L1 data cache.",
+            "D. strace encrypts all file descriptors with AES-256."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `strace` is a purely userspace binary and never recompiles the kernel.",
+            "Correct (B): `PTRACE_SYSCALL` halts the tracee twice per syscall and wakes the `strace` process to read registers via `ptrace(PTRACE_GETREGSET)`, turning a ~200ns syscall into tens of microseconds.",
+            "Wrong (C): CPU caches stay enabled under `ptrace`.",
+            "Wrong (D): `strace` only inspects registers and memory; it does not encrypt anything."
+          ]
+        },
+        {
+          q: "2. An eBPF program calls `val = bpf_map_lookup_elem(&my_map, &key)` and immediately writes `(*val)++`. Why does the Linux eBPF verifier reject it with `R0 invalid mem access 'map_value_or_null'`?",
+          options: [
+            "A. eBPF programs are forbidden from modifying map values.",
+            "B. bpf_map_lookup_elem returns a nullable pointer; without an explicit `if (!val) return 0;` branch, dereferencing R0 could crash the kernel with a NULL pointer dereference.",
+            "C. eBPF only supports 32-bit counters.",
+            "D. Maps can only be accessed from userspace, never inside kernel probes."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Updating map values in-place (with atomic or per-CPU maps) is a core eBPF pattern.",
+            "Correct (B): The verifier tracks pointer types (`PTR_TO_MAP_VALUE_OR_NULL`). A `NULL` check narrows the fallthrough branch type to `PTR_TO_MAP_VALUE`, proving safety before JIT.",
+            "Wrong (C): eBPF is a 64-bit ISA supporting `u64` counters and `BPF_F_LOCK` / `__sync_fetch_and_add`.",
+            "Wrong (D): BPF maps exist specifically to share state between kernel eBPF probes and userspace."
+          ]
+        },
+        {
+          q: "3. In the eBPF calling convention, you store a socket pointer in R3, call `bpf_ktime_get_ns()`, and then read R3 afterward. What does the verifier say?",
+          options: [
+            "A. Accepted, because R3 is callee-saved.",
+            "B. Rejected! Helper calls clobber caller-saved registers R1–R5; values needed across a CALL must be saved in callee-saved registers R6–R9 or on the 512B stack.",
+            "C. Accepted only on ARM64, rejected on x86-64.",
+            "D. Rejected because bpf_ktime_get_ns() cannot be called from eBPF."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `R1–R5` are caller-saved argument/scratch registers, NOT callee-saved.",
+            "Correct (B): Every eBPF `CALL` instruction invalidates `R1–R5` and overwrites `R0` with the helper return value. Only `R6–R9` and `R10` (stack FP) survive across helper calls.",
+            "Wrong (C): The eBPF verifier operates on architecture-neutral eBPF bytecode before JIT.",
+            "Wrong (D): `bpf_ktime_get_ns()` is one of the most common allowed eBPF tracing helpers."
+          ]
+        },
+        {
+          q: "4. Your Android app suffers 300ms UI freezes, but a `simpleperf` On-CPU flamegraph shows the UI thread consuming almost 0% CPU. Why, and what tool fixes your blind spot?",
+          options: [
+            "A. simpleperf only profiles Java code, not C++.",
+            "B. On-CPU sampling only catches threads actively running on a core; threads blocked on a futex, Binder reply, or fsync() are sleeping Off-CPU. Use Perfetto (sched_switch + thread_state) or an Off-CPU eBPF trace.",
+            "C. A 300ms freeze means the CPU clock stopped completely.",
+            "D. You should switch to `perf stat` average IPC to see which mutex blocked."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `simpleperf` samples native C++ stacks (DWARF/FP) and ART JIT frames alike.",
+            "Correct (B): Sleeping threads are descheduled off the CPU! Perfetto `sched_switch` + `sched_waking` tracks show exact Off-CPU duration and which lock/Binder peer woke the thread.",
+            "Wrong (C): Other threads keep running; only the UI thread is blocked in the wait queue.",
+            "Wrong (D): Aggregate `perf stat` hardware counters have no visibility into lock wait chains."
+          ]
+        },
+        {
+          q: "5. Why does the eBPF verifier impose a 512-byte stack limit and reject arbitrary backward jumps?",
+          options: [
+            "A. To force developers to use recursion instead of loops.",
+            "B. To prevent kernel stack overflow (kernel stacks are small, e.g. 16KB, and share IRQ/trap paths) and guarantee finite termination inside atomic/IRQ probe contexts.",
+            "C. Because Linux only allocates 512 bytes of RAM for all eBPF maps combined.",
+            "D. To prevent eBPF programs from compiling with clang."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Unbounded recursion is also forbidden by the verifier for the exact same stack-overflow reason.",
+            "Correct (B): eBPF hooks execute synchronously inside critical kernel paths (interrupts, scheduler, network RX). A stack overflow or infinite loop would immediately panic or wedge the kernel.",
+            "Wrong (C): eBPF maps reside in normal kernel heap/vmalloc memory and can hold many megabytes.",
+            "Wrong (D): `clang -target bpf` is the standard compiler for eBPF programs."
+          ]
+        },
+        {
+          q: "6. A storage service reports p50 write latency = 0.2ms, yet users complain of periodic 180ms stalls. What does this illustrate?",
+          options: [
+            "A. p50 is broken when latency is measured in microseconds.",
+            "B. Bimodal / tail latency: 99% of writes hit fast page cache (0.2ms), while 1% hit synchronous journal flushes or lock contention (180ms), visible only in p99/p99.9/max.",
+            "C. Mean latency is always lower than p50.",
+            "D. The clock went backwards during NTP sync."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Units (ms vs &mu;s) don't change the median rank.",
+            "Correct (B): Median (`p50`) hides anything affecting &lt;50% of requests. Tracking `p95`, `p99`, and `max` catches rare synchronous disk stalls, GC pauses, and lock convoys.",
+            "Wrong (C): Right-skewed latency tails pull the `mean` *above* `p50`, not below.",
+            "Wrong (D): `CLOCK_MONOTONIC` / `bpf_ktime_get_ns()` never jumps backwards due to NTP."
+          ]
+        }
+      ]
+    };
+
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 06 — Callbacks, Futures &amp; How suspend Compiles to CPS State Machines</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 06 · Coroutine Internals</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 2 · Lesson 06 · Coroutine Internals</div>
+      <h1>Callbacks, Futures &amp; How <code>suspend</code> Compiles to CPS State Machines</h1>
+      <p class="hero-sub">
+        Decompile a Kotlin <code>suspend</code> function in your head: <code>Continuation&lt;T&gt;</code>, the <code>label</code> state machine,
+        spilling local variables across suspension points, and returning <code>COROUTINE_SUSPENDED</code> without blocking any OS thread.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. CPS State Machine Stepper</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Production Kotlin &amp; Android</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>From Callback Pyramids to Heap-Allocated State Machines</h2>
+      <p class="section-lead">
+        A Kotlin <strong>coroutine</strong> is not a JVM OS thread or magic runtime trick—it is a user-space suspendable computation represented by a heap
+        <code>Continuation&lt;T&gt;</code> object whose bytecode is rewritten via <strong>Continuation-Passing Style (CPS)</strong>
+        (<a href="https://kotlinlang.org/docs/coroutines-basics.html" target="_blank" rel="noopener">Kotlin Coroutines Basics</a>;
+        <a href="https://kotlinlang.org/docs/coroutines-guide.html" target="_blank" rel="noopener">Kotlin Coroutines Guide</a>).
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">What CPS Transformation Does</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            Every <code>suspend fun fetchUser(id: Int): User</code> compiles to an extra hidden parameter:<br/><br/>
+            <code>fun fetchUser(id: Int, cont: Continuation&lt;User&gt;): Any?</code><br/><br/>
+            Instead of returning <code>User</code> by blocking the OS thread stack, the function either returns a synchronous <code>User</code> directly (fast path) or returns the sentinel <code>COROUTINE_SUSPENDED</code> and frees the OS thread immediately.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">Why <code>label</code> + Spilled Locals Exist</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            When an OS thread unwinds and leaves a <code>suspend</code> function, its native call stack disappears.<br/><br/>
+            To resume later where it left off, <code>kotlinc</code> generates a <code>ContinuationImpl</code> subclass holding:<br/>
+            • <code>var label: Int</code> — which suspension point to jump to next.<br/>
+            • <strong>Spilled fields</strong> (e.g., <code>L$0</code>, <code>I$0</code>) — any local variables needed after a suspension point.<br/>
+            • <code>resumeWith(Result&lt;T&gt;)</code> — callback that restores state and re-enters <code>invokeSuspend</code>.
+          </p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 24px;">Comparing Async Control Models on the JVM</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Stack &amp; Heap Footprint</th>
+              <th>Error Handling</th>
+              <th>Cancellation</th>
+              <th>OS Thread Behavior</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Raw Callbacks</strong></td>
+              <td>Closure objects per nested step (pyramid of doom)</td>
+              <td>Split <code>onError</code> branches; <code>try/catch</code> cannot span async callbacks</td>
+              <td>Manual listener removal; easy to leak or double-fire</td>
+              <td>Non-blocking, but hard to compose loops or <code>try/finally</code></td>
+            </tr>
+            <tr>
+              <td><strong><code>Future</code> / <code>CompletableFuture</code></strong></td>
+              <td>Chain of stage wrapper objects per <code>thenCompose</code></td>
+              <td><code>exceptionally</code> / <code>handle</code> chains; checked wrappers</td>
+              <td><code>cancel(true)</code> does not propagate down arbitrary custom trees</td>
+              <td><code>.get()</code> parks a ~1 MB OS thread; async chains avoid <code>while</code>/<code>try</code></td>
+            </tr>
+            <tr>
+              <td><strong>Kotlin <code>suspend</code> (CPS)</strong></td>
+              <td><strong>Single</strong> heap <code>ContinuationImpl</code> per function call</td>
+              <td>Standard <code>try / catch / finally</code> across suspend points</td>
+              <td>Cooperative <code>Job</code> tree via <code>suspendCancellableCoroutine</code></td>
+              <td><strong>Zero OS threads parked</strong> while suspended; switches cooperatively at <code>suspend</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-top: 18px;">
+        <h3 style="margin-top:0;">Anatomy of a Compiler-Generated State Machine</h3>
+<pre>// Kotlin source you write:
+suspend fun loadProfile(userId: Int): Profile {
+    val token = fetchToken(userId)      // Suspend point #0
+    return fetchProfile(userId, token)  // Suspend point #1
+}
+
+// Conceptual JVM bytecode shape generated by kotlinc:
+fun loadProfile(userId: Int, completion: Continuation&lt;Profile&gt;): Any? {
+    val cont = completion as? LoadProfileContinuation ?: LoadProfileContinuation(completion)
+    when (cont.label) {
+        0 -&gt; {
+            ResultKt.throwOnFailure(cont.result)
+            cont.userId = userId                 // Spill local before suspend!
+            cont.label = 1                       // Advance state before async call
+            val res = fetchToken(userId, cont)
+            if (res === COROUTINE_SUSPENDED) return COROUTINE_SUSPENDED // Free OS thread!
+            cont.result = res
+            // Falls through synchronously if fetchToken returned a cached value!
+        }
+        1 -&gt; {
+            ResultKt.throwOnFailure(cont.result) // Rethrows if resumed with Result.failure
+            val token = cont.result as String
+            cont.label = 2
+            val res = fetchProfile(cont.userId, token, cont)
+            if (res === COROUTINE_SUSPENDED) return COROUTINE_SUSPENDED
+            return res
+        }
+        2 -&gt; {
+            ResultKt.throwOnFailure(cont.result)
+            return cont.result as Profile
+        }
+    }
+}</pre>
+      </div>
+
+      <div class="callout warn">
+        <strong>Two critical invariants:</strong> (1) Returning <code>COROUTINE_SUSPENDED</code> unwinds the stack without allocating a new thread—the dispatcher is free to run another coroutine or render UI frames immediately.
+        (2) Calling a <code>suspend</code> function does <em>not</em> automatically switch threads; execution stays on the caller's thread until a dispatcher or callback explicitly resumes <code>cont.resumeWith(...)</code> elsewhere.
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive CPS State Machine Stepper</div>
+      <h2>Step Through <code>Label 0 → COROUTINE_SUSPENDED → resumeWith → Label 1 → Label 2</code></h2>
+      <p class="section-lead">
+        Trace how a 3-step Kotlin <code>suspend</code> function executes on a single dispatcher thread without blocking, how local variables spill onto the heap <code>Continuation</code>, and why synchronous cache hits skip thread switching.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="async">Async Suspend (Non-Blocking)</button>
+            <button class="btn" data-mode="fastpath">Sync Fast-Path (Cache Hit)</button>
+            <button class="btn" data-mode="error">Failure via Result.failure</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span>Dispatcher OS Thread</span><span id="sim-step-counter">Step 0 / 0</span></div>
+              <div class="timeline-track" id="lane-thread"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Async I/O / Network Callback</span><span>Non-Blocking Hardware</span></div>
+              <div class="timeline-track" id="lane-io"></div>
+            </div>
+
+            <div class="registers-grid">
+              <div class="reg-card">
+                <div class="reg-name">Continuation.label</div>
+                <div class="reg-val" id="reg-label" style="color:var(--accent);">0</div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">Spilled Heap Locals</div>
+                <div class="reg-val" id="reg-locals" style="color:var(--purple); font-size:0.88rem;">userId: 42</div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">OS Thread / Sentinel</div>
+                <div class="reg-val" id="reg-thread" style="color:var(--green); font-size:0.88rem;">READY</div>
+              </div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Click <strong>Step →</strong> or <strong>▶ Play</strong> to watch <code>loadProfile(42)</code> transition across labels and free the OS thread.
+            </div>
+          </div>
+
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">CPS STATE MACHINE TRACE LOG</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; Android</div>
+      <h2>Junior Traps vs. Senior Patterns in Kotlin</h2>
+      <p class="section-lead">
+        Follow <a href="https://developer.android.com/kotlin/coroutines/coroutines-best-practices" target="_blank" rel="noopener">Android Coroutines Best Practices</a> and bridge legacy SDKs safely without blocking OS threads or leaking callbacks.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Callback Pyramid &amp; Blocking Futures vs. Sequential <code>suspend</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Nested Callbacks or Future.get()</span></div>
+<pre>// Pyramid of doom: broken try/catch, tangled cleanup
+authApi.fetchToken(userId, { token -&gt;
+    profileApi.fetchProfile(token, { profile -&gt;
+        cacheApi.save(profile, { render(profile) }, ::onErr)
+    }, ::onErr)
+}, ::onErr)
+
+// Or Future trap: parks a ~1MB OS thread idle!
+val profile = futureProfile.get() // Blocks thread!</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Clean Sequential suspend</span></div>
+<pre>// Compiles to flat state machine; zero parked threads
+suspend fun loadAndSave(userId: Int): Profile {
+    return try {
+        val token = authApi.fetchToken(userId)
+        val profile = profileApi.fetchProfile(token)
+        cacheApi.save(profile)
+        profile
+    } catch (e: IOException) {
+        cacheApi.readFallback(userId)
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: Understanding What the Compiler Generates (<code>suspend</code> != Thread Switch)</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Assuming suspend Means Background</span></div>
+<pre>// Called from Main thread (e.g., viewModelScope.launch)
+suspend fun parseLargeFile(file: File): Config {
+    // No suspension point or dispatcher switch here!
+    // Runs 100% synchronously on Dispatchers.Main -&gt; ANR!
+    return json.decodeFromString(file.readText())
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Main-Safe withContext(Dispatcher)</span></div>
+<pre>// Main-safe: explicitly shifts blocking I/O &amp; CPU parsing
+suspend fun parseLargeFile(file: File): Config {
+    val raw = withContext(Dispatchers.IO) {
+        file.readText()
+    }
+    return withContext(Dispatchers.Default) {
+        json.decodeFromString(raw)
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: Bridging Legacy Callbacks Safely with <code>suspendCancellableCoroutine</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: suspendCoroutine + Double Resume</span></div>
+<pre>suspend fun Call.awaitLegacy(): Response =
+    suspendCoroutine { cont -&gt; // Ignores Job cancellation!
+        enqueue(object : Callback {
+            override fun onResponse(c: Call, r: Response) {
+                cont.resume(r) // Crashes if fired twice!
+            }
+            override fun onFailure(c: Call, e: IOException) {
+                cont.resumeWithException(e)
+            }
+        })
+    }</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Cancellable + Single-Shot Guard</span></div>
+<pre>suspend fun Call.awaitSafe(): Response =
+    suspendCancellableCoroutine { cont -&gt;
+        cont.invokeOnCancellation { cancel() } // Cancel HTTP!
+        enqueue(object : Callback {
+            override fun onResponse(c: Call, r: Response) {
+                if (cont.isActive) cont.resume(r)
+            }
+            override fun onFailure(c: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWithException(e)
+            }
+        })
+    }</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Write code below and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>). Each starter exposes a flaw you must fix.</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 6.1 · COMPILER CPS STATE MACHINE</span>
+            <h3 style="margin:8px 0 4px;">Build a Manual 3-Label CPS State Machine</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>runCpsStateMachine(userId, api, onComplete)</code> transitioning <code>label</code> <code>0 → 1 → 2</code> without blocking.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Create a continuation object <code>cont</code> with <code>label: 0</code>, spilled locals (<code>userId</code>, <code>token: null</code>), <code>result: null</code>, and <code>resumeWith(val)</code>.<br/>
+          • <code>label 0</code>: advance <code>cont.label = 1</code>, call <code>api.fetchToken(cont.userId, cont)</code>. If it returns <code>'COROUTINE_SUSPENDED'</code>, return <code>'COROUTINE_SUSPENDED'</code> immediately.<br/>
+          • <code>label 1</code>: if <code>cont.result instanceof Error</code> propagate to <code>onComplete(err, null)</code>; else spill <code>cont.token = cont.result</code>, advance <code>cont.label = 2</code>, call <code>api.fetchProfile(cont.token, cont)</code> (handle <code>'COROUTINE_SUSPENDED'</code>).<br/>
+          • <code>label 2</code>: if error propagate; else build <code>{ userId: cont.userId, token: cont.token, profile: cont.result }</code>, call <code>onComplete(null, out)</code>, and return <code>out</code>. Also handle synchronous fast-path return values!
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_6_1_cps_state_machine.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 6.2 · SINGLE-SHOT CONTINUATION BRIDGE</span>
+            <h3 style="margin:8px 0 4px;">Bridge a Legacy Callback API with Single-Shot Settlement &amp; Cleanup</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>bridgeCallbackToPromise(id, legacyFetch, cancelToken)</code> guarding against duplicate callbacks and leaks.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>legacyFetch(id, onSuccess, onError)</code> starts work and may return an optional <code>cleanup()</code> function.<br/>
+          • Optional <code>cancelToken</code> exposes <code>isCancelled</code> (boolean) and <code>onCancel(cb)</code>.<br/>
+          • Reject immediately with <code>new Error('Cancelled')</code> if <code>cancelToken?.isCancelled</code> is already true (do not invoke <code>legacyFetch</code>).<br/>
+          • Guarantee single-shot settlement (ignore duplicate <code>onSuccess</code>/<code>onError</code>/cancel fires) and invoke <code>cleanup()</code> at most once—even if <code>onSuccess</code> runs synchronously before <code>legacyFetch</code> returns <code>cleanup</code>!
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_6_2_callback_bridge.js</span><span>Kotlin suspendCancellableCoroutine equivalent</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 6.3 · CONTINUATION TIMEOUT RACE</span>
+            <h3 style="margin:8px 0 4px;">Race an Async Continuation Against a Timer Without Leaking Timers</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>withTimeoutRace(promiseFn, timeoutMs)</code> clearing the timer whenever work settles early.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Invoke <code>promiseFn()</code> and race it against a <code>setTimeout</code> timer that rejects with <code>new Error(`Timeout after ${timeoutMs}ms`)</code>.<br/>
+          • Always call <code>clearTimeout(timerId)</code> in a <code>finally</code> block when <code>promiseFn()</code> resolves OR rejects before the deadline so no timer leaks.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_6_3_timeout_race.js</span><span>Kotlin withTimeout / select race equivalent</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in word count so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Study the
+          <a href="https://kotlinlang.org/docs/coroutines-basics.html" target="_blank" rel="noopener">Kotlin Coroutines Guide &amp; CPS Design</a>
+          and keep <a href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a> bookmarked for dispatcher, cancellation, and Flow invariants.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"Show me the javap bytecode of a suspend loop"</em> or <em>"Why does suspendCancellableCoroutine check isActive before resuming?"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0005-producers-consumers-semaphores-backpressure.html">← Lesson 05</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0007-structured-concurrency-job-trees.html">Lesson 07 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_SCENARIOS = {
+      async: {
+        steps: [
+          {
+            thread: { cls: 'ta', txt: 'L0: enter' },
+            io: null,
+            label: '0 → 1',
+            locals: 'userId: 42',
+            threadState: 'RUNNING (Thread-1)',
+            type: '',
+            msg: 'Label 0: invokeSuspend() spills userId=42 to heap Continuation, sets label=1, calls fetchToken(42, cont).'
+          },
+          {
+            thread: { cls: 'sw', txt: 'SUSPENDED' },
+            io: { cls: 'io', txt: 'HTTP token' },
+            label: '1',
+            locals: 'userId: 42',
+            threadState: 'FREED! (COROUTINE_SUSPENDED)',
+            type: 'good',
+            msg: 'fetchToken returns COROUTINE_SUSPENDED! Call stack unwinds and OS Thread-1 is immediately freed.'
+          },
+          {
+            thread: { cls: 'tb', txt: 'Peer: UI/Task' },
+            io: { cls: 'io', txt: 'Wait 40ms' },
+            label: '1 (Heap)',
+            locals: 'userId: 42',
+            threadState: 'BUSY ON PEER TASK',
+            type: 'warn',
+            msg: 'Thread-1 renders UI / runs Peer Coroutine while Continuation sleeps cheaply on the heap.'
+          },
+          {
+            thread: { cls: 'ta', txt: 'resumeWith' },
+            io: { cls: 'io', txt: 'Token OK' },
+            label: '1',
+            locals: 'userId: 42, token: "tok_9a"',
+            threadState: 'RESUMED (Thread-1)',
+            type: 'good',
+            msg: 'Network callback invokes cont.resumeWith(Result.success("tok_9a")) -> re-enters invokeSuspend at label=1.'
+          },
+          {
+            thread: { cls: 'sw', txt: 'L1 → SUSP' },
+            io: { cls: 'io', txt: 'HTTP profile' },
+            label: '1 → 2',
+            locals: 'userId: 42, token: "tok_9a"',
+            threadState: 'FREED! (COROUTINE_SUSPENDED)',
+            type: 'good',
+            msg: 'Label 1 spills token="tok_9a", sets label=2, calls fetchProfile("tok_9a", cont) -> returns COROUTINE_SUSPENDED.'
+          },
+          {
+            thread: { cls: 'ta', txt: 'resumeWith' },
+            io: { cls: 'io', txt: 'Profile OK' },
+            label: '2',
+            locals: 'userId: 42, token: "tok_9a", profile: "Ada"',
+            threadState: 'RESUMED (Thread-1)',
+            type: '',
+            msg: 'Profile arrives; cont.resumeWith(Result.success("Ada")) jumps straight to Label 2.'
+          },
+          {
+            thread: { cls: 'ta', txt: 'L2: DONE' },
+            io: null,
+            label: 'DONE (-1)',
+            locals: 'User(42, "tok_9a", "Ada")',
+            threadState: 'COMPLETED',
+            type: 'good',
+            msg: 'Label 2 reads spilled userId + token + profile, constructs User(42, "tok_9a", "Ada"), and resumes caller.'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout tip',
+          html: '<strong>Zero OS Threads Blocked:</strong> Across 2 async I/O hops, the state machine returned <code>COROUTINE_SUSPENDED</code> twice so Thread-1 stayed free for peer work.'
+        }
+      },
+      fastpath: {
+        steps: [
+          {
+            thread: { cls: 'ta', txt: 'L0: enter' },
+            io: null,
+            label: '0 → 1',
+            locals: 'userId: 42',
+            threadState: 'RUNNING (Thread-1)',
+            type: '',
+            msg: 'Label 0: sets label=1 and calls fetchToken(42, cont).'
+          },
+          {
+            thread: { cls: 'ta', txt: 'Cache Hit' },
+            io: { cls: 'idle', txt: 'No I/O' },
+            label: '1',
+            locals: 'userId: 42, token: "tok_cached"',
+            threadState: 'NO SUSPEND (Direct Return)',
+            type: 'good',
+            msg: 'fetchToken hits memory cache and returns "tok_cached" directly (NOT COROUTINE_SUSPENDED)!'
+          },
+          {
+            thread: { cls: 'ta', txt: 'L1: Fallthru' },
+            io: { cls: 'idle', txt: 'No I/O' },
+            label: '1 → 2',
+            locals: 'userId: 42, token: "tok_cached"',
+            threadState: 'SAME CALL STACK',
+            type: 'good',
+            msg: 'Because sentinel !== COROUTINE_SUSPENDED, state machine falls directly into Label 1 without dispatching!'
+          },
+          {
+            thread: { cls: 'ta', txt: 'L2: DONE' },
+            io: null,
+            label: 'DONE (-1)',
+            locals: 'User(42, "tok_cached", "Ada")',
+            threadState: 'COMPLETED SYNC',
+            type: 'good',
+            msg: 'fetchProfile also hits cache -> Label 2 completes synchronously with zero thread switches.'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout tip',
+          html: '<strong>Why COROUTINE_SUSPENDED Exists:</strong> Distinguishing synchronous values from suspension lets cache hits avoid queue dispatches and thread hops.'
+        }
+      },
+      error: {
+        steps: [
+          {
+            thread: { cls: 'ta', txt: 'L0: enter' },
+            io: null,
+            label: '0 → 1',
+            locals: 'userId: 42',
+            threadState: 'RUNNING (Thread-1)',
+            type: '',
+            msg: 'Label 0 spills userId=42, sets label=1, calls fetchToken(42, cont).'
+          },
+          {
+            thread: { cls: 'sw', txt: 'SUSPENDED' },
+            io: { cls: 'io', txt: 'HTTP token' },
+            label: '1',
+            locals: 'userId: 42',
+            threadState: 'FREED! (COROUTINE_SUSPENDED)',
+            type: 'warn',
+            msg: 'fetchToken returns COROUTINE_SUSPENDED; OS Thread-1 is freed.'
+          },
+          {
+            thread: { cls: 'bad', txt: 'resumeErr' },
+            io: { cls: 'bad', txt: 'HTTP 503' },
+            label: '1',
+            locals: 'result: Failure(IOException)',
+            threadState: 'RESUMED WITH FAILURE',
+            type: 'bad',
+            msg: 'HTTP fails with 503; callback calls cont.resumeWith(Result.failure(IOException)).'
+          },
+          {
+            thread: { cls: 'ta', txt: 'catch(e)' },
+            io: null,
+            label: 'DONE (-1)',
+            locals: 'Fallback Profile',
+            threadState: 'RECOVERED IN TRY/CATCH',
+            type: 'good',
+            msg: 'Label 1 calls ResultKt.throwOnFailure(result), throwing IOException into the coroutine\'s normal try/catch block!'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout warn',
+          html: '<strong>Unified Error Flow:</strong> <code>ResultKt.throwOnFailure</code> turns async <code>Result.failure</code> callbacks back into standard Kotlin <code>try/catch</code> unwinding.'
+        }
+      }
+    };
+
+    let currentSimMode = 'async';
+    let simStepIdx = 0;
+    let simTimer = null;
+
+    function resetSim() {
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        document.getElementById('sim-play').textContent = '▶ Play';
+      }
+      simStepIdx = 0;
+      const sc = SIM_SCENARIOS[currentSimMode];
+      document.getElementById('lane-thread').innerHTML = '';
+      document.getElementById('lane-io').innerHTML = '';
+      document.getElementById('reg-label').textContent = '0';
+      document.getElementById('reg-locals').textContent = 'userId: 42';
+      document.getElementById('reg-thread').textContent = 'READY';
+      document.getElementById('sim-step-counter').textContent = `Step 0 / ${sc.steps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step → or ▶ Play to step the CPS state machine.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through <code>loadProfile(42)</code> to inspect <code>label</code>, spilled locals, and OS thread release.';
+    }
+
+    function stepSim() {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById('sim-play').textContent = '▶ Play';
+        }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      const appendSlot = (id, slot) => {
+        if (!slot) return;
+        const d = document.createElement('div');
+        d.className = `slot ${slot.cls}`;
+        d.textContent = slot.txt;
+        document.getElementById(id).appendChild(d);
+      };
+      appendSlot('lane-thread', s.thread);
+      appendSlot('lane-io', s.io);
+
+      document.getElementById('reg-label').textContent = s.label;
+      document.getElementById('reg-locals').textContent = s.locals;
+      document.getElementById('reg-thread').textContent = s.threadState;
+      document.getElementById('sim-step-counter').textContent = `Step ${simStepIdx} / ${sc.steps.length}`;
+
+      const logEl = document.getElementById('sim-log');
+      if (simStepIdx === 1) logEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.className = `trace-line ${s.type}`;
+      line.textContent = `[${simStepIdx}] ${s.msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+      }
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        btn.textContent = '▶ Play';
+      } else {
+        if (simStepIdx >= SIM_SCENARIOS[currentSimMode].steps.length) resetSim();
+        btn.textContent = '⏸ Pause';
+        simTimer = setInterval(stepSim, 800);
+      }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'runCpsStateMachine',
+        starter: `function runCpsStateMachine(userId, api, onComplete) {
+  // BUG: Assumes synchronous calls; never manages label, spilled locals, or COROUTINE_SUSPENDED!
+  const token = api.fetchToken(userId, null);
+  const profile = api.fetchProfile(token, null);
+  const result = { userId, token, profile };
+  onComplete(null, result);
+  return result;
+}`,
+        hints: [
+          'Create `const cont = { label: 0, userId, token: null, result: null, resumeWith(val) { this.result = val; return invokeSuspend(); } };`.',
+          'Inside `invokeSuspend()`, loop with `while (true)` switching on `cont.label` (0, 1, 2) so synchronous values fall straight through to the next label.',
+          'Before calling `api.fetchToken`/`api.fetchProfile`, advance `cont.label` (`0 -> 1`, `1 -> 2`), and return `\'COROUTINE_SUSPENDED\'` immediately whenever an `api` call returns `\'COROUTINE_SUSPENDED\'`.'
+        ],
+        solution: `function runCpsStateMachine(userId, api, onComplete) {
+  const cont = {
+    label: 0,
+    userId,
+    token: null,
+    result: null,
+    resumeWith(val) {
+      this.result = val;
+      return invokeSuspend();
+    }
+  };
+
+  function invokeSuspend() {
+    try {
+      while (true) {
+        if (cont.label === 0) {
+          cont.label = 1;
+          const res = api.fetchToken(cont.userId, cont);
+          if (res === 'COROUTINE_SUSPENDED') return 'COROUTINE_SUSPENDED';
+          cont.result = res;
+        } else if (cont.label === 1) {
+          if (cont.result instanceof Error) throw cont.result;
+          cont.token = cont.result;
+          cont.label = 2;
+          const res = api.fetchProfile(cont.token, cont);
+          if (res === 'COROUTINE_SUSPENDED') return 'COROUTINE_SUSPENDED';
+          cont.result = res;
+        } else if (cont.label === 2) {
+          if (cont.result instanceof Error) throw cont.result;
+          const finalVal = {
+            userId: cont.userId,
+            token: cont.token,
+            profile: cont.result
+          };
+          onComplete(null, finalVal);
+          return finalVal;
+        } else {
+          throw new Error('Invalid state machine label: ' + cont.label);
+        }
+      }
+    } catch (err) {
+      onComplete(err, null);
+      return err;
+    }
+  }
+
+  return invokeSuspend();
+}`,
+        kotlinEquivalent: `suspend fun loadUser(userId: Int): UserResult {
+    val token = api.fetchToken(userId)      // label 0 -> 1
+    val profile = api.fetchProfile(token)   // label 1 -> 2 (userId & token spilled)
+    return UserResult(userId, token, profile)
+}`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Async 2-step suspension: label 0 -> 1 -> 2 with COROUTINE_SUSPENDED & spilled locals',
+            run: () => {
+              let savedCont = null;
+              let completed = null;
+              const api = {
+                fetchToken(uid, cont) {
+                  assertEq(uid, 7);
+                  assertEq(cont.label, 1, 'Expected label advanced to 1 before suspending');
+                  savedCont = cont;
+                  return 'COROUTINE_SUSPENDED';
+                },
+                fetchProfile(tok, cont) {
+                  assertEq(tok, 'tok-42');
+                  assertEq(cont.label, 2, 'Expected label advanced to 2 before second suspend');
+                  assertEq(cont.token, 'tok-42', 'Expected token spilled on cont');
+                  savedCont = cont;
+                  return 'COROUTINE_SUSPENDED';
+                }
+              };
+              const firstRet = fn(7, api, (err, val) => { completed = { err, val }; });
+              assertEq(firstRet, 'COROUTINE_SUSPENDED');
+              assertEq(completed, null, 'Must not call onComplete while suspended');
+
+              const secondRet = savedCont.resumeWith('tok-42');
+              assertEq(secondRet, 'COROUTINE_SUSPENDED');
+              assertEq(completed, null, 'Must stay suspended until label 2 finishes');
+
+              savedCont.resumeWith({ name: 'Ada' });
+              assertDeepEq(completed, {
+                err: null,
+                val: { userId: 7, token: 'tok-42', profile: { name: 'Ada' } }
+              });
+            }
+          },
+          {
+            name: 'Synchronous fast-path: falls through label 0 -> 1 -> 2 without suspending',
+            run: () => {
+              let calls = 0;
+              let out = null;
+              const api = {
+                fetchToken: (uid) => 'tok-' + uid,
+                fetchProfile: (tok) => ({ name: 'Grace', tok })
+              };
+              const ret = fn(9, api, (err, val) => { calls++; out = { err, val }; });
+              assertEq(calls, 1);
+              assertDeepEq(ret, { userId: 9, token: 'tok-9', profile: { name: 'Grace', tok: 'tok-9' } });
+              assertDeepEq(out, { err: null, val: ret });
+            }
+          },
+          {
+            name: 'Mixed path + Error propagation: resumeWith(Error) aborts before fetchProfile',
+            run: () => {
+              let savedCont = null;
+              let profileCalled = false;
+              let completed = null;
+              const api = {
+                fetchToken(uid, cont) { savedCont = cont; return 'COROUTINE_SUSPENDED'; },
+                fetchProfile() { profileCalled = true; return {}; }
+              };
+              assertEq(fn(3, api, (err, val) => { completed = { err, val }; }), 'COROUTINE_SUSPENDED');
+              savedCont.resumeWith(new Error('401 Unauthorized'));
+              assertEq(profileCalled, false, 'Must not call fetchProfile after fetchToken error');
+              assertEq(completed.val, null);
+              assertEq(completed.err instanceof Error && completed.err.message === '401 Unauthorized', true);
+            }
+          }
+        ])
+      },
+      2: {
+        fnName: 'bridgeCallbackToPromise',
+        starter: `function bridgeCallbackToPromise(id, legacyFetch, cancelToken) {
+  // BUG: No single-shot guard, no cleanup execution, and ignores cancelToken!
+  return new Promise((resolve, reject) => {
+    legacyFetch(id, (val) => resolve(val), (err) => reject(err));
+  });
+}`,
+        hints: [
+          'Check `if (cancelToken && cancelToken.isCancelled) return Promise.reject(new Error(\'Cancelled\'));` before creating the Promise.',
+          'Track `let settled = false`, `let cleanup = null`, and `let cleanedUp = false` inside the Promise executor so settlement and cleanup each happen at most once.',
+          'In `settle(fn, arg)`, bail if `settled`, set `settled = true`, run cleanup if assigned, then call `fn(arg)`. Also check `if (settled) runCleanup();` right after `legacyFetch(...)` returns in case `onSuccess` ran synchronously.'
+        ],
+        solution: `function bridgeCallbackToPromise(id, legacyFetch, cancelToken) {
+  if (cancelToken && cancelToken.isCancelled) {
+    return Promise.reject(new Error('Cancelled'));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let cleanup = null;
+    let cleanedUp = false;
+
+    function runCleanup() {
+      if (!cleanedUp && typeof cleanup === 'function') {
+        cleanedUp = true;
+        cleanup();
+      }
+    }
+
+    function settle(fn, arg) {
+      if (settled) return;
+      settled = true;
+      runCleanup();
+      fn(arg);
+    }
+
+    if (cancelToken && typeof cancelToken.onCancel === 'function') {
+      cancelToken.onCancel(() => settle(reject, new Error('Cancelled')));
+    }
+
+    try {
+      cleanup = legacyFetch(
+        id,
+        (val) => settle(resolve, val),
+        (err) => settle(reject, err)
+      );
+      if (settled) runCleanup();
+    } catch (err) {
+      settle(reject, err);
+    }
+  });
+}`,
+        kotlinEquivalent: `suspend fun fetchSafe(id: String): Data = suspendCancellableCoroutine { cont ->
+    val handle = legacyApi.fetch(
+        id,
+        onSuccess = { data -> if (cont.isActive) cont.resume(data) },
+        onError = { err -> if (cont.isActive) cont.resumeWithException(err) }
+    )
+    cont.invokeOnCancellation { handle.dispose() }
+}`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Happy path resolves value and invokes cleanup exactly once',
+            run: async () => {
+              let cleanups = 0;
+              const val = await fn('user-1', (id, onOk) => {
+                setTimeout(() => onOk({ id, ok: true }), 5);
+                return () => { cleanups++; };
+              });
+              assertDeepEq(val, { id: 'user-1', ok: true });
+              assertEq(cleanups, 1, `Expected 1 cleanup call, got ${cleanups}`);
+            }
+          },
+          {
+            name: 'Single-shot guard: ignores duplicate callbacks and cleans up synchronous settlement once',
+            run: async () => {
+              let cleanups = 0;
+              const val = await fn('sync-1', (id, onOk, onErr) => {
+                onOk('first');
+                onOk('second');
+                onErr(new Error('late error'));
+                return () => { cleanups++; };
+              });
+              assertEq(val, 'first');
+              assertEq(cleanups, 1, `Expected 1 cleanup call on sync settlement, got ${cleanups}`);
+            }
+          },
+          {
+            name: 'Cancellation rejects with Cancelled, runs cleanup once, and ignores late onSuccess',
+            run: async () => {
+              let cleanups = 0;
+              let lateTrigger = null;
+              let cancelCb = null;
+              const token = { isCancelled: false, onCancel: (cb) => { cancelCb = cb; } };
+              const p = fn('req-9', (id, onOk) => {
+                lateTrigger = () => onOk('late-data');
+                return () => { cleanups++; };
+              }, token);
+              token.isCancelled = true;
+              cancelCb();
+              lateTrigger();
+              let errMsg = '';
+              try { await p; } catch (e) { errMsg = e.message; }
+              assertEq(errMsg, 'Cancelled');
+              assertEq(cleanups, 1, `Expected 1 cleanup on cancel, got ${cleanups}`);
+            }
+          },
+          {
+            name: 'Pre-cancelled token rejects immediately without calling legacyFetch',
+            run: async () => {
+              let called = false;
+              let errMsg = '';
+              const p = fn('req-0', (id, onOk) => {
+                called = true;
+                setTimeout(() => onOk('should-not-run'), 10);
+              }, { isCancelled: true, onCancel: () => {} });
+              try {
+                await Promise.race([
+                  p,
+                  new Promise((_, rej) => setTimeout(() => rej(new Error('Hung without rejecting')), 30))
+                ]);
+              } catch (e) {
+                errMsg = e.message;
+              }
+              assertEq(called, false, 'legacyFetch should not be called if already cancelled');
+              assertEq(errMsg, 'Cancelled');
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'withTimeoutRace',
+        starter: `async function withTimeoutRace(promiseFn, timeoutMs) {
+  // BUG: Never races against timeoutMs or clears the timer!
+  return await promiseFn();
+}`,
+        hints: [
+          'Schedule `let timerId;` with `setTimeout(() => reject(new Error(\`Timeout after ${timeoutMs}ms\`)), timeoutMs)`.',
+          'Await `Promise.race([promiseFn(), timeoutPromise])` inside a `try { ... } finally { clearTimeout(timerId); }` block.',
+          'Clearing `timerId` inside `finally` guarantees zero leaked timers whether `promiseFn()` resolves, rejects, or times out.'
+        ],
+        solution: `async function withTimeoutRace(promiseFn, timeoutMs) {
+  let timerId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      reject(new Error(\`Timeout after \${timeoutMs}ms\`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promiseFn(), timeoutPromise]);
+  } finally {
+    clearTimeout(timerId);
+  }
+}`,
+        kotlinEquivalent: `suspend fun <T> fetchWithBudget(block: suspend () -> T): T =
+    withTimeout(1_500L) {
+        block()
+    }`,
+        tests: async (fn) => {
+          async function withTimerSpy(runBody) {
+            const origSet = globalThis.setTimeout.bind(globalThis);
+            const origClear = globalThis.clearTimeout.bind(globalThis);
+            const active = new Set();
+            let clearedCount = 0;
+            globalThis.setTimeout = (cb, ms, ...args) => {
+              const id = origSet(() => { active.delete(id); cb(...args); }, ms);
+              active.add(id);
+              return id;
+            };
+            globalThis.clearTimeout = (id) => {
+              if (active.has(id)) { active.delete(id); clearedCount++; }
+              return origClear(id);
+            };
+            try {
+              return await runBody({ active, getClearedCount: () => clearedCount, origSet });
+            } finally {
+              globalThis.setTimeout = origSet;
+              globalThis.clearTimeout = origClear;
+            }
+          }
+
+          return runTestCases([
+            {
+              name: 'Fast work resolves value and clears timeout timer (0 leaked timers)',
+              run: async () => {
+                await withTimerSpy(async ({ active, getClearedCount, origSet }) => {
+                  const res = await fn(() => new Promise((r) => origSet(() => r('fast-ok'), 5)), 80);
+                  assertEq(res, 'fast-ok');
+                  assertEq(active.size, 0, 'Timeout timer was leaked!');
+                  assertEq(getClearedCount() >= 1, true, 'clearTimeout was not called');
+                });
+              }
+            },
+            {
+              name: 'Slow work exceeds timeoutMs and rejects with Timeout error',
+              run: async () => {
+                await withTimerSpy(async ({ origSet }) => {
+                  let errMsg = '';
+                  try {
+                    await fn(() => new Promise((r) => origSet(() => r('too-late'), 80)), 12);
+                  } catch (e) {
+                    errMsg = e && e.message ? e.message : String(e);
+                  }
+                  assertEq(errMsg.toLowerCase().includes('timeout'), true, `Expected Timeout error, got "${errMsg}"`);
+                });
+              }
+            },
+            {
+              name: 'Early rejection propagates original error and clears timeout timer',
+              run: async () => {
+                await withTimerSpy(async ({ active, getClearedCount, origSet }) => {
+                  let errMsg = '';
+                  try {
+                    await fn(() => new Promise((_, rej) => origSet(() => rej(new Error('Boom')), 5)), 80);
+                  } catch (e) {
+                    errMsg = e.message;
+                  }
+                  assertEq(errMsg, 'Boom');
+                  assertEq(active.size, 0, 'Timeout timer leaked after rejection!');
+                  assertEq(getClearedCount() >= 1, true, 'clearTimeout was not called on rejection');
+                });
+              }
+            }
+          ]);
+        }
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. What is the exact purpose of returning COROUTINE_SUSPENDED from a compiled suspend function?',
+        code: `fun fetchToken(userId: Int, cont: Continuation<String>): Any? {\n    networkClient.enqueue(userId) { token -> cont.resume(token) }\n    return COROUTINE_SUSPENDED\n}`,
+        options: [
+          'It parks the current OS thread inside a kernel mutex until the callback arrives.',
+          'It signals that the coroutine suspended asynchronously and freed the current thread immediately.',
+          'It throws a special control-flow exception caught by the dispatcher to pause execution.',
+          'It instructs the garbage collector to pin the current thread stack frame permanently.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Coroutines never park OS threads with kernel mutexes when suspending on async callbacks.',
+          'CORRECT (B): Returning COROUTINE_SUSPENDED lets the call stack unwind immediately so the dispatcher thread can execute other work.',
+          'WRONG (C): Suspending uses a lightweight singleton sentinel object return value, not exception throwing.',
+          'WRONG (D): Thread stack frames are not pinned by GC; surviving locals are copied to the heap Continuation before unwinding.'
+        ]
+      },
+      {
+        stem: '2. How does a Kotlin suspend function preserve local variables like userId and token across suspension points?',
+        code: `suspend fun loadDashboard(userId: Int): Dashboard {\n    val token = fetchToken(userId) // suspend #1\n    return fetchDashboard(userId, token) // suspend #2\n}`,
+        options: [
+          'The JVM freezes the caller OS thread stack on disk until resumption occurs.',
+          'The compiler spills surviving locals as fields inside the heap Continuation object.',
+          'The dispatcher copies CPU registers into ThreadLocal storage before yielding the thread.',
+          'The runtime serializes stack frames into a byte buffer inside Dispatchers.Default.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): OS thread stacks cannot be frozen on disk by Kotlin; the stack unwinds cleanly when COROUTINE_SUSPENDED returns.',
+          'CORRECT (B): kotlinc generates a ContinuationImpl class with fields (e.g., userId, token, label) that survive across suspend points on the heap.',
+          'WRONG (C): ThreadLocal belongs to a specific OS thread, whereas a resumed coroutine may continue on a different pool thread.',
+          'WRONG (D): Stackless Kotlin CPS coroutines avoid capturing or serializing raw JVM stack frames.'
+        ]
+      },
+      {
+        stem: '3. You mark a blocking disk-read function with suspend and call it on Dispatchers.Main. What happens?',
+        code: `suspend fun readConfig(file: File): String {\n    return file.readText() // Blocking Java I/O\n}`,
+        options: [
+          'Kotlin automatically dispatches every suspend function onto an elastic Dispatchers.IO worker thread.',
+          'The compiler rewrites File.readText into non-blocking Linux epoll calls at compile time.',
+          'The Main thread still blocks because suspend alone never switches the executing dispatcher.',
+          'The Android runtime intercepts blocking disk reads and throws NetworkOnMainThreadException immediately.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): The suspend modifier only enables CPS compilation; it never switches dispatchers automatically.',
+          'WRONG (B): The Kotlin compiler cannot rewrite blocking java.io calls into non-blocking epoll syscalls.',
+          'CORRECT (C): Execution stays on Dispatchers.Main and blocks the UI thread unless you explicitly wrap the call in withContext(Dispatchers.IO).',
+          'WRONG (D): NetworkOnMainThreadException applies to socket calls under StrictMode/Android policy, not automatic suspension magic.'
+        ]
+      },
+      {
+        stem: '4. A legacy callback SDK fires onSuccess twice for the same request inside suspendCancellableCoroutine. What occurs?',
+        code: `suspendCancellableCoroutine<String> { cont ->\n    legacySdk.fetch { value -> cont.resume(value) } // Fired twice!\n}`,
+        options: [
+          'The second resume call throws IllegalStateException because a Continuation settles at most once.',
+          'The coroutine executes its remaining label blocks twice and emits two duplicate return values.',
+          'The Kotlin runtime silently drops every subsequent resume call without raising any exception.',
+          'The Continuation resets its label field back to zero and restarts from the beginning.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): CancellableContinuationImpl enforces single-shot settlement; calling cont.resume a second time throws IllegalStateException("Already resumed").',
+          'WRONG (B): A suspend function returns one result (not a Flow) and refuses to re-run later labels on duplicate callbacks.',
+          'WRONG (C): cont.resume() does not silently ignore duplicate calls unless you guard manually with if (cont.isActive).',
+          'WRONG (D): A Continuation never rewinds its label back to zero upon a second resume.'
+        ]
+      },
+      {
+        stem: '5. Why should production callback wrappers prefer suspendCancellableCoroutine over suspendCoroutine when wrapping network calls?',
+        code: `suspendCancellableCoroutine { cont ->\n    val call = okHttp.newCall(req)\n    cont.invokeOnCancellation { call.cancel() }\n    call.enqueue(...)\n}`,
+        options: [
+          'It allocates zero heap Continuation objects and keeps every local variable on the stack.',
+          'It retries failed callbacks automatically whenever the underlying Dispatcher pool becomes temporarily saturated.',
+          'It converts any blocking socket read into asynchronous I/O without registering any callback.',
+          'It propagates Job cancellation via invokeOnCancellation and skips resuming if already cancelled.'
+        ],
+        correct: 3,
+        why: [
+          'WRONG (A): Both variants wrap a heap Continuation; suspendCancellableCoroutine actually wraps it in CancellableContinuationImpl.',
+          'WRONG (B): Coroutine cancellation bridges never perform automatic network retries.',
+          'WRONG (C): It bridges existing callback APIs cleanly; it does not transform blocking socket reads into callbacks.',
+          'CORRECT (D): suspendCancellableCoroutine wires into the coroutine Job so cancelling the scope invokes invokeOnCancellation to abort in-flight work.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_06',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0089: API Security (OWASP Top 10, BOLA/IDOR, CORS), ABAC/ReBAC, HTTP Caching (ETag) &amp; Sunset</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="lesson-container">
+    <nav class="lesson-nav">
+      <div><a href="0067-security-oauth2-jwt-and-containerization.html">&larr; Prev: Lesson 0067</a></div>
+      <div class="lesson-nav-center">
+        <a href="0001-master-plan-and-curriculum.html">&#128203; Master Plan</a>
+        &nbsp;|&nbsp;
+        <a href="../reference/0089-api-security-cors-etag-lifecycle.html">&#128214; Cheat Sheet 0089</a>
+      </div>
+      <div><a href="0068-observability-opentelemetry-and-logging.html">Next: Lesson 0068 &rarr;</a></div>
+    </nav>
+
+    <header class="lesson-header">
+      <div class="lesson-tag">Main Track 3 &bull; API Security, Caching &amp; Lifecycle &bull; Lesson 0089</div>
+      <h1>API Security (OWASP Top 10, BOLA/IDOR, CORS), ABAC/ReBAC, HTTP Caching (<code>ETag</code>) &amp; Lifecycle</h1>
+      <p class="lesson-subtitle">
+        Close the biggest real-world API gaps on <code>roadmap.sh/api-design</code>: fix Spring Security CORS preflight traps, stop OWASP API1 BOLA/IDOR and SSRF, move beyond coarse RBAC to ABAC/ReBAC, and ship HTTP <code>ETag</code> caching + RFC 8594 <code>Sunset</code> deprecation headers.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. Spring Security 7 CORS Trap &amp; OWASP API Security Top 10 (BOLA, Mass Assignment, SSRF)</h2>
+      <p>
+        Configuring <code>@CrossOrigin</code> or <code>WebMvcConfigurer.addCorsMappings</code> alone fails in production: Spring Security's filter chain executes <em>before</em> Spring MVC, rejecting browser <code>OPTIONS</code> preflight requests with <code>401 Unauthorized</code> or stripping CORS headers on error responses! Always wire a <code>CorsConfigurationSource</code> directly into <code>http.cors(...)</code>:
+      </p>
+      <pre><code>// IDIOMATIC SPRING SECURITY 7: Explicit CORS Filter + Never Wildcard "*" with Credentials
+@Bean
+public SecurityFilterChain apiSecurity(HttpSecurity http) throws Exception {
+    return http
+        .cors(Customizer.withDefaults()) // Runs CorsFilter BEFORE authentication filters!
+        .csrf(csrf -&gt; csrf.disable())
+        .authorizeHttpRequests(auth -&gt; auth.anyRequest().authenticated())
+        .oauth2ResourceServer(oauth2 -&gt; oauth2.jwt(Customizer.withDefaults()))
+        .build();
+}
+
+@Bean
+public CorsConfigurationSource corsConfigurationSource() {
+    CorsConfiguration cfg = new CorsConfiguration();
+    cfg.setAllowedOrigins(List.of("https://app.acme.io")); // NEVER "*" when allowCredentials=true!
+    cfg.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE"));
+    cfg.setAllowedHeaders(List.of("Authorization", "Content-Type", "Idempotency-Key"));
+    cfg.setAllowCredentials(true);
+    var source = new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/api/**", cfg);
+    return source;
+}</code></pre>
+      <p>
+        Even with valid JWT authentication, the #1 vulnerability on the <strong>OWASP API Security Top 10</strong> is <strong>API1: Broken Object Level Authorization (BOLA / IDOR)</strong>—checking that a caller is logged in, without verifying that the caller owns the requested <code>orderId</code> or <code>tenantId</code>:
+      </p>
+      <pre><code>// ANTI-PATTERN (OWASP API1 BOLA): Authenticated user swaps /orders/101 -> /orders/102!
+@GetMapping("/orders/{orderId}")
+public OrderDto getOrderBad(@PathVariable UUID orderId) {
+    return orderRepo.findById(orderId).map(OrderDto::from).orElseThrow(); // No tenant/owner check!
+}
+
+// IDIOMATIC DEFENSE: Scope EVERY query by JWT tenant/subject claim + reject Mass Assignment via DTOs
+@GetMapping("/orders/{orderId}")
+public OrderDto getOrderSafe(@PathVariable UUID orderId, @AuthenticationPrincipal Jwt jwt) {
+    String tenantId = jwt.getClaimAsString("tenant_id");
+    return orderRepo.findByIdAndTenantId(orderId, tenantId)
+        .map(OrderDto::from) // Never bind @RequestBody directly onto @Entity (OWASP API3)!
+        .orElseThrow(() -&gt; new ResponseStatusException(HttpStatus.NOT_FOUND));
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>2. Authorization Models (RBAC vs. ABAC vs. ReBAC), HTTP Caching &amp; API Lifecycle</h2>
+      <p>
+        Roles (<code>ROLE_USER</code>, <code>ROLE_ADMIN</code>) quickly hit a wall when permissions depend on resource attributes or organizational hierarchies:
+      </p>
+      <table>
+        <thead>
+          <tr><th>AuthZ Model</th><th>How Decisions Work</th><th>When to Use in Spring Boot 4</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>RBAC</strong></td><td>Static roles (<code>hasRole('ADMIN')</code>)</td><td>Coarse internal admin vs. standard user endpoints.</td></tr>
+          <tr><td><strong>ABAC</strong></td><td>Attributes on user, resource, environment (e.g., <code>tenantId</code>, <code>region == 'EU'</code>, <code>amount &lt; 1000</code>)</td><td>Multi-tenant SaaS rules via custom <code>AuthorizationManager</code> / OPA.</td></tr>
+          <tr><td><strong>ReBAC</strong></td><td>Graph relationships (<code>user:alice</code> &rarr; <code>editor</code> &rarr; <code>folder:9</code>)</td><td>Google-Docs-style sharing via Zanzibar / OpenFGA / SpiceDB.</td></tr>
+        </tbody>
+      </table>
+      <p>
+        For read scalability and clean API governance, combine <strong>HTTP Conditional Caching</strong> (<code>ETag</code> + <code>If-None-Match</code> &rarr; <code>304 Not Modified</code>) with <strong>RFC 8594 Lifecycle Headers</strong> (<code>Deprecation</code> and <code>Sunset</code>) and explicit <strong>Content Negotiation</strong> (<code>produces = {MediaType.APPLICATION_JSON_VALUE, MediaType.APPLICATION_PROBLEM_JSON_VALUE}</code>):
+      </p>
+      <pre><code>// IDIOMATIC SPRING MVC: Conditional ETag (304 Not Modified) + RFC 8594 Sunset Header
+@GetMapping(path = "/catalog/{id}", produces = MediaType.APPLICATION_JSON_VALUE)
+public ResponseEntity&lt;CatalogItemDto&gt; getCatalogItem(@PathVariable String id, WebRequest request) {
+    CatalogItem item = catalogService.findById(id);
+    String eTag = "\"" + item.version() + "\"";
+    if (request.checkNotModified(eTag)) {
+        return null; // Spring automatically returns 304 Not Modified with zero JSON body!
+    }
+    return ResponseEntity.ok()
+        .cacheControl(CacheControl.maxAge(Duration.ofSeconds(60)).cachePublic())
+        .eTag(eTag)
+        .header("Deprecation", "true")
+        .header("Sunset", "Wed, 01 Jul 2027 00:00:00 GMT")
+        .body(CatalogItemDto.from(item));
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>3. Hands-On Practice Workbenches</h2>
+      <div id="ex-1" class="workbench-container"></div>
+      <div id="ex-2" class="workbench-container"></div>
+    </section>
+
+    <section>
+      <h2>4. Senior Concept &amp; Code Quiz</h2>
+      <div id="quiz-main"></div>
+    </section>
+
+    <section>
+      <h2>Primary Recommended Source</h2>
+      <ul>
+        <li><a href="https://owasp.org/API-Security/" target="_blank" rel="noopener"><strong>OWASP API Security Top 10 (Official Project)</strong></a></li>
+        <li><a href="https://docs.spring.io/spring-security/reference/servlet/integrations/cors.html" target="_blank" rel="noopener"><strong>Spring Security Reference &mdash; CORS Integration</strong></a></li>
+      </ul>
+
+      <div class="teacher-prompt">
+        <strong>Ask Your AI Teacher:</strong> Why does returning <code>404 Not Found</code> instead of <code>403 Forbidden</code> on cross-tenant BOLA lookups prevent resource-ID enumeration attacks?
+      </div>
+    </section>
+
+    <footer class="lesson-footer">
+      <div><a href="0067-security-oauth2-jwt-and-containerization.html">&larr; Prev: Lesson 0067</a></div>
+      <div><a href="../reference/0089-api-security-cors-etag-lifecycle.html">&#128196; Reference Sheet 0089</a> &bull; <a href="0001-master-plan-and-curriculum.html">Course Hub</a></div>
+      <div><a href="0068-observability-opentelemetry-and-logging.html">Next: Lesson 0068 &rarr;</a></div>
+    </footer>
+  </div>
+
+  <script type="application/json" id="lesson-data">
+  {
+    "exercises": [
+      {
+        "id": "ex-1",
+        "filename": "ConditionalEtagHandler.java",
+        "badge": "Implementation Drill",
+        "instructions": "<p>Implement HTTP conditional caching + deprecation headers inside <code>handleGet(String currentVersion, String ifNoneMatchHeader, String payload)</code>:</p><ol><li>Build a strong quoted ETag string <code>\"\\\"\" + currentVersion + \"\\\"\"</code>.</li><li>If <code>etag.equals(ifNoneMatchHeader)</code>, return status <code>304</code> with the <code>ETag</code> header and an empty body <code>\"\"</code>.</li><li>Otherwise return status <code>200</code> with <code>ETag</code>, <code>Cache-Control: private, max-age=60</code>, and <code>Sunset: Wed, 01 Jul 2027 00:00:00 GMT</code>.</li></ol>",
+        "initialCode": "import java.util.Map;\n\npublic class ConditionalEtagHandler {\n    public record HttpResp(int status, Map<String, String> headers, String body) {}\n\n    public static HttpResp handleGet(String currentVersion, String ifNoneMatchHeader, String payload) {\n        // TODO: Compute quoted ETag, return 304 on match or 200 with Cache-Control + Sunset\n        return new HttpResp(200, Map.of(), payload);\n    }\n\n    public static void main(String[] args) {\n        System.out.println(\"Fresh: \" + handleGet(\"v7\", null, \"{\\\"ok\\\":true}\").status());\n        System.out.println(\"Cached: \" + handleGet(\"v7\", \"\\\"v7\\\"\", \"{\\\"ok\\\":true}\").status());\n    }\n}\n",
+        "solution": "import java.util.Map;\n\npublic class ConditionalEtagHandler {\n    public record HttpResp(int status, Map<String, String> headers, String body) {}\n\n    public static HttpResp handleGet(String currentVersion, String ifNoneMatchHeader, String payload) {\n        String etag = \"\\\"\" + currentVersion + \"\\\"\";\n        if (etag.equals(ifNoneMatchHeader)) {\n            return new HttpResp(304, Map.of(\"ETag\", etag), \"\");\n        }\n        return new HttpResp(\n            200,\n            Map.of(\n                \"ETag\", etag,\n                \"Cache-Control\", \"private, max-age=60\",\n                \"Sunset\", \"Wed, 01 Jul 2027 00:00:00 GMT\"\n            ),\n            payload\n        );\n    }\n\n    public static void main(String[] args) {\n        System.out.println(\"Fresh: \" + handleGet(\"v7\", null, \"{\\\"ok\\\":true}\").status());\n        System.out.println(\"Cached: \" + handleGet(\"v7\", \"\\\"v7\\\"\", \"{\\\"ok\\\":true}\").status());\n    }\n}\n",
+        "solutionExplanation": "Returning 304 Not Modified on matching If-None-Match avoids re-serializing and transferring unchanged payloads while Sunset communicates planned API retirement dates to clients.",
+        "hints": [
+          "Format strong ETag with surrounding quotes: <code>String etag = \"\\\"\" + currentVersion + \"\\\"\";</code>.",
+          "Check <code>if (etag.equals(ifNoneMatchHeader))</code> to return <code>304</code> and <code>\"\"</code>."
+        ],
+        "tests": [
+          {
+            "name": "Returns 304 on If-None-Match hit",
+            "regex": "etag\\.equals\\s*\\(\\s*ifNoneMatchHeader\\s*\\)[\\s\\S]*new\\s+HttpResp\\s*\\(\\s*304",
+            "flags": "m",
+            "passMessage": "Returns HTTP 304 Not Modified when client ETag matches.",
+            "failMessage": "Compare etag.equals(ifNoneMatchHeader) and return status 304."
+          },
+          {
+            "name": "Sets Cache-Control header",
+            "regex": "\"Cache-Control\"",
+            "flags": "m",
+            "passMessage": "Sets Cache-Control policy on 200 response.",
+            "failMessage": "Include \"Cache-Control\" header on 200 response."
+          },
+          {
+            "name": "Sets RFC 8594 Sunset header",
+            "regex": "\"Sunset\"",
+            "flags": "m",
+            "passMessage": "Includes RFC 8594 Sunset header.",
+            "failMessage": "Include \"Sunset\" header on 200 response."
+          }
+        ],
+        "simulatedOutput": "Fresh: 200\nCached: 304\nProcess finished with exit code 0"
+      },
+      {
+        "id": "ex-2",
+        "filename": "BolaAndSsrfGuardFix.java",
+        "badge": "Bug-Fix Challenge",
+        "instructions": "<p>Fix two OWASP API Security Top 10 vulnerabilities below:</p><ol><li><code>findOrderForCaller</code> leaks any tenant's order (BOLA/IDOR) because it ignores <code>callerTenantId</code>. Throw <code>SecurityException</code> if <code>!order.tenantId().equals(callerTenantId)</code>.</li><li><code>isSafeWebhookTarget</code> allows SSRF to cloud metadata (<code>169.254.169.254</code>) and plain <code>http</code>. Require <code>\"https\".equals(uri.getScheme())</code> and reject hosts starting with <code>169.254.</code>, <code>127.</code>, or equal to <code>localhost</code>.</li></ol>",
+        "initialCode": "import java.net.URI;\nimport java.util.Map;\n\npublic class BolaAndSsrfGuardFix {\n    public record Order(String id, String tenantId, long cents) {}\n    private static final Map<String, Order> DB = Map.of(\n        \"ORD-1\", new Order(\"ORD-1\", \"T-ALPHA\", 5000),\n        \"ORD-2\", new Order(\"ORD-2\", \"T-BETA\", 9900)\n    );\n\n    public static Order findOrderForCaller(String orderId, String callerTenantId) {\n        Order order = DB.get(orderId);\n        if (order == null) throw new IllegalArgumentException(\"Not found\");\n        // BUG 1 (OWASP API1 BOLA): Returns another tenant's order without checking tenantId!\n        return order;\n    }\n\n    public static boolean isSafeWebhookTarget(String url) {\n        URI uri = URI.create(url);\n        // BUG 2 (OWASP API7 SSRF): Permits http:// and internal metadata IPs like 169.254.169.254!\n        return uri.getHost() != null;\n    }\n\n    public static void main(String[] args) {\n        try {\n            findOrderForCaller(\"ORD-2\", \"T-ALPHA\");\n            System.out.println(\"BOLA_FAILED\");\n        } catch (SecurityException expected) {\n            System.out.println(\"BOLA blocked: true\");\n        }\n        System.out.println(\"Metadata blocked: \" + !isSafeWebhookTarget(\"http://169.254.169.254/latest/meta-data\"));\n        System.out.println(\"HTTPS partner allowed: \" + isSafeWebhookTarget(\"https://hooks.partner.io/events\"));\n    }\n}\n",
+        "solution": "import java.net.URI;\nimport java.util.Map;\n\npublic class BolaAndSsrfGuardFix {\n    public record Order(String id, String tenantId, long cents) {}\n    private static final Map<String, Order> DB = Map.of(\n        \"ORD-1\", new Order(\"ORD-1\", \"T-ALPHA\", 5000),\n        \"ORD-2\", new Order(\"ORD-2\", \"T-BETA\", 9900)\n    );\n\n    public static Order findOrderForCaller(String orderId, String callerTenantId) {\n        Order order = DB.get(orderId);\n        if (order == null) throw new IllegalArgumentException(\"Not found\");\n        if (!order.tenantId().equals(callerTenantId)) {\n            throw new SecurityException(\"Cross-tenant access denied\");\n        }\n        return order;\n    }\n\n    public static boolean isSafeWebhookTarget(String url) {\n        URI uri = URI.create(url);\n        String host = uri.getHost();\n        if (!\"https\".equals(uri.getScheme()) || host == null) {\n            return false;\n        }\n        return !host.equals(\"localhost\") && !host.startsWith(\"127.\") && !host.startsWith(\"169.254.\");\n    }\n\n    public static void main(String[] args) {\n        try {\n            findOrderForCaller(\"ORD-2\", \"T-ALPHA\");\n            System.out.println(\"BOLA_FAILED\");\n        } catch (SecurityException expected) {\n            System.out.println(\"BOLA blocked: true\");\n        }\n        System.out.println(\"Metadata blocked: \" + !isSafeWebhookTarget(\"http://169.254.169.254/latest/meta-data\"));\n        System.out.println(\"HTTPS partner allowed: \" + isSafeWebhookTarget(\"https://hooks.partner.io/events\"));\n    }\n}\n",
+        "solutionExplanation": "Every object lookup must verify tenant/owner authorization (preventing BOLA/IDOR), and outbound server-side URLs must enforce HTTPS plus block loopback and link-local metadata ranges (preventing SSRF).",
+        "hints": [
+          "In <code>findOrderForCaller</code>, add <code>if (!order.tenantId().equals(callerTenantId)) throw new SecurityException(...);</code>.",
+          "In <code>isSafeWebhookTarget</code>, require <code>\"https\".equals(uri.getScheme())</code> and reject <code>localhost</code>, <code>127.</code>, and <code>169.254.</code>."
+        ],
+        "tests": [
+          {
+            "name": "Enforces object-level tenant ownership",
+            "regex": "!order\\.tenantId\\(\\)\\.equals\\s*\\(\\s*callerTenantId\\s*\\)",
+            "flags": "m",
+            "passMessage": "Verifies tenant ownership before returning order.",
+            "failMessage": "Check !order.tenantId().equals(callerTenantId) and throw SecurityException."
+          },
+          {
+            "name": "Enforces HTTPS scheme for outbound URLs",
+            "regex": "\"https\"\\.equals\\s*\\(\\s*uri\\.getScheme\\(\\)\\s*\\)",
+            "flags": "m",
+            "passMessage": "Rejects non-HTTPS webhook targets.",
+            "failMessage": "Verify \"https\".equals(uri.getScheme())."
+          },
+          {
+            "name": "Blocks link-local metadata IP 169.254.",
+            "regex": "startsWith\\s*\\(\\s*\"169\\.254\\.\"\\s*\\)",
+            "flags": "m",
+            "passMessage": "Blocks cloud metadata link-local range 169.254.0.0/16.",
+            "failMessage": "Reject hosts starting with \"169.254.\"."
+          }
+        ],
+        "simulatedOutput": "BOLA blocked: true\nMetadata blocked: true\nHTTPS partner allowed: true\nProcess finished with exit code 0"
+      }
+    ],
+    "quiz": {
+      "id": "quiz-main",
+      "questions": [
+        {
+          "question": "1. Why do `@CrossOrigin` or `WebMvcConfigurer` CORS rules still break with `401` in a Spring Security app?",
+          "correctIndex": 1,
+          "options": [
+            {
+              "text": "Spring Boot 4 disables `OPTIONS` HTTP methods inside embedded Tomcat by default.",
+              "explanation": "Tomcat accepts `OPTIONS` requests normally; Spring Security blocks unauthenticated preflight requests before MVC runs."
+            },
+            {
+              "text": "Spring Security's filter chain intercepts preflight `OPTIONS` before Spring MVC runs.",
+              "explanation": "Browser CORS preflight `OPTIONS` carries no `Authorization` header, so without `http.cors(...)` the security filter chain rejects it with `401` before MVC sees it."
+            },
+            {
+              "text": "Browsers refuse every CORS response unless `Access-Control-Allow-Origin` equals `*`.",
+              "explanation": "Browsers actually forbid `*` when `Allow-Credentials: true` is set; an explicit origin is required."
+            },
+            {
+              "text": "Jackson 3 strips `Origin` headers whenever JSON validation annotations are present.",
+              "explanation": "Jackson handles body serialization only and never inspects or drops HTTP `Origin` headers."
+            }
+          ]
+        },
+        {
+          "question": "2. Which bug represents OWASP API1: Broken Object Level Authorization (BOLA / IDOR)?",
+          "correctIndex": 2,
+          "options": [
+            {
+              "text": "Returning a `304 Not Modified` status when client `ETag` headers match.",
+              "explanation": "Conditional `304 Not Modified` responses are standard RFC 9110 HTTP caching, not a security flaw."
+            },
+            {
+              "text": "Exposing a public `/actuator/health` liveness probe to Kubernetes kubelets.",
+              "explanation": "Permitting `/actuator/health/liveness` without exposing sensitive env/heap dumps is standard Kubernetes practice."
+            },
+            {
+              "text": "Trusting a path `orderId` after JWT check without verifying caller ownership.",
+              "explanation": "Authenticating the JWT proves *who* the caller is, not *which* object IDs they own; missing tenant/owner predicates let any logged-in user read other users' records."
+            },
+            {
+              "text": "Using `SecureRandom` instead of `ThreadLocalRandom` for session token generation.",
+              "explanation": "`SecureRandom` is the cryptographically secure standard; `ThreadLocalRandom` is the predictable bug."
+            }
+          ]
+        },
+        {
+          "question": "3. When is ABAC or ReBAC justified instead of pure Spring Security RBAC (`hasRole`)?",
+          "correctIndex": 0,
+          "options": [
+            {
+              "text": "When access depends on resource attributes, approval limits, or sharing graphs.",
+              "explanation": "RBAC handles coarse role checks (`ADMIN` vs `USER`), whereas ABAC evaluates contextual attributes and ReBAC evaluates document/folder relationship graphs."
+            },
+            {
+              "text": "When an internal microservice only exposes a single healthcheck endpoint.",
+              "explanation": "A healthcheck endpoint needs no complex attribute or relationship engine at all."
+            },
+            {
+              "text": "Whenever a Spring Boot application switches from Maven to Gradle.",
+              "explanation": "Build tools have zero bearing on whether an authorization domain requires RBAC, ABAC, or ReBAC."
+            },
+            {
+              "text": "When JPA entities use `UUID` primary keys instead of auto-increment `Long`.",
+              "explanation": "Switching primary key types reduces enumeration guesswork slightly but never changes authorization logic."
+            }
+          ]
+        }
+      ]
+    }
+  }
+  </script>
+  <script src="../assets/workbench.js"></script>
+  <script src="../assets/quiz.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const data = JSON.parse(document.getElementById('lesson-data').textContent);
+      data.exercises.forEach(ex => new JavaExercise(ex));
+      new JavaQuiz(data.quiz);
+    });
+  </script>
+</body>
+</html>

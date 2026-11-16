@@ -84,8 +84,9 @@
         pyodideInstance = py;
         py.runPython(`
 import sys, io, json, traceback
+from pyodide.code import eval_code_async
 
-def _py2027_run_isolated(user_code, tests_json=None):
+async def _py2027_run_isolated(user_code, tests_json=None):
     ns = {"__name__": "__main__"}
     buf_out = io.StringIO()
     buf_err = io.StringIO()
@@ -95,7 +96,7 @@ def _py2027_run_isolated(user_code, tests_json=None):
     test_results = []
 
     try:
-        exec(compile(user_code, "<lesson_cell>", "exec"), ns, ns)
+        await eval_code_async(user_code, globals=ns, locals=ns)
     except Exception:
         error_msg = traceback.format_exc()
     finally:
@@ -108,7 +109,7 @@ def _py2027_run_isolated(user_code, tests_json=None):
             t_err = io.StringIO()
             sys.stdout, sys.stderr = t_out, t_err
             try:
-                exec(compile(t["code"], f"<test:{t['name']}>", "exec"), ns, ns)
+                await eval_code_async(t["code"], globals=ns, locals=ns)
                 test_results.append({"name": t["name"], "passed": True, "detail": ""})
             except AssertionError as e:
                 detail = str(e) if str(e) else "Assertion failed"
@@ -141,7 +142,7 @@ def _py2027_run_isolated(user_code, tests_json=None):
     const py = await ensurePyodide();
     const runner = py.globals.get("_py2027_run_isolated");
     const testsJson = tests ? JSON.stringify(tests) : null;
-    const rawResult = runner(userCode, testsJson);
+    const rawResult = await runner(userCode, testsJson);
     return JSON.parse(rawResult);
   }
 

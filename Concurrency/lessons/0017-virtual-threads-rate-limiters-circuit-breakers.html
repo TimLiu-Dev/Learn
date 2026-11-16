@@ -1,0 +1,1102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 17 — Virtual Threads (Loom) vs Coroutines, Rate Limiters &amp; Circuit Breakers</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+  <style>
+    .state-pill {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+    .state-closed { background: var(--green-soft); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.45); }
+    .state-open { background: var(--rose-soft); color: var(--rose); border: 1px solid rgba(244, 63, 94, 0.45); }
+    .state-half { background: var(--amber-soft); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.45); }
+    .sim-registers-4 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .token-bar-wrap {
+      height: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    .token-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--green));
+      transition: width 0.2s ease;
+    }
+    .manual-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 14px;
+      padding: 10px 12px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .manual-label {
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-right: 4px;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Phase 6 · Lesson 17</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/concurrency-cheat-sheet.html">Core Concurrency Cheat Sheet</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 6 · Lesson 17 · JVM Loom &amp; Service Resilience</div>
+      <h1>Virtual Threads (Loom) vs Coroutines, Rate Limiters &amp; Circuit Breakers</h1>
+      <p class="hero-sub">
+        How Java 21+ Virtual Threads work vs Kotlin CPS coroutines, carrier-thread pinning traps (<code>synchronized</code>!),
+        Token Bucket &amp; Sliding Window rate limiters, Bulkheads, and Circuit Breakers.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. Rate Limiter &amp; Circuit Breaker Visualizer</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Production Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First-Principles Mental Model</div>
+      <h2>Stackful Virtual Threads vs. Stackless Coroutines &amp; Resilience Primitives</h2>
+      <p class="section-lead">
+        Scaling to 100,000+ concurrent I/O operations requires decoupling logical tasks from kernel-scheduled <strong>OS Threads</strong>—either via
+        JVM-managed stackful virtual threads (<a href="https://openjdk.org/jeps/444" target="_blank" rel="noopener">OpenJDK JEP 444: Virtual Threads</a>)
+        or compiler-generated stackless continuations (<a href="https://kotlinlang.org/docs/coroutines-guide.html" target="_blank" rel="noopener">Kotlin Coroutines Guide</a>).
+        High concurrency then demands admission control and fault isolation so a slow dependency cannot cascade into a total outage.
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">Java 21+ Virtual Threads (Project Loom)</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong>Stackful user-mode threads mounted on ForkJoinPool carrier OS threads.</strong><br/><br/>
+            Each virtual thread owns a dynamically resized heap-stored call stack chunk. When it hits a JDK blocking I/O operation
+            (e.g., <code>Socket.read()</code>, <code>Thread.sleep()</code>, <code>LockSupport.park()</code>), the JVM <em>unmounts</em> the virtual thread's stack
+            frames to the heap, freeing the carrier OS thread to run another virtual thread.<br/><br/>
+            <strong>Pinning Hazard (Java 21):</strong> Entering a <code>synchronized</code> monitor block or a JNI native frame <em>pins</em> the virtual thread to its carrier OS thread,
+            preventing unmounting during blocking I/O and starving the carrier pool!
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">Kotlin Coroutines (CPS State Machines)</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong>Stackless cooperative computations compiled into Continuation objects.</strong><br/><br/>
+            The Kotlin compiler rewrites every <code>suspend</code> function into a finite state machine stored in a heap <code>Continuation</code>.
+            Suspension is explicit in the type system: a coroutine only yields its dispatcher OS thread at <code>suspend</code> calls.<br/><br/>
+            <strong>Structured Concurrency &amp; Pinning:</strong> Kotlin prevents calling <code>suspend</code> functions inside <code>synchronized</code> at compile time.
+            Using <code>Mutex.withLock</code> suspends cooperatively without pinning any carrier thread, and <code>Job</code> trees enforce cancellation propagation.
+          </p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 24px;">Virtual Threads (Loom) vs. Kotlin Coroutines</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>Java 21+ Virtual Threads</th>
+              <th>Kotlin Coroutines (CPS)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Stack Model</strong></td>
+              <td>Stackful (resizable heap stack chunks)</td>
+              <td>Stackless (compiler state machine + <code>Continuation</code>)</td>
+            </tr>
+            <tr>
+              <td><strong>Yield Mechanism</strong></td>
+              <td>Implicit unmount on JDK blocking I/O &amp; <code>park()</code></td>
+              <td>Explicit cooperative suspension at <code>suspend</code> points</td>
+            </tr>
+            <tr>
+              <td><strong>Carrier Scheduler</strong></td>
+              <td>FIFO <code>ForkJoinPool</code> sized to CPU cores</td>
+              <td>Pluggable <code>CoroutineDispatcher</code> (<code>Default</code>, <code>IO</code>, <code>Main</code>)</td>
+            </tr>
+            <tr>
+              <td><strong>Pinning Trap</strong></td>
+              <td><code>synchronized</code> + blocking I/O or JNI pins carrier thread</td>
+              <td>Compiler forbids <code>suspend</code> inside <code>synchronized</code>; use <code>Mutex</code></td>
+            </tr>
+            <tr>
+              <td><strong>Cancellation</strong></td>
+              <td>Legacy <code>Thread.interrupt()</code> (opt-in checks)</td>
+              <td>Built-in cooperative <code>Job</code> tree &amp; <code>CancellationException</code></td>
+            </tr>
+            <tr>
+              <td><strong>Best Fit</strong></td>
+              <td>Retrofitting legacy blocking JDBC/Servlet JVM backends</td>
+              <td>Android UI/lifecycle, reactive Flow pipelines, structured async</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 style="margin-top: 28px;">Traffic Shaping &amp; Fault Isolation Primitives</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Primitive</th>
+              <th>Core Mechanism</th>
+              <th>Failure Mode Prevented</th>
+              <th>Key Production Invariant</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Token Bucket</strong></td>
+              <td>Bucket holds up to <code>capacity</code> tokens; refills at steady <code>refillPerSec</code></td>
+              <td>Sustained overload while permitting bounded bursts</td>
+              <td>Use monotonic clock (<code>System.nanoTime()</code>); never allow negative tokens</td>
+            </tr>
+            <tr>
+              <td><strong>Sliding Window</strong></td>
+              <td>Tracks timestamps/weighted sub-windows over rolling interval <code>W</code></td>
+              <td>2× boundary burst spike seen in naive Fixed Window counters</td>
+              <td>Bounded memory via sub-bucket counters or pruned ring buffer</td>
+            </tr>
+            <tr>
+              <td><strong>Bulkhead</strong></td>
+              <td>Partitions concurrency permits/pools per downstream service</td>
+              <td>Slow Service B exhausting all threads/slots and starving Service A</td>
+              <td>Independent semaphores per dependency; release permit in <code>finally</code></td>
+            </tr>
+            <tr>
+              <td><strong>Circuit Breaker</strong></td>
+              <td>State machine: <code>CLOSED</code> → <code>OPEN</code> → <code>HALF_OPEN</code></td>
+              <td>Cascading timeouts &amp; retry storms against an already failing peer</td>
+              <td>Fail fast when <code>OPEN</code>; cap concurrent probes (<code>halfOpenMaxCalls</code>)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Monotonic Clock Rule:</strong> Never compute token refill elapsed time or circuit-breaker cooldowns using wall-clock time
+        (<code>System.currentTimeMillis()</code> or <code>Date.now()</code>). NTP clock adjustments can jump backwards or forwards, causing
+        token starvation, negative durations, or premature circuit transitions. Always use a monotonic clock source
+        (<code>System.nanoTime()</code> on JVM, <code>TimeSource.Monotonic</code> in Kotlin, <code>performance.now()</code> in browsers).
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive Gateway Visualizer</div>
+      <h2>Token Bucket &amp; Circuit Breaker State Machine Simulator</h2>
+      <p class="section-lead">
+        Fire burst traffic at an API gateway (<code>capacity = 5</code>, <code>refill = 2/sec</code>, <code>failureThreshold = 3</code>,
+        <code>resetTimeout = 2000ms</code>, <code>halfOpenMaxCalls = 2</code>) and watch live <code>CLOSED → OPEN → HALF_OPEN</code> transitions and token refill.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="healthy">Mode: Burst &amp; Refill</button>
+            <button class="btn" data-mode="outage">Mode: Outage → OPEN</button>
+            <button class="btn" data-mode="recovery">Mode: HALF-OPEN Recovery</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="manual-bar">
+          <span class="manual-label">Live Actions:</span>
+          <button class="btn" id="act-req">Fire 1 Req</button>
+          <button class="btn" id="act-burst">Fire Burst (5×)</button>
+          <button class="btn" id="act-tick">Advance +500ms</button>
+          <button class="btn" id="act-backend">Backend: <strong id="backend-health-label" style="color:var(--green);">HEALTHY</strong></button>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span>API Gateway Admission (Token Bucket + Breaker)</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-gateway"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Downstream Backend Calls</span><span id="sim-clock-label">Monotonic t = 0 ms</span></div>
+              <div class="timeline-track" id="lane-backend"></div>
+            </div>
+
+            <div class="sim-registers-4">
+              <div class="reg-card">
+                <div class="reg-name">Circuit State</div>
+                <div class="reg-val" id="reg-state"><span class="state-pill state-closed">CLOSED</span></div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">Tokens (Cap 5)</div>
+                <div class="reg-val" id="reg-tokens" style="color:var(--accent);">5.0 / 5</div>
+                <div class="token-bar-wrap"><div class="token-bar-fill" id="token-bar" style="width:100%;"></div></div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">Failures (Max 3)</div>
+                <div class="reg-val" id="reg-failures" style="color:var(--amber);">0 / 3</div>
+              </div>
+              <div class="reg-card">
+                <div class="reg-name">Half-Open Probes</div>
+                <div class="reg-val" id="reg-probes" style="color:var(--purple);">0 / 2</div>
+              </div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Click <strong>Step →</strong> to trace the selected scenario, or use <strong>Live Actions</strong> to fire requests and advance monotonic time.
+            </div>
+          </div>
+
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">GATEWAY TRACE LOG</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; JVM Patterns</div>
+      <h2>Junior Traps vs. Senior Patterns</h2>
+      <p class="section-lead">
+        Avoiding carrier-thread pinning in Loom, clock-drift bugs in Token Buckets, and thundering-herd probes in Circuit Breakers.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Virtual Thread Pinning (<code>synchronized</code>) vs. <code>ReentrantLock</code> / Kotlin <code>Mutex</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: synchronized + Blocking I/O</span></div>
+<pre>// Java 21 Virtual Thread Pool
+synchronized (lock) {
+    // Pins virtual thread to carrier OS thread!
+    // All 8 carrier threads block on HTTP/DB I/O.
+    String body = httpClient.send(req, BodyHandlers.ofString()).body();
+    cache.put(key, body);
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: ReentrantLock or Kotlin Mutex</span></div>
+<pre>// Option A (Java 21 Loom): ReentrantLock unmounts cleanly
+lock.lock();
+try {
+    String body = httpClient.send(req, BodyHandlers.ofString()).body();
+    cache.put(key, body);
+} finally { lock.unlock(); }
+
+// Option B (Kotlin Coroutines): non-blocking Mutex
+mutex.withLock { cache[key] = api.fetchSuspended(key) }</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: Wall-Clock Rate Limiter vs. Monotonic Token Bucket</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: System.currentTimeMillis() + Unbounded Tokens</span></div>
+<pre>fun tryAcquire(): Boolean {
+    val now = System.currentTimeMillis() // NTP can jump!
+    val elapsedSec = (now - lastMs) / 1000.0
+    tokens += elapsedSec * refillPerSec // Exceeds capacity!
+    lastMs = now
+    tokens -= 1.0 // Goes negative on rejection!
+    return tokens &gt;= 0.0
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Monotonic Clock + Clamped Atomic/Locked Refill</span></div>
+<pre>private val lock = ReentrantLock()
+fun tryAcquire(permits: Int = 1): Boolean = lock.withLock {
+    val nowNs = System.nanoTime()
+    val elapsedNs = (nowNs - lastNs).coerceAtLeast(0L)
+    milliTokens = minOf(capacity * 1000L,
+        milliTokens + (elapsedNs * refillPerSec) / 1_000_000L)
+    lastNs = nowNs
+    val cost = permits * 1000L
+    if (milliTokens &lt; cost) return false
+    milliTokens -= cost
+    return true
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: Racy Circuit Breaker vs. Probe-Capped State Machine</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Unsynchronized Check-Then-Act &amp; Probe Herd</span></div>
+<pre>if (state == OPEN &amp;&amp; elapsed &gt;= resetMs) {
+    state = HALF_OPEN // 1,000 threads see HALF_OPEN!
+}
+if (state == OPEN) throw OpenException()
+// All 1,000 threads stampede the recovering backend!
+return callBackend()</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Guarded Transitions + halfOpenMaxCalls Cap</span></div>
+<pre>mutex.withLock {
+    if (state == OPEN &amp;&amp; nowMs() - openedAtMs &gt;= resetTimeoutMs) {
+        state = HALF_OPEN; halfOpenUsed = 0; halfOpenOk = 0
+    }
+    when (state) {
+        OPEN -&gt; throw CircuitOpenException()
+        HALF_OPEN -&gt; if (halfOpenUsed &gt;= halfOpenMaxCalls)
+            throw ProbeLimitException() else halfOpenUsed++
+        CLOSED -&gt; Unit
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">
+        Fix each starter implementation and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>).
+        All three labs test edge cases deterministically with injected monotonic clocks and concurrent async schedules.
+      </p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 17.1 · MONOTONIC TOKEN BUCKET</span>
+            <h3 style="margin:8px 0 4px;">TokenBucketLimiter</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Implement <code>class TokenBucketLimiter</code> accepting <code>{ capacity, refillPerSec, nowMs }</code> with <code>tryAcquire(tokens = 1)</code> and <code>getTokens()</code>.
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Starts full at <code>capacity</code> tokens; <code>nowMs()</code> returns monotonic milliseconds.<br/>
+          • Refill proportionally to elapsed time without exceeding <code>capacity</code>, never allowing negative tokens on failed <code>tryAcquire(tokens)</code>, and without floating-point drift over 1,000 × 1ms increments.<br/>
+          • Return <code>false</code> for <code>tokens &lt;= 0</code> or when fewer than <code>tokens</code> are available.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_17_1_token_bucket.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 17.2 · CIRCUIT BREAKER STATE MACHINE</span>
+            <h3 style="margin:8px 0 4px;">CircuitBreaker</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Implement <code>class CircuitBreaker</code> accepting <code>{ failureThreshold, resetTimeoutMs, halfOpenMaxCalls, nowMs }</code> with <code>getState()</code> and <code>async execute(fn)</code>.
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>CLOSED</code>: tracks consecutive failures; any success resets failure count; reaching <code>failureThreshold</code> transitions to <code>OPEN</code>.<br/>
+          • <code>OPEN</code>: rejects calls immediately without invoking <code>fn</code> until <code>nowMs() - openedAtMs &gt;= resetTimeoutMs</code>, then transitions to <code>HALF_OPEN</code>.<br/>
+          • <code>HALF_OPEN</code>: permits at most <code>halfOpenMaxCalls</code> concurrent/sequential probes (preventing a probe herd). If all succeed, transitions to <code>CLOSED</code>; any probe failure immediately trips back to <code>OPEN</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_17_2_circuit_breaker.js</span><span>CLOSED → OPEN → HALF_OPEN</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 17.3 · BULKHEAD ISOLATION</span>
+            <h3 style="margin:8px 0 4px;">BulkheadIsolator</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Implement <code>class BulkheadIsolator</code> partitioning concurrency slots across separate downstream dependencies.
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>constructor(limits)</code> takes a map like <code>{ serviceA: 2, serviceB: 2 }</code>.<br/>
+          • <code>async run(serviceName, fn)</code> rejects if <code>serviceName</code> is unconfigured or its active slots equal its limit; otherwise runs <code>await fn()</code> and always releases the slot in <code>finally</code>.<br/>
+          • <code>getActiveCount(serviceName)</code> returns current in-flight count for that dependency.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_17_3_bulkhead.js</span><span>Independent per-service slot pools</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in word count so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Primary Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Read
+          <a href="https://openjdk.org/jeps/444" target="_blank" rel="noopener">OpenJDK JEP 444: Virtual Threads</a>
+          alongside the
+          <a href="https://kotlinlang.org/docs/coroutines-guide.html" target="_blank" rel="noopener">Kotlin Coroutines Guide</a>
+          and review the <a href="../reference/concurrency-cheat-sheet.html">Core Concurrency Cheat Sheet</a>.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime
+          (e.g., <em>"Why does synchronized pin a Java 21 virtual thread while ReentrantLock does not?"</em> or
+          <em>"How does a Token Bucket differ from a Sliding Window Log under bursty traffic?"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0016-workmanager-foreground-process-death.html">← Lesson 16</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0018-distributed-locks-fencing-crdts.html">Lesson 18 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_SCENARIOS = {
+      healthy: {
+        init: { state: 'CLOSED', tokens: 5, failures: 0, probes: 0, clock: 0, healthy: true },
+        steps: [
+          { gw: { cls: 'ta', txt: 'ALLOW #1' }, be: { cls: 'io', txt: '200 OK' }, state: 'CLOSED', tokens: 4.0, failures: 0, probes: 0, clock: 0, type: 'good', msg: 't=0ms: Request #1 consumes 1 token (4.0 left) -> Backend 200 OK.' },
+          { gw: { cls: 'ta', txt: 'BURST 4x' }, be: { cls: 'io', txt: '4x 200 OK' }, state: 'CLOSED', tokens: 0.0, failures: 0, probes: 0, clock: 0, type: 'good', msg: 't=0ms: Burst of 4 requests drains remaining 4 tokens (0.0 left) -> All 200 OK.' },
+          { gw: { cls: 'bad', txt: '429 DROP' }, be: { cls: 'idle', txt: 'SHIELDED' }, state: 'CLOSED', tokens: 0.0, failures: 0, probes: 0, clock: 0, type: 'bad', msg: 't=0ms: Request #6 rejected (429 Too Many Requests). Tokens stay 0.0 (never negative!).' },
+          { gw: { cls: 'sw', txt: '+500ms' }, be: { cls: 'idle', txt: 'REFILL +1' }, state: 'CLOSED', tokens: 1.0, failures: 0, probes: 0, clock: 500, type: 'warn', msg: 't=500ms: Monotonic clock advances +500ms at 2 tok/sec -> +1.0 token refilled (1.0 left).' },
+          { gw: { cls: 'ta', txt: 'ALLOW #7' }, be: { cls: 'io', txt: '200 OK' }, state: 'CLOSED', tokens: 0.0, failures: 0, probes: 0, clock: 500, type: 'good', msg: 't=500ms: Request #7 consumes 1 token (0.0 left) -> Backend 200 OK.' },
+          { gw: { cls: 'sw', txt: '+3000ms' }, be: { cls: 'idle', txt: 'CLAMP 5' }, state: 'CLOSED', tokens: 5.0, failures: 0, probes: 0, clock: 3500, type: 'good', msg: 't=3500ms: +3000ms elapsed (+6 theoretical tokens), clamped cleanly to capacity = 5.0.' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Burst Absorbed &amp; Clamped:</strong> Token Bucket absorbed 5 burst calls, rejected excess at 0.0 without going negative, and refilled monotonically up to capacity 5.' }
+      },
+      outage: {
+        init: { state: 'CLOSED', tokens: 5, failures: 0, probes: 0, clock: 0, healthy: false },
+        steps: [
+          { gw: { cls: 'ta', txt: 'ALLOW #1' }, be: { cls: 'bad', txt: '500 ERR' }, state: 'CLOSED', tokens: 4.0, failures: 1, probes: 0, clock: 0, type: 'warn', msg: 't=0ms: Request #1 passes Token Bucket -> Backend 500 error (failures = 1/3).' },
+          { gw: { cls: 'ta', txt: 'ALLOW #2' }, be: { cls: 'bad', txt: '500 ERR' }, state: 'CLOSED', tokens: 3.0, failures: 2, probes: 0, clock: 100, type: 'warn', msg: 't=100ms: Request #2 -> Backend 500 error (failures = 2/3).' },
+          { gw: { cls: 'bad', txt: 'TRIP OPEN' }, be: { cls: 'bad', txt: '500 ERR' }, state: 'OPEN', tokens: 2.2, failures: 3, probes: 0, clock: 200, type: 'bad', msg: 't=200ms: Request #3 fails (3/3) -> Circuit Breaker transitions CLOSED -> OPEN!' },
+          { gw: { cls: 'bad', txt: '503 OPEN' }, be: { cls: 'idle', txt: 'NO CALL' }, state: 'OPEN', tokens: 2.2, failures: 3, probes: 0, clock: 300, type: 'bad', msg: 't=300ms: Request #4 fails fast (503 Circuit Open) without hitting failing backend.' },
+          { gw: { cls: 'bad', txt: '503 OPEN' }, be: { cls: 'idle', txt: 'NO CALL' }, state: 'OPEN', tokens: 2.2, failures: 3, probes: 0, clock: 1000, type: 'bad', msg: 't=1000ms: Still inside 2000ms cooldown (800ms elapsed). Fails fast!' }
+        ],
+        finalVerdict: { cls: 'callout danger', html: '<strong>Circuit Tripped OPEN:</strong> After 3 failures, the breaker short-circuited subsequent calls in microseconds so the degraded backend can recover.' }
+      },
+      recovery: {
+        init: { state: 'OPEN', tokens: 5, failures: 3, probes: 0, clock: 200, healthy: true },
+        steps: [
+          { gw: { cls: 'sw', txt: '+2000ms' }, be: { cls: 'idle', txt: 'COOLDOWN' }, state: 'HALF_OPEN', tokens: 5.0, failures: 3, probes: 0, clock: 2200, type: 'warn', msg: 't=2200ms: resetTimeoutMs (2000ms) elapsed -> State transitions OPEN -> HALF_OPEN.' },
+          { gw: { cls: 'tb', txt: 'PROBE #1' }, be: { cls: 'io', txt: '200 OK' }, state: 'HALF_OPEN', tokens: 4.0, failures: 3, probes: 1, clock: 2200, type: 'good', msg: 't=2200ms: Probe #1/2 admitted -> Backend 200 OK.' },
+          { gw: { cls: 'bad', txt: 'HERD DROP' }, be: { cls: 'idle', txt: 'CAPPED' }, state: 'HALF_OPEN', tokens: 4.0, failures: 3, probes: 2, clock: 2200, type: 'warn', msg: 't=2200ms: Probe #2 in-flight + 3rd concurrent caller arrives -> 3rd caller rejected (probe herd blocked at halfOpenMaxCalls=2)!' },
+          { gw: { cls: 'tb', txt: 'PROBE #2' }, be: { cls: 'io', txt: '200 OK' }, state: 'CLOSED', tokens: 3.0, failures: 0, probes: 0, clock: 2250, type: 'good', msg: 't=2250ms: Probe #2/2 succeeds -> Threshold met! Breaker transitions HALF_OPEN -> CLOSED.' },
+          { gw: { cls: 'ta', txt: 'ALLOW' }, be: { cls: 'io', txt: '200 OK' }, state: 'CLOSED', tokens: 2.0, failures: 0, probes: 0, clock: 2300, type: 'good', msg: 't=2300ms: Normal traffic resumes under CLOSED state.' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Safe Recovery:</strong> Cooldown gated HALF_OPEN, probe cap stopped a thundering herd, and 2 clean probes restored CLOSED.' }
+      }
+    };
+
+    let currentSimMode = 'healthy';
+    let simStepIdx = 0;
+    let simTimer = null;
+
+    let liveState = {
+      state: 'CLOSED',
+      milliTokens: 5000,
+      capacity: 5,
+      refillPerSec: 2,
+      failures: 0,
+      failureThreshold: 3,
+      openedAtMs: 0,
+      resetTimeoutMs: 2000,
+      halfOpenUsed: 0,
+      halfOpenOk: 0,
+      halfOpenMaxCalls: 2,
+      clock: 0,
+      backendHealthy: true,
+      lastRefillMs: 0
+    };
+
+    function renderStateBadge(state) {
+      if (state === 'OPEN') return '<span class="state-pill state-open">OPEN</span>';
+      if (state === 'HALF_OPEN') return '<span class="state-pill state-half">HALF_OPEN</span>';
+      return '<span class="state-pill state-closed">CLOSED</span>';
+    }
+
+    function updateReadouts(state, tokens, failures, probes, clock, healthy) {
+      document.getElementById('reg-state').innerHTML = renderStateBadge(state);
+      document.getElementById('reg-tokens').textContent = `${tokens.toFixed(1)} / 5`;
+      document.getElementById('token-bar').style.width = `${Math.max(0, Math.min(100, (tokens / 5) * 100))}%`;
+      document.getElementById('reg-failures').textContent = `${failures} / 3`;
+      document.getElementById('reg-probes').textContent = `${probes} / 2`;
+      document.getElementById('sim-clock-label').textContent = `Monotonic t = ${clock} ms`;
+      const lbl = document.getElementById('backend-health-label');
+      lbl.textContent = healthy ? 'HEALTHY' : 'FAILING (500)';
+      lbl.style.color = healthy ? 'var(--green)' : 'var(--rose)';
+    }
+
+    function appendTimelineSlot(id, cls, txt) {
+      const d = document.createElement('div');
+      d.className = `slot ${cls}`;
+      d.textContent = txt;
+      const track = document.getElementById(id);
+      track.appendChild(d);
+      track.scrollLeft = track.scrollWidth;
+    }
+
+    function appendLog(type, msg) {
+      const logEl = document.getElementById('sim-log');
+      const line = document.createElement('div');
+      line.className = `trace-line ${type || ''}`;
+      line.textContent = msg;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function syncLiveFromSnapshot(snap) {
+      liveState.state = snap.state;
+      liveState.milliTokens = Math.round(snap.tokens * 1000);
+      liveState.failures = snap.failures;
+      liveState.halfOpenUsed = snap.probes;
+      liveState.halfOpenOk = snap.probes;
+      liveState.clock = snap.clock;
+      liveState.lastRefillMs = snap.clock;
+      liveState.openedAtMs = snap.state === 'OPEN' ? 200 : 0;
+      liveState.backendHealthy = snap.healthy;
+    }
+
+    function resetSim() {
+      if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+      simStepIdx = 0;
+      const sc = SIM_SCENARIOS[currentSimMode];
+      document.getElementById('lane-gateway').innerHTML = '';
+      document.getElementById('lane-backend').innerHTML = '';
+      syncLiveFromSnapshot(sc.init);
+      updateReadouts(sc.init.state, sc.init.tokens, sc.init.failures, sc.init.probes, sc.init.clock, sc.init.healthy);
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${sc.steps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step →, ▶ Play, or fire Live Actions above.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Watch Token Bucket admission and Circuit Breaker transitions in lockstep.';
+    }
+
+    function stepSim() {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      appendTimelineSlot('lane-gateway', s.gw.cls, s.gw.txt);
+      appendTimelineSlot('lane-backend', s.be.cls, s.be.txt);
+      syncLiveFromSnapshot({ state: s.state, tokens: s.tokens, failures: s.failures, probes: s.probes, clock: s.clock, healthy: sc.init.healthy });
+      updateReadouts(s.state, s.tokens, s.failures, s.probes, s.clock, liveState.backendHealthy);
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${sc.steps.length}`;
+      if (simStepIdx === 1) document.getElementById('sim-log').innerHTML = '';
+      appendLog(s.type, `[${simStepIdx}] ${s.msg}`);
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+      }
+    }
+
+    function refillLiveTokens() {
+      const elapsed = Math.max(0, liveState.clock - liveState.lastRefillMs);
+      if (elapsed > 0) {
+        liveState.milliTokens = Math.min(liveState.capacity * 1000, liveState.milliTokens + elapsed * liveState.refillPerSec);
+        liveState.lastRefillMs = liveState.clock;
+      }
+    }
+
+    function handleLiveRequest(label) {
+      refillLiveTokens();
+      if (liveState.state === 'OPEN' && liveState.clock - liveState.openedAtMs >= liveState.resetTimeoutMs) {
+        liveState.state = 'HALF_OPEN';
+        liveState.halfOpenUsed = 0;
+        liveState.halfOpenOk = 0;
+        appendLog('warn', `t=${liveState.clock}ms: Cooldown elapsed -> OPEN -> HALF_OPEN`);
+      }
+
+      if (liveState.state === 'OPEN') {
+        appendTimelineSlot('lane-gateway', 'bad', '503 OPEN');
+        appendTimelineSlot('lane-backend', 'idle', 'NO CALL');
+        appendLog('bad', `t=${liveState.clock}ms: ${label} rejected (503 Circuit OPEN).`);
+      } else if (liveState.state === 'HALF_OPEN' && liveState.halfOpenUsed >= liveState.halfOpenMaxCalls) {
+        appendTimelineSlot('lane-gateway', 'bad', 'PROBE CAP');
+        appendTimelineSlot('lane-backend', 'idle', 'SHIELDED');
+        appendLog('warn', `t=${liveState.clock}ms: ${label} rejected (HALF_OPEN probe limit reached).`);
+      } else if (liveState.milliTokens < 1000) {
+        appendTimelineSlot('lane-gateway', 'bad', '429 RATE');
+        appendTimelineSlot('lane-backend', 'idle', 'SHIELDED');
+        appendLog('bad', `t=${liveState.clock}ms: ${label} rate-limited (429; ${(liveState.milliTokens / 1000).toFixed(1)} tokens).`);
+      } else {
+        liveState.milliTokens -= 1000;
+        const wasHalf = liveState.state === 'HALF_OPEN';
+        if (wasHalf) liveState.halfOpenUsed++;
+
+        if (liveState.backendHealthy) {
+          appendTimelineSlot('lane-gateway', wasHalf ? 'tb' : 'ta', wasHalf ? 'PROBE OK' : 'ALLOW');
+          appendTimelineSlot('lane-backend', 'io', '200 OK');
+          if (wasHalf) {
+            liveState.halfOpenOk++;
+            if (liveState.halfOpenOk >= liveState.halfOpenMaxCalls) {
+              liveState.state = 'CLOSED';
+              liveState.failures = 0;
+              liveState.halfOpenUsed = 0;
+              liveState.halfOpenOk = 0;
+              appendLog('good', `t=${liveState.clock}ms: ${label} probe 200 OK -> HALF_OPEN -> CLOSED!`);
+            } else {
+              appendLog('good', `t=${liveState.clock}ms: ${label} probe 200 OK (${liveState.halfOpenOk}/${liveState.halfOpenMaxCalls}).`);
+            }
+          } else {
+            liveState.failures = 0;
+            appendLog('good', `t=${liveState.clock}ms: ${label} -> 200 OK (${(liveState.milliTokens / 1000).toFixed(1)} tok left).`);
+          }
+        } else {
+          appendTimelineSlot('lane-gateway', 'bad', '500 FAIL');
+          appendTimelineSlot('lane-backend', 'bad', '500 ERR');
+          if (wasHalf) {
+            liveState.state = 'OPEN';
+            liveState.openedAtMs = liveState.clock;
+            liveState.halfOpenUsed = 0;
+            liveState.halfOpenOk = 0;
+            appendLog('bad', `t=${liveState.clock}ms: ${label} probe failed -> HALF_OPEN -> OPEN!`);
+          } else {
+            liveState.failures++;
+            if (liveState.failures >= liveState.failureThreshold) {
+              liveState.state = 'OPEN';
+              liveState.openedAtMs = liveState.clock;
+              appendLog('bad', `t=${liveState.clock}ms: ${label} 500 (${liveState.failures}/3) -> CLOSED -> OPEN!`);
+            } else {
+              appendLog('warn', `t=${liveState.clock}ms: ${label} 500 (failures ${liveState.failures}/3).`);
+            }
+          }
+        }
+      }
+      updateReadouts(liveState.state, liveState.milliTokens / 1000, liveState.failures, liveState.halfOpenUsed, liveState.clock, liveState.backendHealthy);
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) { clearInterval(simTimer); simTimer = null; btn.textContent = '▶ Play'; }
+      else { if (simStepIdx >= SIM_SCENARIOS[currentSimMode].steps.length) resetSim(); btn.textContent = '⏸ Pause'; simTimer = setInterval(stepSim, 750); }
+    });
+    document.getElementById('act-req').addEventListener('click', () => handleLiveRequest('Req'));
+    document.getElementById('act-burst').addEventListener('click', () => { for (let i = 1; i <= 5; i++) handleLiveRequest(`Burst#${i}`); });
+    document.getElementById('act-tick').addEventListener('click', () => {
+      liveState.clock += 500;
+      refillLiveTokens();
+      if (liveState.state === 'OPEN' && liveState.clock - liveState.openedAtMs >= liveState.resetTimeoutMs) {
+        liveState.state = 'HALF_OPEN';
+        liveState.halfOpenUsed = 0;
+        liveState.halfOpenOk = 0;
+        appendLog('warn', `t=${liveState.clock}ms: +500ms tick -> Cooldown finished -> OPEN -> HALF_OPEN!`);
+      } else {
+        appendLog('warn', `t=${liveState.clock}ms: +500ms tick -> Tokens now ${(liveState.milliTokens / 1000).toFixed(1)}/5.`);
+      }
+      appendTimelineSlot('lane-gateway', 'sw', '+500ms');
+      appendTimelineSlot('lane-backend', 'idle', 'CLOCK');
+      updateReadouts(liveState.state, liveState.milliTokens / 1000, liveState.failures, liveState.halfOpenUsed, liveState.clock, liveState.backendHealthy);
+    });
+    document.getElementById('act-backend').addEventListener('click', () => {
+      liveState.backendHealthy = !liveState.backendHealthy;
+      appendLog('warn', `t=${liveState.clock}ms: Backend switched to ${liveState.backendHealthy ? 'HEALTHY (200)' : 'FAILING (500)'}.`);
+      updateReadouts(liveState.state, liveState.milliTokens / 1000, liveState.failures, liveState.halfOpenUsed, liveState.clock, liveState.backendHealthy);
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'TokenBucketLimiter',
+        starter: `class TokenBucketLimiter {\n  constructor({ capacity, refillPerSec, nowMs = () => 0 }) {\n    this.capacity = capacity;\n    this.refillPerSec = refillPerSec;\n    this.nowMs = nowMs;\n    this.tokens = capacity;\n  }\n  getTokens() {\n    // BUG: Never refills using monotonic nowMs()\n    return this.tokens;\n  }\n  tryAcquire(tokens = 1) {\n    // BUG: Allows negative tokens and ignores refill!\n    this.tokens -= tokens;\n    return this.tokens >= 0;\n  }\n}`,
+        hints: [
+          'Store token balance in integer milli-tokens (`capacity * 1000`) so adding `elapsedMs * refillPerSec` avoids IEEE-754 floating-point drift across tiny 1ms ticks.',
+          'In `_refill()`, compute `const now = this.nowMs(); const elapsedMs = Math.max(0, now - this.lastRefillMs);` and advance `this.lastRefillMs = now` only when `now > this.lastRefillMs`.',
+          'Before deducting in `tryAcquire(tokens = 1)`, refill first, reject if `tokens <= 0` or `this.milliTokens < tokens * 1000`, and only subtract when sufficient.'
+        ],
+        solution: `class TokenBucketLimiter {\n  constructor({ capacity, refillPerSec, nowMs = () => 0 }) {\n    this.capacity = capacity;\n    this.refillPerSec = refillPerSec;\n    this.nowMs = nowMs;\n    this.milliTokens = capacity * 1000;\n    this.lastRefillMs = this.nowMs();\n  }\n  _refill() {\n    const now = this.nowMs();\n    const elapsedMs = Math.max(0, now - this.lastRefillMs);\n    if (elapsedMs > 0) {\n      this.milliTokens = Math.min(\n        this.capacity * 1000,\n        this.milliTokens + elapsedMs * this.refillPerSec\n      );\n      this.lastRefillMs = now;\n    }\n  }\n  getTokens() {\n    this._refill();\n    return this.milliTokens / 1000;\n  }\n  tryAcquire(tokens = 1) {\n    if (tokens <= 0) return false;\n    this._refill();\n    const cost = tokens * 1000;\n    if (this.milliTokens < cost) return false;\n    this.milliTokens -= cost;\n    return true;\n  }\n}`,
+        kotlinEquivalent: `class MonotonicTokenBucket(\n    private val capacity: Long,\n    private val refillPerSec: Long,\n    private val clock: TimeSource = TimeSource.Monotonic\n) {\n    private val mutex = Mutex()\n    private var milliTokens = capacity * 1000L\n    private var lastMark = clock.markNow()\n\n    suspend fun tryAcquire(tokens: Long = 1L): Boolean = mutex.withLock {\n        if (tokens <= 0L) return false\n        val elapsedMs = lastMark.elapsedNow().inWholeMilliseconds.coerceAtLeast(0L)\n        if (elapsedMs > 0L) {\n            milliTokens = minOf(capacity * 1000L, milliTokens + elapsedMs * refillPerSec)\n            lastMark = clock.markNow()\n        }\n        val cost = tokens * 1000L\n        if (milliTokens < cost) return false\n        milliTokens -= cost\n        true\n    }\n}`,
+        tests: async (Cls) => runTestCases([
+          {
+            name: 'Starts at full capacity, drains cleanly, and never goes negative on rejection',
+            run: () => {
+              let t = 0;
+              const b = new Cls({ capacity: 3, refillPerSec: 1, nowMs: () => t });
+              assertEq(b.tryAcquire(2), true);
+              assertEq(b.getTokens(), 1);
+              assertEq(b.tryAcquire(2), false, 'Should reject when only 1 token remains');
+              assertEq(b.getTokens(), 1, 'Rejected acquire must not leave negative or altered tokens');
+              assertEq(b.tryAcquire(1), true);
+              assertEq(b.getTokens(), 0);
+            }
+          },
+          {
+            name: 'Clamps refilled tokens at capacity after long idle period',
+            run: () => {
+              let t = 0;
+              const b = new Cls({ capacity: 5, refillPerSec: 10, nowMs: () => t });
+              assertEq(b.tryAcquire(5), true);
+              t += 10000;
+              assertEq(b.getTokens(), 5);
+            }
+          },
+          {
+            name: 'Zero floating-point drift across 1,000 x 1ms ticks at 1 token/sec',
+            run: () => {
+              let t = 0;
+              const b = new Cls({ capacity: 2, refillPerSec: 1, nowMs: () => t });
+              assertEq(b.tryAcquire(2), true);
+              for (let i = 0; i < 999; i++) {
+                t += 1;
+                assertEq(b.tryAcquire(1), false, `Should not refill before 1000ms (at ${t}ms)`);
+              }
+              t += 1;
+              assertEq(b.tryAcquire(1), true, 'Exact 1000ms across 1ms ticks must yield 1 full token');
+              assertEq(b.getTokens(), 0);
+            }
+          },
+          {
+            name: 'Resilient to non-monotonic clock regression (elapsed < 0 ignored)',
+            run: () => {
+              let t = 1000;
+              const b = new Cls({ capacity: 4, refillPerSec: 2, nowMs: () => t });
+              assertEq(b.tryAcquire(3), true);
+              t = 500;
+              assertEq(b.getTokens(), 1);
+              t = 1500;
+              assertEq(b.getTokens(), 2);
+            }
+          }
+        ])
+      },
+      2: {
+        fnName: 'CircuitBreaker',
+        starter: `class CircuitBreaker {\n  constructor({ failureThreshold, resetTimeoutMs, halfOpenMaxCalls, nowMs = () => 0 }) {\n    this.failureThreshold = failureThreshold;\n    this.resetTimeoutMs = resetTimeoutMs;\n    this.halfOpenMaxCalls = halfOpenMaxCalls;\n    this.nowMs = nowMs;\n    this.state = 'CLOSED';\n  }\n  getState() { return this.state; }\n  async execute(fn) {\n    // BUG: Never trips OPEN or caps HALF_OPEN probes!\n    return await fn();\n  }\n}`,
+        hints: [
+          'Maintain a helper `_refreshState()` that checks `if (this.state === "OPEN" && this.nowMs() - this.openedAtMs >= this.resetTimeoutMs)` and transitions to `"HALF_OPEN"`, resetting probe counters.',
+          'In `execute(fn)`, call `_refreshState()`. Reject immediately if `OPEN`, and if `HALF_OPEN` check `if (this.halfOpenUsed >= this.halfOpenMaxCalls)` before incrementing `this.halfOpenUsed++` synchronously before `await fn()`.',
+          'In `try/catch`: on success in `CLOSED` reset `failures = 0`; on success in `HALF_OPEN` increment `halfOpenSuccesses++` and close when `>= halfOpenMaxCalls`. On any failure in `CLOSED` increment `failures` (trip `OPEN` at threshold); in `HALF_OPEN` immediately trip back to `OPEN`.'
+        ],
+        solution: `class CircuitBreaker {\n  constructor({ failureThreshold, resetTimeoutMs, halfOpenMaxCalls, nowMs = () => 0 }) {\n    this.failureThreshold = failureThreshold;\n    this.resetTimeoutMs = resetTimeoutMs;\n    this.halfOpenMaxCalls = halfOpenMaxCalls;\n    this.nowMs = nowMs;\n    this.state = 'CLOSED';\n    this.failures = 0;\n    this.openedAtMs = 0;\n    this.halfOpenUsed = 0;\n    this.halfOpenSuccesses = 0;\n  }\n  _refreshState() {\n    if (this.state === 'OPEN' && this.nowMs() - this.openedAtMs >= this.resetTimeoutMs) {\n      this.state = 'HALF_OPEN';\n      this.halfOpenUsed = 0;\n      this.halfOpenSuccesses = 0;\n    }\n  }\n  getState() {\n    this._refreshState();\n    return this.state;\n  }\n  async execute(fn) {\n    this._refreshState();\n    if (this.state === 'OPEN') {\n      throw new Error('CircuitBreaker is OPEN');\n    }\n    const inHalfOpen = this.state === 'HALF_OPEN';\n    if (inHalfOpen) {\n      if (this.halfOpenUsed >= this.halfOpenMaxCalls) {\n        throw new Error('CircuitBreaker HALF_OPEN probe limit reached');\n      }\n      this.halfOpenUsed++;\n    }\n    try {\n      const result = await fn();\n      if (inHalfOpen) {\n        if (this.state === 'HALF_OPEN') {\n          this.halfOpenSuccesses++;\n          if (this.halfOpenSuccesses >= this.halfOpenMaxCalls) {\n            this.state = 'CLOSED';\n            this.failures = 0;\n            this.halfOpenUsed = 0;\n            this.halfOpenSuccesses = 0;\n          }\n        }\n      } else if (this.state === 'CLOSED') {\n        this.failures = 0;\n      }\n      return result;\n    } catch (err) {\n      if (inHalfOpen) {\n        this.state = 'OPEN';\n        this.openedAtMs = this.nowMs();\n        this.halfOpenUsed = 0;\n        this.halfOpenSuccesses = 0;\n      } else if (this.state === 'CLOSED') {\n        this.failures++;\n        if (this.failures >= this.failureThreshold) {\n          this.state = 'OPEN';\n          this.openedAtMs = this.nowMs();\n        }\n      }\n      throw err;\n    }\n  }\n}`,
+        kotlinEquivalent: `class CircuitBreaker(\n    private val failureThreshold: Int,\n    private val resetTimeoutMs: Long,\n    private val halfOpenMaxCalls: Int,\n    private val clock: TimeSource = TimeSource.Monotonic\n) {\n    private val mutex = Mutex()\n    private var state = State.CLOSED\n    private var failures = 0\n    private var openedMark: TimeMark? = null\n    private var halfOpenUsed = 0\n    private var halfOpenOk = 0\n\n    suspend fun <T> execute(block: suspend () -> T): T {\n        val isProbe = mutex.withLock {\n            if (state == State.OPEN && openedMark!!.elapsedNow().inWholeMilliseconds >= resetTimeoutMs) {\n                state = State.HALF_OPEN; halfOpenUsed = 0; halfOpenOk = 0\n            }\n            when (state) {\n                State.OPEN -> throw CircuitOpenException()\n                State.HALF_OPEN -> { if (halfOpenUsed >= halfOpenMaxCalls) throw ProbeLimitException(); halfOpenUsed++; true }\n                State.CLOSED -> false\n            }\n        }\n        return try {\n            block().also { onSuccess(isProbe) }\n        } catch (t: Throwable) {\n            onFailure(isProbe); throw t\n        }\n    }\n}`,
+        tests: async (Cls) => runTestCases([
+          {
+            name: 'CLOSED resets failure streak on success and trips OPEN at failureThreshold',
+            run: async () => {
+              let t = 0;
+              const cb = new Cls({ failureThreshold: 3, resetTimeoutMs: 1000, halfOpenMaxCalls: 2, nowMs: () => t });
+              const fail = () => Promise.reject(new Error('500'));
+              await cb.execute(fail).catch(() => {});
+              await cb.execute(fail).catch(() => {});
+              assertEq(cb.getState(), 'CLOSED');
+              await cb.execute(async () => 'ok');
+              await cb.execute(fail).catch(() => {});
+              await cb.execute(fail).catch(() => {});
+              assertEq(cb.getState(), 'CLOSED', 'Success should have reset consecutive failure count');
+              await cb.execute(fail).catch(() => {});
+              assertEq(cb.getState(), 'OPEN');
+            }
+          },
+          {
+            name: 'OPEN fails fast without invoking backend fn until resetTimeoutMs elapses',
+            run: async () => {
+              let t = 100, calls = 0;
+              const cb = new Cls({ failureThreshold: 1, resetTimeoutMs: 500, halfOpenMaxCalls: 1, nowMs: () => t });
+              await cb.execute(async () => { calls++; throw new Error('boom'); }).catch(() => {});
+              assertEq(cb.getState(), 'OPEN');
+              t = 599;
+              let rejected = false;
+              try { await cb.execute(async () => { calls++; return 'ok'; }); } catch (e) { rejected = true; }
+              assertEq(rejected, true);
+              assertEq(calls, 1, 'Backend must not be invoked while OPEN');
+              t = 600;
+              assertEq(cb.getState(), 'HALF_OPEN');
+            }
+          },
+          {
+            name: 'HALF_OPEN caps concurrent probe herd at halfOpenMaxCalls and closes on full probe success',
+            run: async () => {
+              let t = 0;
+              const cb = new Cls({ failureThreshold: 1, resetTimeoutMs: 100, halfOpenMaxCalls: 2, nowMs: () => t });
+              await cb.execute(async () => { throw new Error('err'); }).catch(() => {});
+              t = 100;
+              assertEq(cb.getState(), 'HALF_OPEN');
+
+              let release1, release2, backendRuns = 0;
+              const p1 = cb.execute(() => { backendRuns++; return new Promise((r) => { release1 = () => r('p1'); }); });
+              const p2 = cb.execute(() => { backendRuns++; return new Promise((r) => { release2 = () => r('p2'); }); });
+              let herdBlocked = false;
+              try { await cb.execute(async () => { backendRuns++; return 'p3'; }); } catch (e) { herdBlocked = true; }
+              assertEq(herdBlocked, true, '3rd concurrent probe must be blocked');
+              assertEq(backendRuns, 2);
+
+              release1();
+              await p1;
+              assertEq(cb.getState(), 'HALF_OPEN', 'Needs 2 successful probes to close');
+              release2();
+              await p2;
+              assertEq(cb.getState(), 'CLOSED');
+            }
+          },
+          {
+            name: 'HALF_OPEN probe failure immediately re-opens circuit for a fresh cooldown',
+            run: async () => {
+              let t = 0;
+              const cb = new Cls({ failureThreshold: 2, resetTimeoutMs: 500, halfOpenMaxCalls: 2, nowMs: () => t });
+              await cb.execute(async () => { throw new Error('e1'); }).catch(() => {});
+              await cb.execute(async () => { throw new Error('e2'); }).catch(() => {});
+              t = 500;
+              assertEq(cb.getState(), 'HALF_OPEN');
+              await cb.execute(async () => { throw new Error('probe-fail'); }).catch(() => {});
+              assertEq(cb.getState(), 'OPEN');
+              t = 900;
+              assertEq(cb.getState(), 'OPEN');
+              t = 1000;
+              assertEq(cb.getState(), 'HALF_OPEN');
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'BulkheadIsolator',
+        starter: `class BulkheadIsolator {\n  constructor(limits) {\n    this.limits = limits;\n    this.globalActive = 0;\n  }\n  getActiveCount(serviceName) {\n    return this.globalActive;\n  }\n  async run(serviceName, fn) {\n    // BUG: Uses one shared pool & never releases on error!\n    const max = Object.values(this.limits).reduce((a, b) => a + b, 0);\n    if (this.globalActive >= max) throw new Error('Pool full');\n    this.globalActive++;\n    return await fn();\n  }\n}`,
+        hints: [
+          'Track active counts in a per-service map (`this.active = {}`) rather than one shared counter.',
+          'In `run(serviceName, fn)`, verify `this.limits[serviceName]` exists, reject if `active >= limit`, and increment `this.active[serviceName]` synchronously before `await fn()`.',
+          'Wrap `return await fn();` inside `try { ... } finally { this.active[serviceName]--; }` so errors never leak a slot.'
+        ],
+        solution: `class BulkheadIsolator {\n  constructor(limits) {\n    this.limits = { ...limits };\n    this.active = {};\n    for (const key of Object.keys(this.limits)) {\n      this.active[key] = 0;\n    }\n  }\n  getActiveCount(serviceName) {\n    return this.active[serviceName] || 0;\n  }\n  async run(serviceName, fn) {\n    const limit = this.limits[serviceName];\n    if (typeof limit !== 'number') {\n      throw new Error(\`Unknown bulkhead: \${serviceName}\`);\n    }\n    if (this.active[serviceName] >= limit) {\n      throw new Error(\`Bulkhead full for \${serviceName}\`);\n    }\n    this.active[serviceName]++;\n    try {\n      return await fn();\n    } finally {\n      this.active[serviceName]--;\n    }\n  }\n}`,
+        kotlinEquivalent: `class BulkheadIsolator(limits: Map<String, Int>) {\n    private val semaphores = limits.mapValues { Semaphore(it.value) }\n\n    suspend fun <T> run(service: String, block: suspend () -> T): T {\n        val sem = semaphores[service] ?: error("Unknown bulkhead: $service")\n        if (!sem.tryAcquire()) throw BulkheadFullException(service)\n        return try {\n            block()\n        } finally {\n            sem.release()\n        }\n    }\n}`,
+        tests: async (Cls) => runTestCases([
+          {
+            name: 'Slow Service B saturation never blocks or starves Service A slots',
+            run: async () => {
+              const bh = new Cls({ serviceA: 2, serviceB: 2 });
+              let relB1, relB2;
+              const b1 = bh.run('serviceB', () => new Promise((r) => { relB1 = () => r('b1'); }));
+              const b2 = bh.run('serviceB', () => new Promise((r) => { relB2 = () => r('b2'); }));
+              assertEq(bh.getActiveCount('serviceB'), 2);
+
+              let b3Rejected = false;
+              try { await bh.run('serviceB', async () => 'b3'); } catch (e) { b3Rejected = true; }
+              assertEq(b3Rejected, true, '3rd concurrent Service B call must be rejected');
+
+              const aResults = await Promise.all([
+                bh.run('serviceA', async () => 'a1'),
+                bh.run('serviceA', async () => 'a2')
+              ]);
+              assertDeepEq(aResults, ['a1', 'a2']);
+              assertEq(bh.getActiveCount('serviceA'), 0);
+
+              relB1(); relB2();
+              await Promise.all([b1, b2]);
+              assertEq(bh.getActiveCount('serviceB'), 0);
+            }
+          },
+          {
+            name: 'Releases slot cleanly when fn() throws an exception',
+            run: async () => {
+              const bh = new Cls({ serviceA: 1 });
+              let threw = false;
+              try {
+                await bh.run('serviceA', async () => { throw new Error('downstream crash'); });
+              } catch (e) { threw = true; }
+              assertEq(threw, true);
+              assertEq(bh.getActiveCount('serviceA'), 0, 'Slot leaked after exception');
+              const ok = await bh.run('serviceA', async () => 'recovered');
+              assertEq(ok, 'recovered');
+            }
+          },
+          {
+            name: 'Rejects unconfigured service names',
+            run: async () => {
+              const bh = new Cls({ serviceA: 1 });
+              let threw = false;
+              try { await bh.run('unknown', async () => 'x'); } catch (e) { threw = true; }
+              assertEq(threw, true);
+            }
+          }
+        ])
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. How do Java 21+ Virtual Threads fundamentally differ from Kotlin CPS Coroutines in runtime architecture?',
+        code: `// Java 21: Thread.startVirtualThread(() -> blockingSocketRead());\n// Kotlin:  scope.launch { suspendingSocketRead() }`,
+        options: [
+          'Virtual threads use heap-managed call stacks, whereas Kotlin coroutines compile into stackless continuation state machines.',
+          'Virtual threads execute without OS carrier threads, whereas Kotlin coroutines allocate one kernel thread each.',
+          'Virtual threads require explicit suspend keywords everywhere, whereas Kotlin coroutines unmount on any native call.',
+          'Virtual threads run strictly single-threaded per core, whereas Kotlin coroutines bypass the JVM garbage collector.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Virtual threads are stackful (resizable heap stack chunks unmounted on blocking JDK I/O), whereas Kotlin coroutines are stackless CPS state machines compiled into Continuation objects.',
+          'WRONG (B): Both run on top of OS thread pools (ForkJoinPool carriers for Loom; Dispatchers for Kotlin); neither allocates a dedicated OS thread per task.',
+          'WRONG (C): The exact opposite is true: Kotlin uses explicit suspend keywords, while Loom unmounts implicitly at JDK blocking boundaries (and pins on native JNI calls).',
+          'WRONG (D): Loom schedules across multi-core ForkJoinPool carriers, and Kotlin Continuation objects live on and are collected by the JVM heap/GC.'
+        ]
+      },
+      {
+        stem: '2. A Java 21 service spawns 10,000 virtual threads that call blocking JDBC inside synchronized blocks. What happens?',
+        code: `synchronized (dbLock) {\n    return jdbcStatement.executeQuery(); // 80ms socket wait\n}`,
+        options: [
+          'The JVM converts synchronized into non-blocking mutexes automatically, keeping total system throughput steady.',
+          'Every virtual thread pins to its carrier OS thread, starving the carrier pool.',
+          'The ForkJoinPool throws IllegalMonitorStateException whenever virtual threads enter synchronized monitor lock blocks.',
+          'JDBC automatically spawns 10,000 native kernel threads to bypass JVM monitor locks.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): In Java 21 (JEP 444), synchronized monitors are not automatically converted into unmountable locks; ReentrantLock or Kotlin Mutex is required.',
+          'CORRECT (B): Blocking I/O inside synchronized pins the virtual thread to its carrier OS thread, exhausting the small ForkJoinPool carrier pool and stalling unrelated work.',
+          'WRONG (C): Entering synchronized on a virtual thread is legal and does not throw IllegalMonitorStateException; it simply causes carrier pinning.',
+          'WRONG (D): JDBC drivers do not manufacture 10,000 OS threads to evade synchronized; the caller virtual threads remain blocked on the socket while holding the carrier.'
+        ]
+      },
+      {
+        stem: '3. Why should a production Token Bucket rate limiter use System.nanoTime() rather than System.currentTimeMillis()?',
+        code: `val elapsed = (clockNow() - lastRefill) // Used to add new tokens`,
+        options: [
+          'System.currentTimeMillis() throws SecurityException on Android whenever called inside background dispatchers.',
+          'System.nanoTime() is monotonic and immune to backward or forward NTP wall-clock jumps.',
+          'System.currentTimeMillis() returns cached compile-time timestamps that never advance during JVM uptime.',
+          'System.nanoTime() synchronizes CPU caches across threads automatically without needing any locks.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): System.currentTimeMillis() is freely callable from any thread or dispatcher without throwing SecurityException.',
+          'CORRECT (B): Wall-clock time can jump backwards or forwards during NTP syncs or manual clock changes, corrupting elapsed refill intervals; monotonic clocks only move forward.',
+          'WRONG (C): System.currentTimeMillis() advances in real time; the defect is non-monotonicity under clock adjustments, not being frozen.',
+          'WRONG (D): Reading System.nanoTime() provides no mutual exclusion or atomic compound updates; concurrent Token Bucket access still needs synchronization.'
+        ]
+      },
+      {
+        stem: '4. When a Circuit Breaker transitions from OPEN to HALF_OPEN after cooldown, why must it enforce halfOpenMaxCalls?',
+        code: `// 500 concurrent callers arrive right as resetTimeoutMs expires`,
+        options: [
+          'Because unlimited HALF_OPEN callers create a probe herd that slams the recovering backend.',
+          'Because JVM SocketChannel crashes immediately if more than two threads read state variables.',
+          'Because Token Buckets automatically double their capacity whenever a circuit becomes HALF_OPEN.',
+          'Because HALF_OPEN circuits permanently block all future traffic unless halfOpenMaxCalls equals zero.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Without a strict probe cap (halfOpenMaxCalls), hundreds of queued callers seeing HALF_OPEN at once would stampede the recovering downstream service.',
+          'WRONG (B): SocketChannel does not crash from reading state variables; the hazard is downstream overload from uncapped concurrent probes.',
+          'WRONG (C): Token Buckets and Circuit Breakers are independent mechanisms; HALF_OPEN does not mutate bucket capacity.',
+          'WRONG (D): Setting halfOpenMaxCalls to zero would permit zero probes and prevent the circuit from ever testing recovery back to CLOSED.'
+        ]
+      },
+      {
+        stem: '5. An Android app shares one 4-permit Semaphore across Checkout API and Analytics API. Analytics stalls for 15s. Why does Checkout fail?',
+        code: `val sharedPool = Semaphore(4)\n// 4 Analytics uploads hang -> Checkout awaits sharedPool.acquire()`,
+        options: [
+          'Kotlin Mutex automatically cancels Checkout jobs whenever Analytics takes longer than ten seconds.',
+          'Without Bulkhead isolation, slow Analytics calls hold every permit and starve Checkout.',
+          'Shared Semaphores promote Analytics coroutines onto Dispatchers.Main, freezing the entire UI thread.',
+          'Android WorkManager deletes Checkout network sockets when four Analytics requests run concurrently.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Neither Semaphore nor Mutex auto-cancels unrelated coroutines based on execution duration without an explicit withTimeout.',
+          'CORRECT (B): Sharing one pool couples failure domains; Bulkhead isolation partitions separate permit pools per dependency so slow Analytics cannot exhaust Checkout.',
+          'WRONG (C): Semaphore acquisition does not change a coroutine’s dispatcher or move work onto Dispatchers.Main.',
+          'WRONG (D): WorkManager does not tear down active sockets belonging to another feature due to semaphore contention.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_17',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

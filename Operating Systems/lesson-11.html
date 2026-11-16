@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 11: VFS, Ext4, F2FS &amp; Crash Consistency — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <style>
+    .sim-tabs {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.9rem;
+    }
+    .sim-tab {
+      padding: 0.38rem 0.78rem;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-card);
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .sim-tab.active {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .sim-pane { display: none; }
+    .sim-pane.active { display: block; }
+    .blk-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+      gap: 0.45rem;
+      margin-top: 0.45rem;
+    }
+    .blk-cell {
+      border: 1px solid var(--border);
+      background: var(--bg-code);
+      border-radius: 6px;
+      padding: 0.42rem 0.55rem;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+    }
+    .blk-cell.dirty { border-color: var(--amber); background: var(--amber-soft); }
+    .blk-cell.ok { border-color: var(--green); background: var(--green-soft); }
+    .blk-cell.bad { border-color: var(--red); background: var(--red-soft); }
+    .wal-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.32rem;
+      margin-top: 0.4rem;
+      max-height: 170px;
+      overflow-y: auto;
+    }
+    .wal-item {
+      padding: 0.32rem 0.55rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-code);
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+    }
+    .wal-item.committed { border-left: 3px solid var(--green); }
+    .wal-item.uncommitted { border-left: 3px solid var(--amber); }
+    .wal-item.torn { border-left: 3px solid var(--red); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 11</span>
+        <span>VFS, Ext4, F2FS &amp; Crash Consistency</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-10.html">&larr; Prev Lesson</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C &amp; Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">Code Labs (3)</a>
+        <a href="#quiz">Quiz (6)</a>
+        <a href="#senior-bar">Senior Bar</a>
+        <a href="lesson-12.html">Next Lesson &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="badge b-concept">PHASE 4 // I/O, STORAGE, FILESYSTEMS &amp; NETWORKING</span>
+      <h1>Lesson 11: VFS, Ext4, F2FS &amp; Crash Consistency</h1>
+      <p>
+        Filesystems sit on top of an unreliable reality: RAM page caches are volatile, SSD/UFS Flash Translation Layers (FTLs)
+        hate random overwrites, and phones lose power mid-write. Learn how Linux abstracts filesystems via the VFS,
+        how Ext4 JBD2 and Android's log-structured F2FS guarantee crash consistency, and why <code>fsync()</code> semantics break naive apps.
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button id="markLessonComplete" class="btn btn-green btn-sm" type="button">Mark Lesson 11 Complete</button>
+      </div>
+    </section>
+
+    <!-- MODULE 1: MENTAL MODEL + INTERACTIVE SIMULATOR -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>VFS Object Model, Crash Consistency &amp; Flash-Aware Storage</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. The 4 VFS Objects &amp; Hard Links vs Symlinks</h3>
+          <p>Linux's <strong>Virtual File System (VFS)</strong> exposes one unified POSIX API (<code>openat</code>, <code>read</code>, <code>statx</code>) across Ext4, F2FS, procfs, and FUSE using four core kernel structures:</p>
+          <p><strong><code>super_block</code>:</strong> One per mounted filesystem instance (block size, mount flags, root dentry, dirty inode list).</p>
+          <p><strong><code>inode</code>:</strong> The true file identity (<code>i_ino</code>, permissions, size, extent/block pointers, and <code>i_nlink</code>). Filenames do <em>not</em> live inside the inode!</p>
+          <p><strong><code>dentry</code>:</strong> Maps a directory + filename string to an inode. Cached in the <strong>dcache</strong> hash table for fast lockless RCU path walks.</p>
+          <p><strong><code>file</code> (Open File Description):</strong> Per-<code>open()</code> kernel state holding current offset <code>f_pos</code>, access mode, and refcount <code>f_count</code> (shared by <code>dup()</code>/<code>fork()</code>).</p>
+          <p><strong>Hard link vs Symlink:</strong> A hard link adds another <code>dentry</code> pointing to the <em>same</em> <code>inode</code> (incrementing <code>i_nlink</code>; data is freed only when <code>i_nlink == 0</code> AND all open <code>file</code> descriptors close). A symlink is a separate <code>inode</code> containing a target path string, resolved recursively up to <code>MAXSYMLINKS</code> (40) to stop cycles (<code>-ELOOP</code>).</p>
+        </div>
+
+        <div class="card">
+          <h3>2. Crash Consistency: Ext4 JBD2 vs F2FS</h3>
+          <p>Modifying a file updates multiple blocks: data blocks, inode size/timestamps, and allocation bitmaps. If power dies mid-update, metadata can point to uninitialized garbage blocks or leak space.</p>
+          <p><strong>Ext4 Journaling (JBD2):</strong> Writes changes into a circular write-ahead journal before updating home locations. In default <code>data=ordered</code> mode, data blocks are flushed <em>first</em>, then metadata + commit record are written to the journal—preventing stale garbage inside extended files without double-writing all data.</p>
+          <p><strong>Why Flash Hates Ext4 In-Place Updates:</strong> NAND flash cannot overwrite a 4KB page in place; the FTL must copy valid pages from a multi-MB erase block, erase the block, and rewrite—causing high <strong>Write Amplification (WAF)</strong>.</p>
+          <p><strong>F2FS (Flash-Friendly File System):</strong> Uses a <strong>Log-Structured</strong> design! Updates are appended sequentially into 2MB <em>segments</em> grouped into hot/warm/cold logs (mapped via the Node Address Table, NAT). Periodically, F2FS Garbage Collection (GC) migrates remaining live blocks from fragmented segments and reclaims empty segments.</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <strong>Durability Contract — <code>fsync()</code> vs <code>fdatasync()</code> vs Write Barriers:</strong><br/>
+        &bull; <code>write()</code> only copies bytes into the kernel <strong>Page Cache</strong> in RAM.<br/>
+        &bull; <code>fdatasync(fd)</code> flushes dirty data blocks + minimal metadata needed to retrieve them (e.g., file size), skipping <code>mtime</code>.<br/>
+        &bull; <code>fsync(fd)</code> flushes all dirty data + inode metadata AND sends storage write barriers (<code>REQ_PREFLUSH | REQ_FUA</code>) so the UFS/NVMe controller drains its volatile DRAM cache to NAND.<br/>
+        &bull; <strong>The Classic Bug:</strong> Calling <code>fsync(fd)</code> on a newly created file does <em>not</em> persist its directory entry! You must also call <code>fsync(parent_dir_fd)</code>.
+      </div>
+
+      <h3 style="margin:1.25rem 0 0.4rem;">Interactive Simulators: VFS Path Walk &amp; WAL Crash Recovery</h3>
+      <p style="margin:0; font-size:0.89rem; color:var(--text-muted);">Switch between the VFS Path/Symlink Walker and the Write-Ahead Log (WAL) Power-Loss Recovery Simulator.</p>
+
+      <div class="sim-box">
+        <div class="sim-tabs">
+          <button class="sim-tab active" type="button" data-pane="vfsPane">1. VFS Path Walk &amp; Symlink Simulator</button>
+          <button class="sim-tab" type="button" data-pane="walPane">2. WAL Journal Crash-Recovery Simulator</button>
+        </div>
+
+        <!-- PANE 1: VFS -->
+        <div id="vfsPane" class="sim-pane active">
+          <div class="sim-controls">
+            <button class="btn btn-primary btn-sm" type="button" id="vfsStepBtn">Step Component &rarr;</button>
+            <button class="btn btn-sm" type="button" data-vfs-path="/data/app/notes.db">Normal (/data/app/notes.db)</button>
+            <button class="btn btn-sm" type="button" data-vfs-path="/data/cur/notes.db">Symlink (/data/cur/notes.db)</button>
+            <button class="btn btn-amber btn-sm" type="button" data-vfs-path="/data/loop_a/notes.db">Cycle (-ELOOP)</button>
+            <button class="btn btn-sm" type="button" data-vfs-path="/data/app/notes.db/child">Not Dir (-ENOTDIR)</button>
+            <span class="pill" id="vfsStatusPill">READY</span>
+          </div>
+          <div class="sim-grid">
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">VFS LOOKUP STATE</div>
+              <div class="reg-row"><span>Target Path</span><span class="reg-val" id="vfsPathVal">/data/app/notes.db</span></div>
+              <div class="reg-row"><span>Current Inode</span><span class="reg-val" id="vfsInodeVal">ino=2 (dir "/")</span></div>
+              <div class="reg-row"><span>Remaining Queue</span><span class="reg-val" id="vfsQueueVal">[data, app, notes.db]</span></div>
+              <div class="reg-row"><span>Symlinks Followed</span><span class="reg-val" id="vfsSymVal">0 / 4</span></div>
+              <div class="reg-row"><span>Dentry Cache</span><span class="reg-val" id="vfsDcacheVal">-</span></div>
+            </div>
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">KERNEL WALK TRACE</div>
+              <div id="vfsTrace" style="font-family:var(--font-sans); font-size:0.83rem; color:var(--text); line-height:1.45;">
+                Starting at root dentry (<code>ino=2</code>). Click <strong>Step Component</strong> to walk <code>path_lookupat()</code>.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PANE 2: WAL -->
+        <div id="walPane" class="sim-pane">
+          <div class="sim-controls">
+            <button class="btn btn-primary btn-sm" type="button" id="walTx1Btn">+ Commit TX1 (Blk 0, 1)</button>
+            <button class="btn btn-amber btn-sm" type="button" id="walTx2Btn">+ Torn TX2 (No Commit)</button>
+            <button class="btn btn-sm" type="button" id="walCrashBtn">Simulate Power Loss!</button>
+            <button class="btn btn-green btn-sm" type="button" id="walRecoverBtn">Run WAL Recovery</button>
+            <button class="btn btn-sm" type="button" id="walResetBtn">Reset</button>
+            <span class="pill" id="walStatePill">ONLINE</span>
+          </div>
+          <div class="sim-grid">
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.2rem; color:var(--text-muted);">WAL JOURNAL LOG</div>
+              <div class="wal-list" id="walLogView"></div>
+            </div>
+            <div class="reg-panel">
+              <div style="font-weight:700; margin-bottom:0.2rem; color:var(--text-muted);">DISK BLOCKS (MAIN DB)</div>
+              <div class="blk-grid" id="walDiskView"></div>
+              <div id="walExplain" style="font-family:var(--font-sans); font-size:0.81rem; color:var(--text-muted); margin-top:0.6rem;">
+                Append transactions to the WAL, trigger power loss, and run crash recovery.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 2: C & KERNEL REALITY -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C &amp; KERNEL REALITY</span>
+          <h2>VFS Kernel Structures, Ext4 Extents &amp; Crash-Safe Atomic Rename</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>vfs_inode_file.c — Why dup() shares f_pos but open() does not</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code11_1">Copy</button>
+          </div>
+          <pre class="code" id="code11_1">// Conceptual Linux kernel VFS relationship (fs/file_table.c, include/linux/fs.h)
+struct inode {
+  unsigned long       i_ino;      // Unique inode number within super_block
+  umode_t             i_mode;     // File type (S_IFREG/S_IFDIR/S_IFLNK) + perms
+  unsigned int        i_nlink;    // Hard-link reference count on disk
+  loff_t              i_size;     // File size in bytes
+  struct address_space *i_mapping;// Page cache radix/xarray of cached 4KB pages
+};
+
+struct dentry {
+  struct qstr         d_name;     // Filename component ("notes.db")
+  struct inode       *d_inode;    // NULL for negative dentry (cached -ENOENT!)
+  struct dentry      *d_parent;   // Parent directory dentry
+};
+
+struct file {
+  struct path         f_path;     // (mnt, dentry) pair
+  struct inode       *f_inode;    // Cached pointer to underlying inode
+  loff_t              f_pos;      // Current read/write byte offset!
+  atomic_long_t       f_count;    // Refcount: dup()/fork() increment f_count,
+};                                // whereas two open() calls allocate two struct files!</pre>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>atomic_save_fsync.c — Crash-Safe File Replacement in POSIX C</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code11_2">Copy</button>
+          </div>
+          <pre class="code" id="code11_2">// The ONLY crash-safe way to overwrite a config/DB file on Linux/Android
+int atomic_write_file(const char *dir_path, const char *tmp_name,
+                      const char *final_name, const void *buf, size_t len) {
+  int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dir_fd &lt; 0) return -1;
+
+  int tmp_fd = openat(dir_fd, tmp_name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (tmp_fd &lt; 0) { close(dir_fd); return -1; }
+
+  // 1. Write payload into page cache, then force data + inode to NAND (with FUA barrier)
+  if (write(tmp_fd, buf, len) != (ssize_t)len || fsync(tmp_fd) &lt; 0) {
+    close(tmp_fd); close(dir_fd); return -1;
+  }
+  close(tmp_fd);
+
+  // 2. Atomically swing directory entry from old inode -> new inode
+  if (renameat(dir_fd, tmp_name, dir_fd, final_name) &lt; 0) {
+    close(dir_fd); return -1;
+  }
+  // 3. CRITICAL: Persist the directory metadata itself! Without this, power loss
+  //    can lose BOTH the new entry and leave the old file missing!
+  int rc = fsync(dir_fd);
+  close(dir_fd);
+  return rc;
+}</pre>
+        </div>
+      </div>
+
+      <div class="callout amber">
+        <strong>Ext4 Extents vs F2FS Segments in Practice:</strong><br/>
+        Instead of legacy Ext2/Ext3 indirect block trees (which needed thousands of pointer blocks for a 4GB video), Ext4 stores contiguous runs as compact 12-byte <strong>extents</strong> (<code>struct ext4_extent { ee_block, ee_len, ee_start_hi/lo }</code>), mapping up to 128MB per leaf entry. Meanwhile, F2FS divides storage into 2MB <strong>segments</strong> and maintains a <strong>Segment Info Table (SIT)</strong> tracking valid-block bitmaps per segment so its Garbage Collector can pick cold, mostly-invalidated segments using a cost-benefit heuristic.
+      </div>
+    </section>
+
+    <!-- MODULE 3: ANDROID BRIDGE -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2>Why Android Adopted F2FS, SQLite WAL &amp; Scoped Storage FUSE Overhead</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. Why Android Switched <code>/data</code> from Ext4 to F2FS</h3>
+          <p><strong>Flash-Friendly Append Writes:</strong> Mobile workloads (SQLite journals, ART <code>.odex</code>/<code>.vdex</code> profiles, SharedPreferences, app caches) emit lots of small random 4KB writes. On Ext4, JBD2 journaling + random in-place updates amplify writes inside the UFS controller's FTL, degrading random read latency and wearing out NAND.</p>
+          <p><strong>F2FS Atomic Writes for SQLite:</strong> F2FS originally added <code>F2FS_IOC_START_ATOMIC_WRITE</code> / <code>COMMIT_ATOMIC_WRITE</code> so SQLite could buffer pages in-memory/append segments and commit atomically without a separate rollback journal—cutting flash writes nearly in half.</p>
+          <p><strong>Multi-Head Logging:</strong> F2FS separates hot (directory/small sync), warm (normal data), and cold (media/immutable) segments so cold data isn't repeatedly copied during GC.</p>
+        </div>
+
+        <div class="card">
+          <h3>2. SQLite WAL on Room &amp; FUSE Scoped Storage Overhead</h3>
+          <p><strong>SQLite WAL Mode (Default in Android Room):</strong> Instead of modifying the main <code>.db</code> file in place, writers append frames + a commit frame to <code>db-wal</code>. Readers see a consistent snapshot using the <code>db-shm</code> WAL index. With <code>PRAGMA synchronous=NORMAL</code>, Room skips <code>fsync()</code> on individual WAL commits (survives app crashes, risks losing last uncommitted checkpoint on sudden battery pull) and <code>fsync()</code>s only during WAL checkpoints.</p>
+          <p><strong>FUSE Scoped Storage Tax:</strong> External storage (<code>/sdcard</code>) runs through MediaProvider's user-space <strong>FUSE</strong> daemon for per-app privacy filtering. Every uncached <code>read()</code>/<code>write()</code> bounces <code>App (EL0) &rarr; Kernel VFS (EL1) &rarr; /dev/fuse &rarr; MediaProvider (EL0) &rarr; Lower FS (EL1)</code>! Android 12+ mitigates this via <strong>FUSE passthrough</strong> (<code>FUSE_PASSTHROUGH</code>) backed by an opened lower-FS file descriptor.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: RUNNABLE CODE PRACTICE LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // RUNNABLE CODE PRACTICE LABS</span>
+          <h2>Hands-On Filesystem Labs (VFS Walk, WAL Recovery, F2FS GC)</h2>
+        </div>
+      </div>
+      <p style="color:var(--text-muted); margin-top:0;">
+        Write real JavaScript implementations matching Linux VFS, WAL, and F2FS algorithms. Click <strong>Run &amp; Check</strong> (or <code>Ctrl/Cmd + Enter</code>).
+      </p>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // VFS PATH RESOLUTION</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>resolveVfsPath(fs, startInodeId, path, maxSymlinks)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Walk <code>/</code>-separated paths, expand relative/absolute symlinks, and enforce <code>-ENOENT</code>, <code>-ENOTDIR</code>, and <code>-ELOOP</code>.
+            </p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> <code>fs</code> is <code>{ rootId, inodes: { [id]: { id, type: "dir"|"file"|"symlink", entries?: { [name]: id }, target?: string } } }</code>.<br/>
+          &bull; Error codes: <code>ENOENT = -2</code>, <code>ENOTDIR = -20</code>, <code>ELOOP = -40</code>.<br/>
+          &bull; If <code>!path</code> or non-string, return <code>{ ok: false, errno: -2 }</code>.<br/>
+          &bull; Start at <code>curId = path.startsWith("/") ? fs.rootId : startInodeId</code>. Split <code>path</code> on <code>"/"</code> into a queue (skipping <code>""</code> and <code>"."</code>).<br/>
+          &bull; While queue is non-empty, pop <code>seg</code>: look up <code>cur = fs.inodes[curId]</code>. If <code>!cur</code> return <code>-2</code>; if <code>cur.type !== "dir"</code> return <code>{ ok: false, errno: -20 }</code>.<br/>
+          &bull; Look up <code>nextId = cur.entries?.[seg]</code>. If <code>nextId === undefined</code> return <code>{ ok: false, errno: -2 }</code>. Look up <code>next = fs.inodes[nextId]</code>.<br/>
+          &bull; If <code>next.type === "symlink"</code>: increment symlink counter; if <code>&gt; maxSymlinks</code> return <code>{ ok: false, errno: -40 }</code>. If <code>next.target.startsWith("/")</code>, set <code>curId = fs.rootId</code> (else keep <code>curId</code> as parent dir), and prepend <code>next.target</code>'s non-empty/non-<code>"."</code> segments to the queue.<br/>
+          &bull; Else set <code>curId = nextId</code>. When queue finishes, return <code>{ ok: true, inodeId: curId }</code>.
+        </div>
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // CRASH CONSISTENCY</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>recoverWal(journalEntries, diskBlocks)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Replay ONLY committed transactions in commit order while discarding uncommitted, aborted, and torn writes.
+            </p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> <code>journalEntries</code> is an array of entries: <code>{ txId, type: "BEGIN" | "WRITE" | "COMMIT" | "ABORT" | "TORN", blockId?, data?, checksumOk? }</code>. <code>diskBlocks</code> is <code>{ [blockId]: string }</code>.<br/>
+          &bull; Do <strong>not</strong> mutate <code>diskBlocks</code> in place; clone it into <code>blocks</code>.<br/>
+          &bull; A transaction <code>txId</code> is valid &amp; committed iff: it saw <code>BEGIN</code>, never saw <code>ABORT</code>, never had <code>type === "TORN"</code> or <code>checksumOk === false</code> on any of its entries, and saw a <code>COMMIT</code> entry.<br/>
+          &bull; Replay all <code>WRITE</code> entries of committed transactions in their <code>COMMIT</code> order (and write order within each tx), updating <code>blocks[entry.blockId] = entry.data</code>.<br/>
+          &bull; Return <code>{ blocks, replayedTxIds, discardedTxIds }</code> where <code>replayedTxIds</code> are committed IDs in commit order and <code>discardedTxIds</code> are non-committed seen IDs in first-seen order (unique).
+        </div>
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // F2FS COST-BENEFIT GC</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>f2fsSelectGcSegment(segments)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">
+              Choose the victim flash segment minimizing F2FS cost-benefit <code>(validRatio / (1 - validRatio)) / age</code> and return migrated live blocks + reclaimed space.
+            </p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> <code>segments</code> is an array of <code>{ id, capacity, liveBlocks: string[], age: number, isFree?: boolean }</code>.<br/>
+          &bull; Skip already-free segments (<code>seg.isFree === true</code>) and 100%-live segments (<code>seg.liveBlocks.length &gt;= seg.capacity</code>, which yield 0 reclaimed space).<br/>
+          &bull; Compute <code>validRatio = seg.liveBlocks.length / seg.capacity</code>.<br/>
+          &bull; Cost-benefit score to <strong>minimize</strong>: if <code>seg.liveBlocks.length === 0</code>, <code>score = 0</code> (free reclaim!). Else if <code>seg.age &lt;= 0</code>, <code>score = Infinity</code>; else <code>score = (validRatio / (1 - validRatio)) / seg.age</code>.<br/>
+          &bull; Break ties by smallest <code>liveBlocks.length</code>, then smallest <code>id</code>. If no eligible victim exists, return <code>null</code>.<br/>
+          &bull; Otherwise return <code>{ victimId: best.id, score: bestScore, migratedBlocks: [...best.liveBlocks], reclaimedBlocks: best.capacity - best.liveBlocks.length }</code>.
+        </div>
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: DIAGNOSTIC QUIZZES -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (6 Questions)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Inspecting VFS, Ext4 &amp; F2FS on Live Linux / Android Devices</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header"><span>Real Linux / Android Storage Forensics</span></div>
+          <pre class="code"># 1. Check filesystem types &amp; mount options (/data is f2fs on modern Android)
+adb shell mount | grep -E "ext4|f2fs|fuse"
+
+# 2. Inspect inode number, hard link count (Links), and block usage
+stat /data/local/tmp/test.bin
+
+# 3. Inspect F2FS segment count, dirty segments &amp; GC status on Android
+adb shell cat /sys/kernel/debug/f2fs/status
+
+# 4. Trace fsync/fdatasync/renameat2 syscalls from an app process
+strace -e trace=openat,write,fsync,fdatasync,renameat2 ./db_bench</pre>
+        </div>
+
+        <div class="card">
+          <h3>Senior Engineer Mastery Checklist</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can explain why <code>inode</code> holds <code>i_nlink</code> while <code>file</code> holds <code>f_pos</code>, and why deleting an open file reclaims space only after the last <code>fd</code> closes.</span></li>
+            <li><input type="checkbox" /> <span>I know why crash-safe file replacement requires <code>write &rarr; fsync(tmp_fd) &rarr; renameat &rarr; fsync(dir_fd)</code>.</span></li>
+            <li><input type="checkbox" /> <span>I can articulate why F2FS outperforms Ext4 on mobile NAND flash via sequential segment appends and cost-benefit GC.</span></li>
+            <li><input type="checkbox" /> <span>I understand how SQLite WAL mode and Android's Scoped Storage FUSE boundary impact tail latency and write amplification.</span></li>
+          </ul>
+          <div class="callout green" style="margin-top:0.85rem; margin-bottom:0; font-size:0.84rem;">
+            <strong>Capstone Link:</strong> Lesson 11 connects directly to <code>kernel/vfs.c</code> in <a href="capstone.html">AegisOS-64 Capstone</a>. Ready for <a href="lesson-12.html">Lesson 12: Kernel Networking Stack &rarr;</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a class="btn" href="lesson-10.html">&larr; Prev: Lesson 10 (I/O, blk-mq &amp; io_uring)</a>
+      <a class="btn" href="master-plan.html">Master Plan</a>
+      <a class="btn btn-primary" href="lesson-12.html">Next: Lesson 12 (Kernel Networking) &rarr;</a>
+    </div>
+  </main>
+
+  <script src="assets/os-course.js"></script>
+  <script>
+    /* ============================================================
+       INTERACTIVE SIMULATORS (VFS PATH WALK + WAL RECOVERY)
+       ============================================================ */
+    (function () {
+      document.querySelectorAll(".sim-tab").forEach((tab) => {
+        tab.addEventListener("click", () => {
+          document.querySelectorAll(".sim-tab").forEach((t) => t.classList.remove("active"));
+          document.querySelectorAll(".sim-pane").forEach((p) => p.classList.remove("active"));
+          tab.classList.add("active");
+          document.getElementById(tab.dataset.pane).classList.add("active");
+        });
+      });
+
+      // --- Simulator 1: VFS Walk ---
+      const SIM_FS = {
+        rootId: 2,
+        inodes: {
+          2:  { id: 2,  type: "dir", name: "/", entries: { data: 10 } },
+          10: { id: 10, type: "dir", name: "data", entries: { app: 11, cur: 12, loop_a: 13, loop_b: 14 } },
+          11: { id: 11, type: "dir", name: "app", entries: { "notes.db": 20 } },
+          12: { id: 12, type: "symlink", name: "cur", target: "/data/app" },
+          13: { id: 13, type: "symlink", name: "loop_a", target: "/data/loop_b" },
+          14: { id: 14, type: "symlink", name: "loop_b", target: "/data/loop_a" },
+          20: { id: 20, type: "file", name: "notes.db" }
+        }
+      };
+      const SIM_DCACHE = new Set(["2:data", "10:app"]);
+      let vfsState = null;
+
+      function resetVfs(path) {
+        const segs = path.split("/").filter((s) => s && s !== ".");
+        vfsState = {
+          path,
+          curId: SIM_FS.rootId,
+          queue: segs,
+          symCount: 0,
+          maxSym: 4,
+          done: false,
+          status: "IN PROGRESS",
+          dcacheNote: "-",
+          explain: `Loaded path <code>${path}</code>. Starting at root <code>ino=2</code>.`
+        };
+        renderVfs();
+      }
+
+      function stepVfs() {
+        if (!vfsState || vfsState.done) return;
+        if (vfsState.queue.length === 0) {
+          vfsState.done = true;
+          vfsState.status = `RESOLVED (ino=${vfsState.curId})`;
+          vfsState.explain = `Path walk complete! Resolved to inode <code>${vfsState.curId}</code> (<code>${SIM_FS.inodes[vfsState.curId].type}</code>).`;
+          renderVfs();
+          return;
+        }
+        const seg = vfsState.queue.shift();
+        const cur = SIM_FS.inodes[vfsState.curId];
+        if (!cur || cur.type !== "dir") {
+          vfsState.done = true;
+          vfsState.status = "ERROR: -ENOTDIR (-20)";
+          vfsState.explain = `Cannot traverse segment <code>${seg}</code>: current inode <code>${vfsState.curId}</code> is a <code>${cur ? cur.type : "null"}</code>, not a directory!`;
+          renderVfs();
+          return;
+        }
+        const cacheKey = `${cur.id}:${seg}`;
+        const hit = SIM_DCACHE.has(cacheKey);
+        vfsState.dcacheNote = hit ? `HIT (${cacheKey})` : `MISS -> disk dir lookup (${cacheKey})`;
+        SIM_DCACHE.add(cacheKey);
+
+        const nextId = cur.entries[seg];
+        if (nextId === undefined) {
+          vfsState.done = true;
+          vfsState.status = "ERROR: -ENOENT (-2)";
+          vfsState.explain = `Segment <code>${seg}</code> not found in directory <code>ino=${cur.id}</code> (negative dentry cached).`;
+          renderVfs();
+          return;
+        }
+        const next = SIM_FS.inodes[nextId];
+        if (next.type === "symlink") {
+          vfsState.symCount++;
+          if (vfsState.symCount > vfsState.maxSym) {
+            vfsState.done = true;
+            vfsState.status = "ERROR: -ELOOP (-40)";
+            vfsState.explain = `Symlink depth ${vfsState.symCount} exceeded limit (${vfsState.maxSym}) on <code>${seg}</code>! Kernel aborts cycle with <code>-ELOOP</code>.`;
+            renderVfs();
+            return;
+          }
+          const targetSegs = next.target.split("/").filter((s) => s && s !== ".");
+          if (next.target.startsWith("/")) vfsState.curId = SIM_FS.rootId;
+          vfsState.queue = targetSegs.concat(vfsState.queue);
+          vfsState.explain = `Hit symlink <code>${seg}</code> &rarr; <code>${next.target}</code>. Expanded target segments into lookup queue (depth ${vfsState.symCount}/${vfsState.maxSym}).`;
+        } else {
+          vfsState.curId = nextId;
+          if (vfsState.queue.length === 0) {
+            vfsState.done = true;
+            vfsState.status = `RESOLVED (ino=${nextId})`;
+            vfsState.explain = `Resolved final component <code>${seg}</code> to <code>ino=${nextId}</code> (<code>${next.type}</code>).`;
+          } else {
+            vfsState.explain = `Traversed <code>${seg}</code> &rarr; <code>ino=${nextId}</code> (<code>${next.type}</code>).`;
+          }
+        }
+        renderVfs();
+      }
+
+      function renderVfs() {
+        const cur = SIM_FS.inodes[vfsState.curId];
+        document.getElementById("vfsPathVal").textContent = vfsState.path;
+        document.getElementById("vfsInodeVal").textContent = `ino=${cur.id} (${cur.type} "${cur.name}")`;
+        document.getElementById("vfsQueueVal").textContent = `[${vfsState.queue.join(", ")}]`;
+        document.getElementById("vfsSymVal").textContent = `${vfsState.symCount} / ${vfsState.maxSym}`;
+        document.getElementById("vfsDcacheVal").textContent = vfsState.dcacheNote;
+        document.getElementById("vfsStatusPill").textContent = vfsState.status;
+        document.getElementById("vfsTrace").innerHTML = vfsState.explain;
+      }
+
+      document.getElementById("vfsStepBtn").addEventListener("click", stepVfs);
+      document.querySelectorAll("[data-vfs-path]").forEach((btn) => {
+        btn.addEventListener("click", () => resetVfs(btn.dataset.vfsPath));
+      });
+      resetVfs("/data/app/notes.db");
+
+      // --- Simulator 2: WAL Recovery ---
+      let walEntries = [];
+      let walDisk = { 0: "v0", 1: "v0", 2: "v0", 3: "v0" };
+      let walCrashed = false;
+      let nextTx = 1;
+
+      function resetWal() {
+        walEntries = [];
+        walDisk = { 0: "v0", 1: "v0", 2: "v0", 3: "v0" };
+        walCrashed = false;
+        nextTx = 1;
+        document.getElementById("walStatePill").textContent = "ONLINE";
+        document.getElementById("walExplain").textContent = "Clean disk blocks. Append transactions, trigger power loss, and run WAL recovery.";
+        renderWal();
+      }
+
+      function renderWal() {
+        const logEl = document.getElementById("walLogView");
+        if (walEntries.length === 0) {
+          logEl.innerHTML = `<div class="wal-item">WAL empty — no logged transactions yet.</div>`;
+        } else {
+          const committed = new Set();
+          walEntries.forEach((e) => { if (e.type === "COMMIT") committed.add(e.txId); });
+          logEl.innerHTML = walEntries.map((e) => {
+            const cls = e.type === "TORN" || e.checksumOk === false ? "torn" : (committed.has(e.txId) ? "committed" : "uncommitted");
+            const desc = e.type === "WRITE" ? `WRITE blk=${e.blockId} "${e.data}"` : e.type;
+            return `<div class="wal-item ${cls}">[TX${e.txId}] ${desc}${e.checksumOk === false ? " (BAD CRC)" : ""}</div>`;
+          }).join("");
+        }
+
+        const diskEl = document.getElementById("walDiskView");
+        diskEl.innerHTML = Object.keys(walDisk).map((k) => {
+          const val = walDisk[k];
+          const cls = val.includes("corrupt") ? "bad" : (val !== "v0" ? "ok" : "");
+          return `<div class="blk-cell ${cls}"><div><strong>Blk ${k}</strong></div><div>${val}</div></div>`;
+        }).join("");
+      }
+
+      document.getElementById("walTx1Btn").addEventListener("click", () => {
+        if (walCrashed) return;
+        const id = nextTx++;
+        walEntries.push(
+          { txId: id, type: "BEGIN" },
+          { txId: id, type: "WRITE", blockId: 0, data: `tx${id}_A`, checksumOk: true },
+          { txId: id, type: "WRITE", blockId: 1, data: `tx${id}_B`, checksumOk: true },
+          { txId: id, type: "COMMIT" }
+        );
+        document.getElementById("walExplain").textContent = `TX${id} logged & COMMITTED to WAL (main DB blocks not yet checkpointed!).`;
+        renderWal();
+      });
+
+      document.getElementById("walTx2Btn").addEventListener("click", () => {
+        if (walCrashed) return;
+        const id = nextTx++;
+        walEntries.push(
+          { txId: id, type: "BEGIN" },
+          { txId: id, type: "WRITE", blockId: 2, data: `tx${id}_partial`, checksumOk: true },
+          { txId: id, type: "WRITE", blockId: 3, data: `corrupt`, checksumOk: false }
+        );
+        document.getElementById("walExplain").textContent = `TX${id} wrote dirty/torn frames without a COMMIT record.`;
+        renderWal();
+      });
+
+      document.getElementById("walCrashBtn").addEventListener("click", () => {
+        walCrashed = true;
+        document.getElementById("walStatePill").textContent = "POWER LOSS!";
+        document.getElementById("walExplain").textContent = "Sudden power loss! Volatile page cache lost. Only WAL frames on NAND survive. Click 'Run WAL Recovery'.";
+      });
+
+      document.getElementById("walRecoverBtn").addEventListener("click", () => {
+        const committedOrder = [];
+        const txMap = new Map();
+        for (const e of walEntries) {
+          if (!txMap.has(e.txId)) txMap.set(e.txId, { began: false, bad: false, committed: false, writes: [] });
+          const st = txMap.get(e.txId);
+          if (e.type === "BEGIN") st.began = true;
+          else if (e.type === "ABORT" || e.type === "TORN" || e.checksumOk === false) st.bad = true;
+          else if (e.type === "WRITE") st.writes.push(e);
+          else if (e.type === "COMMIT" && st.began && !st.bad) {
+            st.committed = true;
+            committedOrder.push(e.txId);
+          }
+        }
+        const replayed = [];
+        const discarded = [];
+        for (const id of committedOrder) {
+          replayed.push(`TX${id}`);
+          for (const w of txMap.get(id).writes) walDisk[w.blockId] = w.data;
+        }
+        for (const [id, st] of txMap.entries()) {
+          if (!st.committed) discarded.push(`TX${id}`);
+        }
+        walCrashed = false;
+        document.getElementById("walStatePill").textContent = "RECOVERED";
+        document.getElementById("walExplain").textContent =
+          `Recovery complete! Replayed: [${replayed.join(", ") || "none"}]. Discarded uncommitted/torn: [${discarded.join(", ") || "none"}].`;
+        renderWal();
+      });
+
+      document.getElementById("walResetBtn").addEventListener("click", resetWal);
+      resetWal();
+    })();
+
+    /* ============================================================
+       LESSON CONFIG: 3 LABS + 6 QUIZZES
+       ============================================================ */
+    window.LESSON_CONFIG = {
+      num: "11",
+      labs: {
+        1: {
+          fnName: "resolveVfsPath",
+          starter: `function resolveVfsPath(fs, startInodeId, path, maxSymlinks) {\n  const ENOENT = -2, ENOTDIR = -20, ELOOP = -40;\n  // TODO: walk '/', expand symlinks, detect -ENOENT / -ENOTDIR / -ELOOP\n  \n}`,
+          hints: [
+            "Hint 1: Check `if (typeof path !== \"string\" || path.length === 0) return { ok: false, errno: -2 };`. Initialize `curId = path.startsWith(\"/\") ? fs.rootId : startInodeId` and `queue = path.split(\"/\").filter(s => s && s !== \".\")`.",
+            "Hint 2: In a `while (queue.length > 0)` loop, shift `seg`. Validate `cur = fs.inodes[curId]` exists (`-2`) and `cur.type === \"dir\"` (otherwise return `-20`). Look up `nextId = cur.entries && Object.prototype.hasOwnProperty.call(cur.entries, seg) ? cur.entries[seg] : undefined`.",
+            "Hint 3: If `next.type === \"symlink\"`, increment `symCount`. If `symCount > maxSymlinks` return `{ ok: false, errno: -40 }`. If `next.target.startsWith(\"/\")`, reset `curId = fs.rootId` (else keep `curId`), then prepend `next.target.split(\"/\").filter(s => s && s !== \".\")` to `queue`."
+          ],
+          solution: `function resolveVfsPath(fs, startInodeId, path, maxSymlinks) {\n  const ENOENT = -2, ENOTDIR = -20, ELOOP = -40;\n  if (typeof path !== "string" || path.length === 0) {\n    return { ok: false, errno: ENOENT };\n  }\n  let curId = path.startsWith("/") ? fs.rootId : startInodeId;\n  let queue = path.split("/").filter((s) => s !== "" && s !== ".");\n  let symlinksFollowed = 0;\n\n  while (queue.length > 0) {\n    const seg = queue.shift();\n    const cur = fs.inodes[curId];\n    if (!cur) return { ok: false, errno: ENOENT };\n    if (cur.type !== "dir") return { ok: false, errno: ENOTDIR };\n\n    const entries = cur.entries || {};\n    if (!Object.prototype.hasOwnProperty.call(entries, seg)) {\n      return { ok: false, errno: ENOENT };\n    }\n    const nextId = entries[seg];\n    const next = fs.inodes[nextId];\n    if (!next) return { ok: false, errno: ENOENT };\n\n    if (next.type === "symlink") {\n      symlinksFollowed++;\n      if (symlinksFollowed > maxSymlinks) {\n        return { ok: false, errno: ELOOP };\n      }\n      const target = next.target || "";\n      if (target.startsWith("/")) curId = fs.rootId;\n      const targetSegs = target.split("/").filter((s) => s !== "" && s !== ".");\n      queue = targetSegs.concat(queue);\n    } else {\n      curId = nextId;\n    }\n  }\n  return { ok: true, inodeId: curId };\n}`,
+          solutionExplain: "A queue-based walker handles both absolute and relative symlinks cleanly: expanding a symlink prepends the target segments ahead of remaining path segments while counting symlink expansions against maxSymlinks.",
+          tests: function (fn) {
+            const mkFs = () => ({
+              rootId: 1,
+              inodes: {
+                1: { id: 1, type: "dir", entries: { "..": 1, data: 2, etc: 3, link_abs: 6 } },
+                2: { id: 2, type: "dir", entries: { "..": 1, app: 4, rel_link: 7, loop1: 8, loop2: 9 } },
+                3: { id: 3, type: "dir", entries: { "..": 1, hosts: 5 } },
+                4: { id: 4, type: "dir", entries: { "..": 2, "app.db": 10 } },
+                5: { id: 5, type: "file" },
+                6: { id: 6, type: "symlink", target: "/data/app" },
+                7: { id: 7, type: "symlink", target: "app/app.db" },
+                8: { id: 8, type: "symlink", target: "/data/loop2" },
+                9: { id: 9, type: "symlink", target: "/data/loop1" },
+                10: { id: 10, type: "file" }
+              }
+            });
+            const fs = mkFs();
+            const r1 = fn(fs, 2, "/data/app/../app/app.db", 8);
+            const r2 = fn(fs, 2, "/link_abs/app.db", 8);
+            const r3 = fn(fs, 2, "rel_link", 8);
+            const r4 = fn(fs, 1, "/data/loop1/x", 5);
+            const r5 = fn(fs, 1, "/etc/hosts/sub", 8);
+            const r6 = fn(fs, 1, "/data/missing", 8);
+            return [
+              { name: "Absolute path + '..' traversal", pass: r1 && r1.ok === true && r1.inodeId === 10, detail: `got ${JSON.stringify(r1)}` },
+              { name: "Absolute symlink intermediate expansion", pass: r2 && r2.ok === true && r2.inodeId === 10, detail: `got ${JSON.stringify(r2)}` },
+              { name: "Relative symlink from startInodeId", pass: r3 && r3.ok === true && r3.inodeId === 10, detail: `got ${JSON.stringify(r3)}` },
+              { name: "Symlink cycle returns -ELOOP (-40)", pass: r4 && r4.ok === false && r4.errno === -40, detail: `got ${JSON.stringify(r4)}` },
+              { name: "Traversing regular file returns -ENOTDIR (-20)", pass: r5 && r5.ok === false && r5.errno === -20, detail: `got ${JSON.stringify(r5)}` },
+              { name: "Missing path returns -ENOENT (-2)", pass: r6 && r6.ok === false && r6.errno === -2, detail: `got ${JSON.stringify(r6)}` }
+            ];
+          }
+        },
+        2: {
+          fnName: "recoverWal",
+          starter: `function recoverWal(journalEntries, diskBlocks) {\n  // TODO: replay only committed tx writes in commit order; discard torn/uncommitted/aborted\n  \n}`,
+          hints: [
+            "Hint 1: Clone `diskBlocks` (`const blocks = Object.assign({}, diskBlocks);`) and track per-tx state `{ began, bad, committed, writes }` in a `Map` so insertion order preserves first-seen order.",
+            "Hint 2: Mark `st.bad = true` if `entry.type === \"ABORT\" || entry.type === \"TORN\" || entry.checksumOk === false`. Only mark `st.committed = true` and push to `commitOrder` when `entry.type === \"COMMIT\" && st.began && !st.bad`.",
+            "Hint 3: After scanning all journal entries, loop over `commitOrder` and apply every write `{ blockId, data }` to `blocks`. Any txId in the `Map` with `!st.committed` goes into `discardedTxIds`."
+          ],
+          solution: `function recoverWal(journalEntries, diskBlocks) {\n  const blocks = Object.assign({}, diskBlocks);\n  const txState = new Map();\n  const commitOrder = [];\n\n  for (const e of journalEntries) {\n    if (!txState.has(e.txId)) {\n      txState.set(e.txId, { began: false, bad: false, committed: false, writes: [] });\n    }\n    const st = txState.get(e.txId);\n    if (e.type === "BEGIN") {\n      st.began = true;\n    } else if (e.type === "ABORT" || e.type === "TORN" || e.checksumOk === false) {\n      st.bad = true;\n    } else if (e.type === "WRITE") {\n      if (st.began && !st.bad && !st.committed) st.writes.push(e);\n    } else if (e.type === "COMMIT") {\n      if (st.began && !st.bad && !st.committed) {\n        st.committed = true;\n        commitOrder.push(e.txId);\n      }\n    }\n  }\n\n  for (const txId of commitOrder) {\n    for (const w of txState.get(txId).writes) {\n      blocks[w.blockId] = w.data;\n    }\n  }\n\n  const discardedTxIds = [];\n  for (const [txId, st] of txState.entries()) {\n    if (!st.committed) discardedTxIds.push(txId);\n  }\n  return { blocks, replayedTxIds: commitOrder, discardedTxIds };\n}`,
+          solutionExplain: "Only transactions with a valid BEGIN, intact checksums, no ABORT/TORN records, and an explicit COMMIT are replayed in commit order, guaranteeing atomicity and idempotence across crashes.",
+          tests: function (fn) {
+            const init = { 0: "init0", 1: "init1", 2: "init2" };
+            const log = [
+              { txId: 1, type: "BEGIN" },
+              { txId: 1, type: "WRITE", blockId: 0, data: "tx1_0", checksumOk: true },
+              { txId: 2, type: "BEGIN" },
+              { txId: 2, type: "WRITE", blockId: 0, data: "tx2_0", checksumOk: true },
+              { txId: 2, type: "WRITE", blockId: 1, data: "tx2_1", checksumOk: true },
+              { txId: 1, type: "COMMIT" },
+              { txId: 2, type: "COMMIT" },
+              { txId: 3, type: "BEGIN" },
+              { txId: 3, type: "WRITE", blockId: 2, data: "uncommitted", checksumOk: true },
+              { txId: 4, type: "BEGIN" },
+              { txId: 4, type: "WRITE", blockId: 1, data: "bad_crc", checksumOk: false },
+              { txId: 4, type: "COMMIT" },
+              { txId: 5, type: "BEGIN" },
+              { txId: 5, type: "WRITE", blockId: 2, data: "aborted" },
+              { txId: 5, type: "ABORT" }
+            ];
+            const res = fn(log, init);
+            const res2 = fn(log, res.blocks);
+            return [
+              { name: "Input diskBlocks not mutated", pass: init[0] === "init0" && init[1] === "init1", detail: `init[0]=${init[0]}` },
+              { name: "Commit order overwrites (TX2 after TX1)", pass: res.blocks[0] === "tx2_0" && res.blocks[1] === "tx2_1", detail: `blk0=${res.blocks[0]}, blk1=${res.blocks[1]}` },
+              { name: "Uncommitted, torn, and aborted writes discarded", pass: res.blocks[2] === "init2" && JSON.stringify(res.discardedTxIds) === "[3,4,5]", detail: `blk2=${res.blocks[2]}, discarded=${JSON.stringify(res.discardedTxIds)}` },
+              { name: "Idempotent recovery on second pass", pass: JSON.stringify(res.blocks) === JSON.stringify(res2.blocks) && JSON.stringify(res.replayedTxIds) === "[1,2]", detail: `replayed=${JSON.stringify(res.replayedTxIds)}` }
+            ];
+          }
+        },
+        3: {
+          fnName: "f2fsSelectGcSegment",
+          starter: `function f2fsSelectGcSegment(segments) {\n  // TODO: minimize (validRatio / (1 - validRatio)) / age for eligible segments\n  \n}`,
+          hints: [
+            "Hint 1: Filter out `seg.isFree === true`, `seg.capacity <= 0`, and full segments (`seg.liveBlocks.length >= seg.capacity`).",
+            "Hint 2: Compute `validRatio = seg.liveBlocks.length / seg.capacity`. If `seg.liveBlocks.length === 0`, `score = 0`; else if `seg.age <= 0`, `score = Infinity`; else `score = (validRatio / (1 - validRatio)) / seg.age`.",
+            "Hint 3: Pick lowest `score` (tie-break by lowest `liveBlocks.length`, then lowest `id`). Return `null` if no eligible victim, otherwise `{ victimId, score, migratedBlocks: [...best.liveBlocks], reclaimedBlocks: best.capacity - best.liveBlocks.length }`."
+          ],
+          solution: `function f2fsSelectGcSegment(segments) {\n  let best = null;\n  let bestScore = Infinity;\n\n  for (const seg of segments) {\n    if (seg.isFree || seg.capacity <= 0) continue;\n    const liveCount = seg.liveBlocks.length;\n    if (liveCount >= seg.capacity) continue;\n\n    const validRatio = liveCount / seg.capacity;\n    let score;\n    if (liveCount === 0) {\n      score = 0;\n    } else if (seg.age <= 0) {\n      score = Infinity;\n    } else {\n      score = (validRatio / (1 - validRatio)) / seg.age;\n    }\n\n    const better =\n      !best ||\n      score < bestScore ||\n      (score === bestScore && (liveCount < best.liveBlocks.length || (liveCount === best.liveBlocks.length && seg.id < best.id)));\n\n    if (better) {\n      best = seg;\n      bestScore = score;\n    }\n  }\n\n  if (!best) return null;\n  return {\n    victimId: best.id,\n    score: bestScore,\n    migratedBlocks: [...best.liveBlocks],\n    reclaimedBlocks: best.capacity - best.liveBlocks.length\n  };\n}`,
+          solutionExplain: "Cost-benefit GC balances valid blocks that must be copied against free space gained and segment age (avoiding hot segments that will naturally accumulate more garbage soon).",
+          tests: function (fn) {
+            const s1 = fn([
+              { id: 1, capacity: 10, liveBlocks: ["a","b","c","d","e","f","g","h","i","j"], age: 100, isFree: false }, // 100% live -> skip
+              { id: 2, capacity: 10, liveBlocks: ["k","l"], age: 2, isFree: false },  // (0.2/0.8)/2 = 0.125
+              { id: 3, capacity: 10, liveBlocks: ["m","n","o"], age: 20, isFree: false }, // (0.3/0.7)/20 = 0.0214 -> wins!
+              { id: 4, capacity: 10, liveBlocks: [], age: 0, isFree: true } // already free -> skip
+            ]);
+            const s2 = fn([
+              { id: 5, capacity: 8, liveBlocks: ["x"], age: 1 },
+              { id: 6, capacity: 8, liveBlocks: [], age: 1 } // 0 live -> score 0 wins immediately
+            ]);
+            const s3 = fn([
+              { id: 7, capacity: 4, liveBlocks: ["a","b","c","d"], age: 50 },
+              { id: 8, capacity: 4, liveBlocks: [], age: 0, isFree: true }
+            ]);
+            return [
+              { name: "Cold older segment beats hot younger segment", pass: s1 && s1.victimId === 3 && s1.reclaimedBlocks === 7 && s1.migratedBlocks.length === 3, detail: `got ${JSON.stringify(s1)}` },
+              { name: "Zero-live non-free segment has score 0", pass: s2 && s2.victimId === 6 && s2.score === 0 && s2.reclaimedBlocks === 8, detail: `got ${JSON.stringify(s2)}` },
+              { name: "Returns null when no reclaimable segment exists", pass: s3 === null, detail: `got ${JSON.stringify(s3)}` }
+            ];
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "1. Process A opens `/tmp/log.txt` (creating FD 3) and writes 100 bytes. Process B immediately calls `unlink(\"/tmp/log.txt\")`. What happens when Process A calls `read()`/`write()` on FD 3?",
+          options: [
+            "A. Both calls fail immediately with -ENOENT because the filename was removed.",
+            "B. The kernel keeps the inode and data blocks alive until i_nlink == 0 AND the last open struct file (FD 3) is closed.",
+            "C. The kernel converts the inode into a dangling symlink.",
+            "D. Only write() fails with -EPIPE; read() still succeeds."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): `unlink()` removes the directory entry (`dentry`) and decrements `i_nlink`, not the open `struct file`.",
+            "Correct (B): Linux separates directory entries (`dentry`) from the underlying `inode` and open `struct file`. Disk blocks are reclaimed only when BOTH `i_nlink == 0` and all open file descriptors referencing that inode are closed.",
+            "Wrong (C): Unlinking never turns an inode into a symlink.",
+            "Wrong (D): Both `read()` and `write()` continue working normally on the already-open FD; this is a classic reason `df` shows a full disk when `du` shows free space (an unlinked open log file!)."
+          ]
+        },
+        {
+          q: "2. Why does crash-safe file replacement require `fsync(tmp_fd)` -> `renameat(...)` -> `fsync(dir_fd)` instead of just `fsync(tmp_fd)`?",
+          options: [
+            "A. `fsync(tmp_fd)` flushes file data and inode metadata, NOT the parent directory's updated dentry mapping.",
+            "B. `renameat()` is asynchronous and happens in a background thread 5 seconds later.",
+            "C. `fsync(tmp_fd)` only works on Ext4, not F2FS.",
+            "D. `fsync(dir_fd)` shrinks the file size to align with 4KB blocks."
+          ],
+          correct: 0,
+          why: [
+            "Correct (A): In POSIX/Linux, `fsync(file_fd)` persists the file's data and inode, whereas directory entries live inside the parent directory's data blocks. Without `fsync(dir_fd)`, a power loss after `renameat()` can lose the directory entry entirely.",
+            "Wrong (B): `renameat()` is atomic in the kernel VFS cache immediately, but the modified directory blocks still sit dirty in the page cache until `fsync(dir_fd)` or writeback.",
+            "Wrong (C): Both Ext4 and F2FS follow POSIX `fsync()` semantics.",
+            "Wrong (D): `fsync(dir_fd)` never alters the target file's size."
+          ]
+        },
+        {
+          q: "3. In Ext4, why does default `data=ordered` mode flush new data blocks to disk BEFORE committing the metadata journal entry?",
+          options: [
+            "A. To compress data blocks before journaling them.",
+            "B. To prevent a crash from leaving an updated `i_size` pointing at uninitialized/stale disk blocks belonging to another user's deleted file.",
+            "C. Because Ext4 journals cannot store 64-bit block numbers.",
+            "D. To disable NAND wear leveling in the SSD controller."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Ext4 `data=ordered` does not compress data blocks.",
+            "Correct (B): In `data=writeback` mode, metadata can commit before data blocks land on disk—exposing stale garbage or old sensitive file contents after a crash! `data=ordered` guarantees data lands first without double-writing data into the journal.",
+            "Wrong (C): JBD2 handles 64-bit block addresses cleanly.",
+            "Wrong (D): The filesystem cannot disable the SSD/UFS controller's internal wear leveling."
+          ]
+        },
+        {
+          q: "4. Why did Android migrate `/data` from Ext4 to F2FS on modern phones?",
+          options: [
+            "A. F2FS runs entirely in user space without syscalls.",
+            "B. F2FS writes sequentially in log-structured segments, reducing random-write amplification on NAND erase blocks and supporting atomic writes for SQLite.",
+            "C. Ext4 does not support files larger than 2GB on ARM64.",
+            "D. F2FS eliminates the need for a Linux Page Cache."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): F2FS is an in-kernel Linux filesystem driver (`fs/f2fs/`).",
+            "Correct (B): NAND flash can only erase multi-MB blocks at once; Ext4's in-place updates + JBD2 double writes amplify FTL garbage collection. F2FS appends sequentially in segments, separates hot/cold data, and cuts write amplification.",
+            "Wrong (C): Ext4 supports files up to 16TB+.",
+            "Wrong (D): F2FS uses the Linux Page Cache just like Ext4."
+          ]
+        },
+        {
+          q: "5. Under Android Room's default SQLite WAL mode with `PRAGMA synchronous=NORMAL`, what happens if the phone's battery is abruptly yanked right after a transaction commits?",
+          options: [
+            "A. The main `.db` file is guaranteed to be corrupted beyond repair.",
+            "B. SQLite skipped `fsync()` on the WAL commit, so the last committed transaction may roll back to the previous synced checkpoint, though the DB remains structurally consistent.",
+            "C. SQLite blocks all readers until `fsync()` runs.",
+            "D. The kernel automatically converts WAL into Ext4 JBD2."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): WAL preserves structural integrity because committed frames have cumulative checksums and the main `.db` is untouched until checkpoint.",
+            "Correct (B): With `synchronous=NORMAL`, WAL commits skip `fsync()` for speed (surviving app crashes cleanly), only syncing during checkpoints. Power loss can lose recent un-synced WAL transactions without corrupting the database.",
+            "Wrong (C): WAL allows concurrent readers and a writer without blocking readers.",
+            "Wrong (D): SQLite WAL is an application-level journal completely independent of Ext4 JBD2."
+          ]
+        },
+        {
+          q: "6. Why can uncached reads/writes to `/sdcard` (Scoped Storage) on Android be significantly slower than `/data/data/<pkg>/`?",
+          options: [
+            "A. `/sdcard` is stored on an uncached SPI NOR flash chip.",
+            "B. `/sdcard` is mediated by a user-space FUSE daemon (MediaProvider), causing extra EL0 <-> EL1 context switches and buffer copies unless FUSE passthrough is used.",
+            "C. `/sdcard` disables the CPU's L1 data cache.",
+            "D. `/sdcard` uses FAT12 with 512-byte clusters."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Modern Android phones emulate `/sdcard` on the exact same UFS flash `/data` partition!",
+            "Correct (B): MediaProvider runs as a user-space FUSE daemon to enforce Scoped Storage rules. Every uncached I/O crosses kernel VFS -> `/dev/fuse` -> MediaProvider -> lower F2FS unless `FUSE_PASSTHROUGH` hands a direct FD to the kernel.",
+            "Wrong (C): Filesystems never disable CPU hardware caches.",
+            "Wrong (D): Internal emulated `/sdcard` sits on `/data/media` (F2FS/Ext4) wrapped by FUSE, not FAT12."
+          ]
+        }
+      ]
+    };
+
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

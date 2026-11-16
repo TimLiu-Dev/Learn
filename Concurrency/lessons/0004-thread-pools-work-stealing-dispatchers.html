@@ -1,0 +1,1043 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 04 — Thread Pools, Work-Stealing &amp; Coroutine Dispatcher Internals</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+  <style>
+    .sim-action-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      align-items: center;
+      justify-content: space-between;
+    }
+    .sim-action-label {
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .deque-ends {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      margin-top: 3px;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 04 · Thread Pools &amp; Dispatchers</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 2 · Lesson 04 · Execution Engines</div>
+      <h1>Thread Pools, Work-Stealing &amp; Coroutine Dispatcher Internals</h1>
+      <p class="hero-sub">
+        Spawning raw OS threads (~1 MB stack each) on demand crashes production services under load.
+        Learn how to size <code>ExecutorService</code> pools, prevent unbounded-queue <code>OutOfMemoryError</code>s,
+        understand <code>ForkJoinPool</code> work-stealing deques, and trace how <code>Dispatchers.Default</code> and <code>Dispatchers.IO</code> share an underlying thread pool.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model &amp; Sizing</a>
+        <a class="toc-chip" href="#simulator">2. Interactive Pool &amp; Work-Stealing Visualizer</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Kotlin &amp; Android Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>Why Thread Pools, Bounded Queues &amp; Work-Stealing Exist</h2>
+      <p class="section-lead">
+        An <strong>OS Thread</strong> is expensive to allocate and schedule. High-throughput JVM and Android runtimes amortize thread creation in pools and schedule lightweight <strong>Coroutines</strong> on top
+        (<a href="https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html" target="_blank" rel="noopener">Kotlin Coroutine Context &amp; Dispatchers</a>).
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">1. OS Thread Cost &amp; Pool Sizing</h3>
+          <p style="color:var(--text-muted); margin-bottom:10px;">
+            On a 64-bit JVM/ART process, every OS thread reserves roughly <strong>~1 MB of native call stack</strong> (configurable via <code>-Xss</code>) plus kernel descriptors and page-table overhead.
+            Creating 2,000 threads reserves ~2 GB of virtual/stack space before doing useful work and triggers OS <strong>Preemptive Scheduling</strong> thrashing.
+          </p>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong>Sizing rule of thumb:</strong><br/>
+            • <strong>CPU-bound:</strong> <code>N_threads = N_cores</code> (or <code>N_cores + 1</code>) for maximum <strong>Parallelism</strong> without cache thrashing.<br/>
+            • <strong>Blocking I/O-bound:</strong> <code>N_threads = N_cores * U_target * (1 + W / C)</code>, where <code>W / C</code> is wait-time to compute-time ratio.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--rose);">2. Bounded vs. Unbounded Queue OOM Traps</h3>
+          <p style="color:var(--text-muted); margin-bottom:10px;">
+            Java's <code>Executors</code> factory helpers hide two classic production OOM traps:<br/>
+            • <code>newFixedThreadPool(n)</code> uses an <strong>unbounded</strong> <code>LinkedBlockingQueue(Integer.MAX_VALUE)</code>. If producers outpace workers, queued tasks consume the entire JVM heap.<br/>
+            • <code>newCachedThreadPool()</code> uses a <code>SynchronousQueue</code> with <code>maximumPoolSize = Integer.MAX_VALUE</code>—a traffic spike spawns thousands of OS threads and exhausts stack/OS thread limits.
+          </p>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong>Senior fix:</strong> Use a bounded <code>ArrayBlockingQueue</code> plus an explicit <code>RejectedExecutionHandler</code> (<code>AbortPolicy</code>, <code>DiscardOldestPolicy</code>, or <code>CallerRunsPolicy</code> for backpressure).
+          </p>
+        </div>
+      </div>
+
+      <div class="two-col" style="margin-top:18px;">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">3. ForkJoinPool Work-Stealing Deques</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            A single shared FIFO queue forces every worker thread to contend on the same head/tail lock or CAS pointer.
+            <code>ForkJoinPool</code> (and Kotlin's <code>CoroutineScheduler</code>) gives each worker its own double-ended queue (<strong>deque</strong>):<br/><br/>
+            • <strong>Owner pops LIFO</strong> from its own <strong>head</strong>: newest child subtasks stay hot in L1/L2 CPU cache with zero lock contention.<br/>
+            • <strong>Idle thief steals FIFO</strong> from a busy victim's <strong>tail</strong>: grabs older, coarser-grained work from the opposite end, minimizing CAS collisions with the owner.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--green);">4. Dispatchers.Default &amp; IO Share One Pool</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            In <code>kotlinx.coroutines</code>, <code>Dispatchers.Default</code> (CPU cap = <code>max(2, cores)</code>) and <code>Dispatchers.IO</code> (elastic cap = <code>max(64, cores)</code>)
+            share the <strong>same underlying <code>CoroutineScheduler</code> thread pool</strong>!<br/><br/>
+            Switching via <code>withContext(Dispatchers.IO)</code> inside a <code>Default</code> coroutine often keeps executing on the <strong>exact same OS thread</strong>—reclassifying the thread's quota from CPU to blocking I/O without an OS context switch
+            (<a href="https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html#dispatchers-and-threads" target="_blank" rel="noopener">Official Dispatchers Spec</a>).
+          </p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 24px;">Pool &amp; Dispatcher Architecture Comparison</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Mechanism</th><th>Queue Topology</th><th>Thread Cap</th><th>Failure Mode Under Burst</th><th>Best Fit</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong><code>newFixedThreadPool(n)</code></strong></td><td>Unbounded <code>LinkedBlockingQueue</code></td><td>Fixed <code>n</code></td><td>Heap <code>OutOfMemoryError</code> from queued runnables</td><td>Avoid without explicit queue bound</td></tr>
+            <tr><td><strong><code>newCachedThreadPool()</code></strong></td><td>Zero-capacity <code>SynchronousQueue</code></td><td><code>Integer.MAX_VALUE</code></td><td>Thread/stack (~1 MB each) exhaustion OOM</td><td>Avoid for unbounded external bursts</td></tr>
+            <tr><td><strong>Bounded <code>ThreadPoolExecutor</code></strong></td><td>Bounded <code>ArrayBlockingQueue(cap)</code></td><td><code>core..max</code></td><td>Triggers policy (<code>CallerRuns</code> throttles producer)</td><td>Legacy blocking Java SDKs / bounded workers</td></tr>
+            <tr><td><strong><code>Dispatchers.Default</code></strong></td><td>Per-worker work-stealing deques + global</td><td><code>max(2, CPU cores)</code></td><td>Starvation if threads are parked on blocking I/O</td><td>CPU-bound coroutines (JSON, sorting, DiffUtil)</td></tr>
+            <tr><td><strong><code>Dispatchers.IO</code></strong></td><td>Shared <code>CoroutineScheduler</code> pool</td><td><code>max(64, CPU cores)</code></td><td>Excessive blocking if unbounded calls pile up</td><td>Blocking disk, Room, JDBC, legacy HTTP</td></tr>
+            <tr><td><strong><code>Dispatchers.IO.limitedParallelism(n)</code></strong></td><td>Isolated bounded view on shared pool</td><td>At most <code>n</code> concurrent</td><td>Never starves <code>Default</code> or other IO lanes</td><td>Rate-limiting DB/file/legacy pools cleanly</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Why <code>limitedParallelism(n)</code> is special:</strong> Calling <code>Dispatchers.IO.limitedParallelism(4)</code> does <em>not</em> spawn 4 dedicated permanent OS threads. It creates a lightweight dispatcher view that borrows up to 4 threads from the shared elastic pool on demand—and even <code>Dispatchers.IO.limitedParallelism(100)</code> can exceed 64 without blocking <code>Dispatchers.Default</code>
+        (<a href="https://developer.android.com/kotlin/coroutines/coroutines-best-practices" target="_blank" rel="noopener">Android Coroutines Best Practices</a>).
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive Pool &amp; Scheduler Visualizer</div>
+      <h2>Compare Queue Contention, Work-Stealing &amp; Backpressure</h2>
+      <p class="section-lead">
+        Switch between the three pool architectures below. Use <strong>Step →</strong> / <strong>▶ Play</strong> to run the guided trace, or trigger live <strong>Actions</strong> to inject bursts and steals.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="shared">1. Single Shared Queue Contention</button>
+            <button class="btn" data-mode="worksteal">2. ForkJoin Work-Stealing Deques</button>
+            <button class="btn" data-mode="bounded">3. Bounded Queue &amp; Backpressure</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-action-bar">
+          <span class="sim-action-label" id="sim-action-title">Live Pool Actions (Single Shared Queue):</span>
+          <div class="btn-group" id="sim-actions"></div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row" id="lane-q0-wrap">
+              <div class="lane-label"><span id="label-q0">Shared FIFO Queue (Global Lock / CAS)</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-q0"></div>
+              <div class="deque-ends" id="deque-ends-0" style="display:none;"><span>← Tail (FIFO Steal)</span><span>Head (LIFO Owner) →</span></div>
+            </div>
+
+            <div class="lane-row" id="lane-q1-wrap" style="display:none;">
+              <div class="lane-label"><span id="label-q1">Worker 1 Local Deque</span><span>Owner: W1</span></div>
+              <div class="timeline-track" id="lane-q1"></div>
+              <div class="deque-ends"><span>← Tail (FIFO Steal)</span><span>Head (LIFO Owner) →</span></div>
+            </div>
+
+            <div class="lane-row">
+              <div class="lane-label"><span id="label-w0">Worker 0 Execution</span><span id="state-w0">Idle</span></div>
+              <div class="timeline-track" id="lane-w0"></div>
+            </div>
+
+            <div class="lane-row">
+              <div class="lane-label"><span id="label-w1">Worker 1 Execution</span><span id="state-w1">Idle</span></div>
+              <div class="timeline-track" id="lane-w1"></div>
+            </div>
+
+            <div class="registers-grid">
+              <div class="reg-card"><div class="reg-name" id="metric-1-name">Queued / Capacity</div><div class="reg-val" id="metric-1-val" style="color:var(--accent);">0</div></div>
+              <div class="reg-card"><div class="reg-name" id="metric-2-name">Contention / Steals</div><div class="reg-val" id="metric-2-val" style="color:var(--amber);">0</div></div>
+              <div class="reg-card"><div class="reg-name" id="metric-3-name">Completed / Rejected</div><div class="reg-val" id="metric-3-val" style="color:var(--green);">0</div></div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Click <strong>Step →</strong>, <strong>▶ Play</strong>, or use the live pool action buttons above.
+            </div>
+          </div>
+
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">SCHEDULER TRACE LOG</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; Android</div>
+      <h2>Junior Traps vs. Senior Patterns in Production</h2>
+      <p class="section-lead">
+        Spot the hidden OOM hazards in <code>java.util.concurrent.Executors</code> and use Kotlin's shared scheduler dispatchers cleanly.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Unbounded Queue / Thread Explosion vs. Bounded ThreadPoolExecutor + CallerRunsPolicy</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Executors.newCachedThreadPool() / newFixedThreadPool()</span></div>
+<pre>// Trap A: Unbounded threads (~1 MB stack each -> OOM!)
+val cached = Executors.newCachedThreadPool()
+
+// Trap B: Unbounded LinkedBlockingQueue -> Heap OOM!
+val fixed = Executors.newFixedThreadPool(4)
+
+// Under burst traffic, either native stack or JVM heap exhausts.</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Bounded Queue + CallerRunsPolicy</span></div>
+<pre>val boundedPool = ThreadPoolExecutor(
+    4, 4,
+    0L, TimeUnit.MILLISECONDS,
+    ArrayBlockingQueue(64), // Explicit memory bound!
+    ThreadPoolExecutor.CallerRunsPolicy() // Natural backpressure
+)
+// When all 4 workers + 64 slots are full, the producer runs the task
+// itself, slowing submissions without OOM or silent drops.</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: Dispatchers.Default vs. Dispatchers.IO Sharing Threads</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Blocking I/O on Dispatchers.Default</span></div>
+<pre>suspend fun loadUserProfile(id: String): Profile =
+    withContext(Dispatchers.Default) {
+        // Blocks one of only ~8 CPU threads on socket/disk wait!
+        val json = blockingHttpClient.get("/users/$id")
+        parseProfile(json)
+    }</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Shared CoroutineScheduler Hop</span></div>
+<pre>suspend fun loadUserProfile(id: String): Profile {
+    val json = withContext(Dispatchers.IO) {
+        blockingHttpClient.get("/users/$id")
+    }
+    // Returns to Default on the shared CoroutineScheduler—often
+    // staying on the exact same OS thread without a context switch!
+    return withContext(Dispatchers.Default) { parseProfile(json) }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: Bounding Legacy Subsystems with <code>limitedParallelism(n)</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Allocating a Private Thread Pool</span></div>
+<pre>// Allocates 4 permanent ~1MB OS threads that never shrink
+// and leak if close() is forgotten!
+private val dbDispatcher =
+    Executors.newFixedThreadPool(4).asCoroutineDispatcher()
+
+suspend fun queryUser(id: Long) = withContext(dbDispatcher) {
+    legacyJdbcDao.find(id)
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Dispatchers.IO.limitedParallelism(4)</span></div>
+<pre>// Independent view over the shared IO pool:
+// caps concurrent DB calls at 4, allocates 0 idle threads,
+// and never starves Dispatchers.Default!
+private val dbDispatcher = Dispatchers.IO.limitedParallelism(4)
+
+suspend fun queryUser(id: Long) = withContext(dbDispatcher) {
+    legacyJdbcDao.find(id)
+}</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Edit the starter implementations below and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>). Every starter contains an intentional pool/scheduling bug you must fix.</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 4.1 · EXECUTOR POOL SIZING</span>
+            <h3 style="margin:8px 0 4px;">Optimal CPU vs. I/O Thread Pool Sizing</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>calculateOptimalPoolSize(config)</code> using Little's Law / Goetz's sizing formula with safety bounds.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          Input object: <code>{ type, cores, targetUtil = 1, waitMs = 0, computeMs = 1, maxThreads = 64 }</code>.<br/>
+          • If <code>type === 'cpu'</code>: target size is <code>cores</code>.<br/>
+          • If <code>type === 'io'</code>: target size is <code>Math.round(cores * targetUtil * (1 + waitMs / computeMs))</code> (if <code>computeMs &lt;= 0</code> and <code>waitMs &gt; 0</code>, clamp up to <code>maxThreads</code>).<br/>
+          • Clamp final integer result into <code>[1, Math.max(1, maxThreads)]</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_4_1_pool_sizing.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 4.2 · BACKPRESSURE &amp; REJECTION POLICIES</span>
+            <h3 style="margin:8px 0 4px;">Bounded Executor Queue with Rejection Policies</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Fix <code>BoundedExecutorQueue</code> so fast producers cannot grow the queue past <code>capacity</code>.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          Methods on <code>class BoundedExecutorQueue</code>:<br/>
+          • <code>constructor(capacity, policy = 'ABORT')</code> (<code>'ABORT'</code> | <code>'DROP_OLDEST'</code> | <code>'CALLER_RUNS'</code>)<br/>
+          • <code>submit(task)</code>: when <code>queue.length &lt; capacity</code>, enqueue and return <code>{ status: 'ENQUEUED', queueSize }</code>. When full:<br/>
+            &nbsp;&nbsp;- <code>'ABORT'</code>: increment <code>rejected</code> and throw <code>Error('RejectedExecutionException: queue full')</code>.<br/>
+            &nbsp;&nbsp;- <code>'DROP_OLDEST'</code>: evict oldest (`shift()`), enqueue `task`, increment `dropped`, return <code>{ status: 'DROPPED_OLDEST', dropped: evictedTask, queueSize }</code>.<br/>
+            &nbsp;&nbsp;- <code>'CALLER_RUNS'</code>: invoke <code>task()</code> immediately on the caller thread, increment <code>callerRuns</code>, return <code>{ status: 'CALLER_RUNS', result, queueSize }</code>.<br/>
+          • <code>take()</code> pops oldest (`shift()`, or `null` if empty); <code>size()</code> returns current length; <code>stats()</code> returns <code>{ enqueued, rejected, dropped, callerRuns, queued }</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_4_2_bounded_queue.js</span><span>ThreadPoolExecutor ArrayBlockingQueue model</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 4.3 · FORKJOIN WORK-STEALING DEQUE</span>
+            <h3 style="margin:8px 0 4px;">LIFO Local Pop vs. FIFO Victim Tail Steal</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>workStealingStep(deques, workerId)</code> for 2 worker deques.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          Each array in <code>deques = [deque0, deque1]</code> puts the <strong>tail</strong> at index <code>0</code> and the <strong>head</strong> at <code>length - 1</code>:<br/>
+          • If <code>deques[workerId]</code> is non-empty, owner pops <strong>LIFO</strong> from its head (<code>pop()</code>) and returns <code>{ workerId, action: 'LOCAL_LIFO', task, fromWorker: workerId }</code>.<br/>
+          • Else if the peer deque (<code>1 - workerId</code>) is non-empty, idle thief steals <strong>FIFO</strong> from the victim's tail (<code>shift()</code>) and returns <code>{ workerId, action: 'STEAL_FIFO', task, fromWorker: victimId }</code>.<br/>
+          • If both deques are empty, return <code>{ workerId, action: 'IDLE', task: null, fromWorker: null }</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_4_3_work_stealing.js</span><span>ForkJoinPool / CoroutineScheduler deque step</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in word count so only true systems understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Sources:</strong> Read the official
+          <a href="https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html" target="_blank" rel="noopener">Kotlin Coroutine Context and Dispatchers</a>
+          specification and
+          <a href="https://developer.android.com/kotlin/coroutines/coroutines-best-practices" target="_blank" rel="noopener">Android Developers: Best Practices for Coroutines</a>,
+          then keep the <a href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a> bookmarked for daily work.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"How does CoroutineScheduler reclassify a thread from Default to IO without a context switch?"</em> or <em>"Why does CallerRunsPolicy break down if used on the Android Main thread?"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0003-mutexes-deadlocks-cas-atomics.html">← Lesson 03</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0005-producers-consumers-semaphores-backpressure.html">Lesson 05 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_MODES = {
+      shared: {
+        actionTitle: 'Live Actions (Single Shared Queue):',
+        q0Label: 'Shared FIFO Queue (Single Lock / CAS)',
+        showQ1: false,
+        showEnds0: false,
+        m1Name: 'Queue Depth',
+        m2Name: 'Lock Contention',
+        m3Name: 'Completed',
+        steps: [
+          { q0: ['T1','T2','T3','T4'], w0: { cls: 'sw', txt: 'LOCK Q' }, w1: { cls: 'idle', txt: 'WAIT LOCK' }, m1: 4, m2: 1, m3: 0, type: 'warn', msg: 'W0 acquires global queue lock; W1 stalls waiting on the same lock.' },
+          { q0: ['T2','T3','T4'], w0: { cls: 'ta', txt: 'RUN T1' }, w1: { cls: 'sw', txt: 'LOCK Q' }, m1: 3, m2: 2, m3: 0, type: '', msg: 'W0 pops T1; W1 retries CAS/lock to grab T2 (cache-line bouncing).' },
+          { q0: ['T3','T4'], w0: { cls: 'ta', txt: 'T1->T1a' }, w1: { cls: 'tb', txt: 'RUN T2' }, m1: 2, m2: 2, m3: 0, type: '', msg: 'T1 spawns child subtask T1a—must push back to the global locked queue!' },
+          { q0: ['T3','T4','T1a'], w0: { cls: 'sw', txt: 'LOCK Q' }, w1: { cls: 'sw', txt: 'LOCK Q' }, m1: 3, m2: 4, m3: 1, type: 'warn', msg: 'Both W0 and W1 collide on the single queue lock pushing/popping T1a and T3.' },
+          { q0: ['T4','T1a'], w0: { cls: 'ta', txt: 'RUN T3' }, w1: { cls: 'tb', txt: 'RUN T4' }, m1: 2, m2: 4, m3: 2, type: 'bad', msg: 'T1a sits behind T4 and loses W0 warm L1/L2 cache before W1 eventually runs it cold.' }
+        ],
+        finalVerdict: { cls: 'callout warn', html: '<strong>Shared Queue Bottleneck:</strong> All workers serialize on one lock/CAS and child subtasks lose cache locality.' }
+      },
+      worksteal: {
+        actionTitle: 'Live Actions (Work-Stealing Deques):',
+        q0Label: 'Worker 0 Local Deque (Tail ← → Head)',
+        q1Label: 'Worker 1 Local Deque (Tail ← → Head)',
+        showQ1: true,
+        showEnds0: true,
+        m1Name: 'Total Deque Items',
+        m2Name: 'FIFO Tail Steals',
+        m3Name: 'LIFO Local Pops',
+        steps: [
+          { q0: ['T1','T2','T3'], q1: [], w0: { cls: 'ta', txt: 'PUSH T1..3' }, w1: { cls: 'idle', txt: 'IDLE' }, m1: 3, m2: 0, m3: 0, type: '', msg: 'W0 holds [T1, T2, T3] (T1 at tail, T3 at head). W1 deque is empty.' },
+          { q0: ['T1','T2'], q1: [], w0: { cls: 'ta', txt: 'POP T3 (LIFO)' }, w1: { cls: 'idle', txt: 'SCAN W0' }, m1: 2, m2: 0, m3: 1, type: 'good', msg: 'W0 pops newest T3 LIFO from its own head—hot cache, zero contention!' },
+          { q0: ['T2'], q1: [], w0: { cls: 'ta', txt: 'SPAWN T3a' }, w1: { cls: 'sw', txt: 'STEAL T1 (FIFO)' }, m1: 1, m2: 1, m3: 1, type: 'good', msg: 'Idle W1 steals oldest T1 FIFO from W0 tail while W0 works near head!' },
+          { q0: ['T2','T3a'], q1: [], w0: { cls: 'ta', txt: 'POP T3a (LIFO)' }, w1: { cls: 'tb', txt: 'RUN T1' }, m1: 1, m2: 1, m3: 2, type: 'good', msg: 'W0 immediately pops newly spawned T3a LIFO while W1 executes stolen T1 in parallel.' },
+          { q0: [], q1: [], w0: { cls: 'ta', txt: 'POP T2 (LIFO)' }, w1: { cls: 'tb', txt: 'DONE T1' }, m1: 0, m2: 1, m3: 3, type: 'good', msg: 'Both deques drained: 3 cache-warm LIFO pops and 1 low-contention FIFO tail steal.' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Work-Stealing Efficiency:</strong> Owner pops <code>LIFO</code> at head for warm caches; thief steals <code>FIFO</code> from victim tail with minimal contention.' }
+      },
+      bounded: {
+        actionTitle: 'Live Actions (Cap = 3, Policy = CallerRuns):',
+        q0Label: 'Bounded Queue (Max Capacity = 3)',
+        showQ1: false,
+        showEnds0: false,
+        m1Name: 'Queue / Cap (3)',
+        m2Name: 'CallerRuns / Rej',
+        m3Name: 'Completed',
+        steps: [
+          { q0: ['J1'], w0: { cls: 'ta', txt: 'RUN A' }, w1: { cls: 'tb', txt: 'RUN B' }, m1: '1 / 3', m2: 0, m3: 0, type: '', msg: '2 workers busy (A, B). Producer enqueues J1 into bounded queue (1/3).' },
+          { q0: ['J1','J2','J3'], w0: { cls: 'ta', txt: 'RUN A' }, w1: { cls: 'tb', txt: 'RUN B' }, m1: '3 / 3', m2: 0, m3: 0, type: 'warn', msg: 'Producer bursts J2 & J3. Bounded queue is now FULL (3/3).' },
+          { q0: ['J1','J2','J3'], w0: { cls: 'sw', txt: 'PRODUCER: J4' }, w1: { cls: 'tb', txt: 'RUN B' }, m1: '3 / 3', m2: 1, m3: 0, type: 'warn', msg: 'Queue full! CallerRunsPolicy forces Producer thread to run J4 itself (backpressure!).' },
+          { q0: ['J2','J3'], w0: { cls: 'ta', txt: 'RUN J1' }, w1: { cls: 'tb', txt: 'RUN J2' }, m1: '1 / 3', m2: 1, m3: 3, type: 'good', msg: 'While Producer paused running J4, workers finished A & B and drained J1 & J2.' },
+          { q0: [], w0: { cls: 'ta', txt: 'RUN J3' }, w1: { cls: 'idle', txt: 'IDLE' }, m1: '0 / 3', m2: 1, m3: 6, type: 'good', msg: 'All 6 tasks completed with zero OOM and zero dropped tasks!' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Backpressure Worked:</strong> Bounded queue capped heap memory at 3 tasks while <code>CallerRunsPolicy</code> throttled the producer.' }
+      }
+    };
+
+    let currentMode = 'shared';
+    let simStepIdx = 0;
+    let simTimer = null;
+    let liveState = null;
+
+    function initLiveState(mode) {
+      if (mode === 'shared') {
+        liveState = { q0: ['T1','T2','T3'], q1: [], w0: [], w1: [], contention: 0, completed: 0, seq: 4 };
+      } else if (mode === 'worksteal') {
+        liveState = { q0: ['T1','T2','T3'], q1: [], w0: [], w1: [], steals: 0, lifo: 0, seq: 4 };
+      } else {
+        liveState = { q0: ['J1','J2'], q1: [], w0: [{ cls: 'ta', txt: 'BUSY A' }], w1: [{ cls: 'tb', txt: 'BUSY B' }], cap: 3, policy: 'CALLER_RUNS', rejected: 0, completed: 0, seq: 3 };
+      }
+    }
+
+    function renderSlots(elId, items, clsDefault) {
+      const el = document.getElementById(elId);
+      el.innerHTML = '';
+      if (!items || items.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'slot idle';
+        empty.textContent = 'EMPTY';
+        el.appendChild(empty);
+        return;
+      }
+      items.forEach((item) => {
+        const d = document.createElement('div');
+        if (typeof item === 'string') {
+          d.className = `slot ${clsDefault}`;
+          d.textContent = item;
+        } else {
+          d.className = `slot ${item.cls}`;
+          d.textContent = item.txt;
+        }
+        el.appendChild(d);
+      });
+    }
+
+    function appendLog(msg, type = '') {
+      const logEl = document.getElementById('sim-log');
+      if (logEl.dataset.pristine === '1') {
+        logEl.innerHTML = '';
+        logEl.dataset.pristine = '0';
+      }
+      const line = document.createElement('div');
+      line.className = `trace-line ${type}`;
+      line.textContent = msg;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function renderActionButtons() {
+      const wrap = document.getElementById('sim-actions');
+      wrap.innerHTML = '';
+      const defs = {
+        shared: [
+          { label: '+ Enqueue Task', fn: () => liveSharedEnqueue() },
+          { label: '⚡ Workers Pop Together (Contend)', fn: () => liveSharedPop() }
+        ],
+        worksteal: [
+          { label: '+ Push Subtask to W0 Head', fn: () => liveStealPushW0() },
+          { label: 'W0 Pop LIFO (Head)', fn: () => liveStealPopW0() },
+          { label: 'W1 Steal FIFO (W0 Tail)', fn: () => liveStealW1FromW0() }
+        ],
+        bounded: [
+          { label: '+ Submit Burst (2 Tasks)', fn: () => liveBoundedSubmit(2) },
+          { label: 'Workers Drain 1 Task', fn: () => liveBoundedDrain() },
+          { label: 'Policy: CallerRuns', id: 'pol-btn', fn: () => liveBoundedCyclePolicy() }
+        ]
+      }[currentMode];
+
+      defs.forEach((d) => {
+        const b = document.createElement('button');
+        b.className = 'btn';
+        if (d.id) b.id = d.id;
+        b.textContent = d.label;
+        b.addEventListener('click', d.fn);
+        wrap.appendChild(b);
+      });
+    }
+
+    function liveSharedEnqueue() {
+      const id = `T${liveState.seq++}`;
+      liveState.q0.push(id);
+      liveState.contention++;
+      renderSlots('lane-q0', liveState.q0, 'ta');
+      document.getElementById('metric-1-val').textContent = liveState.q0.length;
+      document.getElementById('metric-2-val').textContent = liveState.contention;
+      appendLog(`[LIVE] Acquired global lock to enqueue ${id} (lock ops = ${liveState.contention}).`, 'warn');
+    }
+
+    function liveSharedPop() {
+      if (liveState.q0.length === 0) {
+        appendLog('[LIVE] Shared queue empty.', 'warn');
+        return;
+      }
+      const t0 = liveState.q0.shift();
+      liveState.contention += 2;
+      liveState.completed++;
+      liveState.w0.push({ cls: 'ta', txt: `RUN ${t0}` });
+      let msg = `[LIVE] W0 & W1 contended on shared lock; W0 popped ${t0}`;
+      if (liveState.q0.length > 0) {
+        const t1 = liveState.q0.shift();
+        liveState.completed++;
+        liveState.w1.push({ cls: 'tb', txt: `RUN ${t1}` });
+        msg += `, W1 waited then popped ${t1}.`;
+      } else {
+        liveState.w1.push({ cls: 'idle', txt: 'STALLED' });
+        msg += ', W1 stalled.';
+      }
+      renderSlots('lane-q0', liveState.q0, 'ta');
+      renderSlots('lane-w0', liveState.w0, 'ta');
+      renderSlots('lane-w1', liveState.w1, 'tb');
+      document.getElementById('metric-1-val').textContent = liveState.q0.length;
+      document.getElementById('metric-2-val').textContent = liveState.contention;
+      document.getElementById('metric-3-val').textContent = liveState.completed;
+      appendLog(msg, 'warn');
+    }
+
+    function liveStealPushW0() {
+      const id = `T${liveState.seq++}`;
+      liveState.q0.push(id);
+      renderSlots('lane-q0', liveState.q0, 'ta');
+      document.getElementById('metric-1-val').textContent = liveState.q0.length + liveState.q1.length;
+      appendLog(`[LIVE] W0 pushed ${id} to its local HEAD (no lock).`, '');
+    }
+
+    function liveStealPopW0() {
+      if (liveState.q0.length === 0) {
+        appendLog('[LIVE] W0 deque empty—nothing to pop locally.', 'warn');
+        return;
+      }
+      const t = liveState.q0.pop();
+      liveState.lifo++;
+      liveState.w0.push({ cls: 'ta', txt: `LIFO ${t}` });
+      renderSlots('lane-q0', liveState.q0, 'ta');
+      renderSlots('lane-w0', liveState.w0, 'ta');
+      document.getElementById('metric-1-val').textContent = liveState.q0.length + liveState.q1.length;
+      document.getElementById('metric-3-val').textContent = liveState.lifo;
+      appendLog(`[LIVE] W0 popped ${t} LIFO from HEAD (warm cache!).`, 'good');
+    }
+
+    function liveStealW1FromW0() {
+      if (liveState.q0.length === 0) {
+        appendLog('[LIVE] W0 deque empty—nothing for W1 to steal.', 'warn');
+        return;
+      }
+      const t = liveState.q0.shift();
+      liveState.steals++;
+      liveState.w1.push({ cls: 'sw', txt: `STEAL ${t}` });
+      renderSlots('lane-q0', liveState.q0, 'ta');
+      renderSlots('lane-w1', liveState.w1, 'tb');
+      document.getElementById('metric-1-val').textContent = liveState.q0.length + liveState.q1.length;
+      document.getElementById('metric-2-val').textContent = liveState.steals;
+      appendLog(`[LIVE] Idle W1 stole ${t} FIFO from W0 TAIL!`, 'good');
+    }
+
+    function liveBoundedSubmit(count) {
+      for (let i = 0; i < count; i++) {
+        const id = `J${liveState.seq++}`;
+        if (liveState.q0.length < liveState.cap) {
+          liveState.q0.push(id);
+          appendLog(`[LIVE] Enqueued ${id} (${liveState.q0.length}/${liveState.cap}).`, '');
+        } else if (liveState.policy === 'CALLER_RUNS') {
+          liveState.rejected++;
+          liveState.completed++;
+          liveState.w0.push({ cls: 'sw', txt: `CALLER:${id}` });
+          appendLog(`[LIVE] Queue full! CallerRunsPolicy ran ${id} on producer thread (backpressure).`, 'warn');
+        } else if (liveState.policy === 'ABORT') {
+          liveState.rejected++;
+          liveState.w0.push({ cls: 'bad', txt: `ABORT:${id}` });
+          appendLog(`[LIVE] Queue full! AbortPolicy rejected ${id} with RejectedExecutionException.`, 'bad');
+        } else {
+          const evicted = liveState.q0.shift();
+          liveState.q0.push(id);
+          liveState.rejected++;
+          liveState.w1.push({ cls: 'bad', txt: `DROP:${evicted}` });
+          appendLog(`[LIVE] Queue full! DiscardOldestPolicy evicted ${evicted}, queued ${id}.`, 'warn');
+        }
+      }
+      renderSlots('lane-q0', liveState.q0, 'ta');
+      renderSlots('lane-w0', liveState.w0, 'ta');
+      renderSlots('lane-w1', liveState.w1, 'tb');
+      document.getElementById('metric-1-val').textContent = `${liveState.q0.length} / ${liveState.cap}`;
+      document.getElementById('metric-2-val').textContent = liveState.rejected;
+      document.getElementById('metric-3-val').textContent = liveState.completed;
+    }
+
+    function liveBoundedDrain() {
+      if (liveState.q0.length === 0) {
+        appendLog('[LIVE] Queue empty; workers idle.', '');
+        return;
+      }
+      const job = liveState.q0.shift();
+      liveState.completed++;
+      liveState.w1.push({ cls: 'tb', txt: `DONE ${job}` });
+      renderSlots('lane-q0', liveState.q0, 'ta');
+      renderSlots('lane-w1', liveState.w1, 'tb');
+      document.getElementById('metric-1-val').textContent = `${liveState.q0.length} / ${liveState.cap}`;
+      document.getElementById('metric-3-val').textContent = liveState.completed;
+      appendLog(`[LIVE] Worker drained ${job} from bounded queue (${liveState.q0.length}/${liveState.cap}).`, 'good');
+    }
+
+    function liveBoundedCyclePolicy() {
+      const order = ['CALLER_RUNS', 'ABORT', 'DROP_OLDEST'];
+      const labels = { CALLER_RUNS: 'Policy: CallerRuns', ABORT: 'Policy: Abort', DROP_OLDEST: 'Policy: DropOldest' };
+      const next = order[(order.indexOf(liveState.policy) + 1) % order.length];
+      liveState.policy = next;
+      const btn = document.getElementById('pol-btn');
+      if (btn) btn.textContent = labels[next];
+      appendLog(`[LIVE] Switched rejection policy to ${next}.`, 'warn');
+    }
+
+    function resetSim() {
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        document.getElementById('sim-play').textContent = '▶ Play';
+      }
+      simStepIdx = 0;
+      initLiveState(currentMode);
+      const cfg = SIM_MODES[currentMode];
+
+      document.getElementById('sim-action-title').textContent = cfg.actionTitle;
+      document.getElementById('label-q0').textContent = cfg.q0Label;
+      document.getElementById('deque-ends-0').style.display = cfg.showEnds0 ? 'flex' : 'none';
+      document.getElementById('lane-q1-wrap').style.display = cfg.showQ1 ? 'block' : 'none';
+      if (cfg.showQ1) document.getElementById('label-q1').textContent = cfg.q1Label;
+
+      document.getElementById('metric-1-name').textContent = cfg.m1Name;
+      document.getElementById('metric-2-name').textContent = cfg.m2Name;
+      document.getElementById('metric-3-name').textContent = cfg.m3Name;
+
+      renderSlots('lane-q0', liveState.q0, 'ta');
+      renderSlots('lane-q1', liveState.q1, 'tb');
+      renderSlots('lane-w0', liveState.w0, 'ta');
+      renderSlots('lane-w1', liveState.w1, 'tb');
+
+      document.getElementById('metric-1-val').textContent = currentMode === 'bounded' ? `${liveState.q0.length} / 3` : liveState.q0.length;
+      document.getElementById('metric-2-val').textContent = '0';
+      document.getElementById('metric-3-val').textContent = '0';
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${cfg.steps.length}`;
+      document.getElementById('state-w0').textContent = 'Ready';
+      document.getElementById('state-w1').textContent = 'Ready';
+
+      const logEl = document.getElementById('sim-log');
+      logEl.innerHTML = '<div class="trace-line">Ready. Click Step →, ▶ Play, or use Live Actions.</div>';
+      logEl.dataset.pristine = '1';
+
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through the trace or click Live Actions to inspect queue contention, LIFO/FIFO deques, or backpressure.';
+
+      renderActionButtons();
+    }
+
+    function stepSim() {
+      const cfg = SIM_MODES[currentMode];
+      if (simStepIdx >= cfg.steps.length) {
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById('sim-play').textContent = '▶ Play';
+        }
+        return;
+      }
+      if (simStepIdx === 0) {
+        document.getElementById('lane-w0').innerHTML = '';
+        document.getElementById('lane-w1').innerHTML = '';
+      }
+      const s = cfg.steps[simStepIdx++];
+      renderSlots('lane-q0', s.q0, 'ta');
+      if (cfg.showQ1) renderSlots('lane-q1', s.q1, 'tb');
+
+      const appendLane = (id, slot) => {
+        if (!slot) return;
+        const d = document.createElement('div');
+        d.className = `slot ${slot.cls}`;
+        d.textContent = slot.txt;
+        document.getElementById(id).appendChild(d);
+      };
+      appendLane('lane-w0', s.w0);
+      appendLane('lane-w1', s.w1);
+
+      document.getElementById('state-w0').textContent = s.w0 ? s.w0.txt : 'Idle';
+      document.getElementById('state-w1').textContent = s.w1 ? s.w1.txt : 'Idle';
+      document.getElementById('metric-1-val').textContent = s.m1;
+      document.getElementById('metric-2-val').textContent = s.m2;
+      document.getElementById('metric-3-val').textContent = s.m3;
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${cfg.steps.length}`;
+      appendLog(`[${simStepIdx}] ${s.msg}`, s.type);
+
+      if (simStepIdx === cfg.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = cfg.finalVerdict.cls;
+        v.innerHTML = cfg.finalVerdict.html;
+      }
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        btn.textContent = '▶ Play';
+      } else {
+        if (simStepIdx >= SIM_MODES[currentMode].steps.length) resetSim();
+        btn.textContent = '⏸ Pause';
+        simTimer = setInterval(stepSim, 800);
+      }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'calculateOptimalPoolSize',
+        starter: `function calculateOptimalPoolSize(config) {\n  // BUG: Ignores I/O wait ratio and maxThreads safety cap!\n  return config.cores;\n}`,
+        hints: [
+          'Destructure `{ type, cores, targetUtil = 1, waitMs = 0, computeMs = 1, maxThreads = 64 } = config`.',
+          'For `type === "cpu"`, raw size is `cores`. For `type === "io"`, raw size is `Math.round(cores * targetUtil * (1 + waitMs / computeMs))` (guard `computeMs <= 0`).',
+          'Clamp the result with `Math.max(1, Math.min(Math.max(1, maxThreads), Math.round(raw)))`.'
+        ],
+        solution: `function calculateOptimalPoolSize(config) {\n  const {\n    type,\n    cores,\n    targetUtil = 1,\n    waitMs = 0,\n    computeMs = 1,\n    maxThreads = 64\n  } = config;\n  const cap = Math.max(1, maxThreads);\n  let raw;\n  if (type === 'cpu') {\n    raw = cores;\n  } else {\n    if (computeMs <= 0) {\n      raw = waitMs > 0 ? cap : cores * targetUtil;\n    } else {\n      raw = Math.round(cores * targetUtil * (1 + waitMs / computeMs));\n    }\n  }\n  return Math.max(1, Math.min(cap, Math.round(raw)));\n}`,
+        kotlinEquivalent: `fun calculateOptimalPoolSize(\n    isIo: Boolean,\n    cores: Int = Runtime.getRuntime().availableProcessors(),\n    targetUtil: Double = 1.0,\n    waitMs: Double = 0.0,\n    computeMs: Double = 1.0,\n    maxThreads: Int = 64\n): Int {\n    val raw = if (!isIo) cores else (cores * targetUtil * (1.0 + waitMs / computeMs)).roundToInt()\n    return raw.coerceIn(1, maxOf(1, maxThreads))\n}`,
+        tests: async (fn) => runTestCases([
+          { name: 'CPU-bound on 8 cores -> 8 threads', run: () => assertEq(fn({ type: 'cpu', cores: 8, maxThreads: 64 }), 8) },
+          { name: 'I/O-bound: 4 cores, 0.8 util, 90ms wait / 10ms compute -> 32 threads', run: () => assertEq(fn({ type: 'io', cores: 4, targetUtil: 0.8, waitMs: 90, computeMs: 10, maxThreads: 64 }), 32) },
+          { name: 'I/O-bound clamps to maxThreads cap (e.g. 64)', run: () => assertEq(fn({ type: 'io', cores: 8, targetUtil: 1, waitMs: 190, computeMs: 10, maxThreads: 64 }), 64) },
+          { name: 'Zero or low target still clamps at minimum 1 thread', run: () => assertEq(fn({ type: 'io', cores: 4, targetUtil: 0, waitMs: 50, computeMs: 10, maxThreads: 64 }), 1) },
+          { name: 'CPU-bound honors small maxThreads cap', run: () => assertEq(fn({ type: 'cpu', cores: 16, maxThreads: 4 }), 4) }
+        ])
+      },
+      2: {
+        fnName: 'BoundedExecutorQueue',
+        starter: `class BoundedExecutorQueue {\n  constructor(capacity, policy = 'ABORT') {\n    this.capacity = capacity;\n    this.policy = policy;\n    this.queue = [];\n    this.enqueued = 0;\n    this.rejected = 0;\n    this.dropped = 0;\n    this.callerRuns = 0;\n  }\n  submit(task) {\n    // BUG: Unbounded queue! Never enforces capacity or rejection policies.\n    this.queue.push(task);\n    this.enqueued++;\n    return { status: 'ENQUEUED', queueSize: this.queue.length };\n  }\n  take() { return this.queue.length ? this.queue.shift() : null; }\n  size() { return this.queue.length; }\n  stats() { return { enqueued: this.enqueued, rejected: this.rejected, dropped: this.dropped, callerRuns: this.callerRuns, queued: this.queue.length }; }\n}`,
+        hints: [
+          'Check `if (this.queue.length < this.capacity)` first to enqueue normally.',
+          'When full: `ABORT` increments `this.rejected` and throws an Error; `DROP_OLDEST` calls `this.queue.shift()`, pushes `task`, and increments `this.dropped`.',
+          'For `CALLER_RUNS`, increment `this.callerRuns`, execute `const result = task()`, and return `{ status: "CALLER_RUNS", result, queueSize: this.queue.length }`.'
+        ],
+        solution: `class BoundedExecutorQueue {\n  constructor(capacity, policy = 'ABORT') {\n    this.capacity = capacity;\n    this.policy = policy;\n    this.queue = [];\n    this.enqueued = 0;\n    this.rejected = 0;\n    this.dropped = 0;\n    this.callerRuns = 0;\n  }\n  submit(task) {\n    if (this.queue.length < this.capacity) {\n      this.queue.push(task);\n      this.enqueued++;\n      return { status: 'ENQUEUED', queueSize: this.queue.length };\n    }\n    if (this.policy === 'ABORT') {\n      this.rejected++;\n      throw new Error('RejectedExecutionException: queue full');\n    }\n    if (this.policy === 'DROP_OLDEST') {\n      const dropped = this.queue.shift();\n      this.queue.push(task);\n      this.dropped++;\n      this.enqueued++;\n      return { status: 'DROPPED_OLDEST', dropped, queueSize: this.queue.length };\n    }\n    if (this.policy === 'CALLER_RUNS') {\n      this.callerRuns++;\n      const result = typeof task === 'function' ? task() : task;\n      return { status: 'CALLER_RUNS', result, queueSize: this.queue.length };\n    }\n    throw new Error('Unknown rejection policy: ' + this.policy);\n  }\n  take() { return this.queue.length ? this.queue.shift() : null; }\n  size() { return this.queue.length; }\n  stats() {\n    return {\n      enqueued: this.enqueued,\n      rejected: this.rejected,\n      dropped: this.dropped,\n      callerRuns: this.callerRuns,\n      queued: this.queue.length\n    };\n  }\n}`,
+        kotlinEquivalent: `val pool = ThreadPoolExecutor(\n    2, 2, 0L, TimeUnit.MILLISECONDS,\n    ArrayBlockingQueue<Runnable>(capacity),\n    ThreadPoolExecutor.CallerRunsPolicy() // or AbortPolicy / DiscardOldestPolicy\n)`,
+        tests: async (Cls) => runTestCases([
+          {
+            name: 'ABORT throws RejectedExecutionException when queue reaches capacity',
+            run: () => {
+              const q = new Cls(2, 'ABORT');
+              assertEq(q.submit(() => 't1').status, 'ENQUEUED');
+              assertEq(q.submit(() => 't2').status, 'ENQUEUED');
+              let threw = false;
+              try { q.submit(() => 't3'); } catch (e) { threw = true; }
+              assertEq(threw, true, 'Expected ABORT policy to throw when full');
+              assertEq(q.size(), 2);
+              assertEq(q.stats().rejected, 1);
+            }
+          },
+          {
+            name: 'DROP_OLDEST evicts oldest task and keeps queue bounded at capacity',
+            run: () => {
+              const q = new Cls(2, 'DROP_OLDEST');
+              const t1 = () => 't1', t2 = () => 't2', t3 = () => 't3';
+              q.submit(t1); q.submit(t2);
+              const res = q.submit(t3);
+              assertEq(res.status, 'DROPPED_OLDEST');
+              assertEq(res.dropped, t1);
+              assertEq(q.size(), 2);
+              assertEq(q.take()(), 't2');
+              assertEq(q.take()(), 't3');
+              assertEq(q.stats().dropped, 1);
+            }
+          },
+          {
+            name: 'CALLER_RUNS executes overflow task synchronously on caller without dropping queued tasks',
+            run: () => {
+              const q = new Cls(2, 'CALLER_RUNS');
+              const ran = [];
+              q.submit(() => { ran.push('A'); return 'A'; });
+              q.submit(() => { ran.push('B'); return 'B'; });
+              const res = q.submit(() => { ran.push('C'); return 'C-sync'; });
+              assertEq(res.status, 'CALLER_RUNS');
+              assertEq(res.result, 'C-sync');
+              assertDeepEq(ran, ['C']);
+              assertEq(q.size(), 2);
+              assertEq(q.stats().callerRuns, 1);
+              assertEq(q.take()(), 'A');
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'workStealingStep',
+        starter: `function workStealingStep(deques, workerId) {\n  // BUG: Pops FIFO from own tail and steals LIFO from victim head!\n  const own = deques[workerId];\n  const victimId = workerId === 0 ? 1 : 0;\n  const victim = deques[victimId];\n  if (own.length > 0) {\n    return { workerId, action: 'LOCAL_LIFO', task: own.shift(), fromWorker: workerId };\n  }\n  if (victim.length > 0) {\n    return { workerId, action: 'STEAL_FIFO', task: victim.pop(), fromWorker: victimId };\n  }\n  return { workerId, action: 'IDLE', task: null, fromWorker: null };\n}`,
+        hints: [
+          'Owner deque puts tail at index `0` and head at `length - 1`.',
+          'Owner must pop LIFO from its own head using `own.pop()`.',
+          'Idle thief must steal FIFO from the victim tail using `victim.shift()`.'
+        ],
+        solution: `function workStealingStep(deques, workerId) {\n  const own = deques[workerId];\n  const victimId = workerId === 0 ? 1 : 0;\n  const victim = deques[victimId];\n  if (own.length > 0) {\n    return { workerId, action: 'LOCAL_LIFO', task: own.pop(), fromWorker: workerId };\n  }\n  if (victim.length > 0) {\n    return { workerId, action: 'STEAL_FIFO', task: victim.shift(), fromWorker: victimId };\n  }\n  return { workerId, action: 'IDLE', task: null, fromWorker: null };\n}`,
+        kotlinEquivalent: `// Inside kotlinx.coroutines.scheduling.WorkQueue:\n// Owner pops LIFO from producerIndex - 1 (lastScheduledTask / local ring head)\n// Idle worker steals FIFO from consumerIndex (tail) via CAS`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Owner pops LIFO from its own head (newest task first)',
+            run: () => {
+              const deques = [['T1', 'T2', 'T3'], ['B1']];
+              assertDeepEq(fn(deques, 0), { workerId: 0, action: 'LOCAL_LIFO', task: 'T3', fromWorker: 0 });
+              assertDeepEq(deques, [['T1', 'T2'], ['B1']]);
+            }
+          },
+          {
+            name: 'Idle thief steals FIFO from victim tail (oldest task first)',
+            run: () => {
+              const deques = [['T1', 'T2', 'T3'], []];
+              assertDeepEq(fn(deques, 1), { workerId: 1, action: 'STEAL_FIFO', task: 'T1', fromWorker: 0 });
+              assertDeepEq(deques, [['T2', 'T3'], []]);
+            }
+          },
+          {
+            name: 'Simultaneous owner LIFO + thief FIFO preserve opposite-end invariant',
+            run: () => {
+              const deques = [['A', 'B', 'C'], []];
+              const ownRes = fn(deques, 0);
+              const stealRes = fn(deques, 1);
+              assertEq(ownRes.task, 'C');
+              assertEq(stealRes.task, 'A');
+              assertDeepEq(deques, [['B'], []]);
+            }
+          },
+          {
+            name: 'Returns IDLE when both deques are empty',
+            run: () => assertDeepEq(fn([[], []], 0), { workerId: 0, action: 'IDLE', task: null, fromWorker: null })
+          }
+        ])
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. An Android service uses Executors.newCachedThreadPool() during a network outage, spawning 1,800 concurrent tasks. Why does the app crash with OutOfMemoryError?',
+        code: `val pool = Executors.newCachedThreadPool()\nrepeat(1_800) { id -> pool.submit { callSlowBackend(id) } }`,
+        options: [
+          'newCachedThreadPool uses an unbounded queue that fills the heap with millions of pending runnables.',
+          'newCachedThreadPool caps active OS threads at sixty-four and rejects every task past that threshold.',
+          'Each idle or blocked JVM OS thread reserves roughly one megabyte of stack memory.',
+          'Submitted lambdas automatically switch onto Dispatchers.Main and trigger a fatal Android ANR watchdog crash.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): newCachedThreadPool uses a zero-capacity SynchronousQueue, not an unbounded LinkedBlockingQueue.',
+          'WRONG (B): Sixty-four is Dispatchers.IO default parallelism; newCachedThreadPool sets maximumPoolSize to Integer.MAX_VALUE.',
+          'CORRECT (C): Blocking 1,800 tasks spawns ~1,800 OS threads, each reserving ~1 MB native stack plus kernel metadata until OOM.',
+          'WRONG (D): ExecutorService pools run on their own worker threads and never switch tasks onto Dispatchers.Main.'
+        ]
+      },
+      {
+        stem: '2. A backend worker uses Executors.newFixedThreadPool(4) to process image uploads, yet heap usage climbs until OutOfMemoryError occurs. What is the root cause?',
+        code: `val pool = Executors.newFixedThreadPool(4)\nuploadEvents.collect { img -> pool.submit { resizeAndUpload(img) } }`,
+        options: [
+          'newFixedThreadPool backs itself with an unbounded LinkedBlockingQueue that buffers arbitrary upload task backlogs.',
+          'Four fixed worker threads leak one megabyte of native stack memory on every upload.',
+          'ThreadPoolExecutor defaults to CallerRunsPolicy, which stalls the producer and corrupts the main JVM heap.',
+          'Fixed pools automatically spawn extra OS threads whenever upload latency exceeds sixty seconds total.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Executors.newFixedThreadPool uses LinkedBlockingQueue(Integer.MAX_VALUE), so slow workers let fast producers exhaust the heap.',
+          'WRONG (B): Worker threads reuse their existing stack across tasks; they do not allocate 1 MB per task.',
+          'WRONG (C): ThreadPoolExecutor defaults to AbortPolicy (not CallerRunsPolicy), and CallerRunsPolicy prevents heap growth rather than corrupting memory.',
+          'WRONG (D): A fixed pool keeps corePoolSize == maximumPoolSize == n and never scales beyond n threads.'
+        ]
+      },
+      {
+        stem: '3. Why does switching between Dispatchers.Default and Dispatchers.IO via withContext avoid creating a completely separate thread pool?',
+        code: `withContext(Dispatchers.Default) {\n    val raw = withContext(Dispatchers.IO) { readDiskFile() }\n    parseCpuData(raw)\n}`,
+        options: [
+          'Both dispatchers pin every launched coroutine permanently onto the single Android main looper thread.',
+          'Dispatchers.IO creates an isolated ForkJoinPool per call and shuts it down after returning.',
+          'Both dispatchers share an underlying elastic CoroutineScheduler pool, often avoiding OS thread switches.',
+          'Calling withContext(Dispatchers.IO) rewrites blocking file reads into non-blocking kernel epoll calls automatically.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): Neither Default nor IO uses the Android main looper; Dispatchers.Main handles the UI thread.',
+          'WRONG (B): Dispatchers.IO is a singleton backed by the shared CoroutineScheduler, never a per-call ForkJoinPool.',
+          'CORRECT (C): Default and IO share CoroutineScheduler worker threads, so withContext often keeps the coroutine on the same OS thread.',
+          'WRONG (D): Kotlin cannot rewrite blocking Java I/O syscalls into epoll; Dispatchers.IO allocates extra threads up to 64+ to tolerate blocking.'
+        ]
+      },
+      {
+        stem: '4. In a ForkJoinPool or CoroutineScheduler work-stealing deque, why does a worker pop its own tasks LIFO while thieves steal FIFO?',
+        code: `// Owner thread: localDeque.pop() (LIFO head)\n// Idle thief:   victimDeque.shift() (FIFO tail)`,
+        options: [
+          'LIFO preserves warm CPU caches locally, while FIFO steals older work with minimal contention.',
+          'FIFO local pops keep caches hot, while LIFO steals guarantee strict task arrival ordering.',
+          'Owner threads must acquire a global mutex lock before reading any local deque entry.',
+          'Thieves steal from the head to discard stale subtasks before the owner executes them.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Recent child tasks at the head stay hot in L1/L2 caches (LIFO), while thieves take older tasks at the opposite tail (FIFO) with rare CAS conflict.',
+          'WRONG (B): The directions are reversed: LIFO keeps recent data cache-hot locally, whereas FIFO at the tail is used by thieves.',
+          'WRONG (C): Work-stealing deques use lock-free/CAS synchronization specifically to avoid global mutex locks.',
+          'WRONG (D): Thieves steal valid older tasks from the tail to execute them in parallel, never to discard subtasks.'
+        ]
+      },
+      {
+        stem: '5. Your bounded ThreadPoolExecutor uses queue capacity 16 and RejectedExecutionHandler CallerRunsPolicy. What happens when a producer submits task #21 while all 4 workers and 16 queue slots are full?',
+        code: `ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,\n    ArrayBlockingQueue(16), ThreadPoolExecutor.CallerRunsPolicy())`,
+        options: [
+          'The executor throws RejectedExecutionException immediately and crashes the submitting producer coroutine or thread.',
+          'The executor silently evicts the oldest queued task to enqueue the newly submitted task.',
+          'The executor expands its pool past four threads up to Integer.MAX_VALUE to absorb load.',
+          'The submitting thread runs task #21 itself, naturally slowing down the fast producer rate.'
+        ],
+        correct: 3,
+        why: [
+          'WRONG (A): Throwing RejectedExecutionException is AbortPolicy behavior, whereas CallerRunsPolicy executes the task on the caller.',
+          'WRONG (B): Evicting the oldest queued task is DiscardOldestPolicy behavior, not CallerRunsPolicy.',
+          'WRONG (C): maximumPoolSize is fixed at 4; ThreadPoolExecutor never exceeds maximumPoolSize.',
+          'CORRECT (D): CallerRunsPolicy runs task #21 on the submitting thread, creating natural backpressure while workers drain the 16-slot queue.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_04',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

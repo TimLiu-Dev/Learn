@@ -84,6 +84,7 @@ flowchart TB
 | [infra/cdk/lib/saas-platform-stack.ts](infra/cdk/lib/saas-platform-stack.ts) | Primary AWS CDK v2 TypeScript stack (VPC, PrivateLink, KMS, Cognito, WAFv2, API GW, ALB, ECS Fargate ARM64, Aurora/RDS Proxy, DynamoDB, SQS/DLQ, EventBridge, Step Functions Saga, CloudWatch SLOs) |
 | [infra/cdk/bin/cloudpulse.ts](infra/cdk/bin/cloudpulse.ts) | CDK app entrypoint with `cdk-nag` `AwsSolutionsChecks` enforcement |
 | [services/saga/index.mjs](services/saga/index.mjs) | Dependency-free Node.js 20 ARM64 Saga step & compensation handlers |
+| [clients/android/CloudPulseApiClient.kt](clients/android/CloudPulseApiClient.kt) | Android Kotlin `OkHttp` client: Cognito JWT auth, `Idempotency-Key`, W3C `traceparent`, Full Jitter backoff, and two-step Pre-Signed S3 uploads |
 | [infra/terraform/main.tf](infra/terraform/main.tf) | Companion Terraform foundation: S3 remote state backend, Multi-AZ VPC + PrivateLink, and GitHub Actions OIDC IAM Role (zero static keys) |
 | [infra/terraform/variables.tf](infra/terraform/variables.tf) | Validated Terraform input variables |
 | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) | GitHub Actions OIDC pipeline: `tsc`, `cdk synth` + `cdk-nag`, PR `cdk diff`, and canary deploy with 5-minute CloudWatch SLO rollback guard |
@@ -181,3 +182,14 @@ Copy and tailor metrics to your measured benchmark results:
 > 4. `PublishProvisionedEvent` → emits `TenantProvisioned` onto EventBridge.
 >
 > Every step and compensation is **idempotent** (safe under Step Functions retries), traced via AWS X-Ray, and backed by an EventBridge target DLQ so no onboarding request is silently dropped.
+
+---
+
+## 7. Android Client Integration (Mobile-to-Cloud End-to-End)
+
+See [clients/android/CloudPulseApiClient.kt](clients/android/CloudPulseApiClient.kt) for the reference Kotlin `OkHttpClient` client connecting a mobile app cleanly to CloudPulse:
+
+- **Singleton Connection Pool:** Reuses TCP + TLS 1.3 sockets across API Gateway / ALB (`ConnectionPool`) while bounding connect/read/write timeouts.
+- **Auth, Idempotency & Tracing Interceptors:** Attaches `Authorization: Bearer <Cognito-PKCE-JWT>`, generates a per-mutation `Idempotency-Key` UUID before retries, and propagates W3C `traceparent` into X-Ray/ADOT.
+- **Direct-to-S3 Pre-Signed PUT Upload:** Requests a short-lived pre-signed URL from the API, then streams large attachments directly from Android `ContentResolver` to S3 so binaries never transit API Gateway, ALB, or ECS Fargate.
+- **Resilient Backoff:** Honors `429 Retry-After` and retries `503` using bounded Full Jitter exponential backoff.

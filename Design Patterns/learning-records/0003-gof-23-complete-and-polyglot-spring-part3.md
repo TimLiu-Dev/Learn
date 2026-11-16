@@ -1,0 +1,3 @@
+# GoF 23/23 Completeness & Polyglot Spring Boot Part 3
+
+The user asked whether all classic Gang of Four patterns were included and requested an additional backend part comparing Spring Boot in Java and Kotlin side-by-side. Lesson 0034 closes the remaining two GoF patterns (Flyweight and Interpreter, alongside Null Object) bringing coverage to 23/23 GoF patterns, and Lessons 0035–0039 cover Kotlin vs. Java Spring Boot side-by-side (`allopen`, JPA Entity equality, Coroutines vs. Virtual Threads, `coRouter` vs. `RouterFunction`, Specification, MockK vs. Mockito, Testcontainers, and a Polyglot Capstone).

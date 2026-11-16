@@ -1,0 +1,1426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 16 — WorkManager, Foreground Services, Process Death &amp; Doze</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 16 · Background &amp; Process Death</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 5 · Lesson 16 · Android Production Concurrency</div>
+      <h1>WorkManager, Foreground Services, Process Death &amp; Doze</h1>
+      <p class="hero-sub">
+        <code>CoroutineWorker</code> execution guarantees, <code>ExistingWorkPolicy</code>, surviving OS process death mid-mutation,
+        foreground service constraints, and crash-recoverable mobile state machines.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. Process Death &amp; Outbox Visualizer</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Production Kotlin Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>Designing for Crash-Recoverable Background Execution</h2>
+      <p class="section-lead">
+        Junior Android engineers assume an active coroutine inside <code>viewModelScope</code> or <code>GlobalScope</code> will run to completion.
+        Senior engineers treat OS process death (Low Memory Killer <code>SIGKILL</code>), Doze Mode maintenance windows, and network drops as normal control-flow events—anchoring state in SQLite and scheduling deferrable work through
+        <a href="https://developer.android.com/topic/libraries/architecture/workmanager" target="_blank" rel="noopener">Android Developers: WorkManager &amp; CoroutineWorker</a>.
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">In-Memory Scopes vs. Persistent WorkManager</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong>Process death wipes all heap memory without running <code>finally</code> blocks.</strong><br/><br/>
+            When Android reclaims a backgrounded app via LMK <code>SIGKILL</code>, <code>viewModelScope</code>, <code>GlobalScope</code>, and in-memory <code>Channel</code> queues vanish instantly.
+            <br/><br/>
+            <code>WorkManager</code> writes each <code>WorkRequest</code>, input <code>Data</code>, backoff policy, and <code>Constraints</code> into its internal SQLite <code>WorkDatabase</code> and delegates wakeups to <code>JobScheduler</code>, surviving process kills and device reboots.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);"><code>CoroutineWorker</code> &amp; Foreground Service Rules</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong><code>CoroutineWorker.doWork()</code> executes on <code>Dispatchers.Default</code> by default—NOT <code>Dispatchers.IO</code>.</strong><br/><br/>
+            Each worker gets ~10 minutes of execution budget unless promoted via <code>setForeground(ForegroundInfo(...))</code> (or short expedited quotas via <code>setExpedited()</code>).
+            <br/><br/>
+            Since Android 14 (API 34), foreground services require an explicit <code>foregroundServiceType</code> (such as <code>dataSync</code>), and Android 15 (API 35) enforces a 6-hour rolling runtime cap on <code>dataSync</code> services
+            (<a href="https://developer.android.com/develop/background-work/services/foreground-services" target="_blank" rel="noopener">Foreground Service Types</a>).
+          </p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 24px;">Android Background Execution Primitives Compared</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Primitive</th>
+              <th>Survives Process Kill?</th>
+              <th>Default Thread / Dispatcher</th>
+              <th>Doze &amp; Constraint Behavior</th>
+              <th>Production Role</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong><code>viewModelScope.launch</code></strong></td>
+              <td>No (dies on <code>onCleared()</code> or LMK)</td>
+              <td><code>Dispatchers.Main.immediate</code></td>
+              <td>Aborted if process killed or frozen</td>
+              <td>UI-scoped work that should cancel when leaving screen</td>
+            </tr>
+            <tr>
+              <td><strong><code>ForegroundService</code></strong></td>
+              <td>Restartable (<code>START_STICKY</code>), requires ongoing notification</td>
+              <td>Main thread (must launch own scope)</td>
+              <td>Bypasses App Standby; subject to API 34/35 type &amp; 6h limits</td>
+              <td>User-perceived ongoing work (audio, turn-by-turn, active transfer)</td>
+            </tr>
+            <tr>
+              <td><strong><code>CoroutineWorker</code></strong></td>
+              <td>Yes (persisted in <code>WorkDatabase</code>)</td>
+              <td><code>Dispatchers.Default</code> (<a href="https://developer.android.com/develop/background-work/background-tasks/persistent/threading/coroutineworker" target="_blank" rel="noopener">CoroutineWorker Docs</a>)</td>
+              <td>Defers cleanly until <code>Constraints</code> &amp; Doze window align</td>
+              <td>Guaranteed deferrable background sync, log upload, cleanup</td>
+            </tr>
+            <tr>
+              <td><strong><code>WorkManager</code> + Room Outbox</strong></td>
+              <td>Yes + crash-recoverable mid-HTTP call</td>
+              <td><code>Default</code> + <code>withContext(Dispatchers.IO)</code></td>
+              <td>Recovers stale <code>IN_FLIGHT</code> leases with same idempotency key</td>
+              <td>Zero-loss, zero-duplicate offline mutations &amp; payments</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 style="margin-top: 24px;">Crash-Recoverable Mobile State Machine (Outbox + WorkManager)</h3>
+      <pre>User Mutation ──► Room Transaction: INSERT outbox_row(status = PENDING, idempotencyKey = "idem-9f2a")
+                         │
+                         ▼
+         WorkManager.enqueueUniqueWork("sync_outbox", ExistingWorkPolicy.KEEP, request)
+                         │  (Defers under Doze until NetworkType.CONNECTED)
+                         ▼
+         CoroutineWorker claims row: status = IN_FLIGHT, leaseExpiresAt = now + 30_000ms
+                         │
+                         ▼
+         HTTP POST /orders (Header: Idempotency-Key: idem-9f2a)
+             ├── 200 OK / 409 Replay ──► Update Outbox: SENT ──► Result.success()
+             ├── 5xx / IOException   ──► Release to PENDING  ──► Result.retry() (Exponential Backoff)
+             ├── 4xx Validation Err  ──► Update Outbox: FAILED ► Result.failure()
+             └── OS SIGKILL mid-call ──► New PID boots worker ──► leaseExpiresAt &lt;= now!
+                                         Recover stale IN_FLIGHT ──► PENDING ──► Replay w/ SAME idem-9f2a</pre>
+
+      <div class="callout warn">
+        <strong>Doze Mode &amp; Constraint Deferral:</strong> Under
+        <a href="https://developer.android.com/training/monitoring-device-state/doze-standby" target="_blank" rel="noopener">Android Doze and App Standby</a>,
+        network access is suspended outside periodic maintenance windows. Attaching <code>Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()</code>
+        ensures WorkManager <strong>defers</strong> execution until connectivity returns—instead of waking up offline and wasting <code>Result.retry()</code> backoff attempts.
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive Crash &amp; Recovery Visualizer</div>
+      <h2>Process Death &amp; Outbox Recovery Simulator</h2>
+      <p class="section-lead">
+        Compare <code>viewModelScope</code>, a naive <code>CoroutineWorker</code>, and a Room Outbox + Idempotency Key worker when Android's Low Memory Killer sends <code>SIGKILL</code> mid-HTTP upload.
+        Use <strong>Step →</strong> to walk through the crash &amp; restart, or click <strong>⚡ Kill Process Mid-Sync</strong> to inject <code>SIGKILL</code> live.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn" data-mode="viewmodel">1. viewModelScope (Data Loss)</button>
+            <button class="btn" data-mode="naive">2. Naive Worker (Duplicate Write)</button>
+            <button class="btn active" data-mode="outbox">3. Outbox + WorkManager (Exact)</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn" id="sim-kill" style="border-color:rgba(244,63,94,0.55); color:#fda4af;">⚡ Kill Process Mid-Sync</button>
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span id="label-proc">OS Process (PID 4102)</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-proc"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Disk Persistence (WorkDatabase + Room Outbox)</span><span>SQLite WAL</span></div>
+              <div class="timeline-track" id="lane-disk"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Backend Server (Idempotency Ledger)</span><span>POST /orders</span></div>
+              <div class="timeline-track" id="lane-server"></div>
+            </div>
+            <div class="registers-grid" style="grid-template-columns: repeat(4, 1fr);">
+              <div class="reg-card"><div class="reg-name">Process PID</div><div class="reg-val" id="reg-pid" style="color:var(--accent);">4102</div></div>
+              <div class="reg-card"><div class="reg-name">Outbox State</div><div class="reg-val" id="reg-outbox" style="color:var(--amber);">—</div></div>
+              <div class="reg-card"><div class="reg-name">Idempotency Key</div><div class="reg-val" id="reg-key" style="color:var(--purple);">—</div></div>
+              <div class="reg-card"><div class="reg-name">Server Writes</div><div class="reg-val" id="reg-writes" style="color:var(--green);">0</div></div>
+            </div>
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Select a mode and click <strong>Step →</strong>, <strong>▶ Play</strong>, or <strong>⚡ Kill Process Mid-Sync</strong>.
+            </div>
+          </div>
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">EXECUTION &amp; RECOVERY TRACE</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; Android</div>
+      <h2>Junior Traps vs. Senior Patterns in WorkManager</h2>
+      <p class="section-lead">
+        Follow <a href="https://developer.android.com/kotlin/coroutines/coroutines-best-practices" target="_blank" rel="noopener">Android Coroutines Best Practices</a> and persistent worker contracts so mutations survive kills without duplicate side effects.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Fire-and-Forget <code>viewModelScope</code> vs. Persistent Outbox + <code>CoroutineWorker</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: In-Memory Upload Lost on LMK Kill</span></div>
+<pre>class CheckoutViewModel(private val api: OrderApi) : ViewModel() {
+    fun submitOrder(order: Order) {
+        viewModelScope.launch {
+            // If user leaves screen or OS kills process mid-call,
+            // coroutine dies silently; order is lost forever!
+            api.postOrder(order)
+        }
+    }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Room Outbox + Constrained Worker</span></div>
+<pre>suspend fun enqueueOrder(order: Order) {
+    outboxDao.insertPending(order.toOutboxEntity(idempotencyKey = uuid()))
+    val req = OneTimeWorkRequestBuilder&lt;OutboxSyncWorker&gt;()
+        .setConstraints(Constraints(requiredNetworkType = NetworkType.CONNECTED))
+        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS)
+        .build()
+    workManager.enqueueUniqueWork("outbox_sync", ExistingWorkPolicy.KEEP, req)
+}
+
+class OutboxSyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        outboxRepo.recoverStaleInFlightAndFlush() // Reuses stored idempotencyKey
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: <code>ExistingWorkPolicy.KEEP</code> vs. <code>REPLACE</code> vs. <code>APPEND_OR_REPLACE</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Blindly Using REPLACE for Sync</span></div>
+<pre>// Called from Pull-to-Refresh AND Push Notification simultaneously:
+workManager.enqueueUniqueWork(
+    "sync_inbox",
+    ExistingWorkPolicy.REPLACE, // Cancels in-flight HTTP upload mid-mutation!
+    syncRequest
+)
+// Worker #1 gets CancellationException AFTER server committed,
+// Worker #2 starts from scratch and causes duplicate mutations.</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Match Policy to State Semantics</span></div>
+<pre>// 1) KEEP: Ignore duplicate triggers while sync is ENQUEUED/RUNNING
+workManager.enqueueUniqueWork("sync_inbox", ExistingWorkPolicy.KEEP, syncReq)
+
+// 2) APPEND_OR_REPLACE: Chain next upload after active chain,
+//    OR wipe a stuck FAILED chain cleanly without cancelling new work
+workManager.enqueueUniqueWork(
+    "upload_chain",
+    ExistingWorkPolicy.APPEND_OR_REPLACE,
+    nextChunkReq
+)</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: Distinguishing <code>Result.success()</code>, <code>Result.retry()</code> &amp; <code>Result.failure()</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Catch-All Swallows Cancellation &amp; Retries 4xx</span></div>
+<pre>override suspend fun doWork(): Result {
+    return try {
+        api.upload(inputData.getString("id")!!)
+        Result.success()
+    } catch (e: Exception) {
+        // BUG 1: Swallows CancellationException when OS stops worker!
+        // BUG 2: Retries permanent HTTP 400 Bad Request 20 times!
+        Result.retry()
+    }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Rethrow Cancellation, Classify HTTP Errors</span></div>
+<pre>override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+    try {
+        api.upload(idempotencyKey)
+        Result.success()
+    } catch (ce: CancellationException) {
+        throw ce // Mandatory: cooperative cancellation for WorkManager stop/constraints!
+    } catch (e: HttpException) {
+        if (e.code() in 400..499 &amp;&amp; e.code() != 429) Result.failure()
+        else Result.retry() // 429 Too Many Requests / 5xx transient
+    } catch (e: IOException) {
+        Result.retry() // Network drop / Doze socket interruption
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">
+        Write code below and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>).
+        Each starter intentionally fails at least one test until you fix the durability, policy, or checkpointing bug.
+      </p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 16.1 · CRASH-RECOVERABLE OUTBOX WORKER</span>
+            <h3 style="margin:8px 0 4px;">Implement <code>DurableOutboxWorker</code> (Stale Lease Recovery + Idempotency)</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Recover stale <code>IN_FLIGHT</code> rows left behind by OS process death and flush <code>PENDING</code> mutations using persisted idempotency keys.
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>outboxStore.getRows()</code> returns <code>[{ id, payload, idempotencyKey, status, leaseExpiresAt, attempts }]</code>; <code>outboxStore.update(id, patch)</code> patches a row.<br/>
+          • In <code>async doWork()</code>: first reset any stale <code>'IN_FLIGHT'</code> row where <code>leaseExpiresAt &lt;= this.clock()</code> back to <code>{ status: 'PENDING', leaseExpiresAt: null }</code> (leave active non-stale leases untouched!).<br/>
+          • For each <code>'PENDING'</code> row: claim <code>{ status: 'IN_FLIGHT', leaseExpiresAt: now + this.leaseMs, attempts: (row.attempts || 0) + 1 }</code>, then call <code>await this.apiClient.send(row.payload, row.idempotencyKey)</code>.<br/>
+          • On success mark <code>'SENT'</code>; on error with <code>err.permanent === true</code> mark <code>'FAILED'</code>; on transient error reset to <code>'PENDING'</code> (<code>leaseExpiresAt: null</code>). Return <code>'RETRY'</code> if any transient failure occurred, else <code>'FAILURE'</code> if any permanent failure occurred, else <code>'SUCCESS'</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_16_1_durable_outbox_worker.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 16.2 · EXISTING WORK POLICY</span>
+            <h3 style="margin:8px 0 4px;">Implement <code>WorkQueuePolicyManager</code> (<code>KEEP</code> / <code>REPLACE</code> / <code>APPEND</code>)</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Implement WorkManager's <code>enqueueUniqueWork(name, policy, workItem)</code> semantics over active vs. completed work items.
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Work item states: <code>'ENQUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'</code>. Active items are <code>'ENQUEUED'</code> or <code>'RUNNING'</code>.<br/>
+          • <code>'KEEP'</code>: If any active item exists for <code>name</code>, do nothing and return <code>'KEPT'</code>; otherwise enqueue <code>{ ...workItem, state: 'ENQUEUED' }</code> and return <code>'ENQUEUED'</code>.<br/>
+          • <code>'REPLACE'</code>: Mark all active items for <code>name</code> as <code>'CANCELLED'</code>, enqueue the new item, and return <code>'REPLACED'</code>.<br/>
+          • <code>'APPEND'</code>: Keep existing items intact, append the new item to the queue, and return <code>'APPENDED'</code>. Throw an <code>Error</code> on unknown policy.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_16_2_work_queue_policy.js</span><span>ExistingWorkPolicy state transitions</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 16.3 · DOZE-RESILIENT CHUNK CHECKPOINTING</span>
+            <h3 style="margin:8px 0 4px;">Implement <code>ResumableChunkUploader</code> (Byte-Offset Checkpoints)</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">
+              Checkpoint acknowledged offsets after each chunk so resuming after Doze or a network drop skips already-uploaded chunks.
+            </p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Read initial offset via <code>this.checkpointStore.getOffset(fileId) || 0</code>. Loop while <code>offset &lt; data.length</code>.<br/>
+          • Send <code>const chunk = data.slice(offset, Math.min(offset + this.chunkSize, data.length))</code> via <code>await this.transport.uploadChunk(fileId, offset, chunk)</code>.<br/>
+          • Immediately persist <code>const nextOffset = (res &amp;&amp; typeof res.ackOffset === 'number') ? res.ackOffset : end;</code> with <code>this.checkpointStore.saveOffset(fileId, nextOffset)</code>.<br/>
+          • Catch errors: return <code>{ status: err.permanent ? 'FAILURE' : 'RETRY', finalOffset: offset, chunksSent, uploadedBytes }</code>; on full completion return <code>{ status: 'SUCCESS', finalOffset: offset, chunksSent, uploadedBytes }</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_16_3_resumable_chunk_uploader.js</span><span>Zero re-upload after Doze / drop</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in length so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Study
+          <a href="https://developer.android.com/topic/libraries/architecture/workmanager" target="_blank" rel="noopener">Android Developers: WorkManager &amp; CoroutineWorker</a>
+          alongside the <a href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a>.
+        </p>
+        <ul class="cite-list">
+          <li><a href="https://developer.android.com/develop/background-work/background-tasks/persistent/threading/coroutineworker" target="_blank" rel="noopener">Threading in CoroutineWorker</a> — Why <code>doWork()</code> defaults to <code>Dispatchers.Default</code> and how to offload blocking I/O safely.</li>
+          <li><a href="https://developer.android.com/develop/background-work/services/foreground-services" target="_blank" rel="noopener">Foreground Service Types (Android 14/15)</a> — Mandatory service types, expedited work quotas, and <code>dataSync</code> time limits.</li>
+          <li><a href="https://developer.android.com/training/monitoring-device-state/doze-standby" target="_blank" rel="noopener">Optimize for Doze and App Standby</a> — Maintenance windows, network restrictions, and constraint-based deferral.</li>
+        </ul>
+        <div class="callout mentor" style="margin-top:16px; margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"Why can catching Exception in CoroutineWorker break WorkManager constraint cancellation?"</em> or <em>"Walk me through how stale IN_FLIGHT leases recover safely in Lab 16.1"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0015-room-sqlite-wal-single-flight-retries.html">← Lesson 15</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0017-virtual-threads-rate-limiters-circuit-breakers.html">Lesson 17 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_SCENARIOS = {
+      viewmodel: {
+        baseSteps: [
+          {
+            pid: '4102', outbox: 'NONE (RAM)', key: 'none', writes: 0,
+            proc: { cls: 'ta', txt: 'VM: LAUNCH' },
+            disk: { cls: 'idle', txt: 'EMPTY' },
+            server: null,
+            type: '', msg: 'viewModelScope.launch starts upload in heap RAM (PID 4102). Nothing written to SQLite.'
+          },
+          {
+            pid: '4102', outbox: 'NONE (RAM)', key: 'none', writes: 0,
+            proc: { cls: 'ta', txt: 'HTTP POST' },
+            disk: { cls: 'idle', txt: 'EMPTY' },
+            server: { cls: 'io', txt: 'INCOMING' },
+            type: 'warn', msg: 'HTTP POST /orders sent over socket; user backgrounds app to take a photo.'
+          },
+          {
+            pid: 'DEAD', outbox: 'LOST!', key: 'none', writes: 0,
+            proc: { cls: 'bad', txt: 'SIGKILL!' },
+            disk: { cls: 'bad', txt: 'NO RECORD' },
+            server: { cls: 'idle', txt: 'DROPPED' },
+            type: 'bad', msg: 'OS Low Memory Killer sends SIGKILL to PID 4102. Heap RAM wiped; finally blocks never run!'
+          },
+          {
+            pid: '8819', outbox: 'GONE', key: 'none', writes: 0,
+            proc: { cls: 'sw', txt: 'COLD BOOT' },
+            disk: { cls: 'bad', txt: '0 WORK' },
+            server: { cls: 'bad', txt: '0 WRITES' },
+            type: 'bad', msg: 'User reopens app (new PID 8819). WorkManager has no queued work; order is permanently lost!'
+          }
+        ],
+        killStep: {
+          pid: 'DEAD', outbox: 'LOST!', key: 'none', writes: 0,
+          proc: { cls: 'bad', txt: 'SIGKILL!' },
+          disk: { cls: 'bad', txt: 'NO RECORD' },
+          server: { cls: 'bad', txt: '0 WRITES' },
+          type: 'bad', msg: 'MANUAL SIGKILL! PID 4102 killed mid-flight. In-memory viewModelScope job and order vanished.'
+        },
+        finalVerdict: {
+          cls: 'callout danger',
+          html: '<strong>Silent Data Loss:</strong> <code>viewModelScope</code> lives only in process RAM. LMK <code>SIGKILL</code> destroyed the upload with zero recovery path.'
+        }
+      },
+      naive: {
+        baseSteps: [
+          {
+            pid: '4102', outbox: 'NO OUTBOX', key: 'rand-1a', writes: 0,
+            proc: { cls: 'ta', txt: 'WM: ENQUEUE' },
+            disk: { cls: 'io', txt: 'WorkDB' },
+            server: null,
+            type: '', msg: 'WorkManager persists WorkRequest in WorkDatabase; starts CoroutineWorker on PID 4102.'
+          },
+          {
+            pid: '4102', outbox: 'NO OUTBOX', key: 'rand-1a', writes: 1,
+            proc: { cls: 'ta', txt: 'POST #1' },
+            disk: { cls: 'io', txt: 'RUNNING' },
+            server: { cls: 'io', txt: 'WRITE #1' },
+            type: 'warn', msg: 'Worker sends POST /orders (key=rand-1a). Server commits Write #1, but ACK is still in transit.'
+          },
+          {
+            pid: 'DEAD', outbox: 'NO OUTBOX', key: 'lost', writes: 1,
+            proc: { cls: 'bad', txt: 'SIGKILL!' },
+            disk: { cls: 'sw', txt: 'RE-QUEUE' },
+            server: { cls: 'io', txt: 'APPLIED 1' },
+            type: 'bad', msg: 'OS sends SIGKILL to PID 4102 BEFORE Result.success()! WorkDatabase keeps worker ENQUEUED.'
+          },
+          {
+            pid: '8819', outbox: 'NO OUTBOX', key: 'rand-2b', writes: 1,
+            proc: { cls: 'tb', txt: 'WM: REBOOT' },
+            disk: { cls: 'io', txt: 'RUNNING' },
+            server: null,
+            type: 'warn', msg: 'WorkManager restarts CoroutineWorker on PID 8819. doWork() generates a NEW random key (rand-2b)!'
+          },
+          {
+            pid: '8819', outbox: 'NO OUTBOX', key: 'rand-2b', writes: 2,
+            proc: { cls: 'tb', txt: 'POST #2' },
+            disk: { cls: 'io', txt: 'SUCCESS' },
+            server: { cls: 'bad', txt: 'WRITE #2!' },
+            type: 'bad', msg: 'DUPLICATE MUTATION! Server treats rand-2b as a new order -> 2 charges applied!'
+          }
+        ],
+        killStep: {
+          pid: 'DEAD', outbox: 'NO OUTBOX', key: 'lost', writes: 1,
+          proc: { cls: 'bad', txt: 'SIGKILL!' },
+          disk: { cls: 'sw', txt: 'RE-QUEUE' },
+          server: { cls: 'io', txt: 'APPLIED 1' },
+          type: 'bad', msg: 'MANUAL SIGKILL! PID 4102 killed before Result.success(). WorkManager will re-run without persisted key!'
+        },
+        recoveryTail: [
+          {
+            pid: '8819', outbox: 'NO OUTBOX', key: 'rand-2b', writes: 1,
+            proc: { cls: 'tb', txt: 'WM: REBOOT' },
+            disk: { cls: 'io', txt: 'RUNNING' },
+            server: null,
+            type: 'warn', msg: 'WorkManager restarts CoroutineWorker on PID 8819 with fresh random key rand-2b.'
+          },
+          {
+            pid: '8819', outbox: 'NO OUTBOX', key: 'rand-2b', writes: 2,
+            proc: { cls: 'tb', txt: 'POST #2' },
+            disk: { cls: 'io', txt: 'SUCCESS' },
+            server: { cls: 'bad', txt: 'WRITE #2!' },
+            type: 'bad', msg: 'DUPLICATE MUTATION! Server sees unknown key rand-2b and applies Write #2.'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout danger',
+          html: '<strong>Duplicate Write Bug:</strong> WorkManager survived process death, but generating a new key inside <code>doWork()</code> caused <code>2</code> server writes.'
+        }
+      },
+      outbox: {
+        baseSteps: [
+          {
+            pid: '4102', outbox: 'PENDING', key: 'idem-9f2a', writes: 0,
+            proc: { cls: 'ta', txt: 'TX: SAVE' },
+            disk: { cls: 'io', txt: 'PENDING' },
+            server: null,
+            type: 'good', msg: 'Room TX persists Outbox row (PENDING, key=idem-9f2a) and enqueues WorkManager KEEP.'
+          },
+          {
+            pid: '4102', outbox: 'IN_FLIGHT', key: 'idem-9f2a', writes: 0,
+            proc: { cls: 'ta', txt: 'CLAIM' },
+            disk: { cls: 'sw', txt: 'IN_FLIGHT' },
+            server: null,
+            type: '', msg: 'Worker on PID 4102 claims row -> IN_FLIGHT (leaseExpiresAt = T+30s).'
+          },
+          {
+            pid: '4102', outbox: 'IN_FLIGHT', key: 'idem-9f2a', writes: 1,
+            proc: { cls: 'ta', txt: 'POST #1' },
+            disk: { cls: 'sw', txt: 'LEASED' },
+            server: { cls: 'io', txt: 'WRITE #1' },
+            type: 'warn', msg: 'POST /orders (Idempotency-Key: idem-9f2a) commits Write #1 on server; ACK in flight.'
+          },
+          {
+            pid: 'DEAD', outbox: 'STALE LEASE', key: 'idem-9f2a', writes: 1,
+            proc: { cls: 'bad', txt: 'SIGKILL!' },
+            disk: { cls: 'sw', txt: 'IN_FLIGHT*' },
+            server: { cls: 'io', txt: 'LEDGER: 1' },
+            type: 'bad', msg: 'OS LMK sends SIGKILL to PID 4102 mid-ACK! Outbox stays IN_FLIGHT; WorkDatabase keeps work ENQUEUED.'
+          },
+          {
+            pid: '8819', outbox: 'RECOVERED', key: 'idem-9f2a', writes: 1,
+            proc: { cls: 'tb', txt: 'WM: REBOOT' },
+            disk: { cls: 'io', txt: 'PENDING' },
+            server: null,
+            type: 'good', msg: 'New PID 8819 starts worker. Sees leaseExpiresAt <= now -> resets stale IN_FLIGHT to PENDING!'
+          },
+          {
+            pid: '8819', outbox: 'SENT', key: 'idem-9f2a', writes: 1,
+            proc: { cls: 'tb', txt: 'REPLAY' },
+            disk: { cls: 'io', txt: 'SENT ✓' },
+            server: { cls: 'io', txt: 'DEDUP 200' },
+            type: 'good', msg: 'Replays POST with SAME idem-9f2a. Server hits ledger, skips Write #2, returns 200 OK -> Outbox marked SENT!'
+          }
+        ],
+        killStep: {
+          pid: 'DEAD', outbox: 'STALE LEASE', key: 'idem-9f2a', writes: 1,
+          proc: { cls: 'bad', txt: 'SIGKILL!' },
+          disk: { cls: 'sw', txt: 'IN_FLIGHT*' },
+          server: { cls: 'io', txt: 'LEDGER: 1' },
+          type: 'bad', msg: 'MANUAL SIGKILL! PID 4102 killed with row IN_FLIGHT (key=idem-9f2a preserved on disk).'
+        },
+        recoveryTail: [
+          {
+            pid: '8819', outbox: 'RECOVERED', key: 'idem-9f2a', writes: 1,
+            proc: { cls: 'tb', txt: 'WM: REBOOT' },
+            disk: { cls: 'io', txt: 'PENDING' },
+            server: null,
+            type: 'good', msg: 'New PID 8819 boots CoroutineWorker; detects expired lease -> transitions IN_FLIGHT to PENDING.'
+          },
+          {
+            pid: '8819', outbox: 'SENT', key: 'idem-9f2a', writes: 1,
+            proc: { cls: 'tb', txt: 'REPLAY' },
+            disk: { cls: 'io', txt: 'SENT ✓' },
+            server: { cls: 'io', txt: 'DEDUP 200' },
+            type: 'good', msg: 'Replays SAME key idem-9f2a. Server deduplicates (1 total write), returns 200 OK -> Outbox SENT!'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout tip',
+          html: '<strong>Exactly-Once Effect Achieved:</strong> Stale <code>IN_FLIGHT</code> recovery + persisted <code>idempotencyKey</code> survived <code>SIGKILL</code> with <code>1</code> total server write.'
+        }
+      }
+    };
+
+    let currentSimMode = 'outbox';
+    let simStepIdx = 0;
+    let simSteps = [];
+    let simKilled = false;
+    let simTimer = null;
+
+    function stopSimTimer() {
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        document.getElementById('sim-play').textContent = '▶ Play';
+      }
+    }
+
+    function applySimStep(s) {
+      const appendSlot = (id, slot) => {
+        if (!slot) return;
+        const d = document.createElement('div');
+        d.className = `slot ${slot.cls}`;
+        d.textContent = slot.txt;
+        document.getElementById(id).appendChild(d);
+      };
+      appendSlot('lane-proc', s.proc);
+      appendSlot('lane-disk', s.disk);
+      appendSlot('lane-server', s.server);
+
+      document.getElementById('label-proc').textContent = s.pid === 'DEAD' ? 'OS Process (KILLED)' : `OS Process (PID ${s.pid})`;
+      document.getElementById('reg-pid').textContent = s.pid;
+      document.getElementById('reg-pid').style.color = s.pid === 'DEAD' ? 'var(--rose)' : 'var(--accent)';
+      document.getElementById('reg-outbox').textContent = s.outbox;
+      document.getElementById('reg-key').textContent = s.key;
+      document.getElementById('reg-writes').textContent = String(s.writes);
+      document.getElementById('reg-writes').style.color = s.writes > 1 ? 'var(--rose)' : (s.writes === 1 ? 'var(--green)' : 'var(--text-muted)');
+
+      const logEl = document.getElementById('sim-log');
+      if (simStepIdx === 1) logEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.className = `trace-line ${s.type}`;
+      line.textContent = `[${simStepIdx}] ${s.msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+      if (s.pid === 'DEAD') simKilled = true;
+    }
+
+    function resetSim() {
+      stopSimTimer();
+      simStepIdx = 0;
+      simKilled = false;
+      simSteps = [...SIM_SCENARIOS[currentSimMode].baseSteps];
+      document.getElementById('lane-proc').innerHTML = '';
+      document.getElementById('lane-disk').innerHTML = '';
+      document.getElementById('lane-server').innerHTML = '';
+      document.getElementById('label-proc').textContent = 'OS Process (PID 4102)';
+      document.getElementById('reg-pid').textContent = '4102';
+      document.getElementById('reg-pid').style.color = 'var(--accent)';
+      document.getElementById('reg-outbox').textContent = '—';
+      document.getElementById('reg-key').textContent = '—';
+      document.getElementById('reg-writes').textContent = '0';
+      document.getElementById('reg-writes').style.color = 'var(--text-muted)';
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${simSteps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step →, ▶ Play, or ⚡ Kill Process Mid-Sync.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through to watch <code>PID 4102</code> die mid-mutation and see how SQLite state determines recovery.';
+    }
+
+    function stepSim() {
+      if (simStepIdx >= simSteps.length) {
+        stopSimTimer();
+        return;
+      }
+      const s = simSteps[simStepIdx++];
+      applySimStep(s);
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${simSteps.length}`;
+      if (simStepIdx === simSteps.length) {
+        const sc = SIM_SCENARIOS[currentSimMode];
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+        stopSimTimer();
+      }
+    }
+
+    function triggerManualKill() {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx >= simSteps.length || simKilled) {
+        resetSim();
+        if (currentSimMode === 'outbox') stepSim();
+        stepSim();
+      } else if (simStepIdx === 0) {
+        stepSim();
+      }
+      const tail = sc.recoveryTail ? [...sc.recoveryTail] : [];
+      simSteps = simSteps.slice(0, simStepIdx).concat([sc.killStep], tail);
+      stepSim();
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-kill').addEventListener('click', triggerManualKill);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) {
+        stopSimTimer();
+      } else {
+        if (simStepIdx >= simSteps.length) resetSim();
+        btn.textContent = '⏸ Pause';
+        simTimer = setInterval(stepSim, 900);
+      }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'DurableOutboxWorker',
+        starter: `class DurableOutboxWorker {
+  constructor(outboxStore, apiClient, clock = () => Date.now(), leaseMs = 5000) {
+    this.outboxStore = outboxStore;
+    this.apiClient = apiClient;
+    this.clock = clock;
+    this.leaseMs = leaseMs;
+  }
+
+  async doWork() {
+    // BUG 1: Skips recovering stale IN_FLIGHT rows (leaseExpiresAt <= now) from crashed PIDs!
+    // BUG 2: Generates a new random idempotencyKey instead of reusing row.idempotencyKey!
+    // BUG 3: Fails to release transient errors back to PENDING or classify permanent errors!
+    const pending = this.outboxStore.getRows().filter((r) => r.status === 'PENDING');
+    for (const row of pending) {
+      await this.apiClient.send(row.payload, 'random-' + row.id + '-' + Math.random());
+      this.outboxStore.update(row.id, { status: 'SENT', leaseExpiresAt: null });
+    }
+    return 'SUCCESS';
+  }
+}`,
+        hints: [
+          'First call `const now = this.clock();` and scan `this.outboxStore.getRows()` for rows with `status === "IN_FLIGHT" && row.leaseExpiresAt <= now`. Reset those to `{ status: "PENDING", leaseExpiresAt: null }`.',
+          'Re-read `PENDING` rows and claim each before sending: `status: "IN_FLIGHT"`, `leaseExpiresAt: now + this.leaseMs`, `attempts: (row.attempts || 0) + 1`, then call `await this.apiClient.send(row.payload, row.idempotencyKey)`.',
+          'In `catch (err)`: if `err && err.permanent` mark `"FAILED"` and set `hasPermanent = true`; else reset to `"PENDING"` (`leaseExpiresAt: null`) and set `needsRetry = true`. Return `"RETRY"` if `needsRetry`, else `"FAILURE"` if `hasPermanent`, else `"SUCCESS"`.'
+        ],
+        solution: `class DurableOutboxWorker {
+  constructor(outboxStore, apiClient, clock = () => Date.now(), leaseMs = 5000) {
+    this.outboxStore = outboxStore;
+    this.apiClient = apiClient;
+    this.clock = clock;
+    this.leaseMs = leaseMs;
+  }
+
+  async doWork() {
+    const now = this.clock();
+    for (const row of this.outboxStore.getRows()) {
+      if (row.status === 'IN_FLIGHT' && typeof row.leaseExpiresAt === 'number' && row.leaseExpiresAt <= now) {
+        this.outboxStore.update(row.id, { status: 'PENDING', leaseExpiresAt: null });
+      }
+    }
+
+    let needsRetry = false;
+    let hasPermanent = false;
+    const pending = this.outboxStore.getRows().filter((r) => r.status === 'PENDING');
+    for (const row of pending) {
+      this.outboxStore.update(row.id, {
+        status: 'IN_FLIGHT',
+        leaseExpiresAt: now + this.leaseMs,
+        attempts: (row.attempts || 0) + 1
+      });
+      try {
+        await this.apiClient.send(row.payload, row.idempotencyKey);
+        this.outboxStore.update(row.id, { status: 'SENT', leaseExpiresAt: null });
+      } catch (err) {
+        if (err && err.permanent === true) {
+          this.outboxStore.update(row.id, { status: 'FAILED', leaseExpiresAt: null });
+          hasPermanent = true;
+        } else {
+          this.outboxStore.update(row.id, { status: 'PENDING', leaseExpiresAt: null });
+          needsRetry = true;
+        }
+      }
+    }
+
+    if (needsRetry) return 'RETRY';
+    if (hasPermanent) return 'FAILURE';
+    return 'SUCCESS';
+  }
+}`,
+        kotlinEquivalent: `class OutboxSyncWorker(
+    ctx: Context,
+    params: WorkerParameters,
+    private val outboxDao: OutboxDao,
+    private val api: OrderApi,
+    private val clock: () -> Long = System::currentTimeMillis
+) : CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        val now = clock()
+        outboxDao.requeueStaleInFlight(expiredBefore = now)
+        var needsRetry = false
+        var hasPermanent = false
+        for (row in outboxDao.getPending()) {
+            outboxDao.claim(row.id, leaseExpiresAt = now + 30_000L)
+            try {
+                api.send(row.payload, idempotencyKey = row.idempotencyKey)
+                outboxDao.markSent(row.id)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: HttpException) {
+                if (e.code() in 400..499 && e.code() != 429) {
+                    outboxDao.markFailed(row.id)
+                    hasPermanent = true
+                } else {
+                    outboxDao.releaseToPending(row.id)
+                    needsRetry = true
+                }
+            } catch (e: IOException) {
+                outboxDao.releaseToPending(row.id)
+                needsRetry = true
+            }
+        }
+        when {
+            needsRetry -> Result.retry()
+            hasPermanent -> Result.failure()
+            else -> Result.success()
+        }
+    }
+}`,
+        tests: async (WorkerCls) => {
+          function createStore(initialRows) {
+            const rows = initialRows.map((r) => ({ ...r }));
+            return {
+              getRows: () => rows.map((r) => ({ ...r })),
+              update: (id, patch) => {
+                const idx = rows.findIndex((r) => r.id === id);
+                if (idx >= 0) rows[idx] = { ...rows[idx], ...patch };
+              },
+              getById: (id) => rows.find((r) => r.id === id)
+            };
+          }
+          return runTestCases([
+            {
+              name: 'Flushes PENDING rows with exact persisted idempotencyKey and marks SENT',
+              run: async () => {
+                const store = createStore([
+                  { id: 1, payload: 'order-A', idempotencyKey: 'idem-A', status: 'PENDING', leaseExpiresAt: null, attempts: 0 }
+                ]);
+                const sentKeys = [];
+                const api = { send: async (p, k) => { sentKeys.push([p, k]); } };
+                const res = await new WorkerCls(store, api, () => 1000, 5000).doWork();
+                assertEq(res, 'SUCCESS');
+                assertDeepEq(sentKeys, [['order-A', 'idem-A']]);
+                assertEq(store.getById(1).status, 'SENT');
+                assertEq(store.getById(1).attempts, 1);
+              }
+            },
+            {
+              name: 'Recovers stale IN_FLIGHT row after simulated OS kill without duplicate server writes',
+              run: async () => {
+                let now = 10_000;
+                const serverLedger = new Map();
+                let serverAppliedCount = 0;
+                const store = createStore([
+                  // Simulates row left IN_FLIGHT when previous PID died at t=2000 (lease expired at 7000 <= 10000)
+                  { id: 7, payload: 'pay-99', idempotencyKey: 'idem-pay-99', status: 'IN_FLIGHT', leaseExpiresAt: 7000, attempts: 1 }
+                ]);
+                // Server already applied first attempt before process died mid-ACK
+                serverLedger.set('idem-pay-99', 'ok');
+                serverAppliedCount = 1;
+                const api = {
+                  send: async (payload, key) => {
+                    if (!serverLedger.has(key)) {
+                      serverLedger.set(key, payload);
+                      serverAppliedCount++;
+                    }
+                  }
+                };
+                const res = await new WorkerCls(store, api, () => now, 5000).doWork();
+                assertEq(res, 'SUCCESS');
+                assertEq(serverAppliedCount, 1, 'Idempotency key should prevent duplicate server write!');
+                assertEq(store.getById(7).status, 'SENT');
+                assertEq(store.getById(7).attempts, 2);
+              }
+            },
+            {
+              name: 'Leaves non-stale active IN_FLIGHT lease untouched',
+              run: async () => {
+                const store = createStore([
+                  { id: 2, payload: 'active', idempotencyKey: 'idem-2', status: 'IN_FLIGHT', leaseExpiresAt: 15_000, attempts: 1 }
+                ]);
+                let calls = 0;
+                const api = { send: async () => { calls++; } };
+                const res = await new WorkerCls(store, api, () => 10_000, 5000).doWork();
+                assertEq(res, 'SUCCESS');
+                assertEq(calls, 0, 'Must not steal an unexpired IN_FLIGHT lease');
+                assertEq(store.getById(2).status, 'IN_FLIGHT');
+              }
+            },
+            {
+              name: 'Transient failure releases row to PENDING and returns RETRY; subsequent run succeeds with same key',
+              run: async () => {
+                const store = createStore([
+                  { id: 3, payload: 'msg', idempotencyKey: 'idem-3', status: 'PENDING', leaseExpiresAt: null, attempts: 0 }
+                ]);
+                let failNext = true;
+                const keys = [];
+                const api = {
+                  send: async (_p, k) => {
+                    keys.push(k);
+                    if (failNext) { failNext = false; throw new Error('503 Service Unavailable'); }
+                  }
+                };
+                const worker = new WorkerCls(store, api, () => 2000, 5000);
+                assertEq(await worker.doWork(), 'RETRY');
+                assertEq(store.getById(3).status, 'PENDING');
+                assertEq(store.getById(3).leaseExpiresAt, null);
+                assertEq(await worker.doWork(), 'SUCCESS');
+                assertDeepEq(keys, ['idem-3', 'idem-3']);
+                assertEq(store.getById(3).status, 'SENT');
+              }
+            },
+            {
+              name: 'Permanent 4xx error marks row FAILED and returns FAILURE',
+              run: async () => {
+                const store = createStore([
+                  { id: 4, payload: 'bad', idempotencyKey: 'idem-4', status: 'PENDING', leaseExpiresAt: null, attempts: 0 }
+                ]);
+                const api = {
+                  send: async () => {
+                    const err = new Error('400 Bad Request');
+                    err.permanent = true;
+                    throw err;
+                  }
+                };
+                const res = await new WorkerCls(store, api, () => 3000, 5000).doWork();
+                assertEq(res, 'FAILURE');
+                assertEq(store.getById(4).status, 'FAILED');
+              }
+            }
+          ]);
+        }
+      },
+      2: {
+        fnName: 'WorkQueuePolicyManager',
+        starter: `class WorkQueuePolicyManager {
+  constructor() {
+    this.queues = new Map();
+  }
+
+  enqueueUniqueWork(name, policy, workItem) {
+    // BUG: Ignores KEEP / REPLACE / APPEND rules and always pushes unconditionally!
+    const q = this.queues.get(name) || [];
+    q.push({ ...workItem, state: 'ENQUEUED' });
+    this.queues.set(name, q);
+    return 'ENQUEUED';
+  }
+
+  startNext(name) {
+    const q = this.queues.get(name) || [];
+    if (q.some((w) => w.state === 'RUNNING')) return null;
+    const next = q.find((w) => w.state === 'ENQUEUED');
+    if (!next) return null;
+    next.state = 'RUNNING';
+    return next;
+  }
+
+  completeRunning(name, outcome = 'SUCCEEDED') {
+    const q = this.queues.get(name) || [];
+    const cur = q.find((w) => w.state === 'RUNNING');
+    if (!cur) return null;
+    cur.state = outcome;
+    return cur;
+  }
+
+  getQueue(name) {
+    return this.queues.get(name) || [];
+  }
+}`,
+        hints: [
+          'Validate `policy` first: if not `"KEEP"`, `"REPLACE"`, or `"APPEND"`, throw `new Error(...)`.',
+          'Compute `const hasActive = q.some((w) => w.state === "ENQUEUED" || w.state === "RUNNING");`. For `"KEEP"`, if `hasActive` return `"KEPT"`.',
+          'For `"REPLACE"`, loop over `q` and set `w.state = "CANCELLED"` for any `"ENQUEUED"` or `"RUNNING"` entry before pushing `{ ...workItem, state: "ENQUEUED" }` and returning `"REPLACED"`. For `"APPEND"`, push and return `"APPENDED"`.'
+        ],
+        solution: `class WorkQueuePolicyManager {
+  constructor() {
+    this.queues = new Map();
+  }
+
+  enqueueUniqueWork(name, policy, workItem) {
+    if (policy !== 'KEEP' && policy !== 'REPLACE' && policy !== 'APPEND') {
+      throw new Error('Unknown ExistingWorkPolicy: ' + policy);
+    }
+    const q = this.queues.get(name) || [];
+    this.queues.set(name, q);
+    const isActive = (w) => w.state === 'ENQUEUED' || w.state === 'RUNNING';
+
+    if (policy === 'KEEP') {
+      if (q.some(isActive)) return 'KEPT';
+      q.push({ ...workItem, state: 'ENQUEUED' });
+      return 'ENQUEUED';
+    }
+
+    if (policy === 'REPLACE') {
+      for (const w of q) {
+        if (isActive(w)) w.state = 'CANCELLED';
+      }
+      q.push({ ...workItem, state: 'ENQUEUED' });
+      return 'REPLACED';
+    }
+
+    q.push({ ...workItem, state: 'ENQUEUED' });
+    return 'APPENDED';
+  }
+
+  startNext(name) {
+    const q = this.queues.get(name) || [];
+    if (q.some((w) => w.state === 'RUNNING')) return null;
+    const next = q.find((w) => w.state === 'ENQUEUED');
+    if (!next) return null;
+    next.state = 'RUNNING';
+    return next;
+  }
+
+  completeRunning(name, outcome = 'SUCCEEDED') {
+    const q = this.queues.get(name) || [];
+    const cur = q.find((w) => w.state === 'RUNNING');
+    if (!cur) return null;
+    cur.state = outcome;
+    return cur;
+  }
+
+  getQueue(name) {
+    return this.queues.get(name) || [];
+  }
+}`,
+        kotlinEquivalent: `workManager.enqueueUniqueWork(
+    "sync_orders",
+    ExistingWorkPolicy.KEEP, // or REPLACE / APPEND / APPEND_OR_REPLACE
+    OneTimeWorkRequestBuilder<OrderSyncWorker>().build()
+)`,
+        tests: async (MgrCls) => runTestCases([
+          {
+            name: 'KEEP drops duplicate requests while ENQUEUED or RUNNING',
+            run: () => {
+              const mgr = new MgrCls();
+              assertEq(mgr.enqueueUniqueWork('sync', 'KEEP', { id: 'w1' }), 'ENQUEUED');
+              assertEq(mgr.enqueueUniqueWork('sync', 'KEEP', { id: 'w2' }), 'KEPT');
+              mgr.startNext('sync');
+              assertEq(mgr.enqueueUniqueWork('sync', 'KEEP', { id: 'w3' }), 'KEPT');
+              assertEq(mgr.getQueue('sync').length, 1);
+            }
+          },
+          {
+            name: 'KEEP allows enqueuing fresh work once previous work is SUCCEEDED or FAILED',
+            run: () => {
+              const mgr = new MgrCls();
+              mgr.enqueueUniqueWork('sync', 'KEEP', { id: 'w1' });
+              mgr.startNext('sync');
+              mgr.completeRunning('sync', 'SUCCEEDED');
+              assertEq(mgr.enqueueUniqueWork('sync', 'KEEP', { id: 'w2' }), 'ENQUEUED');
+              assertEq(mgr.getQueue('sync').length, 2);
+            }
+          },
+          {
+            name: 'REPLACE cancels both RUNNING and ENQUEUED active items before inserting new work',
+            run: () => {
+              const mgr = new MgrCls();
+              mgr.enqueueUniqueWork('upload', 'APPEND', { id: 'u1' });
+              mgr.enqueueUniqueWork('upload', 'APPEND', { id: 'u2' });
+              mgr.startNext('upload'); // u1 is RUNNING, u2 is ENQUEUED
+              assertEq(mgr.enqueueUniqueWork('upload', 'REPLACE', { id: 'u3' }), 'REPLACED');
+              const states = mgr.getQueue('upload').map((w) => [w.id, w.state]);
+              assertDeepEq(states, [['u1', 'CANCELLED'], ['u2', 'CANCELLED'], ['u3', 'ENQUEUED']]);
+              assertEq(mgr.startNext('upload').id, 'u3');
+            }
+          },
+          {
+            name: 'APPEND chains items in FIFO order without cancelling running work',
+            run: () => {
+              const mgr = new MgrCls();
+              assertEq(mgr.enqueueUniqueWork('chain', 'APPEND', { id: 'c1' }), 'APPENDED');
+              mgr.startNext('chain');
+              assertEq(mgr.enqueueUniqueWork('chain', 'APPEND', { id: 'c2' }), 'APPENDED');
+              assertEq(mgr.startNext('chain'), null, 'Cannot start c2 while c1 is still RUNNING');
+              mgr.completeRunning('chain', 'SUCCEEDED');
+              assertEq(mgr.startNext('chain').id, 'c2');
+            }
+          },
+          {
+            name: 'Isolates unique work names and rejects unknown policies',
+            run: () => {
+              const mgr = new MgrCls();
+              mgr.enqueueUniqueWork('A', 'KEEP', { id: 'a1' });
+              assertEq(mgr.enqueueUniqueWork('B', 'KEEP', { id: 'b1' }), 'ENQUEUED');
+              let threw = false;
+              try { mgr.enqueueUniqueWork('A', 'BOGUS', { id: 'x' }); } catch (e) { threw = true; }
+              assertEq(threw, true);
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'ResumableChunkUploader',
+        starter: `class ResumableChunkUploader {
+  constructor(checkpointStore, transport, chunkSize = 1024) {
+    this.checkpointStore = checkpointStore;
+    this.transport = transport;
+    this.chunkSize = chunkSize;
+  }
+
+  async upload(fileId, data, onProgress) {
+    // BUG 1: Starts from 0 instead of checkpointStore.getOffset(fileId)!
+    // BUG 2: Never persists acknowledged offsets via checkpointStore.saveOffset!
+    // BUG 3: Crashes on transient Doze/network errors instead of returning { status: 'RETRY', ... }!
+    let offset = 0;
+    let chunksSent = 0;
+    let uploadedBytes = 0;
+    while (offset < data.length) {
+      const end = Math.min(offset + this.chunkSize, data.length);
+      const chunk = data.slice(offset, end);
+      await this.transport.uploadChunk(fileId, offset, chunk);
+      uploadedBytes += chunk.length;
+      offset = end;
+      chunksSent++;
+      if (onProgress) onProgress({ fileId, offset, total: data.length });
+    }
+    return { status: 'SUCCESS', finalOffset: offset, chunksSent, uploadedBytes };
+  }
+}`,
+        hints: [
+          'Initialize `let offset = this.checkpointStore.getOffset(fileId) || 0;` before the loop.',
+          'After `const res = await this.transport.uploadChunk(fileId, offset, chunk);`, compute `const nextOffset = (res && typeof res.ackOffset === "number") ? res.ackOffset : end;` and call `this.checkpointStore.saveOffset(fileId, nextOffset);`.',
+          'Wrap the loop in `try { ... } catch (err) { return { status: err && err.permanent ? "FAILURE" : "RETRY", finalOffset: offset, chunksSent, uploadedBytes }; }`.'
+        ],
+        solution: `class ResumableChunkUploader {
+  constructor(checkpointStore, transport, chunkSize = 1024) {
+    this.checkpointStore = checkpointStore;
+    this.transport = transport;
+    this.chunkSize = chunkSize;
+  }
+
+  async upload(fileId, data, onProgress) {
+    let offset = this.checkpointStore.getOffset(fileId) || 0;
+    let chunksSent = 0;
+    let uploadedBytes = 0;
+    try {
+      while (offset < data.length) {
+        const end = Math.min(offset + this.chunkSize, data.length);
+        const chunk = data.slice(offset, end);
+        const res = await this.transport.uploadChunk(fileId, offset, chunk);
+        const nextOffset = (res && typeof res.ackOffset === 'number') ? res.ackOffset : end;
+        this.checkpointStore.saveOffset(fileId, nextOffset);
+        uploadedBytes += (nextOffset - offset);
+        offset = nextOffset;
+        chunksSent++;
+        if (onProgress) onProgress({ fileId, offset, total: data.length });
+      }
+      return { status: 'SUCCESS', finalOffset: offset, chunksSent, uploadedBytes };
+    } catch (err) {
+      const status = (err && err.permanent === true) ? 'FAILURE' : 'RETRY';
+      return { status, finalOffset: offset, chunksSent, uploadedBytes };
+    }
+  }
+}`,
+        kotlinEquivalent: `suspend fun uploadResumable(fileId: String, file: File): ListenableWorker.Result {
+    var offset = checkpointDao.getOffset(fileId) ?: 0L
+    val total = file.length()
+    return try {
+        while (offset < total) {
+            ensureActive() // Cooperate with WorkManager stop / constraint loss
+            val chunk = file.readSlice(offset, CHUNK_SIZE)
+            val ackOffset = mediaApi.uploadChunk(fileId, offset, chunk)
+            checkpointDao.saveOffset(fileId, ackOffset)
+            offset = ackOffset
+        }
+        ListenableWorker.Result.success()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (e: IOException) {
+        ListenableWorker.Result.retry()
+    }
+}`,
+        tests: async (UploaderCls) => {
+          function createCheckpoints() {
+            const map = new Map();
+            return {
+              getOffset: (id) => map.get(id) || 0,
+              saveOffset: (id, off) => map.set(id, off)
+            };
+          }
+          return runTestCases([
+            {
+              name: 'Splits payload into bounded chunks and checkpoints each acknowledged offset',
+              run: async () => {
+                const cp = createCheckpoints();
+                const sent = [];
+                const progress = [];
+                const transport = {
+                  uploadChunk: async (_id, off, chunk) => {
+                    sent.push([off, chunk]);
+                    return { ackOffset: off + chunk.length };
+                  }
+                };
+                const res = await new UploaderCls(cp, transport, 4).upload('vid-1', 'ABCDEFGHIJ', (p) => progress.push(p.offset));
+                assertDeepEq(sent, [[0, 'ABCD'], [4, 'EFGH'], [8, 'IJ']]);
+                assertDeepEq(progress, [4, 8, 10]);
+                assertEq(cp.getOffset('vid-1'), 10);
+                assertDeepEq(res, { status: 'SUCCESS', finalOffset: 10, chunksSent: 3, uploadedBytes: 10 });
+              }
+            },
+            {
+              name: 'Checkpoints chunk 1 before Doze/network drop on chunk 2 and returns RETRY',
+              run: async () => {
+                const cp = createCheckpoints();
+                let calls = 0;
+                const transport = {
+                  uploadChunk: async (_id, off, chunk) => {
+                    calls++;
+                    if (calls === 2) throw new Error('Doze network lost');
+                    return { ackOffset: off + chunk.length };
+                  }
+                };
+                const res = await new UploaderCls(cp, transport, 4).upload('vid-2', 'ABCDEFGHIJ');
+                assertDeepEq(res, { status: 'RETRY', finalOffset: 4, chunksSent: 1, uploadedBytes: 4 });
+                assertEq(cp.getOffset('vid-2'), 4);
+              }
+            },
+            {
+              name: 'Resuming after RETRY skips already-acknowledged chunks [0..4]',
+              run: async () => {
+                const cp = createCheckpoints();
+                let failChunk2Once = true;
+                const sentOffsets = [];
+                const transport = {
+                  uploadChunk: async (_id, off, chunk) => {
+                    sentOffsets.push(off);
+                    if (failChunk2Once && off === 4) {
+                      failChunk2Once = false;
+                      throw new Error('SocketTimeoutException');
+                    }
+                    return { ackOffset: off + chunk.length };
+                  }
+                };
+                const uploader = new UploaderCls(cp, transport, 4);
+                const run1 = await uploader.upload('vid-3', 'ABCDEFGHIJ');
+                assertEq(run1.status, 'RETRY');
+                const run2 = await uploader.upload('vid-3', 'ABCDEFGHIJ');
+                assertDeepEq(run2, { status: 'SUCCESS', finalOffset: 10, chunksSent: 2, uploadedBytes: 6 });
+                assertDeepEq(sentOffsets, [0, 4, 4, 8], 'Must not re-upload offset 0 after resume!');
+              }
+            },
+            {
+              name: 'Already-completed upload sends 0 chunks idempotently',
+              run: async () => {
+                const cp = createCheckpoints();
+                cp.saveOffset('vid-4', 10);
+                let calls = 0;
+                const transport = { uploadChunk: async () => { calls++; } };
+                const res = await new UploaderCls(cp, transport, 4).upload('vid-4', 'ABCDEFGHIJ');
+                assertEq(calls, 0);
+                assertDeepEq(res, { status: 'SUCCESS', finalOffset: 10, chunksSent: 0, uploadedBytes: 0 });
+              }
+            },
+            {
+              name: 'Permanent 4xx error preserves prior checkpoint and returns FAILURE',
+              run: async () => {
+                const cp = createCheckpoints();
+                let calls = 0;
+                const transport = {
+                  uploadChunk: async (_id, off, chunk) => {
+                    calls++;
+                    if (calls === 2) {
+                      const e = new Error('415 Unsupported Media');
+                      e.permanent = true;
+                      throw e;
+                    }
+                    return { ackOffset: off + chunk.length };
+                  }
+                };
+                const res = await new UploaderCls(cp, transport, 4).upload('vid-5', 'ABCDEFGHIJ');
+                assertDeepEq(res, { status: 'FAILURE', finalOffset: 4, chunksSent: 1, uploadedBytes: 4 });
+                assertEq(cp.getOffset('vid-5'), 4);
+              }
+            }
+          ]);
+        }
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. An app uploads a 15 MB video inside viewModelScope.launch when the user switches to Camera and Android LMK kills the process. What happens?',
+        code: `viewModelScope.launch {\n    mediaApi.uploadVideo(uri) // User switches apps -> LMK SIGKILL\n}`,
+        options: [
+          'The OS transfers active viewModelScope coroutines automatically onto a background JobScheduler task until completion.',
+          'The in-memory coroutine dies immediately with the process; only persisted WorkManager requests survive and restart.',
+          'Kotlin saves the Continuation stack to SavedStateHandle and resumes uploading once the user returns.',
+          'Android pauses the socket gracefully during process death and replays remaining chunks inside onCleared.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): viewModelScope is strictly an in-memory CoroutineScope; Android never migrates RAM coroutines into JobScheduler.',
+          'CORRECT (B): LMK sends SIGKILL, destroying the process heap. Only WorkManager requests persisted in SQLite WorkDatabase restart in a new process.',
+          'WRONG (C): SavedStateHandle stores small Parcelable/Bundle values, never arbitrary coroutine Continuations or live sockets.',
+          'WRONG (D): Process death via SIGKILL kills the process immediately without invoking onCleared() or gracefully pausing sockets.'
+        ]
+      },
+      {
+        stem: '2. You call blocking FileInputStream.read() directly inside CoroutineWorker.doWork() without withContext(). Which dispatcher executes that blocking I/O?',
+        code: `class LogWorker(ctx: Context, p: WorkerParameters) : CoroutineWorker(ctx, p) {\n    override suspend fun doWork(): Result {\n        file.inputStream().readBytes()\n        return Result.success()\n    }\n}`,
+        options: [
+          'Dispatchers.IO runs it automatically because WorkManager detects disk operations inside every CoroutineWorker subclass.',
+          'Dispatchers.Main runs it unless you annotate the worker class with @WorkerThread before scheduling.',
+          'Dispatchers.Default runs it by default, risking CPU pool starvation under heavy blocking I/O.',
+          'An unbounded cached thread pool runs it so blocking socket reads never cause contention.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): WorkManager cannot inspect bytecode for disk calls; CoroutineWorker defaults to Dispatchers.Default.',
+          'WRONG (B): CoroutineWorker does not run doWork() on Dispatchers.Main, and @WorkerThread is only a lint annotation.',
+          'CORRECT (C): CoroutineWorker defaults to Dispatchers.Default (bounded to CPU cores), so blocking I/O should wrap in withContext(Dispatchers.IO).',
+          'WRONG (D): Dispatchers.Default is a CPU-sized bounded pool, not an unbounded cached thread pool.'
+        ]
+      },
+      {
+        stem: '3. Two screens enqueue unique sync work "sync_orders" while an earlier worker is mid-HTTP POST. What distinguishes KEEP from REPLACE?',
+        code: `workManager.enqueueUniqueWork("sync_orders", policy, orderSyncRequest)`,
+        options: [
+          'KEEP drops the new request while active work exists; REPLACE cancels active work and restarts.',
+          'KEEP queues the new request behind active work; REPLACE merges both input Data payloads together.',
+          'KEEP pauses active work until constraints refresh; REPLACE blocks the UI thread awaiting active completion.',
+          'KEEP cancels active work after completion; REPLACE deduplicates requests silently without interrupting running workers.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): ExistingWorkPolicy.KEEP preserves existing ENQUEUED/RUNNING work and ignores the new trigger; REPLACE cancels active work and schedules the new request.',
+          'WRONG (B): Queuing behind existing work is APPEND, and REPLACE never merges input Data payloads.',
+          'WRONG (C): WorkManager enqueueing is asynchronous and never blocks the UI thread awaiting worker completion.',
+          'WRONG (D): Those behaviors are backwards: KEEP avoids interrupting active work, whereas REPLACE cancels it.'
+        ]
+      },
+      {
+        stem: '4. A sync worker uses Constraints(requiredNetworkType = CONNECTED) while the phone enters deep Doze mode overnight. What happens?',
+        code: `val req = OneTimeWorkRequestBuilder<SyncWorker>()\n    .setConstraints(Constraints(requiredNetworkType = NetworkType.CONNECTED))\n    .build()`,
+        options: [
+          'WorkManager wakes the device immediately every minute using alarms, draining battery until the upload finishes.',
+          'WorkManager fires doWork() offline anyway, burning through exponential retry attempts until MAX_RUN_ATTEMPTS fails permanently.',
+          'WorkManager defers execution cleanly until a Doze maintenance window restores network access without burning retries.',
+          'Android deletes the queued WorkRequest from SQLite once Doze blocks network sockets for thirty minutes.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): WorkManager delegates to JobScheduler and strictly respects Doze rather than bypassing it with minute-by-minute alarms.',
+          'WRONG (B): Because NetworkType.CONNECTED is unsatisfied during Doze, WorkManager does not invoke doWork() or increment runAttemptCount.',
+          'CORRECT (C): JobScheduler defers execution until a Doze maintenance window (or device wakeup) grants network access, keeping retry budget intact.',
+          'WRONG (D): WorkRequests stay durably stored in WorkDatabase across Doze until constraints are met or explicitly cancelled.'
+        ]
+      },
+      {
+        stem: '5. OS LMK kills a CoroutineWorker right after POST /orders succeeds remotely, before Room marks SENT. How do you prevent duplicates?',
+        code: `// 1. Worker sends POST /orders -> Server commits order\n// 2. OS LMK sends SIGKILL BEFORE Room updates SENT!\n// 3. WorkManager restarts worker in new process`,
+        options: [
+          'Return Result.failure() on every exception so WorkManager never re-executes partially completed network mutations again.',
+          'Persist an Outbox row with a deterministic idempotencyKey so stale IN_FLIGHT recovery replays safely.',
+          'Generate a fresh UUID inside doWork() before every HTTP attempt so servers distinguish retry traffic.',
+          'Catch Throwable inside a finally block to commit Room SENT state during SIGKILL termination.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Returning Result.failure() drops unconfirmed mutations permanently and cannot protect against SIGKILL (no code runs on SIGKILL).',
+          'CORRECT (B): Persisting the idempotencyKey in Room before sending lets recovery replay stale IN_FLIGHT rows so the server deduplicates safely.',
+          'WRONG (C): A fresh UUID per attempt defeats idempotency—the server treats each retry as a brand-new order and duplicates writes.',
+          'WRONG (D): SIGKILL terminates the OS process immediately at kernel level; catch and finally blocks never execute.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_16',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

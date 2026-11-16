@@ -43,6 +43,12 @@
   Enterprise LLM `ChatClient`, structured `BeanOutputConverter` Java `record` outputs, `PgVectorStore` RAG, and `@Tool` function calling ([LangChain4j](https://docs.langchain4j.dev/)).
 - [Spring gRPC & Spring for GraphQL Reference](https://docs.spring.io/spring-graphql/reference/)
   Protocol Buffers HTTP/2 RPC (`spring-grpc`) and batched GraphQL DataLoader resolvers (`@BatchMapping`).
+- [PostgreSQL Official Docs — Using `EXPLAIN` & Index Types](https://www.postgresql.org/docs/current/using-explain.html)
+  Query plan diagnostics (`Seq Scan` vs. `Index Only Scan`), composite B-Tree prefix rules, and partial indexes (`0087`).
+- [OWASP API Security Top 10](https://owasp.org/API-Security/)
+  Canonical reference for BOLA/IDOR, Mass Assignment, SSRF, and API security hardening (`0089`).
+- [The Twelve-Factor App & Spring Cloud Gateway Reference](https://12factor.net/)
+  Externalized secrets/config, trusted `X-Forwarded-*` reverse-proxy routing ([Spring Cloud Gateway](https://docs.spring.io/spring-cloud-gateway/reference/)), CI/CD, and contract/load verification (`0090`).
 
 ### Optional Tracks: DSA Coding Interviews & Distributed Streaming (Kafka, Spark, Flink)
 - [NeetCode 150 / Roadmap (Java)](https://neetcode.io/roadmap)

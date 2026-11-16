@@ -1,0 +1,1057 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 5: Under the Hood: Slotted Pages, Heap Files, B+Trees &amp; LSM-Trees</title>
+  <link rel="stylesheet" href="assets/course.css" />
+</head>
+<body data-lesson-id="lesson-05">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="master-plan.html">
+        <span class="brand-mark">DB</span>
+        <span>
+          Lesson 5 &bull; Storage Engine Internals
+          <span class="brand-sub">Phase 2 &bull; <span style="color:var(--accent);">&larr; Back to Master Plan</span></span>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <div id="engine-status" class="engine-pill">
+          <span class="engine-dot"></span>
+          <span class="engine-label">Loading SQLite...</span>
+        </div>
+        <a class="btn btn-sm" href="lesson-04.html">&larr; Lesson 4</a>
+        <a class="btn btn-sm" href="master-plan.html">Master Plan</a>
+        <a class="btn btn-primary btn-sm" href="lesson-06.html">Lesson 6 &rarr;</a>
+        <button id="theme-toggle" class="btn btn-sm" type="button">Light Mode</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar">
+      <div class="sidebar-title">Lesson 5 Contents</div>
+      <ul class="toc-list">
+        <li><a href="#room-bridge">1. Room PKs at 50M Rows</a></li>
+        <li><a href="#slotted-pages">2. Slotted Pages, Buffer Pool &amp; TOAST</a></li>
+        <li><a href="#heap-vs-clustered">3. Heap vs Clustered &amp; WITHOUT ROWID</a></li>
+        <li><a href="#uuid-locality">4. UUIDv4 Splits vs BIGINT &amp; UUIDv7</a></li>
+        <li><a href="#btree-vs-lsm">5. B+Tree vs LSM-Tree (RUM)</a></li>
+        <li><a href="#sandbox">6. Free Storage Sandbox</a></li>
+        <li><a href="#labs">7. Coding Labs (4 Auto-Checked)</a></li>
+        <li><a href="#quizzes">8. Senior Quizzes (6 MCQs)</a></li>
+        <li><a href="#cheatsheet">9. Senior Checklist</a></li>
+      </ul>
+
+      <div class="progress-box">
+        <div class="sidebar-title" style="margin-bottom:0.35rem;">Lesson 5 Progress</div>
+        <div class="progress-bar-track">
+          <div id="lesson-progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <div class="progress-meta">
+          <span id="lesson-progress-text">0/10 completed (0%)</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section class="hero">
+        <div class="meta-row">
+          <span class="badge badge-purple">Phase 2 &bull; Lesson 5</span>
+          <span class="badge badge-blue">Storage &amp; Disk Internals</span>
+          <span class="badge badge-green">SQLite 3.45 &amp; PostgreSQL 17/18</span>
+        </div>
+        <h1>Under the Hood: Slotted Pages, Heap Files, B+Trees &amp; LSM-Trees</h1>
+        <p class="lead">
+          Why does a database fly at 10,000 rows and suddenly fall off a latency cliff at 50 million rows?
+          Because databases do not read or write individual rows&mdash;they move fixed-size <strong>4KB/8KB pages</strong> between disk and RAM.
+          Understanding physical page layout, clustered vs heap storage, and B+Tree vs LSM-Tree mechanics turns mysterious slowdowns into predictable engineering tradeoffs.
+        </p>
+        <div class="meta-row">
+          <span class="topic-chip">4 Interactive Demos</span>
+          <span class="topic-chip">1 Open Sandbox</span>
+          <span class="topic-chip">4 Coding Labs (Hints + Auto-Grader + Answers)</span>
+          <span class="topic-chip">6 Diagnostic Quizzes</span>
+        </div>
+      </section>
+
+      <!-- SECTION 1: ROOM BRIDGE -->
+      <section id="room-bridge" class="section-card">
+        <h2><span class="badge badge-purple">Room Bridge</span> 1. Why <code>autoGenerate = true</code> vs Random <code>UUID</code> Behaves Dramatically Differently at 50M Rows</h2>
+        <p>
+          In Android Room, changing a primary key from a monotonically increasing <code>Long</code> to a random <code>UUID</code> string looks like a one-line Kotlin refactor:
+        </p>
+        <pre><code>// Pattern A: Sequential 64-bit integer -> appends to the RIGHTMOST B+Tree leaf page
+@Entity(tableName = "events")
+data class EventInt(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val tenantId: Long,
+    val payload: String
+)
+
+// Pattern B: Random UUIDv4 string -> scatters writes across EVERY leaf page in the tree!
+@Entity(tableName = "events_uuid")
+data class EventUuid(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val tenantId: Long,
+    val payload: String
+)</code></pre>
+
+        <div class="callout room">
+          <div class="callout-title">Why You Never Notice This in a Mobile Prototype</div>
+          <p style="margin:0;">
+            At 5,000 rows inside a mobile app, the entire SQLite file is ~1 MB and sits warm in RAM. Both patterns finish in &lt;1 ms.
+            At <strong>50 million rows</strong> on a production server (100+ GB index), random <code>UUIDv4</code> forces every <code>INSERT</code> to fetch a cold 8KB page from SSD, dirty it, split it at 50% fill, and flush it back&mdash;causing <strong>buffer pool thrashing, 2&times; storage bloat, and 5&ndash;10&times; write amplification</strong>.
+          </p>
+        </div>
+
+        <div class="grid-2">
+          <div class="mini-card">
+            <h4>Sequential Keys (<code>BIGINT</code> / <code>UUIDv7</code>)</h4>
+            <ul style="margin:0.4rem 0 0;padding-left:1.2rem;font-size:0.9rem;color:var(--text-muted);">
+              <li>Inserts land on the <strong>hot rightmost leaf page</strong> already pinned in RAM.</li>
+              <li>Pages stay tightly packed (~90&ndash;95% full) with minimal splits.</li>
+              <li>Recent time-range queries read contiguous pages sequentially.</li>
+            </ul>
+          </div>
+          <div class="mini-card">
+            <h4>Random Keys (<code>UUIDv4</code> / MD5 Hash PK)</h4>
+            <ul style="margin:0.4rem 0 0;padding-left:1.2rem;font-size:0.9rem;color:var(--text-muted);">
+              <li>Inserts jump to random positions across the entire B+Tree.</li>
+              <li>Evicts hot pages from the buffer pool (cache hit ratio collapses).</li>
+              <li>Frequent mid-page splits leave pages ~50&ndash;68% full + bloat WAL volume.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 2: SLOTTED PAGES, BUFFER POOL & TOAST -->
+      <section id="slotted-pages" class="section-card">
+        <h2><span class="badge badge-blue">Disk Layout</span> 2. Slotted Disk Pages, Buffer Pool &amp; PostgreSQL TOAST</h2>
+        <p>
+          Whether you use SQLite (<strong>4KB</strong> pages by default via <code>PRAGMA page_size</code>) or PostgreSQL (<strong>8KB</strong> pages), the storage engine manages files as arrays of fixed-size <strong>slotted pages</strong>:
+        </p>
+        <pre><code>+-------------------------------------------------------------------------+
+| Page Header (24B in PG: LSN, lower/upper offsets, checksum, flags)      |
++-------------------------------------------------------------------------+
+| Slot / Line Pointer Array -> [ptr0][ptr1][ptr2] ... grows downward      |
+|                                                                         |
+|                      ~~~ Free Space (Hole) ~~~                          |
+|                                                                         |
+|              ... grows upward <- [Tuple 2][Tuple 1][Tuple 0]            |
++-------------------------------------------------------------------------+</code></pre>
+        <ul>
+          <li><strong>Indirection via Line Pointers:</strong> External indexes never store raw byte offsets into a page. They store <code>(page_id, slot_index)</code> (called a <strong><code>ctid</code></strong> in PostgreSQL, e.g. <code>(412, 7)</code>). That lets the engine compact free space inside a page without updating every index!</li>
+          <li><strong>Buffer Pool / Page Cache:</strong> Engines read pages into an in-memory buffer pool (PostgreSQL <code>shared_buffers</code> + OS page cache; SQLite <code>PRAGMA cache_size</code>). Queries run against pinned RAM pages; background writers flush dirty pages to disk.</li>
+          <li><strong>Overflow Pages &amp; TOAST:</strong> A single row cannot span across normal 8KB pages cleanly. In PostgreSQL, when a row exceeds ~2KB, <strong>TOAST</strong> (The Oversized-Attribute Storage Technique) compresses large <code>TEXT</code>/<code>JSONB</code>/<code>BYTEA</code> fields and moves chunks out-of-line into a separate <code>pg_toast_*</code> table, keeping the main heap pages dense so scans stay fast. SQLite similarly spills oversized cells into linked <strong>overflow pages</strong>.</li>
+        </ul>
+
+        <div class="callout postgres">
+          <div class="callout-title">PostgreSQL Parity: Inspecting Physical Tuple Addresses (<code>ctid</code>) &amp; TOAST</div>
+          <pre><code>-- In PostgreSQL, every heap row exposes its physical (page_number, slot_number):
+SELECT ctid, id, length(payload) FROM events LIMIT 5;
+-- Example output: (0,1) | (0,2) | (0,3) ... (1,1) on page 1!
+
+-- PostgreSQL TOAST strategies per column (default: EXTENDED = compress + out-of-line):
+ALTER TABLE events ALTER COLUMN payload SET STORAGE EXTERNAL; -- skip compression for pre-compressed blobs</code></pre>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-pages-overflow">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 1</span> Observing 4KB Page Growth &amp; Overflow Spill in SQLite</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <textarea class="sql-editor" spellcheck="false">CREATE TABLE stats_log (step TEXT NOT NULL, page_size INT NOT NULL, page_count INT NOT NULL) STRICT;
+
+-- 1. Empty DB baseline
+CREATE TABLE small_rows (id INTEGER PRIMARY KEY, body TEXT NOT NULL) STRICT;
+INSERT INTO stats_log SELECT '0. Empty schema', p.page_size, c.page_count
+FROM pragma_page_size() p, pragma_page_count() c;
+
+-- 2. Insert 100 compact rows (~120 bytes each -> fits ~30 rows per 4KB page!)
+WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 100)
+INSERT INTO small_rows SELECT x, printf('compact-%0100d', x) FROM cnt;
+
+INSERT INTO stats_log SELECT '1. +100 compact rows (110B)', p.page_size, c.page_count
+FROM pragma_page_size() p, pragma_page_count() c;
+
+-- 3. Insert 100 oversized rows (5,000 bytes each -> forces overflow pages on every row!)
+CREATE TABLE big_rows (id INTEGER PRIMARY KEY, body TEXT NOT NULL) STRICT;
+WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 100)
+INSERT INTO big_rows SELECT x, printf('oversized-%05000d', x) FROM cnt;
+
+INSERT INTO stats_log SELECT '2. +100 oversized rows (5KB)', p.page_size, c.page_count
+FROM pragma_page_size() p, pragma_page_count() c;
+
+SELECT step, page_size, page_count, (page_count * page_size) / 1024 AS total_kb
+FROM stats_log;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 3: HEAP VS CLUSTERED & WITHOUT ROWID -->
+      <section id="heap-vs-clustered" class="section-card">
+        <h2><span class="badge badge-green">Table Organization</span> 3. Heap + Secondary B+Tree (PostgreSQL) vs Clustered B+Tree (SQLite <code>rowid</code> / <code>WITHOUT ROWID</code>)</h2>
+        <p>
+          How do engines connect a primary key to the actual row bytes? There are two dominant architectures:
+        </p>
+        <div class="grid-2">
+          <div class="mini-card">
+            <h4>Heap Table + Secondary B+Tree (PostgreSQL)</h4>
+            <ul style="margin:0.4rem 0 0;padding-left:1.2rem;font-size:0.9rem;color:var(--text-muted);">
+              <li>Table rows sit in an unordered <strong>Heap</strong> of 8KB pages.</li>
+              <li><strong>Every</strong> index (including <code>PRIMARY KEY</code>!) is a separate B+Tree pointing to <code>ctid</code> <code>(page, slot)</code>.</li>
+              <li>Secondary indexes are small and independent&mdash;no PK duplication inside them.</li>
+              <li>Reads via PK need index traversal + 1 heap page fetch (unless Index-Only Scan).</li>
+            </ul>
+          </div>
+          <div class="mini-card">
+            <h4>Clustered B+Tree (SQLite <code>rowid</code>, InnoDB, SQLite <code>WITHOUT ROWID</code>)</h4>
+            <ul style="margin:0.4rem 0 0;padding-left:1.2rem;font-size:0.9rem;color:var(--text-muted);">
+              <li>SQLite tables default to a B+Tree clustered on the 64-bit <code>rowid</code> (aliased by <code>INTEGER PRIMARY KEY</code>).</li>
+              <li>If you declare <code>id TEXT PRIMARY KEY</code> <em>without</em> <code>WITHOUT ROWID</code>, SQLite creates <strong>two</strong> structures: a hidden <code>rowid</code> B+Tree for the rows AND a separate unique index mapping <code>id &rarr; rowid</code>!</li>
+              <li>Adding <code>WITHOUT ROWID</code> eliminates that hidden lookup, storing the entire row inside the PK B+Tree.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout trap">
+          <div class="callout-title">Senior Trap: When <code>WITHOUT ROWID</code> Makes Things WORSE</div>
+          <p style="margin:0;">
+            <code>WITHOUT ROWID</code> shines on <strong>narrow key-value or composite-PK tables</strong> (e.g., <code>(tenant_id, metric_id)</code> with few/no secondary indexes), and is counterproductive on single <code>INTEGER PRIMARY KEY</code> tables (which already cluster directly on the 64-bit <code>rowid</code>!).
+            Avoid <code>WITHOUT ROWID</code> on <strong>wide tables</strong> (&gt;200 bytes/row) or tables with <strong>multiple secondary indexes</strong>:
+            1) Wide rows reduce B+Tree fanout (fewer keys per 4KB page &rarr; taller tree);
+            2) Every secondary index in a <code>WITHOUT ROWID</code> table must store the <strong>entire primary key</strong> (e.g., a 36-byte UUID) instead of a compact 1&ndash;8 byte <code>rowid</code>!
+          </p>
+        </div>
+
+        <div class="callout postgres">
+          <div class="callout-title">PostgreSQL Heap Optimization: HOT Updates, <code>FILLFACTOR</code> &amp; B+Tree Fanout</div>
+          <p style="margin:0;">
+            <strong>1. Why B+Trees stay shallow:</strong> With ~300&ndash;500 keys per 8KB internal page, a 4-level B+Tree indexes 100M+ rows in just 3&ndash;4 page hops (and top levels stay pinned in the Buffer Pool).<br />
+            <strong>2. Heap-Only Tuple (HOT) Updates:</strong> Because PostgreSQL tables are heaps, updating a <code>last_seen_at</code> column normally inserts a new row version AND updates <em>every</em> secondary index. If the updated column is <strong>unindexed</strong> and the same 8KB page has free space (tunable via <code>WITH (fillfactor = 80)</code>), Postgres performs a <strong>HOT update</strong>&mdash;chaining the new tuple inside the same page and updating <strong>zero secondary indexes</strong>!
+          </p>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-without-rowid">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 2</span> <code>rowid</code> Extra Indirection vs <code>WITHOUT ROWID</code> Clustered Lookup</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <textarea class="sql-editor" spellcheck="false">-- Table A: TEXT PRIMARY KEY without WITHOUT ROWID -> creates hidden rowid table + autoindex!
+CREATE TABLE kv_rowid (
+  k TEXT PRIMARY KEY,
+  v INTEGER NOT NULL
+) STRICT;
+
+-- Table B: WITHOUT ROWID -> clustered directly on k!
+CREATE TABLE kv_clustered (
+  k TEXT PRIMARY KEY,
+  v INTEGER NOT NULL
+) WITHOUT ROWID, STRICT;
+
+INSERT INTO kv_rowid VALUES ('feature.dark_mode', 1), ('feature.ai_rag', 1);
+INSERT INTO kv_clustered VALUES ('feature.dark_mode', 1), ('feature.ai_rag', 1);
+
+-- Compare the query plans! Notice kv_rowid uses sqlite_autoindex_kv_rowid_1 -> rowid lookup,
+-- whereas kv_clustered searches the PRIMARY KEY B-tree directly!
+EXPLAIN QUERY PLAN SELECT v FROM kv_rowid WHERE k = 'feature.ai_rag';
+EXPLAIN QUERY PLAN SELECT v FROM kv_clustered WHERE k = 'feature.ai_rag';</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 4: UUIDV4 VS BIGINT & UUIDV7 -->
+      <section id="uuid-locality" class="section-card">
+        <h2><span class="badge badge-red">Write Amplification</span> 4. Random <code>UUIDv4</code> Page Splits vs <code>BIGINT</code> &amp; Time-Ordered <code>UUIDv7</code></h2>
+        <p>
+          Suppose your Room app or microservice needs globally unique IDs generated on clients before hitting the database.
+          If you generate random <strong><code>UUIDv4</code></strong> (122 random bits), consecutive inserts land at completely unrelated places in the B+Tree:
+        </p>
+        <ul>
+          <li><strong>Buffer Pool Misses:</strong> When the working set exceeds RAM, each random insert evicts a cached page to load a cold target leaf page.</li>
+          <li><strong>Page Splits &amp; Internal Fragmentation:</strong> Inserting into a full middle leaf splits it into two ~50% full pages and bubbles keys upward to parent nodes.</li>
+          <li><strong>Secondary Index Bloat (Clustered PKs):</strong> A 36-byte string UUID (or 16-byte binary UUID) embedded as the PK pointer in 4 secondary indexes bloats all 4 indexes!</li>
+        </ul>
+        <p>
+          <strong>The 2027 Senior Standard:</strong> Use <strong><code>BIGINT GENERATED ALWAYS AS IDENTITY</code></strong> for internal server-generated IDs, or <strong><code>UUIDv7</code></strong> (RFC 9562: 48-bit Unix millisecond timestamp prefix + random suffix) when clients/distributed workers must mint IDs offline! Because <code>UUIDv7</code> sorts chronologically, inserts stay pinned to the rightmost B+Tree leaf pages just like <code>BIGINT</code>.
+        </p>
+
+        <div class="callout postgres">
+          <div class="callout-title">PostgreSQL 18 Parity: Native <code>uuidv7()</code> &amp; <code>uuid</code> Binary Storage</div>
+          <pre><code>-- PostgreSQL stores UUID as 16 raw bytes (not 36-char ASCII TEXT!)
+-- PostgreSQL 18 adds built-in uuidv7()! (In PG 14-17, generate UUIDv7 in app code or pg_uuidv7)
+CREATE TABLE ingest_events (
+  id UUID PRIMARY KEY DEFAULT uuidv7(),
+  tenant_id BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  payload JSONB NOT NULL
+);</code></pre>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-uuid-bloat">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-red">Runnable Demo 3</span> Page Count Explosion: Compact <code>INTEGER PK</code> vs <code>WITHOUT ROWID</code> String UUID + Secondary Index</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <textarea class="sql-editor" spellcheck="false">-- Compare storage footprint of 2,000 events + 1 secondary index:
+-- Notice how embedding a 36-char UUID into a WITHOUT ROWID PK + secondary index nearly DOUBLES pages!
+CREATE TABLE ev_int (
+  id INTEGER PRIMARY KEY,
+  tenant_id INTEGER NOT NULL,
+  created_ms INTEGER NOT NULL,
+  msg TEXT NOT NULL
+) STRICT;
+CREATE INDEX idx_ev_int_tc ON ev_int(tenant_id, created_ms);
+
+WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 2000)
+INSERT INTO ev_int
+SELECT x, x % 50, 1700000000000 + x, printf('payload-%040d', x) FROM cnt;
+
+SELECT '1. INTEGER PRIMARY KEY + 1 sec idx' AS layout,
+       (SELECT page_count FROM pragma_page_count()) AS cumulative_pages;
+
+-- Now add the WITHOUT ROWID UUIDv4-style table with the SAME 2,000 rows & 1 sec index:
+CREATE TABLE ev_uuid_wor (
+  id TEXT PRIMARY KEY,
+  tenant_id INTEGER NOT NULL,
+  created_ms INTEGER NOT NULL,
+  msg TEXT NOT NULL
+) WITHOUT ROWID, STRICT;
+CREATE INDEX idx_ev_uuid_tc ON ev_uuid_wor(tenant_id, created_ms);
+
+WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 2000)
+INSERT INTO ev_uuid_wor
+SELECT printf('%08x-%04x-4000-8000-%012x', (x * 2654435761) & 2147483647, x & 65535, x * 40503),
+       x % 50, 1700000000000 + x, printf('payload-%040d', x) FROM cnt;
+
+SELECT '2. +2000 rows in WITHOUT ROWID UUID + 1 sec idx (delta = pages added)' AS layout,
+       (SELECT page_count FROM pragma_page_count()) AS cumulative_pages;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 5: BTREE VS LSM TREE -->
+      <section id="btree-vs-lsm" class="section-card">
+        <h2><span class="badge badge-amber">Engine Architectures</span> 5. B+Tree vs LSM-Tree (RocksDB / Cassandra) &amp; The RUM Conjecture</h2>
+        <p>
+          The <strong>RUM Conjecture</strong> states that no storage engine can simultaneously minimize <strong>Read overhead</strong>, <strong>Update (write) overhead</strong>, and <strong>Memory/Space overhead</strong>&mdash;optimizing two comes at the expense of the third.
+        </p>
+
+        <div class="data-table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Dimension</th>
+                <th>B+Tree (PostgreSQL, SQLite, InnoDB)</th>
+                <th>LSM-Tree (RocksDB, Cassandra, Pebble, CockroachDB)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Write Path</strong></td>
+                <td>Write WAL + locate leaf page + <strong>modify page in place</strong> (random I/O when flushing dirty pages).</td>
+                <td>Write WAL + insert into in-memory <strong>MemTable</strong>; flush sequentially as immutable <strong>SSTables</strong> (L0 &rarr; L1 &rarr; L2).</td>
+              </tr>
+              <tr>
+                <td><strong>Read Path</strong></td>
+                <td>Fast &amp; predictable <code>O(log N)</code> tree descent (3&ndash;4 hops for 100M rows); zero level merging.</td>
+                <td>Must check MemTable + multiple SSTable levels; mitigated by <strong>Bloom filters</strong> &amp; block cache.</td>
+              </tr>
+              <tr>
+                <td><strong>Deletes &amp; Updates</strong></td>
+                <td>Marks tuple dead / overwrites slot in-place; reclaimed by <code>VACUUM</code> / page merge.</td>
+                <td>Appends a <strong>tombstone</strong> record! Old versions linger until background <strong>compaction</strong> merges SSTables.</td>
+              </tr>
+              <tr>
+                <td><strong>Best Workloads</strong></td>
+                <td>Mixed OLTP, point/range queries, predictable p99 read latency, relational joins.</td>
+                <td>Write-heavy telemetry, time-series ingest, append-dominant KV stores, SSDs sensitive to random writes.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-lsm-sim">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 4</span> Simulating an LSM-Tree Read Merge (MemTable L0 + SSTable L1 + Tombstones)</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <textarea class="sql-editor" spellcheck="false">-- Simulate an LSM-Tree where newer writes sit in MemTable (L0) and older sorted runs sit in SSTables (L1, L2).
+-- Deletes are NOT immediate erasures—they append a tombstone (is_tombstone = 1)!
+CREATE TABLE lsm_runs (
+  level_rank INTEGER NOT NULL, -- 0 = newest MemTable, 1 = L0 SSTable, 2 = L1 SSTable
+  seq_no INTEGER NOT NULL,
+  k TEXT NOT NULL,
+  val TEXT,
+  is_tombstone INTEGER NOT NULL CHECK (is_tombstone IN (0, 1))
+) STRICT;
+
+INSERT INTO lsm_runs VALUES
+  (2, 10, 'user:1', 'plan=free', 0),
+  (2, 11, 'user:2', 'plan=pro', 0),
+  (2, 12, 'user:3', 'plan=free', 0),
+  (1, 25, 'user:1', 'plan=pro', 0),       -- Newer update shadows L1 user:1
+  (1, 26, 'user:3', NULL, 1),             -- Tombstone deletes user:3!
+  (0, 40, 'user:4', 'plan=enterprise', 0);-- Unflushed MemTable insert
+
+-- Read Path / Compaction Merge: pick highest seq_no per key, then filter out tombstones!
+WITH latest AS (
+  SELECT k, val, is_tombstone, level_rank, seq_no,
+         ROW_NUMBER() OVER (PARTITION BY k ORDER BY seq_no DESC) AS rn
+  FROM lsm_runs
+)
+SELECT k, val, level_rank AS served_from_level, seq_no
+FROM latest
+WHERE rn = 1 AND is_tombstone = 0
+ORDER BY k;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 6: SANDBOX -->
+      <section id="sandbox" class="section-card">
+        <h2><span class="badge badge-blue">Playground</span> 6. Free Storage Internals Sandbox</h2>
+        <p>
+          Inspect <code>PRAGMA page_size</code>, <code>PRAGMA page_count</code>, <code>PRAGMA freelist_count</code>, and compare <code>EXPLAIN QUERY PLAN</code> across <code>rowid</code>, <code>WITHOUT ROWID</code>, and secondary indexes.
+        </p>
+        <div class="code-demo" data-demo-id="demo-sandbox">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-green">Live Sandbox</span> Page &amp; B-Tree Explorer</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Query (&#8984;/Ctrl+Enter)</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE items_rowid (
+              sku TEXT PRIMARY KEY,
+              category TEXT NOT NULL,
+              price_cents INTEGER NOT NULL
+            ) STRICT;
+            CREATE TABLE items_clustered (
+              sku TEXT PRIMARY KEY,
+              category TEXT NOT NULL,
+              price_cents INTEGER NOT NULL
+            ) WITHOUT ROWID, STRICT;
+            WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 500)
+            INSERT INTO items_rowid SELECT printf('SKU-%05d', x), CASE x % 3 WHEN 0 THEN 'books' WHEN 1 THEN 'cloud' ELSE 'hw' END, x * 100 FROM cnt;
+            INSERT INTO items_clustered SELECT sku, category, price_cents FROM items_rowid;
+          </script>
+          <textarea class="sql-editor" spellcheck="false">SELECT page_size, page_count, freelist_count
+FROM pragma_page_size(), pragma_page_count(), pragma_freelist_count();
+
+EXPLAIN QUERY PLAN
+SELECT price_cents FROM items_rowid WHERE sku = 'SKU-00250';
+
+EXPLAIN QUERY PLAN
+SELECT price_cents FROM items_clustered WHERE sku = 'SKU-00250';</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 7: LABS -->
+      <section id="labs" class="section-card">
+        <h2><span class="badge badge-green">Hands-On Labs</span> 7. Coding Practice (4 Auto-Checked Labs)</h2>
+        <p>
+          Every lab runs real SQLite 3.45.2 verification checks, inspecting table DDL, query plans, page metrics, and negative cases.
+        </p>
+        <div class="lab-card" data-lab-id="lab-1"></div>
+        <div class="lab-card" data-lab-id="lab-2"></div>
+        <div class="lab-card" data-lab-id="lab-3"></div>
+        <div class="lab-card" data-lab-id="lab-4"></div>
+      </section>
+
+      <!-- SECTION 8: QUIZZES -->
+      <section id="quizzes" class="section-card">
+        <h2><span class="badge badge-pink">Knowledge Checks</span> 8. Senior Storage Internals Quizzes (6 MCQs)</h2>
+        <p>
+          Test your judgment on page layouts, clustered indexes, UUIDv4 vs UUIDv7, and B+Tree vs LSM-Tree tradeoffs.
+        </p>
+        <div class="quiz-card" data-quiz-id="quiz-1"></div>
+        <div class="quiz-card" data-quiz-id="quiz-2"></div>
+        <div class="quiz-card" data-quiz-id="quiz-3"></div>
+        <div class="quiz-card" data-quiz-id="quiz-4"></div>
+        <div class="quiz-card" data-quiz-id="quiz-5"></div>
+        <div class="quiz-card" data-quiz-id="quiz-6"></div>
+      </section>
+
+      <!-- SECTION 9: CHEATSHEET -->
+      <section id="cheatsheet" class="section-card">
+        <h2><span class="badge badge-blue">Summary</span> 9. Lesson 5 Senior Engineering Checklist</h2>
+        <ul>
+          <li>Think in <strong>4KB / 8KB pages</strong>, not individual rows: sequential locality keeps hot leaf pages in the buffer pool.</li>
+          <li>Use <strong><code>BIGINT</code> identity</strong> or time-ordered <strong><code>UUIDv7</code></strong> for primary keys&mdash;never random <code>UUIDv4</code> on high-ingest tables.</li>
+          <li>In SQLite, use <code>WITHOUT ROWID, STRICT</code> for narrow KV / composite-PK lookup tables; keep <code>INTEGER PRIMARY KEY</code> (<code>rowid</code>) for wide tables or tables with secondary indexes.</li>
+          <li>In PostgreSQL, understand Heap + <code>ctid</code> + TOAST (&gt;2KB out-of-line storage) so wide blobs don&rsquo;t ruin sequential scan density.</li>
+          <li>Choose B+Trees for predictable OLTP reads/ranges and LSM-Trees (with Bloom filters &amp; compaction) when sustained random write throughput dominates.</li>
+        </ul>
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem;flex-wrap:wrap;">
+          <a class="btn" href="lesson-04.html">&larr; Previous: Lesson 4</a>
+          <a class="btn" href="master-plan.html">Master Plan</a>
+          <a class="btn btn-primary" href="lesson-06.html">Next: Lesson 6 (Indexing Mastery) &rarr;</a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.COURSE_LABS = {
+      "lab-1": {
+        title: "Lab 1: Eliminate Hidden Rowid Indirection with WITHOUT ROWID",
+        difficulty: "Lab 1 of 4 \u2022 Clustered B-Tree",
+        promptHtml: `
+          <p>You have a narrow configuration lookup table <code>feature_flags</code> keyed by a <code>TEXT</code> string. Requirements:</p>
+          <ul>
+            <li>Create <code>feature_flags</code> using <strong>both</strong> <code>WITHOUT ROWID</code> and <code>STRICT</code>:
+              <code>flag_key TEXT PRIMARY KEY</code>,
+              <code>enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))</code>,
+              <code>rollout_pct INTEGER NOT NULL CHECK (rollout_pct BETWEEN 0 AND 100)</code>.
+            </li>
+            <li>Insert at least 2 flags, including <code>('ai.hybrid_search', 1, 50)</code>.</li>
+            <li>Verify that looking up <code>flag_key = 'ai.hybrid_search'</code> searches the clustered <code>PRIMARY KEY</code> directly with zero secondary <code>sqlite_autoindex</code> indirection.</li>
+          </ul>
+        `,
+        setupSql: "",
+        starterSql: `-- Fix this naive table into a WITHOUT ROWID, STRICT clustered B-Tree:\nCREATE TABLE feature_flags (\n  flag_key TEXT PRIMARY KEY,\n  enabled INTEGER NOT NULL,\n  rollout_pct INTEGER NOT NULL\n);\n\nINSERT INTO feature_flags VALUES ('ai.hybrid_search', 1, 50);\n`,
+        hints: [
+          "Add <code>CHECK (enabled IN (0, 1))</code> and <code>CHECK (rollout_pct BETWEEN 0 AND 100)</code> on the columns.",
+          "Append <code>WITHOUT ROWID, STRICT;</code> after the closing parenthesis of <code>CREATE TABLE</code>.",
+          "Insert at least 2 rows, keeping <code>('ai.hybrid_search', 1, 50)</code>."
+        ],
+        solutionSql: `CREATE TABLE feature_flags (
+  flag_key TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+  rollout_pct INTEGER NOT NULL CHECK (rollout_pct BETWEEN 0 AND 100)
+) WITHOUT ROWID, STRICT;
+
+INSERT INTO feature_flags VALUES
+  ('ai.hybrid_search', 1, 50),
+  ('billing.v2', 0, 0);`,
+        solutionExplanationHtml: `
+          <p><code>WITHOUT ROWID, STRICT</code> turns <code>feature_flags</code> into a single clustered B+Tree keyed by <code>flag_key</code>. The verifier checks <code>EXPLAIN QUERY PLAN</code> and confirms <code>SEARCH feature_flags USING PRIMARY KEY (flag_key=?)</code> instead of hopping through <code>sqlite_autoindex_feature_flags_1</code>.</p>
+        `,
+        verify: function (SQL, userSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(userSql);
+            const tbl = db.exec("SELECT sql FROM sqlite_master WHERE type='table' AND name='feature_flags';");
+            const exists = tbl.length > 0 && tbl[0].values.length > 0;
+            checks.push({ label: "Table 'feature_flags' exists", passed: exists });
+            if (!exists) return { passed: false, checks };
+
+            const ddl = tbl[0].values[0][0];
+            const hasWor = /\bWITHOUT\s+ROWID\b/i.test(ddl);
+            const hasStrict = /\bSTRICT\b/i.test(ddl);
+            checks.push({
+              label: "Table uses WITHOUT ROWID and STRICT",
+              passed: hasWor && hasStrict,
+              detail: hasWor && hasStrict ? "Verified WITHOUT ROWID, STRICT." : "Include both WITHOUT ROWID and STRICT at the end of CREATE TABLE."
+            });
+
+            const eqp = db.exec("EXPLAIN QUERY PLAN SELECT enabled, rollout_pct FROM feature_flags WHERE flag_key = 'ai.hybrid_search';");
+            const planStr = eqp.length ? eqp[0].values.map((r) => r[3]).join(" | ") : "";
+            const directPk = /SEARCH\s+feature_flags\s+USING\s+PRIMARY\s+KEY/i.test(planStr);
+            checks.push({
+              label: "EXPLAIN QUERY PLAN shows direct USING PRIMARY KEY search",
+              passed: directPk,
+              detail: `Plan: ${planStr}`
+            });
+
+            const cnt = db.exec("SELECT COUNT(*) FROM feature_flags;")[0].values[0][0];
+            const target = db.exec("SELECT enabled, rollout_pct FROM feature_flags WHERE flag_key = 'ai.hybrid_search';");
+            const hasRows = cnt >= 2 && target.length > 0 && target[0].values.length === 1 && target[0].values[0][0] === 1 && target[0].values[0][1] === 50;
+            checks.push({
+              label: "At least 2 rows inserted including ('ai.hybrid_search', 1, 50)",
+              passed: hasRows,
+              detail: `Row count: ${cnt}`
+            });
+
+            let badRolloutRejected = false;
+            try {
+              db.run("INSERT INTO feature_flags VALUES ('bad', 1, 150);");
+            } catch (_) {
+              badRolloutRejected = true;
+            }
+            checks.push({
+              label: "Negative test: rejects rollout_pct = 150",
+              passed: badRolloutRejected,
+              detail: badRolloutRejected ? "Rejected by CHECK constraint." : "Add CHECK (rollout_pct BETWEEN 0 AND 100)."
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-2": {
+        title: "Lab 2: Composite Clustered Key for Contiguous B-Tree Range Scans",
+        difficulty: "Lab 2 of 4 \u2022 B-Tree Locality",
+        promptHtml: `
+          <p>The pre-seeded table <code>metrics_raw(tenant_id, metric_name, bucket_ts, val)</code> needs to be stored for fast time-range reads per tenant without secondary table jumps.</p>
+          <ul>
+            <li>Create a clustered table <code>metrics_clustered</code> (<code>WITHOUT ROWID, STRICT</code>) with columns <code>tenant_id INTEGER NOT NULL</code>, <code>bucket_ts INTEGER NOT NULL</code>, <code>metric_name TEXT NOT NULL</code>, <code>val REAL NOT NULL</code>, and composite <code>PRIMARY KEY (tenant_id, bucket_ts, metric_name)</code>.</li>
+            <li>Copy all rows from <code>metrics_raw</code> into <code>metrics_clustered</code>.</li>
+            <li>Write a final <code>SELECT bucket_ts, metric_name, val</code> query for <code>tenant_id = 7</code> with <code>bucket_ts BETWEEN 1000 AND 1020</code> ordered by <code>bucket_ts ASC, metric_name ASC</code>.</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE metrics_raw (
+            tenant_id INTEGER NOT NULL,
+            metric_name TEXT NOT NULL,
+            bucket_ts INTEGER NOT NULL,
+            val REAL NOT NULL
+          ) STRICT;
+          INSERT INTO metrics_raw VALUES
+            (7, 'cpu', 990, 0.42),
+            (7, 'mem', 1000, 0.71),
+            (7, 'cpu', 1000, 0.55),
+            (7, 'cpu', 1015, 0.63),
+            (7, 'cpu', 1050, 0.88),
+            (8, 'cpu', 1010, 0.91);
+        `,
+        starterSql: `-- 1. CREATE TABLE metrics_clustered (...) WITHOUT ROWID, STRICT;\n-- 2. INSERT INTO metrics_clustered SELECT tenant_id, bucket_ts, metric_name, val FROM metrics_raw;\n-- 3. Final SELECT for tenant_id = 7 AND bucket_ts BETWEEN 1000 AND 1020 ORDER BY bucket_ts, metric_name;\n`,
+        hints: [
+          "Ordering the composite PK as <code>PRIMARY KEY (tenant_id, bucket_ts, metric_name)</code> groups all of tenant 7's time buckets contiguously on the same B-tree leaf pages!",
+          "Use <code>INSERT INTO metrics_clustered (tenant_id, bucket_ts, metric_name, val) SELECT tenant_id, bucket_ts, metric_name, val FROM metrics_raw;</code>.",
+          "Your final <code>SELECT</code> does not need a <code>TEMP B-TREE</code> sort because rows are already physically sorted by <code>(tenant_id, bucket_ts, metric_name)</code>."
+        ],
+        solutionSql: `CREATE TABLE metrics_clustered (
+  tenant_id INTEGER NOT NULL,
+  bucket_ts INTEGER NOT NULL,
+  metric_name TEXT NOT NULL,
+  val REAL NOT NULL,
+  PRIMARY KEY (tenant_id, bucket_ts, metric_name)
+) WITHOUT ROWID, STRICT;
+
+INSERT INTO metrics_clustered (tenant_id, bucket_ts, metric_name, val)
+SELECT tenant_id, bucket_ts, metric_name, val FROM metrics_raw;
+
+SELECT bucket_ts, metric_name, val
+FROM metrics_clustered
+WHERE tenant_id = 7
+  AND bucket_ts BETWEEN 1000 AND 1020
+ORDER BY bucket_ts ASC, metric_name ASC;`,
+        solutionExplanationHtml: `
+          <p>Because the clustered B+Tree key begins with <code>(tenant_id, bucket_ts, metric_name)</code>, SQLite seeks directly to <code>(7, 1000)</code> and streams contiguous leaf entries until <code>1020</code>&mdash;zero random heap fetches and zero temporary sort!</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            const tbl = db.exec("SELECT sql FROM sqlite_master WHERE type='table' AND name='metrics_clustered';");
+            const exists = tbl.length > 0 && tbl[0].values.length > 0;
+            checks.push({ label: "Table 'metrics_clustered' created", passed: exists });
+            if (!exists) return { passed: false, checks };
+
+            const ddl = tbl[0].values[0][0];
+            const worStrict = /\bWITHOUT\s+ROWID\b/i.test(ddl) && /\bSTRICT\b/i.test(ddl);
+            checks.push({ label: "Uses WITHOUT ROWID and STRICT", passed: worStrict });
+
+            const eqp = db.exec("EXPLAIN QUERY PLAN SELECT bucket_ts, metric_name, val FROM metrics_clustered WHERE tenant_id = 7 AND bucket_ts BETWEEN 1000 AND 1020 ORDER BY bucket_ts ASC, metric_name ASC;");
+            const planStr = eqp.length ? eqp[0].values.map((r) => r[3]).join(" | ") : "";
+            const usesPkRange = /SEARCH\s+metrics_clustered\s+USING\s+PRIMARY\s+KEY/i.test(planStr) && !/TEMP B-TREE/i.test(planStr);
+            checks.push({
+              label: "Uses PRIMARY KEY range scan with NO TEMP B-TREE sort",
+              passed: usesPkRange,
+              detail: `Plan: ${planStr}`
+            });
+
+            const last = res.length ? res[res.length - 1] : null;
+            const expected = [
+              [1000, "cpu", 0.55],
+              [1000, "mem", 0.71],
+              [1015, "cpu", 0.63]
+            ];
+            const ok = last && last.values.length === 3 && JSON.stringify(last.values) === JSON.stringify(expected);
+            checks.push({
+              label: "Final SELECT returns exact 3 sorted rows for tenant 7",
+              passed: Boolean(ok),
+              detail: last ? `Got: ${JSON.stringify(last.values)}` : "No SELECT output returned."
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-3": {
+        title: "Lab 3: Page Bloat & VACUUM Compaction Experiment",
+        difficulty: "Lab 3 of 4 \u2022 Page Compaction",
+        promptHtml: `
+          <p>The database comes pre-loaded with <code>archive_log</code> containing 1,200 rows (~80 pages). You need to purge old rows and actually reclaim disk pages:</p>
+          <ol>
+            <li>Delete all rows from <code>archive_log</code> where <code>id &lt;= 1000</code>.</li>
+            <li>Record the bloated page stats <em>before</em> compaction into a table <code>bloat_report(phase TEXT PRIMARY KEY, page_count INT NOT NULL, freelist_count INT NOT NULL) STRICT</code> with <code>phase = 'before_vacuum'</code>.</li>
+            <li>Run <code>VACUUM;</code> to rebuild contiguous B-tree pages and truncate the file.</li>
+            <li>Insert a second row into <code>bloat_report</code> with <code>phase = 'after_vacuum'</code>, then <code>SELECT * FROM bloat_report;</code>.</li>
+          </ol>
+        `,
+        setupSql: `
+          CREATE TABLE archive_log (id INTEGER PRIMARY KEY, payload TEXT NOT NULL) STRICT;
+          WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1200)
+          INSERT INTO archive_log SELECT x, printf('log-entry-%0220d', x) FROM cnt;
+        `,
+        starterSql: `-- 1. DELETE old rows (id <= 1000) from archive_log\n-- 2. Create bloat_report and record 'before_vacuum' using pragma_page_count() & pragma_freelist_count()\n-- 3. VACUUM;\n-- 4. Record 'after_vacuum' and SELECT * FROM bloat_report;\n`,
+        hints: [
+          "Query page metrics inside SQL with <code>SELECT 'before_vacuum', c.page_count, f.freelist_count FROM pragma_page_count() c, pragma_freelist_count() f;</code>.",
+          "<code>DELETE</code> frees pages onto the internal freelist, so <code>page_count</code> stays high until <code>VACUUM;</code> runs.",
+          "Remember <code>VACUUM;</code> cannot run inside an explicit open transaction, so run statements sequentially."
+        ],
+        solutionSql: `DELETE FROM archive_log WHERE id <= 1000;
+
+CREATE TABLE bloat_report (
+  phase TEXT PRIMARY KEY,
+  page_count INTEGER NOT NULL,
+  freelist_count INTEGER NOT NULL
+) STRICT;
+
+INSERT INTO bloat_report
+SELECT 'before_vacuum', c.page_count, f.freelist_count
+FROM pragma_page_count() c, pragma_freelist_count() f;
+
+VACUUM;
+
+INSERT INTO bloat_report
+SELECT 'after_vacuum', c.page_count, f.freelist_count
+FROM pragma_page_count() c, pragma_freelist_count() f;
+
+SELECT phase, page_count, freelist_count FROM bloat_report;`,
+        solutionExplanationHtml: `
+          <p>Deleting 1,000 of 1,200 rows moves ~60 freed pages to SQLite&rsquo;s freelist without shrinking the database file. Running <code>VACUUM;</code> rewrites the remaining 200 live rows into fresh compact pages, dropping <code>freelist_count</code> to <code>0</code> and cutting <code>page_count</code> dramatically.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            db.run(userSql);
+
+            const rem = db.exec("SELECT COUNT(*) FROM archive_log;")[0].values[0][0];
+            checks.push({
+              label: "Remaining rows in archive_log is 200",
+              passed: rem === 200,
+              detail: `Found ${rem} rows (expected 200).`
+            });
+
+            const rep = db.exec("SELECT phase, page_count, freelist_count FROM bloat_report;");
+            const rows = rep.length ? rep[0].values : [];
+            const before = rows.find((r) => r[0] === "before_vacuum");
+            const after = rows.find((r) => r[0] === "after_vacuum");
+
+            const beforeOk = Boolean(before && before[2] > 0);
+            checks.push({
+              label: "'before_vacuum' recorded non-zero freelist_count",
+              passed: beforeOk,
+              detail: before ? `pages=${before[1]}, freelist=${before[2]}` : "Missing 'before_vacuum' row."
+            });
+
+            const afterOk = Boolean(after && before && after[1] < before[1] && after[2] === 0);
+            checks.push({
+              label: "'after_vacuum' shrank page_count and zeroed freelist_count",
+              passed: afterOk,
+              detail: after ? `pages=${after[1]}, freelist=${after[2]}` : "Missing 'after_vacuum' row."
+            });
+
+            const liveFreelist = db.exec("PRAGMA freelist_count;")[0].values[0][0];
+            checks.push({
+              label: "Actual database freelist_count is 0 (VACUUM actually ran)",
+              passed: liveFreelist === 0,
+              detail: `Live freelist_count=${liveFreelist}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-4": {
+        title: "Lab 4: Design a High-Ingest Event Schema Avoiding UUIDv4 Fragmentation",
+        difficulty: "Lab 4 of 4 \u2022 Production Schema",
+        promptHtml: `
+          <p>Design a high-ingest telemetry table <code>ingest_events</code> (<code>STRICT</code>) that avoids random <code>UUIDv4</code> B-tree page fragmentation while still exposing a globally unique external identifier:</p>
+          <ul>
+            <li><code>id INTEGER PRIMARY KEY</code> (64-bit monotonic clustered <code>rowid</code>&mdash;compact in every secondary index!).</li>
+            <li><code>event_uid TEXT NOT NULL UNIQUE</code> (for time-ordered <code>UUIDv7</code> strings like <code>'0192b1a0-7c10-7000-8000-000000000001'</code>).</li>
+            <li><code>tenant_id INTEGER NOT NULL</code></li>
+            <li><code>created_at_ms INTEGER NOT NULL CHECK (created_at_ms &gt; 0)</code></li>
+            <li><code>payload_json TEXT NOT NULL</code></li>
+            <li>Create a composite index <code>idx_ingest_tenant_ts</code> on <code>ingest_events(tenant_id, created_at_ms)</code>.</li>
+            <li>Insert at least 2 valid rows in chronological order.</li>
+          </ul>
+        `,
+        setupSql: "",
+        starterSql: `-- Design ingest_events (STRICT) + idx_ingest_tenant_ts + insert 2 sample rows:\n`,
+        hints: [
+          "Use <code>id INTEGER PRIMARY KEY</code> so secondary index <code>idx_ingest_tenant_ts</code> stores an 8-byte integer rowid instead of a 36-byte string.",
+          "Include <code>event_uid TEXT NOT NULL UNIQUE</code> and <code>CHECK (created_at_ms > 0)</code> inside a <code>STRICT</code> table.",
+          "Create the index with <code>CREATE INDEX idx_ingest_tenant_ts ON ingest_events(tenant_id, created_at_ms);</code>."
+        ],
+        solutionSql: `CREATE TABLE ingest_events (
+  id INTEGER PRIMARY KEY,
+  event_uid TEXT NOT NULL UNIQUE,
+  tenant_id INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+  payload_json TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX idx_ingest_tenant_ts ON ingest_events(tenant_id, created_at_ms);
+
+INSERT INTO ingest_events (event_uid, tenant_id, created_at_ms, payload_json) VALUES
+  ('0192b1a0-7c10-7000-8000-000000000001', 10, 1760000000100, '{"type":"checkout"}'),
+  ('0192b1a0-7c10-7000-8000-000000000002', 10, 1760000000250, '{"type":"settled"}');`,
+        solutionExplanationHtml: `
+          <p>Using <code>id INTEGER PRIMARY KEY</code> keeps the table clustered monotonically AND keeps secondary indexes compact (<code>(tenant_id, created_at_ms, rowid)</code>), while a time-ordered <code>UUIDv7</code> in <code>event_uid</code> preserves insertion locality inside the unique index too!</p>
+        `,
+        verify: function (SQL, userSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(userSql);
+            const tbl = db.exec("SELECT sql FROM sqlite_master WHERE type='table' AND name='ingest_events';");
+            const exists = tbl.length > 0 && tbl[0].values.length > 0;
+            checks.push({ label: "Table 'ingest_events' exists", passed: exists });
+            if (!exists) return { passed: false, checks };
+
+            const ddl = tbl[0].values[0][0];
+            const isStrict = /\bSTRICT\b/i.test(ddl) && !/\bWITHOUT\s+ROWID\b/i.test(ddl);
+            checks.push({
+              label: "Table is STRICT and uses rowid (INTEGER PRIMARY KEY)",
+              passed: isStrict
+            });
+
+            const idx = db.exec("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_ingest_tenant_ts';");
+            const hasIdx = idx.length > 0 && idx[0].values.length === 1;
+            checks.push({ label: "Composite index 'idx_ingest_tenant_ts' created", passed: hasIdx });
+
+            const eqp = db.exec("EXPLAIN QUERY PLAN SELECT id FROM ingest_events WHERE tenant_id = 10 AND created_at_ms >= 1760000000000;");
+            const planStr = eqp.length ? eqp[0].values.map((r) => r[3]).join(" | ") : "";
+            const usesIdx = /idx_ingest_tenant_ts/i.test(planStr);
+            checks.push({
+              label: "Range query uses idx_ingest_tenant_ts",
+              passed: usesIdx,
+              detail: `Plan: ${planStr}`
+            });
+
+            const rows = db.exec("SELECT COUNT(*) FROM ingest_events;")[0].values[0][0];
+            checks.push({ label: "At least 2 rows inserted", passed: rows >= 2 });
+
+            let dupUidRejected = false;
+            try {
+              db.run("INSERT INTO ingest_events (event_uid, tenant_id, created_at_ms, payload_json) VALUES ('dup-uid', 1, 100, '{}');");
+              db.run("INSERT INTO ingest_events (event_uid, tenant_id, created_at_ms, payload_json) VALUES ('dup-uid', 1, 101, '{}');");
+            } catch (_) {
+              dupUidRejected = true;
+            }
+            checks.push({ label: "Negative test: duplicate event_uid rejected", passed: dupUidRejected });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "SQL executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      }
+    };
+
+    window.COURSE_QUIZZES = {
+      "quiz-1": {
+        tag: "Slotted Pages",
+        questionHtml: "In PostgreSQL and SQLite slotted disk pages, why do B+Tree indexes point to a <code>(page_id, slot_index)</code> (like PostgreSQL&rsquo;s <code>ctid</code>) rather than a raw byte offset inside the page?",
+        options: [
+          {
+            labelHtml: "Because raw byte offsets inside database pages cannot exceed a 255-byte limit.",
+            correct: false,
+            whyHtml: "8KB pages use 16-bit offsets (up to 65,535), so offset size is not the reason."
+          },
+          {
+            labelHtml: "Because slotted pages lay out table columns vertically in a columnar format.",
+            correct: false,
+            whyHtml: "Slotted pages are classic row-oriented (N-ary Storage Model) pages, not columnar."
+          },
+          {
+            labelHtml: "So engines can defragment tuples inside a page without updating external indexes.",
+            correct: true,
+            whyHtml: "The slot (line pointer) array acts as a stable level of indirection. When tuples shift inside the page during intra-page compaction, only the 4-byte line pointer inside that single page updates; external B+Tree indexes stay valid."
+          },
+          {
+            labelHtml: "So oversized rows can span multiple 8KB pages without using overflow or TOAST.",
+            correct: false,
+            whyHtml: "Slotted pages still rely on overflow pages (SQLite) or TOAST (PostgreSQL) when a tuple exceeds page thresholds."
+          }
+        ]
+      },
+
+      "quiz-2": {
+        tag: "Heap vs Clustered B+Tree",
+        questionHtml: "You create <code>CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id INTEGER, expires_at INTEGER) STRICT;</code> in SQLite (<em>without</em> <code>WITHOUT ROWID</code>). How does SQLite physically store it?",
+        options: [
+          {
+            labelHtml: "As a single clustered B+Tree storing full rows keyed directly by <code>token</code>.",
+            correct: false,
+            whyHtml: "SQLite only clusters on a non-integer PK if you explicitly specify <code>WITHOUT ROWID</code>."
+          },
+          {
+            labelHtml: "As an unsorted PostgreSQL-style heap file with a separate visibility map.",
+            correct: false,
+            whyHtml: "SQLite never uses heap files; every normal table is a <code>rowid</code> B+Tree."
+          },
+          {
+            labelHtml: "Inside an in-memory LSM-Tree MemTable until a manual <code>VACUUM</code> flushes it.",
+            correct: false,
+            whyHtml: "SQLite is strictly a B+Tree engine, not an LSM-Tree."
+          },
+          {
+            labelHtml: "As a <code>rowid</code> B+Tree for rows plus a separate <code>token &rarr; rowid</code> index.",
+            correct: true,
+            whyHtml: "Without <code>WITHOUT ROWID</code>, only <code>INTEGER PRIMARY KEY</code> aliases the internal 64-bit <code>rowid</code>. Any <code>TEXT</code> PK becomes a separate <code>sqlite_autoindex</code> pointing to <code>rowid</code>, doubling tree lookups for KV tables."
+          }
+        ]
+      },
+
+      "quiz-3": {
+        tag: "WITHOUT ROWID Tradeoffs",
+        questionHtml: "When does adding <code>WITHOUT ROWID</code> in SQLite <em>hurt</em> performance and bloat disk space?",
+        options: [
+          {
+            labelHtml: "On a wide 1KB table with 3 secondary indexes and a UUID primary key.",
+            correct: true,
+            whyHtml: "Wide rows reduce B+Tree fanout (making the clustered tree deeper), and in <code>WITHOUT ROWID</code> tables every secondary index must store the full 36-byte primary key instead of a compact <code>rowid</code>, bloating all 3 secondary indexes."
+          },
+          {
+            labelHtml: "On a narrow 2-column key-value lookup table that has zero secondary indexes.",
+            correct: false,
+            whyHtml: "That is the ideal use case for <code>WITHOUT ROWID</code>!"
+          },
+          {
+            labelHtml: "Whenever table <code>STRICT</code> mode is enabled alongside <code>WITHOUT ROWID</code> on the table.",
+            correct: false,
+            whyHtml: "<code>WITHOUT ROWID, STRICT</code> works cleanly together with zero penalty."
+          },
+          {
+            labelHtml: "When running exact equality lookups on the primary key using an <code>=</code> filter.",
+            correct: false,
+            whyHtml: "Exact primary key lookups are faster in <code>WITHOUT ROWID</code> when rows are narrow because there is no secondary-to-rowid hop."
+          }
+        ]
+      },
+
+      "quiz-4": {
+        tag: "PostgreSQL TOAST",
+        questionHtml: "Your PostgreSQL <code>events</code> table has mostly small integer/timestamp columns plus a 12KB JSON <code>raw_payload</code> column. Why can <code>SELECT count(*) FROM events WHERE status = 'failed'</code> still scan fast?",
+        options: [
+          {
+            labelHtml: "Because PostgreSQL never loads <code>TEXT</code> or <code>JSONB</code> column values into shared RAM.",
+            correct: false,
+            whyHtml: "Small inline values are still stored in main heap tuples; only oversized attributes are TOASTed out-of-line."
+          },
+          {
+            labelHtml: "Because PostgreSQL moves columns &gt;2KB to TOAST, keeping main heap pages dense.",
+            correct: true,
+            whyHtml: "TOAST compresses and moves oversized attributes (&gt;~2KB) to a side TOAST table, leaving only an 18-byte pointer in the main heap tuple. Queries that don't touch <code>raw_payload</code> never read the TOAST pages!"
+          },
+          {
+            labelHtml: "Because PostgreSQL switches the table to an LSM-Tree once rows exceed 4KB.",
+            correct: false,
+            whyHtml: "PostgreSQL uses slotted heap pages + TOAST, never LSM-Trees."
+          },
+          {
+            labelHtml: "Because <code>count(*)</code> reads a cached exact row total from the table header.",
+            correct: false,
+            whyHtml: "Due to MVCC visibility, PostgreSQL does NOT maintain an exact row counter in the table header."
+          }
+        ]
+      },
+
+      "quiz-5": {
+        tag: "UUIDv4 vs UUIDv7",
+        questionHtml: "A 100M-row PostgreSQL payments table uses random <code>UUIDv4</code> as its <code>PRIMARY KEY</code>. Write latency spikes and buffer pool cache hit ratio drops to 40%. Switching new rows to <code>UUIDv7</code> fixes this. Why?",
+        options: [
+          {
+            labelHtml: "<code>UUIDv7</code> shrinks primary keys to 8 bytes instead of 16-byte <code>UUIDv4</code> keys.",
+            correct: false,
+            whyHtml: "Both <code>UUIDv4</code> and <code>UUIDv7</code> are 128-bit (16-byte) UUIDs."
+          },
+          {
+            labelHtml: "<code>UUIDv7</code> skips writing to PostgreSQL&rsquo;s write-ahead log for sequential inserts.",
+            correct: false,
+            whyHtml: "All durable writes go through WAL regardless of key generation strategy."
+          },
+          {
+            labelHtml: "<code>UUIDv7</code> is time-ordered, appending inserts to hot rightmost B+Tree leaf pages.",
+            correct: true,
+            whyHtml: "Time-ordered prefixes preserve B+Tree insertion locality. Instead of dirtying random cold leaf pages across 100GB of disk, inserts stay pinned to a tiny set of hot rightmost leaf pages, slashing disk reads and page splits."
+          },
+          {
+            labelHtml: "PostgreSQL routes <code>UUIDv7</code> primary keys into an in-memory Hash Index automatically.",
+            correct: false,
+            whyHtml: "Primary keys in PostgreSQL still use B+Tree indexes."
+          }
+        ]
+      },
+
+      "quiz-6": {
+        tag: "B+Tree vs LSM-Tree",
+        questionHtml: "An engineer builds a write-heavy IoT ingestion service (500K writes/sec, occasional point reads) on an LSM-Tree engine (RocksDB). What mechanism prevents point reads from scanning every SSTable on disk for missing keys?",
+        options: [
+          {
+            labelHtml: "Background <code>VACUUM FULL</code> passes compacting every SSTable after each insert.",
+            correct: false,
+            whyHtml: "<code>VACUUM FULL</code> is a PostgreSQL heap rewrite operation, not an LSM-Tree read filter."
+          },
+          {
+            labelHtml: "SQLite-style <code>WITHOUT ROWID</code> B+Tree clustering on every immutable SSTable file.",
+            correct: false,
+            whyHtml: "<code>WITHOUT ROWID</code> is specific to SQLite's B+Tree storage."
+          },
+          {
+            labelHtml: "Replacing the sequential WAL with random in-place 8KB page updates.",
+            correct: false,
+            whyHtml: "LSM-Trees specifically avoid random in-place page updates by flushing immutable SSTables sequentially."
+          },
+          {
+            labelHtml: "In-memory <strong>Bloom filters</strong> per SSTable that rule out missing keys fast.",
+            correct: true,
+            whyHtml: "Bloom filters give zero false negatives: if the Bloom filter says 'not present', the engine skips reading that SSTable from disk completely, bounding LSM read amplification."
+          }
+        ]
+      }
+    };
+  </script>
+  <script src="assets/sql-asm.js"></script>
+  <script src="assets/course-engine.js"></script>
+</body>
+</html>

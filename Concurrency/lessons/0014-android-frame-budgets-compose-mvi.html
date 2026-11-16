@@ -1,0 +1,1214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 14 — Main Thread Frame Budgets, Compose Side-Effects &amp; MVI State</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 14 · Android UI &amp; MVI</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 5 · Lesson 14 · Android UI &amp; Compose Runtime</div>
+      <h1>Main Thread Frame Budgets, Compose Side-Effects &amp; MVI State</h1>
+      <p class="hero-sub">
+        Surviving 120Hz (<code>8.3ms</code>) frame budgets on Android: why <code>StateFlow.update {}</code> CAS loops prevent stale UI state overwrites,
+        how <code>repeatOnLifecycle</code> prevents upstream leaks, when to pick Compose <code>LaunchedEffect</code> vs. <code>snapshotFlow</code>,
+        and eliminating Binder IPC jank from the Main Looper.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. 120Hz Frame Visualizer</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Production Kotlin Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>The 8.3ms Vsync Ceiling, MVI CAS Loops &amp; Lifecycle Bounds</h2>
+      <p class="section-lead">
+        On modern 120Hz Android displays, <code>Choreographer</code> fires a vsync pulse every <code>8.33ms</code>.
+        Within that slice, the Main OS thread (<code>Dispatchers.Main</code> Looper) must process input events, run animations, recompose/measure/layout/draw,
+        and submit a frame to <code>RenderThread</code>
+        (<a href="https://developer.android.com/topic/performance/vitals/render" target="_blank" rel="noopener">Android App Performance: Slow Rendering</a>).
+        Senior Android engineers pair strict main-safety with atomic MVI state transitions and lifecycle-bounded collectors
+        (<a href="https://developer.android.com/topic/libraries/architecture/coroutines" target="_blank" rel="noopener">Android Developers: Lifecycle-aware Coroutines</a>).
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">120Hz Frame Budget &amp; Binder IPC Jank</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong>A 120Hz panel gives you half the time of 60Hz: <code>8.33ms</code> vs. <code>16.67ms</code>.</strong><br/><br/>
+            Work that "felt fine" at 10ms on a 60Hz test phone drops frames on 120Hz flagships. Even worse, synchronous
+            <strong>Binder IPC</strong> calls (<code>PackageManager</code>, <code>ConnectivityManager</code>, cold <code>SharedPreferences</code>,
+            <code>ClipboardManager</code>) cross process boundaries into <code>system_server</code>, blocking the Main thread for milliseconds—or
+            triggering a <strong>5-second Input Dispatch ANR</strong> under lock contention
+            (<a href="https://developer.android.com/kotlin/coroutines/coroutines-best-practices" target="_blank" rel="noopener">Coroutines Best Practices</a>).
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">MVI CAS Loops &amp; Lifecycle Collection</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong><code>_state.value = _state.value.copy(...)</code> is a read-modify-write race condition.</strong><br/><br/>
+            When two coroutines on <code>Dispatchers.Default</code> or <code>Dispatchers.IO</code> finish concurrently, both can read the same snapshot,
+            copy one field, and overwrite the sibling's update. <code>MutableStateFlow.update { it.copy(...) }</code> executes a lock-free
+            <strong>Compare-And-Swap (CAS)</strong> retry loop so no field update is lost. On the UI side, <code>repeatOnLifecycle(STARTED)</code>
+            cancels upstream collectors when backgrounded, avoiding <code>launchWhenStarted</code>'s paused-producer resource leak.
+          </p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 24px;">Display Refresh Budgets &amp; Main Thread Pipeline</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Display / Threshold</th>
+              <th>Budget Window</th>
+              <th>Main Looper Work Allowed</th>
+              <th>When Exceeded</th>
+              <th>Senior Mitigation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>60Hz Vsync</strong></td>
+              <td><code>16.67 ms</code></td>
+              <td>Input + Compose Recompose + Layout + Draw</td>
+              <td>1+ skipped vsyncs (visible stutter)</td>
+              <td>Keep Main work &lt; 6ms; offload JSON/DB</td>
+            </tr>
+            <tr>
+              <td><strong>90Hz Vsync</strong></td>
+              <td><code>11.11 ms</code></td>
+              <td>Input + Compose Recompose + Layout + Draw</td>
+              <td>Drops to 45fps effective cadence</td>
+              <td>Avoid allocations inside <code>drawBehind</code></td>
+            </tr>
+            <tr>
+              <td><strong>120Hz Vsync</strong></td>
+              <td><code>8.33 ms</code></td>
+              <td>Input + Compose Recompose + Layout + Draw</td>
+              <td>Jank (<code>&gt; 8.33ms</code>), 60fps/40fps fallbacks</td>
+              <td>Offload Binder IPC, DiffUtil, JSON to <code>IO</code>/<code>Default</code></td>
+            </tr>
+            <tr>
+              <td><strong>Frozen Frame</strong></td>
+              <td><code>&gt; 700 ms</code></td>
+              <td>Blocked Looper (e.g. cold Binder / disk read)</td>
+              <td>Play Vitals frozen-frame alert</td>
+              <td>Move startup I/O off Main; use Baseline Profiles</td>
+            </tr>
+            <tr>
+              <td><strong>Input ANR</strong></td>
+              <td><code>&gt; 5,000 ms</code></td>
+              <td>Main Looper unable to dispatch input event</td>
+              <td>System kills / prompts "App isn't responding"</td>
+              <td>Never <code>runBlocking</code> or hold locks on Main</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 style="margin-top: 24px;">Compose Side-Effects &amp; Lifecycle Collection Matrix</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>API</th>
+              <th>Scope / Lifetime</th>
+              <th>Restart / Cancel Trigger</th>
+              <th>Primary Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong><code>repeatOnLifecycle(STARTED)</code></strong></td>
+              <td>Starts at <code>ON_START</code>; cancels at <code>ON_STOP</code></td>
+              <td>Cancels &amp; restarts block cleanly on every start/stop</td>
+              <td>Collecting UI <code>Flow</code> / <code>SharedFlow</code> in Views &amp; Fragments</td>
+            </tr>
+            <tr>
+              <td><strong><code>collectAsStateWithLifecycle()</code></strong></td>
+              <td>Compose wrapper around <code>repeatOnLifecycle</code></td>
+              <td>Stops upstream collection in background (<code>ON_STOP</code>)</td>
+              <td>Observing <code>StateFlow&lt;UiState&gt;</code> in Jetpack Compose</td>
+            </tr>
+            <tr>
+              <td><strong><code>LaunchedEffect(key)</code></strong></td>
+              <td>Composition-scoped coroutine</td>
+              <td>Cancels &amp; relaunches if <code>key</code> changes or leaves tree</td>
+              <td>One-shot animations, snackbars, key-driven side effects</td>
+            </tr>
+            <tr>
+              <td><strong><code>rememberCoroutineScope()</code></strong></td>
+              <td>Composition-bound <code>CoroutineScope</code></td>
+              <td>Cancels only when composable leaves composition</td>
+              <td>User event callbacks (<code>onClick</code>, swipe actions)</td>
+            </tr>
+            <tr>
+              <td><strong><code>snapshotFlow { state }</code></strong></td>
+              <td>Cold <code>Flow</code> over Compose Snapshot reads</td>
+              <td>Driven by collector; deduplicates via <code>distinctUntilChanged</code></td>
+              <td>Reacting to rapid scroll/offset state inside <code>LaunchedEffect</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Why <code>launchWhenStarted</code> was deprecated:</strong> Pausing a coroutine on <code>ON_STOP</code> only suspends the collector's execution—it
+        <strong>does not cancel</strong> upstream cold flows (e.g., location GPS, Room queries, WebSocket feeds). Upstream producers keep burning battery and memory while the app is backgrounded
+        (<a href="https://developer.android.com/develop/ui/compose/side-effects" target="_blank" rel="noopener">Jetpack Compose Side-effects</a>).
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive Frame Budget &amp; MVI Visualizer</div>
+      <h2>Watch 120Hz Frame Drops, Binder Stalls &amp; MVI Races Live</h2>
+      <p class="section-lead">
+        Compare Main-thread JSON/Binder overload and stale <code>copy()</code> races against offloaded <code>Dispatchers.Default</code>/<code>IO</code> +
+        <code>StateFlow.update {}</code> CAS. Every frame above <code>8.33ms</code> misses the 120Hz vsync deadline.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="jank">Jank + Stale MVI (Main Overload)</button>
+            <button class="btn" data-mode="smooth">Offloaded + StateFlow.update (120Hz)</button>
+            <button class="btn" data-mode="anr">Binder Stall / ANR Hazard</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn" id="sim-action">⚡ Inject 11.4ms Binder IPC</button>
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span>Main Thread (Looper / Choreographer)</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-main"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Dispatchers.Default / IO</span><span>Background Pool</span></div>
+              <div class="timeline-track" id="lane-bg"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>120Hz Vsync / RenderThread</span><span>8.33ms Deadline</span></div>
+              <div class="timeline-track" id="lane-vsync"></div>
+            </div>
+
+            <div class="registers-grid">
+              <div class="reg-card"><div class="reg-name">Main Frame Work</div><div class="reg-val" id="reg-framems" style="color:var(--green);">0.0 ms</div></div>
+              <div class="reg-card"><div class="reg-name">Dropped Frames</div><div class="reg-val" id="reg-dropped" style="color:var(--accent);">0</div></div>
+              <div class="reg-card"><div class="reg-name">MVI UiState</div><div class="reg-val" id="reg-uistate" style="color:var(--purple); font-size:0.86rem;">{ p:null, f:null }</div></div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Click <strong>Step →</strong>, <strong>▶ Play</strong>, or <strong>⚡ Inject 11.4ms Binder IPC</strong> to inspect 120Hz vsync deadlines and MVI state.
+            </div>
+          </div>
+
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">CHOREOGRAPHER &amp; MVI TRACE LOG</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; Android</div>
+      <h2>Junior Traps vs. Senior Patterns in Android &amp; Compose</h2>
+      <p class="section-lead">
+        Production patterns from <a href="https://developer.android.com/kotlin/coroutines/coroutines-best-practices" target="_blank" rel="noopener">Android Coroutines Best Practices</a>
+        and <a href="https://developer.android.com/develop/ui/compose/side-effects" target="_blank" rel="noopener">Jetpack Compose Side-effects</a>.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Stale <code>copy()</code> Race vs. <code>StateFlow.update { it.copy(...) }</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Non-Atomic Read-Copy-Write</span></div>
+<pre>fun loadDashboard() {
+    viewModelScope.launch(Dispatchers.IO) {
+        val profile = repo.fetchProfile()
+        _state.value = _state.value.copy(profile = profile)
+    }
+    viewModelScope.launch(Dispatchers.IO) {
+        val feed = repo.fetchFeed()
+        _state.value = _state.value.copy(feed = feed)
+    }
+}
+// Both threads read stale _state.value -> one update lost!</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Lock-Free CAS Loop</span></div>
+<pre>fun loadDashboard() {
+    viewModelScope.launch {
+        val profile = withContext(Dispatchers.IO) { repo.fetchProfile() }
+        _state.update { current -&gt; current.copy(profile = profile) }
+    }
+    viewModelScope.launch {
+        val feed = withContext(Dispatchers.IO) { repo.fetchFeed() }
+        _state.update { current -&gt; current.copy(feed = feed) }
+    }
+}
+// .update {} retries via CAS if current changed mid-lambda!</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: <code>launchWhenStarted</code> Leak vs. <code>repeatOnLifecycle</code> / <code>collectAsStateWithLifecycle</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Paused Producer Leak</span></div>
+<pre>// Deprecated! Pauses collector on ON_STOP but leaves
+// upstream GPS / Room / WebSocket Flow running in background:
+lifecycleScope.launchWhenStarted {
+    viewModel.locationFlow.collect { renderMap(it) }
+}
+// Or in Compose: collectAsState() stays active when stopped!</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Lifecycle-Bounded Cancellation</span></div>
+<pre>// Views / Fragments: cancels upstream on ON_STOP, restarts on ON_START
+viewLifecycleOwner.lifecycleScope.launch {
+    viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+        viewModel.uiState.collect { render(it) }
+    }
+}
+// Jetpack Compose:
+val state by viewModel.uiState.collectAsStateWithLifecycle()</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: <code>LaunchedEffect(key)</code> vs. <code>rememberCoroutineScope</code> vs. <code>snapshotFlow</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Effect Restarts on Every Scroll Pixel</span></div>
+<pre>@Composable
+fun FeedList(listState: LazyListState, vm: FeedViewModel) {
+    // Re-launches coroutine on EVERY scroll frame!
+    LaunchedEffect(listState.firstVisibleItemIndex) {
+        vm.trackImpression(listState.firstVisibleItemIndex)
+    }
+    Button(onClick = { /* Cannot call LaunchedEffect here! */ }) { }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: snapshotFlow + rememberCoroutineScope</span></div>
+<pre>@Composable
+fun FeedList(listState: LazyListState, vm: FeedViewModel) {
+    val scope = rememberCoroutineScope() // For UI event callbacks
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .distinctUntilChanged()
+            .debounce(150)
+            .collect { idx -&gt; vm.trackImpression(idx) }
+    }
+    Button(onClick = { scope.launch { listState.animateScrollToItem(0) } }) { }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 4: Eliminating Binder IPC Jank on the Main Thread</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Synchronous Binder in Composition</span></div>
+<pre>@Composable
+fun VersionBadge(context: Context) {
+    // Synchronous Binder IPC to system_server during composition!
+    val info = context.packageManager.getPackageInfo(context.packageName, 0)
+    Text("v${info.versionName}") // Can stall 5-20ms on cold cache!
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Offload to IO &amp; Cache in StateFlow</span></div>
+<pre>// Inject version/network metadata loaded once on Dispatchers.IO:
+val versionName by produceState(initialValue = "") {
+    value = withContext(Dispatchers.IO) {
+        context.packageManager
+            .getPackageInfo(context.packageName, 0).versionName.orEmpty()
+    }
+}
+Text("v$versionName") // Main thread only reads in-memory State&lt;String&gt;</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Write code below and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>). Every starter contains a real concurrency or frame-budget bug to fix.</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 14.1 · MVI STATEFLOW CAS</span>
+            <h3 style="margin:8px 0 4px;">Eliminate Lost MVI Updates with <code>state.update(fn)</code></h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Fix <code>mviConcurrentUpdate(state, loadProfile, loadFeed)</code> so concurrent loaders never overwrite each other or background mutations.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>loadProfile()</code> and <code>loadFeed()</code> are async functions returning partial data concurrently.<br/>
+          • Starter reads <code>const snap = state.value</code> early and writes <code>state.value = ...</code>, losing fields AND racing against background updates.<br/>
+          • Run both loaders concurrently, and as each resolves, apply its field via atomic <code>state.update((s) =&gt; ({ ...s, ... }))</code>; return <code>state.value</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_14_1_mvi_cas_update.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 14.2 · LIFECYCLE STATE MACHINE</span>
+            <h3 style="margin:8px 0 4px;">Implement <code>repeatOnLifecycleSim(events, startCollector)</code></h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Model Android's <code>repeatOnLifecycle(STARTED)</code> state machine across repeated start/stop cycles without duplicate collectors.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Process lifecycle events: <code>'ON_CREATE'</code>, <code>'ON_START'</code>, <code>'ON_RESUME'</code>, <code>'ON_PAUSE'</code>, <code>'ON_STOP'</code>, <code>'ON_DESTROY'</code>.<br/>
+          • On <code>'ON_START'</code>: start <code>startCollector(runId)</code> (returns cancel fn or <code>{ cancel }</code>) ONLY if not already active and not destroyed.<br/>
+          • On <code>'ON_STOP'</code>: cancel the active collector if running. On <code>'ON_DESTROY'</code>: cancel if active and permanently block future starts.<br/>
+          • Return <code>{ starts, cancels, active }</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_14_2_repeat_on_lifecycle.js</span><span>Android Lifecycle.State.STARTED semantics</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 14.3 · 120HZ FRAME ANALYZER</span>
+            <h3 style="margin:8px 0 4px;">Implement <code>frameBudgetMonitor(frames, emissions, budgetMs)</code></h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Flag 120Hz dropped frames (<code>&gt; 8.33ms</code>) and coalesce rapid MVI state emissions per vsync tick.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>frames</code>: <code>[{ vsyncId, workMs }]</code>; flag any frame with <code>workMs &gt; budgetMs</code> (default <code>8.33</code>) in <code>droppedVsyncIds</code>.<br/>
+          • <code>emissions</code>: <code>[{ vsyncId, state }]</code>; coalesce multiple emissions sharing a <code>vsyncId</code> (keep the latest <code>state</code> in first-seen tick order).<br/>
+          • Return <code>{ droppedVsyncIds, droppedCount, jankRatio, coalescedByVsync, totalRendered, totalCoalescedAway }</code> where each entry in <code>coalescedByVsync</code> is <code>{ vsyncId, renderedState, droppedEmissions }</code> and <code>jankRatio = frames.length ? Number((droppedCount / frames.length).toFixed(4)) : 0</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_14_3_frame_budget_monitor.js</span><span>120Hz Choreographer + StateFlow conflation</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in length so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Read
+          <a href="https://developer.android.com/topic/libraries/architecture/coroutines" target="_blank" rel="noopener">Android Developers: Lifecycle-aware Coroutines &amp; repeatOnLifecycle</a>,
+          consult <a href="https://developer.android.com/develop/ui/compose/side-effects" target="_blank" rel="noopener">Jetpack Compose Side-effects</a>,
+          and keep <a href="../reference/coroutines-flow-patterns.html">Kotlin &amp; Flow Reference</a> handy for daily ViewModel and Compose patterns.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime
+          (e.g., <em>"How does StateFlow.update prevent lost updates without a Mutex?"</em> or <em>"Why does snapshotFlow use distinctUntilChanged?"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0013-deterministic-testing-virtual-time-lincheck.html">← Lesson 13</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0015-room-sqlite-wal-single-flight-retries.html">Lesson 15 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_SCENARIOS = {
+      jank: {
+        steps: [
+          {
+            main: { cls: 'ta', txt: 'F1: DRAW 2.4ms' },
+            bg: { cls: 'idle', txt: 'IDLE' },
+            vsync: { cls: 'io', txt: 'V1 OK (2.4ms)' },
+            frameMs: '2.4 ms', droppedDelta: 0, uiState: '{ p:null, f:null }',
+            type: 'good',
+            msg: 'Vsync #1: Main renders skeleton within 8.33ms budget (2.4ms). Two async loaders start.'
+          },
+          {
+            main: { cls: 'bad', txt: 'F2: JSON 9.4ms' },
+            bg: { cls: 'tb', txt: 'NET WAIT' },
+            vsync: { cls: 'bad', txt: 'V2 JANK!' },
+            frameMs: '9.4 ms', droppedDelta: 1, uiState: '{ p:null, f:null }',
+            type: 'bad',
+            msg: 'Vsync #2: Heavy JSON parse runs on Main (9.4ms > 8.33ms). Missed vsync -> 1 dropped frame!'
+          },
+          {
+            main: { cls: 'bad', txt: 'F3: BINDER 4.2ms' },
+            bg: { cls: 'tb', txt: 'PARSED F' },
+            vsync: { cls: 'bad', txt: 'V3 JANK!' },
+            frameMs: '10.6 ms', droppedDelta: 1, uiState: '{ p:"Ada", f:null }',
+            type: 'warn',
+            msg: 'Vsync #3: Synchronous Binder IPC (4.2ms) + Compose (6.4ms) = 10.6ms. Profile loader writes { p:"Ada", f:null }.'
+          },
+          {
+            main: { cls: 'sw', txt: 'F4: STALE COPY' },
+            bg: { cls: 'idle', txt: 'FEED DONE' },
+            vsync: { cls: 'io', txt: 'V4 OK (4.1ms)' },
+            frameMs: '4.1 ms', droppedDelta: 0, uiState: '{ p:null, f:[12] }',
+            type: 'bad',
+            msg: 'RACE! Feed loader kept stale _state.value snapshot { p:null, f:null } and overwrote profile back to null!'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout danger',
+          html: '<strong>Jank + Lost Update:</strong> 2 dropped 120Hz frames from Main-thread JSON/Binder work, plus <code>profile</code> wiped by non-atomic <code>.value.copy()</code>.'
+        }
+      },
+      smooth: {
+        steps: [
+          {
+            main: { cls: 'ta', txt: 'F1: DRAW 2.1ms' },
+            bg: { cls: 'tb', txt: 'IO: BINDER+NET' },
+            vsync: { cls: 'io', txt: 'V1 OK (2.1ms)' },
+            frameMs: '2.1 ms', droppedDelta: 0, uiState: '{ p:null, f:null }',
+            type: 'good',
+            msg: 'Vsync #1: Binder IPC & HTTP calls offloaded to Dispatchers.IO. Main stays at 2.1ms.'
+          },
+          {
+            main: { cls: 'ta', txt: 'F2: ANIM 1.8ms' },
+            bg: { cls: 'tb', txt: 'DEF: JSON PARSE' },
+            vsync: { cls: 'io', txt: 'V2 OK (1.8ms)' },
+            frameMs: '1.8 ms', droppedDelta: 0, uiState: '{ p:null, f:null }',
+            type: 'good',
+            msg: 'Vsync #2: Heavy JSON parsing runs on Dispatchers.Default; 120Hz shimmer animation stays silky.'
+          },
+          {
+            main: { cls: 'ta', txt: 'F3: CAS P -> 2.5ms' },
+            bg: { cls: 'tb', txt: 'CAS RETRY F' },
+            vsync: { cls: 'io', txt: 'V3 OK (2.5ms)' },
+            frameMs: '2.5 ms', droppedDelta: 0, uiState: '{ p:"Ada", f:null }',
+            type: 'good',
+            msg: 'Vsync #3: Profile commits via StateFlow.update CAS; concurrent Feed CAS detects change and retries with fresh state.'
+          },
+          {
+            main: { cls: 'ta', txt: 'F4: DIFF 2.9ms' },
+            bg: { cls: 'idle', txt: 'DONE' },
+            vsync: { cls: 'io', txt: 'V4 OK (2.9ms)' },
+            frameMs: '2.9 ms', droppedDelta: 0, uiState: '{ p:"Ada", f:[12] }',
+            type: 'good',
+            msg: 'Vsync #4: Both profile and feed preserved! Compose diffs in 2.9ms (< 8.33ms) with zero dropped frames.'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout tip',
+          html: '<strong>120Hz Smooth + Atomic MVI:</strong> Zero dropped frames (&lt; 3ms Main work/vsync) and zero lost fields under <code>StateFlow.update {}</code>.'
+        }
+      },
+      anr: {
+        steps: [
+          {
+            main: { cls: 'ta', txt: 'F1: INPUT' },
+            bg: { cls: 'idle', txt: 'IDLE' },
+            vsync: { cls: 'io', txt: 'V1 OK (1.9ms)' },
+            frameMs: '1.9 ms', droppedDelta: 0, uiState: '{ p:"Ada", f:null }',
+            type: '',
+            msg: 'Vsync #1: User taps "Settings". Click handler invokes runBlocking + Binder lock on Main.'
+          },
+          {
+            main: { cls: 'bad', txt: 'BINDER WAIT 1s' },
+            bg: { cls: 'sw', txt: 'SERVER BUSY' },
+            vsync: { cls: 'bad', txt: '120 FRAMES LOST' },
+            frameMs: '1000 ms', droppedDelta: 120, uiState: '{ p:"Ada", f:null }',
+            type: 'bad',
+            msg: 'Main Looper parked in synchronous Binder transaction! 120 consecutive 120Hz vsyncs skipped.'
+          },
+          {
+            main: { cls: 'bad', txt: 'STILL BLOCKED 3s' },
+            bg: { cls: 'sw', txt: 'DEADLOCKED' },
+            vsync: { cls: 'bad', txt: '360 FRAMES LOST' },
+            frameMs: '3000 ms', droppedDelta: 240, uiState: '{ p:"Ada", f:null }',
+            type: 'bad',
+            msg: 'Input queue backs up; Frozen Frame threshold (>700ms) blown 4x over.'
+          },
+          {
+            main: { cls: 'bad', txt: 'ANR > 5000ms' },
+            bg: { cls: 'bad', txt: 'WATCHDOG' },
+            vsync: { cls: 'bad', txt: 'APP KILLED' },
+            frameMs: '5120 ms', droppedDelta: 254, uiState: 'FROZEN',
+            type: 'bad',
+            msg: '5-second Input Dispatch Timeout! Android WindowManager triggers "App isn\'t responding" dialog.'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout danger',
+          html: '<strong>ANR Triggered:</strong> Synchronous Binder IPC / <code>runBlocking</code> stalled the Main Looper for &gt; 5,000ms, dropping 614 vsyncs.'
+        }
+      }
+    };
+
+    let currentSimMode = 'jank';
+    let simStepIdx = 0;
+    let droppedTotal = 0;
+    let simTimer = null;
+
+    function resetSim() {
+      if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+      simStepIdx = 0;
+      droppedTotal = 0;
+      const sc = SIM_SCENARIOS[currentSimMode];
+      document.getElementById('lane-main').innerHTML = '';
+      document.getElementById('lane-bg').innerHTML = '';
+      document.getElementById('lane-vsync').innerHTML = '';
+      document.getElementById('reg-framems').textContent = '0.0 ms';
+      document.getElementById('reg-framems').style.color = 'var(--green)';
+      document.getElementById('reg-dropped').textContent = '0';
+      document.getElementById('reg-dropped').style.color = 'var(--accent)';
+      document.getElementById('reg-uistate').textContent = '{ p:null, f:null }';
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${sc.steps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step →, ▶ Play, or ⚡ Inject 11.4ms Binder IPC.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through this timeline to watch Main thread frame budgets (<code>8.33ms</code>), Binder stalls, and MVI updates.';
+    }
+
+    function appendSimSlot(id, slot) {
+      if (!slot) return;
+      const d = document.createElement('div');
+      d.className = `slot ${slot.cls}`;
+      d.textContent = slot.txt;
+      const track = document.getElementById(id);
+      track.appendChild(d);
+      track.scrollLeft = track.scrollWidth;
+    }
+
+    function appendSimLog(prefix, msg, type) {
+      const logEl = document.getElementById('sim-log');
+      if (logEl.children.length === 1 && logEl.children[0].textContent.startsWith('Ready.')) {
+        logEl.innerHTML = '';
+      }
+      const line = document.createElement('div');
+      line.className = `trace-line ${type || ''}`;
+      line.textContent = `[${prefix}] ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function stepSim() {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      appendSimSlot('lane-main', s.main);
+      appendSimSlot('lane-bg', s.bg);
+      appendSimSlot('lane-vsync', s.vsync);
+
+      droppedTotal += s.droppedDelta;
+      const msVal = parseFloat(s.frameMs);
+      const msEl = document.getElementById('reg-framems');
+      msEl.textContent = s.frameMs;
+      msEl.style.color = msVal > 8.33 ? 'var(--rose)' : 'var(--green)';
+
+      const dropEl = document.getElementById('reg-dropped');
+      dropEl.textContent = String(droppedTotal);
+      dropEl.style.color = droppedTotal > 0 ? 'var(--rose)' : 'var(--green)';
+
+      document.getElementById('reg-uistate').textContent = s.uiState;
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${sc.steps.length}`;
+      appendSimLog(simStepIdx, s.msg, s.type);
+
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+      }
+    }
+
+    function injectBinderSpike() {
+      appendSimSlot('lane-main', { cls: 'bad', txt: 'IPC 11.4ms' });
+      appendSimSlot('lane-bg', { cls: 'sw', txt: 'SYS_SERVER' });
+      appendSimSlot('lane-vsync', { cls: 'bad', txt: 'VSYNC MISS!' });
+      droppedTotal += 1;
+      const msEl = document.getElementById('reg-framems');
+      msEl.textContent = '11.4 ms';
+      msEl.style.color = 'var(--rose)';
+      const dropEl = document.getElementById('reg-dropped');
+      dropEl.textContent = String(droppedTotal);
+      dropEl.style.color = 'var(--rose)';
+      appendSimLog('SPIKE', 'Synchronous Binder IPC on Main took 11.4ms (> 8.33ms budget) -> frame dropped!', 'bad');
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout danger';
+      v.innerHTML = '<strong>Binder IPC Spike Injected:</strong> <code>11.4ms</code> synchronous cross-process call blew the <code>8.33ms</code> 120Hz frame budget.';
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-action').addEventListener('click', injectBinderSpike);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) { clearInterval(simTimer); simTimer = null; btn.textContent = '▶ Play'; }
+      else { if (simStepIdx >= SIM_SCENARIOS[currentSimMode].steps.length) resetSim(); btn.textContent = '⏸ Pause'; simTimer = setInterval(stepSim, 800); }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'mviConcurrentUpdate',
+        starter: `async function mviConcurrentUpdate(state, loadProfile, loadFeed) {
+  // BUG: Reads stale state.value before async loaders resolve,
+  // and uses non-atomic state.value = ... instead of state.update(fn)!
+  const snap = state.value;
+  await Promise.all([
+    loadProfile().then((profile) => {
+      state.value = { ...snap, profile };
+    }),
+    loadFeed().then((feed) => {
+      state.value = { ...snap, feed };
+    })
+  ]);
+  return state.value;
+}`,
+        hints: [
+          'Do not capture `const snap = state.value` before `await`—two concurrent loaders will overwrite each other.',
+          'Replace `state.value = { ...snap, profile }` with `state.update((s) => ({ ...s, profile }))`.',
+          'Update each slice immediately inside its own `.then(...)` (or async helper) inside `Promise.all` so progressive UI emissions work cleanly.'
+        ],
+        solution: `async function mviConcurrentUpdate(state, loadProfile, loadFeed) {
+  await Promise.all([
+    loadProfile().then((profile) => state.update((s) => ({ ...s, profile }))),
+    loadFeed().then((feed) => state.update((s) => ({ ...s, feed })))
+  ]);
+  return state.value;
+}`,
+        kotlinEquivalent: `fun loadDashboard() = viewModelScope.launch {
+    launch {
+        val profile = withContext(Dispatchers.IO) { repo.fetchProfile() }
+        _state.update { it.copy(profile = profile) }
+    }
+    launch {
+        val feed = withContext(Dispatchers.IO) { repo.fetchFeed() }
+        _state.update { it.copy(feed = feed) }
+    }
+}`,
+        tests: async (fn) => {
+          function createStateHolder(initial, opts = {}) {
+            let current = { ...initial };
+            let updateCalls = 0;
+            let casRetries = 0;
+            let contendedOnce = false;
+            return {
+              get value() {
+                const snap = { ...current };
+                // Simulate a concurrent background dispatcher updating badgeCount right after a raw .value read
+                if (opts.raceOnRawRead && !contendedOnce) {
+                  contendedOnce = true;
+                  current = { ...current, badgeCount: (current.badgeCount || 0) + 1 };
+                }
+                return snap;
+              },
+              set value(next) {
+                current = { ...next };
+              },
+              update(transform) {
+                updateCalls++;
+                while (true) {
+                  const prev = current;
+                  const next = transform({ ...prev });
+                  // On first contended update, simulate another thread bumping badgeCount mid-transform
+                  if (opts.casContendOnce && !contendedOnce) {
+                    contendedOnce = true;
+                    current = { ...prev, badgeCount: (prev.badgeCount || 0) + 1 };
+                    casRetries++;
+                    continue; // CAS detects mismatch (current !== prev) and retries!
+                  }
+                  current = next;
+                  return { ...current };
+                }
+              },
+              stats: () => ({ updateCalls, casRetries })
+            };
+          }
+
+          return runTestCases([
+            {
+              name: 'Profile faster than feed: preserves both fields and updates progressively',
+              run: async () => {
+                const state = createStateHolder({ profile: null, feed: null });
+                let profileSeenEarly = false;
+                const res = await fn(
+                  state,
+                  async () => { await new Promise((r) => setTimeout(r, 8)); return 'Ada'; },
+                  async () => {
+                    await new Promise((r) => setTimeout(r, 25));
+                    if (state.value.profile === 'Ada') profileSeenEarly = true;
+                    return ['item1', 'item2'];
+                  }
+                );
+                assertDeepEq(res, { profile: 'Ada', feed: ['item1', 'item2'] });
+                assertEq(profileSeenEarly, true, 'Expected profile to commit via update() before feed finished');
+              }
+            },
+            {
+              name: 'Feed faster than profile: preserves both fields without lost update',
+              run: async () => {
+                const state = createStateHolder({ profile: null, feed: null });
+                const res = await fn(
+                  state,
+                  async () => { await new Promise((r) => setTimeout(r, 25)); return 'Grace'; },
+                  async () => { await new Promise((r) => setTimeout(r, 6)); return ['news']; }
+                );
+                assertDeepEq(res, { profile: 'Grace', feed: ['news'] });
+              }
+            },
+            {
+              name: 'CAS contention: preserves concurrent background badgeCount via state.update()',
+              run: async () => {
+                const state = createStateHolder(
+                  { profile: null, feed: null, badgeCount: 0 },
+                  { raceOnRawRead: true, casContendOnce: true }
+                );
+                const res = await fn(
+                  state,
+                  async () => { await new Promise((r) => setTimeout(r, 5)); return 'Lin'; },
+                  async () => { await new Promise((r) => setTimeout(r, 12)); return ['msg']; }
+                );
+                assertDeepEq(res, { profile: 'Lin', feed: ['msg'], badgeCount: 1 });
+                assertEq(state.stats().updateCalls >= 2, true, 'Must use state.update(fn) for atomic CAS');
+                assertEq(state.stats().casRetries >= 1, true, 'Expected CAS retry to preserve concurrent badgeCount');
+              }
+            }
+          ]);
+        }
+      },
+      2: {
+        fnName: 'repeatOnLifecycleSim',
+        starter: `function repeatOnLifecycleSim(events, startCollector) {
+  // BUG: Starts a collector on ON_START without cancelling on ON_STOP or ON_DESTROY!
+  let starts = 0;
+  let cancels = 0;
+  let activeCancel = null;
+  for (const ev of events) {
+    if (ev === 'ON_START') {
+      starts++;
+      activeCancel = startCollector(starts);
+    }
+  }
+  return { starts, cancels, active: activeCancel !== null };
+}`,
+        hints: [
+          'Track `let activeCancel = null;` and `let destroyed = false;`. Helper `stopActive()` should call `activeCancel()` (or `activeCancel.cancel()`), increment `cancels`, and reset `activeCancel = null`.',
+          'On `ON_START`: only invoke `startCollector` if `!destroyed && activeCancel === null` so duplicate starts are prevented.',
+          'On `ON_STOP`: call `stopActive()`. On `ON_DESTROY`: call `stopActive()` and set `destroyed = true`.'
+        ],
+        solution: `function repeatOnLifecycleSim(events, startCollector) {
+  let starts = 0;
+  let cancels = 0;
+  let activeCancel = null;
+  let destroyed = false;
+
+  function stopActive() {
+    if (!activeCancel) return;
+    if (typeof activeCancel === 'function') activeCancel();
+    else if (typeof activeCancel.cancel === 'function') activeCancel.cancel();
+    activeCancel = null;
+    cancels++;
+  }
+
+  for (const ev of events) {
+    if (ev === 'ON_START') {
+      if (!destroyed && activeCancel === null) {
+        starts++;
+        activeCancel = startCollector(starts);
+      }
+    } else if (ev === 'ON_STOP') {
+      stopActive();
+    } else if (ev === 'ON_DESTROY') {
+      stopActive();
+      destroyed = true;
+    }
+  }
+  return { starts, cancels, active: activeCancel !== null };
+}`,
+        kotlinEquivalent: `viewLifecycleOwner.lifecycleScope.launch {
+    viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+        viewModel.uiState.collect { state -> render(state) }
+    }
+}`,
+        tests: async (fn) => {
+          function makeTracker() {
+            let live = 0;
+            let maxLive = 0;
+            const startCollector = () => {
+              live++;
+              maxLive = Math.max(maxLive, live);
+              let cancelled = false;
+              return () => {
+                if (!cancelled) {
+                  cancelled = true;
+                  live--;
+                }
+              };
+            };
+            return { startCollector, stats: () => ({ live, maxLive }) };
+          }
+
+          return runTestCases([
+            {
+              name: 'Single ON_START -> ON_STOP cycle cleans up active collector',
+              run: () => {
+                const t = makeTracker();
+                const res = fn(['ON_CREATE', 'ON_START', 'ON_RESUME', 'ON_PAUSE', 'ON_STOP'], t.startCollector);
+                assertDeepEq(res, { starts: 1, cancels: 1, active: false });
+                assertDeepEq(t.stats(), { live: 0, maxLive: 1 });
+              }
+            },
+            {
+              name: 'Multiple background/foreground cycles restart without overlapping collectors',
+              run: () => {
+                const t = makeTracker();
+                const res = fn(['ON_START', 'ON_STOP', 'ON_START', 'ON_STOP', 'ON_START'], t.startCollector);
+                assertDeepEq(res, { starts: 3, cancels: 2, active: true });
+                assertDeepEq(t.stats(), { live: 1, maxLive: 1 });
+              }
+            },
+            {
+              name: 'Redundant ON_START / ON_RESUME while started does not spawn duplicates',
+              run: () => {
+                const t = makeTracker();
+                const res = fn(['ON_CREATE', 'ON_START', 'ON_RESUME', 'ON_START', 'ON_PAUSE'], t.startCollector);
+                assertDeepEq(res, { starts: 1, cancels: 0, active: true });
+                assertDeepEq(t.stats(), { live: 1, maxLive: 1 });
+              }
+            },
+            {
+              name: 'ON_DESTROY cancels active collector and ignores subsequent ON_START',
+              run: () => {
+                const t = makeTracker();
+                const res = fn(['ON_START', 'ON_DESTROY', 'ON_START'], t.startCollector);
+                assertDeepEq(res, { starts: 1, cancels: 1, active: false });
+                assertDeepEq(t.stats(), { live: 0, maxLive: 1 });
+              }
+            }
+          ]);
+        }
+      },
+      3: {
+        fnName: 'frameBudgetMonitor',
+        starter: `function frameBudgetMonitor(frames, emissions, budgetMs = 8.33) {
+  // BUG: Uses 60Hz 16.67ms threshold and fails to coalesce rapid emissions per vsyncId!
+  const droppedVsyncIds = frames.filter((f) => f.workMs > 16.67).map((f) => f.vsyncId);
+  const droppedCount = droppedVsyncIds.length;
+  const jankRatio = frames.length ? Number((droppedCount / frames.length).toFixed(4)) : 0;
+  const coalescedByVsync = emissions.map((e) => ({
+    vsyncId: e.vsyncId,
+    renderedState: e.state,
+    droppedEmissions: 0
+  }));
+  return {
+    droppedVsyncIds,
+    droppedCount,
+    jankRatio,
+    coalescedByVsync,
+    totalRendered: coalescedByVsync.length,
+    totalCoalescedAway: 0
+  };
+}`,
+        hints: [
+          'Compare `f.workMs > budgetMs` (not hardcoded `16.67`) to populate `droppedVsyncIds`.',
+          'Use a `Map` keyed by `vsyncId` while iterating `emissions`: track `{ vsyncId, renderedState: e.state, count: 1 }` and on repeat ticks increment `count` and overwrite `renderedState`.',
+          'Convert the `Map` values to `{ vsyncId, renderedState, droppedEmissions: entry.count - 1 }`; `totalRendered = coalescedByVsync.length` and `totalCoalescedAway = emissions.length - totalRendered`.'
+        ],
+        solution: `function frameBudgetMonitor(frames, emissions, budgetMs = 8.33) {
+  const safeFrames = frames || [];
+  const safeEmissions = emissions || [];
+  const droppedVsyncIds = safeFrames
+    .filter((f) => f.workMs > budgetMs)
+    .map((f) => f.vsyncId);
+  const droppedCount = droppedVsyncIds.length;
+  const jankRatio = safeFrames.length ? Number((droppedCount / safeFrames.length).toFixed(4)) : 0;
+
+  const byTick = new Map();
+  for (const em of safeEmissions) {
+    const existing = byTick.get(em.vsyncId);
+    if (!existing) {
+      byTick.set(em.vsyncId, { vsyncId: em.vsyncId, renderedState: em.state, count: 1 });
+    } else {
+      existing.renderedState = em.state;
+      existing.count += 1;
+    }
+  }
+
+  const coalescedByVsync = Array.from(byTick.values()).map((entry) => ({
+    vsyncId: entry.vsyncId,
+    renderedState: entry.renderedState,
+    droppedEmissions: entry.count - 1
+  }));
+
+  const totalRendered = coalescedByVsync.length;
+  const totalCoalescedAway = safeEmissions.length - totalRendered;
+
+  return {
+    droppedVsyncIds,
+    droppedCount,
+    jankRatio,
+    coalescedByVsync,
+    totalRendered,
+    totalCoalescedAway
+  };
+}`,
+        kotlinEquivalent: `// Production JankStats + StateFlow conflation per vsync:
+val jankStats = JankStats.createAndTrack(window) { frameData ->
+    if (frameData.isJank || frameData.frameDurationUiNanos > 8_330_000L) {
+        analytics.logDroppedFrame(frameData.states)
+    }
+}
+// StateFlow automatically conflates rapid emissions between Choreographer frames`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Empty frames and emissions return zeroed summary',
+            run: () => assertDeepEq(fn([], []), {
+              droppedVsyncIds: [],
+              droppedCount: 0,
+              jankRatio: 0,
+              coalescedByVsync: [],
+              totalRendered: 0,
+              totalCoalescedAway: 0
+            })
+          },
+          {
+            name: 'Flags frames > 8.33ms at 120Hz (e.g. 8.34ms and 11.2ms drop, 8.33ms passes)',
+            run: () => {
+              const res = fn(
+                [
+                  { vsyncId: 1, workMs: 5.1 },
+                  { vsyncId: 2, workMs: 8.33 },
+                  { vsyncId: 3, workMs: 8.34 },
+                  { vsyncId: 4, workMs: 11.2 }
+                ],
+                []
+              );
+              assertDeepEq(res.droppedVsyncIds, [3, 4]);
+              assertEq(res.droppedCount, 2);
+              assertEq(res.jankRatio, 0.5);
+            }
+          },
+          {
+            name: 'Coalesces rapid emissions per vsync tick keeping latest state',
+            run: () => {
+              const res = fn(
+                [{ vsyncId: 10, workMs: 4.0 }, { vsyncId: 11, workMs: 9.5 }],
+                [
+                  { vsyncId: 10, state: 'S1' },
+                  { vsyncId: 10, state: 'S2' },
+                  { vsyncId: 10, state: 'S3' },
+                  { vsyncId: 11, state: 'S4' },
+                  { vsyncId: 12, state: 'S5' },
+                  { vsyncId: 12, state: 'S6' }
+                ]
+              );
+              assertDeepEq(res.coalescedByVsync, [
+                { vsyncId: 10, renderedState: 'S3', droppedEmissions: 2 },
+                { vsyncId: 11, renderedState: 'S4', droppedEmissions: 0 },
+                { vsyncId: 12, renderedState: 'S6', droppedEmissions: 1 }
+              ]);
+              assertEq(res.totalRendered, 3);
+              assertEq(res.totalCoalescedAway, 3);
+            }
+          },
+          {
+            name: 'Honors explicit custom budgetMs (e.g. 16.67ms for 60Hz fallback)',
+            run: () => {
+              const res = fn(
+                [{ vsyncId: 1, workMs: 12.0 }, { vsyncId: 2, workMs: 18.5 }],
+                [],
+                16.67
+              );
+              assertDeepEq(res.droppedVsyncIds, [2]);
+              assertEq(res.droppedCount, 1);
+              assertEq(res.jankRatio, 0.5);
+            }
+          }
+        ])
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. An animation runs smoothly on a 60Hz phone when each frame takes 11ms, yet stutters visibly on a 120Hz flagship. Why?',
+        code: `// JankStats report on Pixel 120Hz display:\nFrame #412: uiDuration = 11.1ms | isJank = true`,
+        options: [
+          'At 120Hz the vsync interval shrinks to 8.33ms, so 11ms misses every deadline.',
+          'At 120Hz the RenderThread halves heap limits, causing frequent garbage collection pauses.',
+          'At 120Hz Choreographer disables hardware acceleration whenever frame work exceeds 10ms total.',
+          'At 120Hz Dispatchers.Main throttles coroutine dispatches to execute once every two vsyncs.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): A 120Hz refresh rate fires vsync every 1000 / 120 = 8.33ms. An 11ms frame fits inside 60Hz (16.67ms) but blows past 8.33ms on every frame.',
+          'WRONG (B): Display refresh rate does not shrink the JVM heap or change GC thresholds; the regression comes purely from the tighter 8.33ms deadline.',
+          'WRONG (C): Choreographer never disables hardware acceleration mid-flight; it simply misses the vsync deadline and repeats the previous buffer.',
+          'WRONG (D): Dispatchers.Main dispatches messages immediately on the Looper without throttling coroutine continuations across vsyncs.'
+        ]
+      },
+      {
+        stem: '2. Two coroutines on Dispatchers.Default concurrently load profile and notifications, each running _state.value = _state.value.copy(...). What breaks?',
+        code: `launch(Dispatchers.Default) { _state.value = _state.value.copy(profile = fetchProfile()) }\nlaunch(Dispatchers.Default) { _state.value = _state.value.copy(alerts = fetchAlerts()) }`,
+        options: [
+          'StateFlow throws ConcurrentModificationException whenever two background dispatchers write different data class fields simultaneously.',
+          'Non-atomic read-copy-write lets the slower coroutine read stale state and overwrite the earlier update.',
+          'Kotlin data class copy freezes immutable fields so the second write becomes a silent no-op.',
+          'StateFlow buffers every intermediate copy sequentially, delaying UI recomposition until both coroutines finish.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): StateFlow allows concurrent .value writes without throwing ConcurrentModificationException; the failure is silent data loss.',
+          'CORRECT (B): Reading _state.value, calling .copy(), and assigning _state.value is three separate steps. Both threads can copy the old snapshot and overwrite each other—use _state.update { it.copy(...) }.',
+          'WRONG (C): data class copy() allocates a brand-new object and replaces the StateFlow reference; it never becomes a silent no-op.',
+          'WRONG (D): StateFlow is conflated and has no multi-element buffer waiting for multiple coroutines to finish.'
+        ]
+      },
+      {
+        stem: '3. Why did Android deprecate launchWhenStarted in favor of repeatOnLifecycle(Lifecycle.State.STARTED) for collecting UI flows?',
+        code: `// Deprecated:\nlifecycleScope.launchWhenStarted { viewModel.locationUpdates.collect { ... } }`,
+        options: [
+          'launchWhenStarted only pauses collection on stop, keeping upstream location or database producers active.',
+          'launchWhenStarted immediately cancels the entire ViewModelScope whenever the user rotates the device screen.',
+          'launchWhenStarted runs upstream Flow operators on Dispatchers.Main even when flowOn specifies IO.',
+          'launchWhenStarted ignores StateFlow conflation and replays all past emissions after every activity pause.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): launchWhenStarted suspends the collector coroutine in ON_STOP without cancelling the Flow, leaving cold upstream producers (GPS, Room, sockets) wasting battery and memory.',
+          'WRONG (B): ViewModelScope survives configuration changes like rotation and is never cancelled by lifecycleScope.launchWhenStarted.',
+          'WRONG (C): Flow context preservation (flowOn) works normally under launchWhenStarted; the defect is producer lifetime, not dispatcher routing.',
+          'WRONG (D): StateFlow remains conflated to its latest value regardless of whether launchWhenStarted or repeatOnLifecycle collects it.'
+        ]
+      },
+      {
+        stem: '4. When should a Jetpack Compose screen use rememberCoroutineScope() instead of LaunchedEffect(key) for launching coroutines?',
+        code: `@Composable\nfun CheckoutBar(onSubmit: suspend () -> Unit) {\n    val scope = rememberCoroutineScope()\n    Button(onClick = { scope.launch { onSubmit() } }) { Text("Pay") }\n}`,
+        options: [
+          'When fetching initial screen data automatically as soon as the composable enters the composition.',
+          'When cancelling and restarting an ongoing animation every time a specific state key changes.',
+          'When launching a coroutine from a button onClick callback outside the composable function body.',
+          'When converting Compose snapshot state reads into a cold Flow with distinctUntilChanged filtering.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): Automatic side effects triggered on entering composition belong in LaunchedEffect(Unit) (or better, ViewModel init/StateFlow).',
+          'WRONG (B): Cancelling and restarting work whenever a key changes is the exact purpose of LaunchedEffect(key).',
+          'CORRECT (C): Event handlers like onClick run outside composition so you cannot call LaunchedEffect inside them; rememberCoroutineScope() provides a composition-bound scope.',
+          'WRONG (D): Converting Compose State reads into a deduplicated cold Flow is the job of snapshotFlow { ... }.'
+        ]
+      },
+      {
+        stem: '5. Calling PackageManager.getPackageInfo() or ConnectivityManager synchronously inside a Composable or RecyclerView binder causes jank. Why?',
+        code: `@Composable fun Header(ctx: Context) {\n    val ver = ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName\n    Text(ver)\n}`,
+        options: [
+          'Those calls execute synchronous Binder IPC transactions across processes, blocking Main past 8.33ms.',
+          'Those APIs allocate dedicated native OpenGL textures on Main, exhausting RenderThread frame memory.',
+          'Those calls switch the coroutine onto Dispatchers.Unconfined, skipping Choreographer input and draw callbacks.',
+          'Those APIs throw NetworkOnMainThreadException silently, forcing Compose to recompose the entire tree repeatedly.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): PackageManager and ConnectivityManager proxies issue synchronous Binder IPC calls to system_server; waiting on cross-process locks stalls the Main Looper past 8.33ms (or triggers ANR).',
+          'WRONG (B): System service Binder proxies serialize Parcel messages across process boundaries; they do not allocate OpenGL textures.',
+          'WRONG (C): Legacy Android Java system service getters are plain blocking methods and do not use Kotlin Dispatchers.Unconfined.',
+          'WRONG (D): NetworkOnMainThreadException is thrown by StrictMode on direct socket/HTTP I/O on Main, not by PackageManager Binder queries.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_14',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

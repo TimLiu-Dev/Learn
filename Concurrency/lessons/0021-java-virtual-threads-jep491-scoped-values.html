@@ -1,0 +1,1402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 21 — Java Virtual Threads, JEP 491 Pinning Fix, ScopedValue &amp; StructuredTaskScope</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+  <style>
+    .sim-actions-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 14px;
+      padding: 10px 12px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .sim-actions-label {
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-right: 4px;
+    }
+    .sim-metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(125px, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .arch-diagram {
+      background: #080c15;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      line-height: 1.55;
+      color: #cbd5e1;
+      overflow-x: auto;
+      white-space: pre;
+      margin: 16px 0;
+    }
+    .slot.pin {
+      background: rgba(244, 63, 94, 0.22);
+      color: #fda4af;
+      border: 1px solid rgba(244, 63, 94, 0.55);
+    }
+    .slot.ok {
+      background: rgba(16, 185, 129, 0.2);
+      color: #6ee7b7;
+      border: 1px solid rgba(16, 185, 129, 0.48);
+    }
+    .vt-pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .vt-chip {
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      padding: 4px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-muted);
+    }
+    .vt-chip.running { border-color: rgba(56, 189, 248, 0.55); color: #7dd3fc; background: rgba(56, 189, 248, 0.12); }
+    .vt-chip.pinned { border-color: rgba(244, 63, 94, 0.55); color: #fda4af; background: rgba(244, 63, 94, 0.14); }
+    .vt-chip.unmounted { border-color: rgba(16, 185, 129, 0.5); color: #6ee7b7; background: rgba(16, 185, 129, 0.12); }
+    .vt-chip.queued { border-color: rgba(245, 158, 11, 0.5); color: #fcd34d; background: rgba(245, 158, 11, 0.1); }
+    .vt-chip.done { border-color: rgba(148, 163, 184, 0.35); color: #94a3b8; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Part 2 · Lesson 21 · Java &amp; Spring Boot</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/spring-boot-concurrency.html">Spring Boot Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Part 2 · Java &amp; Spring Boot · Lesson 21</div>
+      <h1>Java Virtual Threads, JEP 491 Pinning Fix, ScopedValue &amp; StructuredTaskScope</h1>
+      <p class="hero-sub">
+        How Java 21–25+ Virtual Threads mount and unmount on carrier threads, how JEP 491 eliminated <code>synchronized</code> pinning,
+        why immutable <code>ScopedValue</code> replaces <code>ThreadLocal</code> at 1M-thread scale, and how <code>StructuredTaskScope</code> guarantees fail-fast fan-out.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. Carrier &amp; Pinning Visualizer</a>
+        <a class="toc-chip" href="#java-patterns">3. Java &amp; Spring Boot Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First-Principles Mental Model</div>
+      <h2>Carrier Mounting, JEP 491 Unmounting, ScopedValue &amp; Structured Fan-Out</h2>
+      <p class="section-lead">
+        Virtual threads (<a href="https://openjdk.org/jeps/444" target="_blank" rel="noopener">OpenJDK JEP 444</a>) decouple the unit of concurrency from OS kernel threads.
+        Instead of dedicating a ~1 MB OS stack per request, the JVM schedules millions of lightweight virtual threads onto a small FIFO <code>ForkJoinPool</code> of <strong>carrier threads</strong> sized to CPU cores.
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">Mounting, Unmounting &amp; JEP 491</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            When a virtual thread runs, the JVM <strong>mounts</strong> its continuation frames onto a carrier OS thread. When it hits a blocking JDK call
+            (e.g., <code>Socket.read()</code>, <code>LockSupport.park()</code>, <code>Semaphore.acquire()</code>), the JVM freezes its stack into heap-allocated <code>StackChunk</code> objects and <strong>unmounts</strong> it—freeing the carrier immediately.<br/><br/>
+            <strong>Java 21–23 Hazard:</strong> JVM monitors (<code>synchronized</code>) were tied to the <em>carrier OS thread</em>. Blocking inside <code>synchronized</code> <strong>pinned</strong> the carrier, collapsing I/O throughput.<br/><br/>
+            <strong>Java 24+ Fix (<a href="https://openjdk.org/jeps/491" target="_blank" rel="noopener">JEP 491</a>):</strong> Virtual threads now acquire, hold, and release <code>ObjectMonitor</code>s independently of their carrier thread. Blocking or waiting inside <code>synchronized</code> unmounts cleanly! (Only JNI native frames and class initialization <code>&lt;clinit&gt;</code> still pin.)
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">ScopedValue &amp; StructuredTaskScope</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <strong>Why <code>ThreadLocal</code> breaks at 1M threads:</strong> Each thread stores a mutable <code>ThreadLocalMap</code>; forgetting <code>remove()</code> leaks objects, and <code>InheritableThreadLocal</code> copies the map to every spawned child thread.<br/><br/>
+            <strong><code>ScopedValue</code> (<a href="https://openjdk.org/jeps/506" target="_blank" rel="noopener">JEP 506</a>):</strong> Binds an <em>immutable</em> value strictly for the dynamic extent of <code>ScopedValue.where(KEY, val).call(...)</code>. Exiting or throwing unwinds it automatically, and <code>StructuredTaskScope</code> shares the snapshot in <strong>O(1)</strong>.<br/><br/>
+            <strong><code>StructuredTaskScope</code> (<a href="https://openjdk.org/jeps/505" target="_blank" rel="noopener">JEP 505</a>):</strong> Replaces manual <code>CompletableFuture</code> orchestration with lexical parent-child lifetimes, interrupting siblings immediately on first failure and waiting for clean unwinding.
+          </p>
+        </div>
+      </div>
+
+      <div class="arch-diagram">Virtual Threads (Heap StackChunks)         FIFO ForkJoinPool Carriers (~CPU Cores)
+┌──────────────────────────────────┐       ┌──────────────────────────────────────┐
+│ VT-1 (blocked on Socket.read())  │ ────▶ │ Unmounted to heap (carrier is FREE!) │
+│ VT-2 (synchronized + Socket I/O) │ ──┬─▶ │ Java 21: PINS Carrier 0 (starvation) │
+│                                  │   └─▶ │ Java 24+ JEP 491: UNMOUNTS cleanly!  │
+│ VT-3 (ready in ForkJoin queue)   │ ────▶ │ Carrier 0 runs VT-3 while VT-2 waits │
+└──────────────────────────────────┘       └──────────────────────────────────────┘</div>
+
+      <h3 style="margin-top: 24px;">Pinning &amp; Context Propagation Matrix (Java 21 vs. Java 24–25+)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Mechanism</th>
+              <th>Java 21 Behavior</th>
+              <th>Java 24+ (JEP 491 / 506)</th>
+              <th>Production Implication</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong><code>synchronized</code> + Blocking I/O</strong></td>
+              <td><strong>Pins</strong> carrier OS thread for full I/O wait</td>
+              <td><strong>Unmounts</strong> cleanly; VT owns monitor</td>
+              <td>Upgrading to JDK 24+ removes legacy JDBC/driver pinning instantly</td>
+            </tr>
+            <tr>
+              <td><strong><code>ReentrantLock</code> + Blocking I/O</strong></td>
+              <td><strong>Unmounts</strong> cleanly on park &amp; I/O</td>
+              <td><strong>Unmounts</strong> cleanly on park &amp; I/O</td>
+              <td>Still ideal for timed <code>tryLock</code>, fairness, or multiple <code>Condition</code>s</td>
+            </tr>
+            <tr>
+              <td><strong>JNI / FFM Native Upcall &amp; <code>&lt;clinit&gt;</code></strong></td>
+              <td><strong>Pins</strong> carrier OS thread</td>
+              <td><strong>Still pins</strong> carrier OS thread</td>
+              <td>Avoid blocking I/O inside JNI callbacks or static class initializers</td>
+            </tr>
+            <tr>
+              <td><strong>CPU-Bound Loops (Crypto / JSON)</strong></td>
+              <td>Occupies carrier continuously (no unmount)</td>
+              <td>Occupies carrier continuously (no unmount)</td>
+              <td>Max parallel throughput still bounded by <code>availableProcessors()</code></td>
+            </tr>
+            <tr>
+              <td><strong><code>ThreadLocal</code> vs. <code>ScopedValue</code></strong></td>
+              <td>Mutable map; <code>InheritableThreadLocal</code> copies per VT</td>
+              <td><code>ScopedValue</code> immutable, auto-cleaned, O(1) child share</td>
+              <td>Use <code>ScopedValue</code> for tenant/trace IDs across virtual fan-outs</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Do not confuse I/O concurrency with CPU parallelism:</strong> Virtual threads scale blocking I/O to millions of concurrent sockets,
+        but they never add CPU cores. A tight hash/JSON/matrix loop runs no faster on 10,000 virtual threads than on a core-sized pool—in fact, excess runnable threads increase scheduling overhead.
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive Carrier Thread &amp; Pinning Visualizer</div>
+      <h2>Watch Java 21 Pinning Collapse Throughput vs. JEP 491 Unmounting</h2>
+      <p class="section-lead">
+        Four virtual threads (<code>VT-1..VT-4</code>) execute on <strong>2 Carrier OS Threads</strong>. Each acquires a monitor and performs blocking I/O.
+        Toggle the JVM runtime mode and lock contention scenario, then step through the scheduler timeline.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="java21">Java 21 (synchronized)</button>
+            <button class="btn" data-mode="jep491">Java 24+ JEP 491 (synchronized)</button>
+            <button class="btn" data-mode="reentrant">ReentrantLock (Java 21+)</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-actions-bar" id="sim-scenarios">
+          <span class="sim-actions-label">Workload Action:</span>
+          <button class="btn active" data-scenario="distinct">Distinct Per-Conn Monitors (4 VTs + I/O)</button>
+          <button class="btn" data-scenario="contended">Shared Contended Lock (Lock + I/O)</button>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span>Carrier 0 (OS Thread)</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-c0"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Carrier 1 (OS Thread)</span><span id="sim-mode-badge">Mode: Java 21 Pinning</span></div>
+              <div class="timeline-track" id="lane-c1"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Virtual Thread States (Heap / Queue / Parked)</span></div>
+              <div class="vt-pill-row" id="vt-state-row"></div>
+            </div>
+
+            <div class="sim-metrics">
+              <div class="reg-card"><div class="reg-name">Pinned Carriers</div><div class="reg-val" id="stat-pinned" style="color:var(--rose);">0</div></div>
+              <div class="reg-card"><div class="reg-name">Concurrent I/O</div><div class="reg-val" id="stat-io" style="color:var(--accent);">0</div></div>
+              <div class="reg-card"><div class="reg-name">Completed VTs</div><div class="reg-val" id="stat-done" style="color:var(--green);">0 / 4</div></div>
+              <div class="reg-card"><div class="reg-name">Elapsed Ticks</div><div class="reg-val" id="stat-elapsed" style="color:var(--amber);">0ms</div></div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Select a JVM mode and click <strong>Step →</strong> or <strong>▶ Play</strong> to trace mounting, pinning, and unmounting.
+            </div>
+          </div>
+
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">CARRIER SCHEDULER TRACE LOG</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="java-patterns">
+      <div class="section-tag">Part 03 · Production Java 21–25+ &amp; Spring Boot Patterns</div>
+      <h2>Junior Traps vs. Senior Patterns in Java &amp; Spring Boot</h2>
+      <p class="section-lead">
+        Follow <a href="https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html" target="_blank" rel="noopener">Spring Boot Task Execution &amp; Virtual Threads</a>
+        guidance: never pool virtual threads, bound scarce downstream connections with a <code>Semaphore</code>, replace <code>ThreadLocal</code> with <code>ScopedValue</code>, and structure fan-outs with <code>StructuredTaskScope</code>.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Pooling Virtual Threads (Anti-Pattern) vs. 1 VT per Task + <code>Semaphore</code> Cap</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Pooling Virtual Threads</span></div>
+<pre>// Anti-pattern: treats cheap VTs like precious OS threads!
+@Bean
+ExecutorService brokenExecutor() {
+    return Executors.newFixedThreadPool(
+        64, Thread.ofVirtual().name("vt-", 0).factory()
+    );
+}
+// Reuses ThreadLocals, caps non-blocking fan-out, and adds queue overhead.</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: 1 VT/Task + Semaphore Downstream Cap</span></div>
+<pre>// application.properties: spring.threads.virtual.enabled=true
+private final Semaphore dbGate = new Semaphore(20); // Protect HikariCP!
+
+public UserDto loadUser(String id) throws InterruptedException {
+    dbGate.acquire(); // Unmounts VT cleanly if 20 permits are busy!
+    try {
+        return jdbcClient.sql("SELECT ...").param(id).query(UserDto.class).single();
+    } finally {
+        dbGate.release();
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: <code>ThreadLocal</code> Memory Leak vs. Immutable <code>ScopedValue</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Mutable InheritableThreadLocal at Scale</span></div>
+<pre>static final ThreadLocal&lt;TenantCtx&gt; TENANT =
+    new InheritableThreadLocal&lt;&gt;();
+
+void handle(TenantCtx ctx) {
+    TENANT.set(ctx); // Mutable! Copies map into every VT spawned
+    runWork();       // Forgot finally { TENANT.remove(); } -> leak!
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: ScopedValue.where(...).call(...)</span></div>
+<pre>static final ScopedValue&lt;TenantCtx&gt; TENANT = ScopedValue.newInstance();
+
+OrderView handle(TenantCtx ctx) throws Exception {
+    return ScopedValue.where(TENANT, ctx).call(() -&gt; {
+        // Immutable &amp; auto-unbound on return/throw; O(1) child share!
+        return orderService.fetchCurrentTenantOrder();
+    });
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: Manual <code>CompletableFuture</code> Cancellation vs. <code>StructuredTaskScope.ShutdownOnFailure</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Orphaned CompletableFuture Siblings</span></div>
+<pre>var userFut = CompletableFuture.supplyAsync(() -&gt; fetchUser(id), vtExec);
+var riskFut = CompletableFuture.supplyAsync(() -&gt; fetchRisk(id), vtExec);
+// If userFut fails immediately, riskFut keeps burning downstream I/O!
+CompletableFuture.allOf(userFut, riskFut).join();
+return new Profile(userFut.join(), riskFut.join());</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: StructuredTaskScope.ShutdownOnFailure</span></div>
+<pre>try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Subtask&lt;User&gt; user = scope.fork(() -&gt; fetchUser(id));
+    Subtask&lt;Risk&gt; risk = scope.fork(() -&gt; fetchRisk(id));
+    scope.join()           // Waits for siblings to unwind (zero orphans!)
+         .throwIfFailed(); // Interrupts siblings immediately on 1st failure
+    return new Profile(user.get(), risk.get());
+}</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Implement each concurrency primitive in JavaScript and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>). Every starter contains an intentional bug you must fix.</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 21.1 · CARRIERPOOLSIMULATOR</span>
+            <h3 style="margin:8px 0 4px;">Simulate Java 21 Pinning vs. JEP 491 Carrier Unmounting</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>simulateVirtualSchedule(tasks, carrierCount, pinningMode)</code> for N carrier threads running M virtual tasks.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Each task is <code>{ id, cpuMs, ioMs, inMonitor }</code>; assign each task in order to the earliest-free carrier (tie-break lowest carrier index).<br/>
+          • If <code>pinningMode === 'JAVA_21_PIN'</code> and <code>task.inMonitor &amp;&amp; task.ioMs &gt; 0</code>, the task <strong>pins</strong> its carrier for <code>cpuMs + ioMs</code> and increments <code>pinnedCount</code>.<br/>
+          • Otherwise (<code>'JEP_491_UNMOUNT'</code> or non-blocking / non-monitor), the task occupies the carrier only for <code>cpuMs</code> and unmounts during <code>ioMs</code>.<br/>
+          • Return <code>{ totalTimeMs, pinnedCount, maxConcurrentIo }</code> using a sweep-line over <code>[startTime + cpuMs, startTime + cpuMs + ioMs)</code> for tasks with <code>ioMs &gt; 0</code> (process ends before starts on equal timestamps).
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_21_1_carrier_pool_simulator.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 21.2 · SCOPEDVALUECONTEXT</span>
+            <h3 style="margin:8px 0 4px;">Immutable Dynamic-Scoped <code>ScopedValue</code> + Snapshot Inheritance</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>createScopedContext()</code> returning <code>{ where, get, forkChild }</code> with exception-safe restoration and snapshot inheritance.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>get(key)</code> returns the binding in the active immutable scope (or <code>undefined</code>); expose no mutable <code>set()</code> API.<br/>
+          • <code>where(key, val, fn)</code> binds <code>key -&gt; val</code> on a fresh immutable snapshot extending outer bindings, invokes <code>fn()</code>, and restores the prior scope in <code>finally</code> (even if <code>fn</code> throws).<br/>
+          • <code>forkChild(fn)</code> captures the current immutable snapshot synchronously when called, runs <code>fn(childScope)</code> asynchronously via <code>Promise.resolve().then(...)</code> with both <code>ctx.get</code> (during sync turn) and <code>childScope.get</code> bound to that snapshot, then restores the caller scope.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_21_2_scoped_value_context.js</span><span>Immutability + try/finally + forkChild snapshot</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 21.3 · STRUCTUREDTSKSCOPERUNNER</span>
+            <h3 style="margin:8px 0 4px;"><code>StructuredTaskScope.ShutdownOnFailure</code> Fan-Out</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>structuredShutdownOnFailure(tasks)</code> running subtasks concurrently with immediate sibling cancellation on first error.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • Launch all <code>tasks[i](token)</code> concurrently, where each <code>token</code> exposes <code>token.aborted</code> (boolean) and <code>token.onAbort(cb)</code>.<br/>
+          • On the <strong>first</strong> task rejection/throw, immediately set all sibling tokens <code>aborted = true</code> and invoke registered <code>onAbort</code> callbacks.<br/>
+          • Wait for all subtasks to settle (zero leaked orphans), then rethrow the first error. If all succeed, return results in exact input order.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_21_3_structured_task_scope.js</span><span>Java StructuredTaskScope.ShutdownOnFailure equivalent</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in length so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Read <a href="https://openjdk.org/jeps/491" target="_blank" rel="noopener">OpenJDK JEP 491: Synchronize Virtual Threads without Pinning</a>,
+          review <a href="https://openjdk.org/jeps/506" target="_blank" rel="noopener">JEP 506: Scoped Values</a> and <a href="https://openjdk.org/jeps/505" target="_blank" rel="noopener">JEP 505: Structured Concurrency</a>,
+          and bookmark the <a href="../reference/spring-boot-concurrency.html">Spring Boot Concurrency &amp; Database Contention Cheat Sheet</a>.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"Why do JNI calls still pin after JEP 491?"</em>, <em>"How does Spring Boot's virtual thread executor work with HikariCP?"</em>, or <em>"Walk me through ScopedValue O(1) snapshot sharing"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0020-capstone-pulsequeue-fullstack.html">← Prev: Capstone 02 (PulseQueue)</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0022-spring-boot-virtual-threads-async-taskdecorator.html">Lesson 22 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_MODES = {
+      java21: {
+        badge: 'Mode: Java 21 (synchronized PINS)',
+        distinct: {
+          steps: [
+            {
+              c0: { cls: 'ta', txt: 'VT1: LOCK' }, c1: { cls: 'tb', txt: 'VT2: LOCK' },
+              vt: { VT1: 'running', VT2: 'running', VT3: 'queued', VT4: 'queued' },
+              pinned: 0, io: 0, done: 0, elapsed: '5ms', type: '',
+              msg: 'Carriers 0 & 1 mount VT-1 and VT-2; both enter distinct synchronized monitors.'
+            },
+            {
+              c0: { cls: 'pin', txt: 'VT1: PIN I/O' }, c1: { cls: 'pin', txt: 'VT2: PIN I/O' },
+              vt: { VT1: 'pinned', VT2: 'pinned', VT3: 'queued', VT4: 'queued' },
+              pinned: 2, io: 2, done: 0, elapsed: '55ms', type: 'bad',
+              msg: 'PINNED! Blocking Socket.read() inside synchronized traps Carriers 0 & 1; VT-3 & VT-4 starve in queue!'
+            },
+            {
+              c0: { cls: 'pin', txt: 'VT1: PIN I/O' }, c1: { cls: 'pin', txt: 'VT2: PIN I/O' },
+              vt: { VT1: 'pinned', VT2: 'pinned', VT3: 'queued', VT4: 'queued' },
+              pinned: 2, io: 2, done: 0, elapsed: '105ms', type: 'bad',
+              msg: 'Still pinned at 105ms: both OS carriers sit idle waiting on sockets while ForkJoinPool cannot mount VT-3/VT-4.'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT1: EXIT' }, c1: { cls: 'tb', txt: 'VT2: EXIT' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'running', VT4: 'running' },
+              pinned: 0, io: 0, done: 2, elapsed: '110ms', type: 'warn',
+              msg: 'VT-1 & VT-2 exit monitors and complete; Carriers 0 & 1 finally mount VT-3 & VT-4.'
+            },
+            {
+              c0: { cls: 'pin', txt: 'VT3: PIN I/O' }, c1: { cls: 'pin', txt: 'VT4: PIN I/O' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'pinned', VT4: 'pinned' },
+              pinned: 2, io: 2, done: 2, elapsed: '205ms', type: 'bad',
+              msg: 'VT-3 & VT-4 also pin Carriers 0 & 1 for 100ms I/O. Max I/O concurrency capped at 2!'
+            },
+            {
+              c0: { cls: 'ok', txt: 'VT3: DONE' }, c1: { cls: 'ok', txt: 'VT4: DONE' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'done', VT4: 'done' },
+              pinned: 0, io: 0, done: 4, elapsed: '210ms', type: 'bad',
+              msg: 'All 4 VTs finished in 210ms (serialized into 2 batches). Throughput collapsed!'
+            }
+          ],
+          verdict: { cls: 'callout danger', html: '<strong>Java 21 Throughput Collapse:</strong> 4 VTs took <code>210ms</code> (max <code>2</code> concurrent I/O) because <code>synchronized</code> pinned both carrier threads.' }
+        },
+        contended: {
+          steps: [
+            {
+              c0: { cls: 'ta', txt: 'VT1: LOCK' }, c1: { cls: 'tb', txt: 'VT2: WAIT' },
+              vt: { VT1: 'running', VT2: 'pinned', VT3: 'queued', VT4: 'queued' },
+              pinned: 1, io: 0, done: 0, elapsed: '5ms', type: 'bad',
+              msg: 'VT-1 acquires shared synchronized lock. VT-2 blocks on monitor entry AND pins Carrier 1!'
+            },
+            {
+              c0: { cls: 'pin', txt: 'VT1: PIN I/O' }, c1: { cls: 'pin', txt: 'VT2: WAIT PIN' },
+              vt: { VT1: 'pinned', VT2: 'pinned', VT3: 'queued', VT4: 'queued' },
+              pinned: 2, io: 1, done: 0, elapsed: '105ms', type: 'bad',
+              msg: 'Both carriers are pinned! VT-1 pins Carrier 0 on I/O while VT-2 pins Carrier 1 waiting for monitor.'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT1: UNLOCK' }, c1: { cls: 'tb', txt: 'VT2: LOCK' },
+              vt: { VT1: 'done', VT2: 'running', VT3: 'running', VT4: 'queued' },
+              pinned: 0, io: 0, done: 1, elapsed: '110ms', type: 'warn',
+              msg: 'VT-1 releases monitor; Carrier 0 picks up VT-3, which immediately hits lock contention.'
+            },
+            {
+              c0: { cls: 'pin', txt: 'VT3: WAIT PIN' }, c1: { cls: 'pin', txt: 'VT2: PIN I/O' },
+              vt: { VT1: 'done', VT2: 'pinned', VT3: 'pinned', VT4: 'queued' },
+              pinned: 2, io: 1, done: 1, elapsed: '210ms', type: 'bad',
+              msg: 'VT-2 pins Carrier 1 on I/O; VT-3 pins Carrier 0 waiting to enter synchronized. VT-4 cannot even start!'
+            },
+            {
+              c0: { cls: 'pin', txt: 'VT3: PIN I/O' }, c1: { cls: 'pin', txt: 'VT4: WAIT PIN' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'pinned', VT4: 'pinned' },
+              pinned: 2, io: 1, done: 2, elapsed: '315ms', type: 'bad',
+              msg: 'VT-3 runs I/O pinned; VT-4 blocks pinned on Carrier 1.'
+            },
+            {
+              c0: { cls: 'ok', txt: 'VT3: DONE' }, c1: { cls: 'ok', txt: 'VT4: DONE' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'done', VT4: 'done' },
+              pinned: 0, io: 0, done: 4, elapsed: '420ms', type: 'bad',
+              msg: 'Finished in 420ms with constant carrier pinning on both I/O and monitor contention.'
+            }
+          ],
+          verdict: { cls: 'callout danger', html: '<strong>Severe Java 21 Contention Pinning:</strong> Both monitor waiters and I/O holders pinned carriers, finishing in <code>420ms</code>.' }
+        }
+      },
+      jep491: {
+        badge: 'Mode: Java 24+ JEP 491 (UNMOUNTS)',
+        distinct: {
+          steps: [
+            {
+              c0: { cls: 'ta', txt: 'VT1: LOCK' }, c1: { cls: 'tb', txt: 'VT2: LOCK' },
+              vt: { VT1: 'running', VT2: 'running', VT3: 'queued', VT4: 'queued' },
+              pinned: 0, io: 0, done: 0, elapsed: '5ms', type: '',
+              msg: 'Carriers 0 & 1 mount VT-1 and VT-2; VT-1 & VT-2 acquire ObjectMonitors directly on their virtual threads.'
+            },
+            {
+              c0: { cls: 'ok', txt: 'VT1: UNMOUNT' }, c1: { cls: 'ok', txt: 'VT2: UNMOUNT' },
+              vt: { VT1: 'unmounted', VT2: 'unmounted', VT3: 'queued', VT4: 'queued' },
+              pinned: 0, io: 2, done: 0, elapsed: '6ms', type: 'good',
+              msg: 'JEP 491! VT-1 & VT-2 hit Socket.read() inside synchronized and UNMOUNT cleanly to heap StackChunks!'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT3: LOCK' }, c1: { cls: 'tb', txt: 'VT4: LOCK' },
+              vt: { VT1: 'unmounted', VT2: 'unmounted', VT3: 'running', VT4: 'running' },
+              pinned: 0, io: 2, done: 0, elapsed: '10ms', type: 'good',
+              msg: 'Free Carriers 0 & 1 immediately mount VT-3 & VT-4 while VT-1 & VT-2 await socket bytes.'
+            },
+            {
+              c0: { cls: 'ok', txt: 'VT3: UNMOUNT' }, c1: { cls: 'ok', txt: 'VT4: UNMOUNT' },
+              vt: { VT1: 'unmounted', VT2: 'unmounted', VT3: 'unmounted', VT4: 'unmounted' },
+              pinned: 0, io: 4, done: 0, elapsed: '11ms', type: 'good',
+              msg: 'ALL 4 VTs are simultaneously unmounted performing I/O concurrently! Zero pinned carriers.'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT1/3: RESUME' }, c1: { cls: 'tb', txt: 'VT2/4: RESUME' },
+              vt: { VT1: 'running', VT2: 'running', VT3: 'running', VT4: 'running' },
+              pinned: 0, io: 0, done: 2, elapsed: '106ms', type: 'good',
+              msg: 'Socket data arrives; Carriers remount VT-1..VT-4, which exit their monitors cleanly.'
+            },
+            {
+              c0: { cls: 'ok', txt: 'ALL DONE' }, c1: { cls: 'ok', txt: '0 PINNED' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'done', VT4: 'done' },
+              pinned: 0, io: 0, done: 4, elapsed: '110ms', type: 'good',
+              msg: 'All 4 VTs finished in 110ms (~2x faster) with 4 concurrent I/O operations and 0 pins!'
+            }
+          ],
+          verdict: { cls: 'callout tip', html: '<strong>JEP 491 Clean Unmounting:</strong> 4 VTs finished in <code>110ms</code> with <code>4</code> concurrent I/O operations and <code>0</code> pinned carriers!' }
+        },
+        contended: {
+          steps: [
+            {
+              c0: { cls: 'ta', txt: 'VT1: LOCK' }, c1: { cls: 'tb', txt: 'VT2: UNMOUNT' },
+              vt: { VT1: 'running', VT2: 'unmounted', VT3: 'queued', VT4: 'queued' },
+              pinned: 0, io: 0, done: 0, elapsed: '5ms', type: 'good',
+              msg: 'VT-1 acquires shared monitor. VT-2 cannot enter, so under JEP 491 VT-2 UNMOUNTS to the monitor wait queue!'
+            },
+            {
+              c0: { cls: 'ok', txt: 'VT1: UNMOUNT' }, c1: { cls: 'tb', txt: 'VT3: UNMOUNT' },
+              vt: { VT1: 'unmounted', VT2: 'unmounted', VT3: 'unmounted', VT4: 'running' },
+              pinned: 0, io: 1, done: 0, elapsed: '10ms', type: 'good',
+              msg: 'VT-1 unmounts for I/O while holding monitor; free carriers let VT-3 & VT-4 do pre-lock CPU work without pinning!'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT1: UNLOCK' }, c1: { cls: 'tb', txt: 'VT2: WAKE' },
+              vt: { VT1: 'done', VT2: 'running', VT3: 'unmounted', VT4: 'unmounted' },
+              pinned: 0, io: 0, done: 1, elapsed: '105ms', type: 'good',
+              msg: 'VT-1 finishes I/O, releases monitor, and wakes VT-2 cleanly on Carrier 1.'
+            },
+            {
+              c0: { cls: 'idle', txt: 'C0: FREE' }, c1: { cls: 'ok', txt: 'VT2: UNMOUNT' },
+              vt: { VT1: 'done', VT2: 'unmounted', VT3: 'unmounted', VT4: 'unmounted' },
+              pinned: 0, io: 1, done: 1, elapsed: '205ms', type: 'good',
+              msg: 'Carrier 0 remains completely free for unrelated app requests while VT-2..VT-4 serialize only the critical section.'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT3: I/O' }, c1: { cls: 'tb', txt: 'VT4: I/O' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'done', VT4: 'running' },
+              pinned: 0, io: 1, done: 3, elapsed: '315ms', type: 'good',
+              msg: 'VT-3 finishes and hands off monitor to VT-4—zero carrier threads were ever pinned.'
+            },
+            {
+              c0: { cls: 'ok', txt: 'DONE' }, c1: { cls: 'ok', txt: '0 PINNED' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'done', VT4: 'done' },
+              pinned: 0, io: 0, done: 4, elapsed: '410ms', type: 'good',
+              msg: 'Critical section serialized safely AND Carriers stayed free for other HTTP traffic the entire time!'
+            }
+          ],
+          verdict: { cls: 'callout tip', html: '<strong>JEP 491 Contention Resilience:</strong> Shared lock still serializes critical work, but <code>0</code> carriers pinned—other requests never starve!' }
+        }
+      },
+      reentrant: {
+        badge: 'Mode: ReentrantLock (Java 21+)',
+        distinct: {
+          steps: [
+            {
+              c0: { cls: 'ta', txt: 'VT1: rLock()' }, c1: { cls: 'tb', txt: 'VT2: rLock()' },
+              vt: { VT1: 'running', VT2: 'running', VT3: 'queued', VT4: 'queued' },
+              pinned: 0, io: 0, done: 0, elapsed: '5ms', type: '',
+              msg: 'VT-1 & VT-2 acquire separate ReentrantLocks (park/unpark uses LockSupport, never carrier monitors).'
+            },
+            {
+              c0: { cls: 'ok', txt: 'VT1: UNMOUNT' }, c1: { cls: 'ok', txt: 'VT2: UNMOUNT' },
+              vt: { VT1: 'unmounted', VT2: 'unmounted', VT3: 'queued', VT4: 'queued' },
+              pinned: 0, io: 2, done: 0, elapsed: '6ms', type: 'good',
+              msg: 'Even on Java 21, VT-1 & VT-2 unmount cleanly on I/O while holding ReentrantLocks.'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT3: rLock()' }, c1: { cls: 'tb', txt: 'VT4: rLock()' },
+              vt: { VT1: 'unmounted', VT2: 'unmounted', VT3: 'running', VT4: 'running' },
+              pinned: 0, io: 2, done: 0, elapsed: '10ms', type: 'good',
+              msg: 'Carriers 0 & 1 mount VT-3 & VT-4 immediately.'
+            },
+            {
+              c0: { cls: 'ok', txt: 'VT3: UNMOUNT' }, c1: { cls: 'ok', txt: 'VT4: UNMOUNT' },
+              vt: { VT1: 'unmounted', VT2: 'unmounted', VT3: 'unmounted', VT4: 'unmounted' },
+              pinned: 0, io: 4, done: 0, elapsed: '11ms', type: 'good',
+              msg: 'All 4 VTs await I/O concurrently on heap StackChunks with 0 pinned carriers.'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT1/3: UNLOCK' }, c1: { cls: 'tb', txt: 'VT2/4: UNLOCK' },
+              vt: { VT1: 'running', VT2: 'running', VT3: 'running', VT4: 'running' },
+              pinned: 0, io: 0, done: 2, elapsed: '106ms', type: 'good',
+              msg: 'VTs resume on available carriers and release ReentrantLocks inside finally blocks.'
+            },
+            {
+              c0: { cls: 'ok', txt: 'ALL DONE' }, c1: { cls: 'ok', txt: '0 PINNED' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'done', VT4: 'done' },
+              pinned: 0, io: 0, done: 4, elapsed: '110ms', type: 'good',
+              msg: 'Completed in 110ms with 4 concurrent I/O operations—identical unmounting efficiency on Java 21+.'
+            }
+          ],
+          verdict: { cls: 'callout tip', html: '<strong>ReentrantLock Unmounting (Java 21+):</strong> <code>110ms</code> total, <code>4</code> concurrent I/O, <code>0</code> carrier pins—even prior to JDK 24.' }
+        },
+        contended: {
+          steps: [
+            {
+              c0: { cls: 'ta', txt: 'VT1: rLock()' }, c1: { cls: 'tb', txt: 'VT2: PARK VT' },
+              vt: { VT1: 'running', VT2: 'unmounted', VT3: 'queued', VT4: 'queued' },
+              pinned: 0, io: 0, done: 0, elapsed: '5ms', type: 'good',
+              msg: 'VT-1 holds shared ReentrantLock; VT-2 calls lock() -> AbstractQueuedSynchronizer parks VT-2 (unmounted!).'
+            },
+            {
+              c0: { cls: 'ok', txt: 'VT1: UNMOUNT' }, c1: { cls: 'tb', txt: 'VT3: PARK VT' },
+              vt: { VT1: 'unmounted', VT2: 'unmounted', VT3: 'unmounted', VT4: 'running' },
+              pinned: 0, io: 1, done: 0, elapsed: '10ms', type: 'good',
+              msg: 'VT-1 unmounts on I/O; VT-3 & VT-4 park cleanly on AQS queue without touching carrier threads.'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT1: UNLOCK' }, c1: { cls: 'tb', txt: 'VT2: UNPARK' },
+              vt: { VT1: 'done', VT2: 'running', VT3: 'unmounted', VT4: 'unmounted' },
+              pinned: 0, io: 0, done: 1, elapsed: '105ms', type: 'good',
+              msg: 'VT-1 unlocks and unparks VT-2; Carrier 0 stays free for unrelated server requests.'
+            },
+            {
+              c0: { cls: 'idle', txt: 'C0: FREE' }, c1: { cls: 'ok', txt: 'VT2: UNMOUNT' },
+              vt: { VT1: 'done', VT2: 'unmounted', VT3: 'unmounted', VT4: 'unmounted' },
+              pinned: 0, io: 1, done: 1, elapsed: '205ms', type: 'good',
+              msg: 'VT-2 unmounts for I/O; carriers stay healthy and unpinned.'
+            },
+            {
+              c0: { cls: 'ta', txt: 'VT3: I/O' }, c1: { cls: 'tb', txt: 'VT4: I/O' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'done', VT4: 'running' },
+              pinned: 0, io: 1, done: 3, elapsed: '315ms', type: 'good',
+              msg: 'VT-3 completes and unparks VT-4 cleanly.'
+            },
+            {
+              c0: { cls: 'ok', txt: 'DONE' }, c1: { cls: 'ok', txt: '0 PINNED' },
+              vt: { VT1: 'done', VT2: 'done', VT3: 'done', VT4: 'done' },
+              pinned: 0, io: 0, done: 4, elapsed: '410ms', type: 'good',
+              msg: 'Zero carrier pins under contention; plus ReentrantLock supports tryLock(timeout) for backpressure!'
+            }
+          ],
+          verdict: { cls: 'callout tip', html: '<strong>ReentrantLock Contention Control:</strong> <code>0</code> carrier pins on Java 21–25+, plus timeout/fairness support via <code>tryLock</code>.' }
+        }
+      }
+    };
+
+    let simMode = 'java21';
+    let simScenario = 'distinct';
+    let simStepIdx = 0;
+    let simTimer = null;
+
+    function currentSteps() {
+      return SIM_MODES[simMode][simScenario];
+    }
+
+    function renderVtStates(vtObj) {
+      const row = document.getElementById('vt-state-row');
+      const labels = {
+        running: 'MOUNTED',
+        pinned: 'PINNED!',
+        unmounted: 'UNMOUNTED',
+        queued: 'QUEUED',
+        done: 'DONE'
+      };
+      row.innerHTML = ['VT1', 'VT2', 'VT3', 'VT4'].map((k) => {
+        const st = vtObj[k] || 'queued';
+        return `<span class="vt-chip ${st}">${k}: ${labels[st]}</span>`;
+      }).join('');
+    }
+
+    function resetSim() {
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        document.getElementById('sim-play').textContent = '▶ Play';
+      }
+      simStepIdx = 0;
+      const sc = currentSteps();
+      document.getElementById('lane-c0').innerHTML = '';
+      document.getElementById('lane-c1').innerHTML = '';
+      document.getElementById('sim-mode-badge').textContent = SIM_MODES[simMode].badge;
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${sc.steps.length}`;
+      renderVtStates({ VT1: 'queued', VT2: 'queued', VT3: 'queued', VT4: 'queued' });
+      document.getElementById('stat-pinned').textContent = '0';
+      document.getElementById('stat-io').textContent = '0';
+      document.getElementById('stat-done').textContent = '0 / 4';
+      document.getElementById('stat-elapsed').textContent = '0ms';
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step → or ▶ Play to run carrier simulation.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Toggle <strong>Java 21</strong> vs <strong>Java 24+ JEP 491</strong> vs <strong>ReentrantLock</strong> and step through.';
+    }
+
+    function stepSim() {
+      const sc = currentSteps();
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById('sim-play').textContent = '▶ Play';
+        }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      const appendSlot = (id, slot) => {
+        if (!slot) return;
+        const d = document.createElement('div');
+        d.className = `slot ${slot.cls}`;
+        d.textContent = slot.txt;
+        document.getElementById(id).appendChild(d);
+      };
+      appendSlot('lane-c0', s.c0);
+      appendSlot('lane-c1', s.c1);
+      renderVtStates(s.vt);
+
+      document.getElementById('stat-pinned').textContent = String(s.pinned);
+      document.getElementById('stat-io').textContent = String(s.io);
+      document.getElementById('stat-done').textContent = `${s.done} / 4`;
+      document.getElementById('stat-elapsed').textContent = s.elapsed;
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${sc.steps.length}`;
+
+      const logEl = document.getElementById('sim-log');
+      if (simStepIdx === 1) logEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.className = `trace-line ${s.type}`;
+      line.textContent = `[${simStepIdx}] ${s.msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.verdict.cls;
+        v.innerHTML = sc.verdict.html;
+      }
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        simMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+
+    document.querySelectorAll('#sim-scenarios button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-scenarios button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        simScenario = btn.dataset.scenario;
+        resetSim();
+      });
+    });
+
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        btn.textContent = '▶ Play';
+      } else {
+        if (simStepIdx >= currentSteps().steps.length) resetSim();
+        btn.textContent = '⏸ Pause';
+        simTimer = setInterval(stepSim, 800);
+      }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'simulateVirtualSchedule',
+        starter: `function simulateVirtualSchedule(tasks, carrierCount, pinningMode) {
+  // BUG: Always pins the carrier for cpuMs + ioMs regardless of pinningMode or inMonitor!
+  if (!tasks || tasks.length === 0) return { totalTimeMs: 0, pinnedCount: 0, maxConcurrentIo: 0 };
+  const carriers = new Array(Math.max(1, carrierCount)).fill(0);
+  let totalTimeMs = 0;
+  for (const task of tasks) {
+    let minIdx = 0;
+    for (let i = 1; i < carriers.length; i++) {
+      if (carriers[i] < carriers[minIdx]) minIdx = i;
+    }
+    const end = carriers[minIdx] + task.cpuMs + task.ioMs;
+    carriers[minIdx] = end;
+    totalTimeMs = Math.max(totalTimeMs, end);
+  }
+  return { totalTimeMs, pinnedCount: 0, maxConcurrentIo: 1 };
+}`,
+        hints: [
+          'Pick the carrier `minIdx` with the smallest `carriers[i]` (startTime = carriers[minIdx]).',
+          'Carrier is occupied until `startTime + task.cpuMs + (pins ? task.ioMs : 0)`, where `pins = (pinningMode === "JAVA_21_PIN" && !!task.inMonitor && task.ioMs > 0)`.',
+          'For `maxConcurrentIo`, push `[ioStart, +1]` and `[ioEnd, -1]` for every task with `ioMs > 0`, sort by time (end `-1` before start `+1` on ties), and track peak active count.'
+        ],
+        solution: `function simulateVirtualSchedule(tasks, carrierCount, pinningMode) {
+  if (!tasks || tasks.length === 0) {
+    return { totalTimeMs: 0, pinnedCount: 0, maxConcurrentIo: 0 };
+  }
+  const carriers = new Array(Math.max(1, carrierCount)).fill(0);
+  const ioEvents = [];
+  let totalTimeMs = 0;
+  let pinnedCount = 0;
+
+  for (const task of tasks) {
+    let minIdx = 0;
+    for (let i = 1; i < carriers.length; i++) {
+      if (carriers[i] < carriers[minIdx]) minIdx = i;
+    }
+    const startTime = carriers[minIdx];
+    const pinsCarrier = pinningMode === 'JAVA_21_PIN' && !!task.inMonitor && task.ioMs > 0;
+    if (pinsCarrier) pinnedCount++;
+
+    carriers[minIdx] = startTime + task.cpuMs + (pinsCarrier ? task.ioMs : 0);
+    const ioStart = startTime + task.cpuMs;
+    const ioEnd = ioStart + task.ioMs;
+    totalTimeMs = Math.max(totalTimeMs, ioEnd);
+
+    if (task.ioMs > 0) {
+      ioEvents.push([ioStart, 1]);
+      ioEvents.push([ioEnd, -1]);
+    }
+  }
+
+  ioEvents.sort((a, b) => (a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1]));
+  let activeIo = 0;
+  let maxConcurrentIo = 0;
+  for (const [, delta] of ioEvents) {
+    activeIo += delta;
+    if (activeIo > maxConcurrentIo) maxConcurrentIo = activeIo;
+  }
+
+  return { totalTimeMs, pinnedCount, maxConcurrentIo };
+}`,
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        kotlinEquivalent: `// Java 24+ (JEP 491): synchronized unmounts cleanly on Socket I/O!
+// On Java 21, run with -Djdk.tracePinnedThreads=full to catch pinning
+// or replace synchronized around I/O with ReentrantLock:
+private final Object legacyMonitor = new Object();
+
+public String fetchInsideMonitor(HttpClient client, URI uri) throws Exception {
+    synchronized (legacyMonitor) {
+        // Java 21: pins carrier thread for full HTTP round-trip!
+        // Java 24+ (JEP 491): virtual thread unmounts cleanly during send()!
+        return client.send(HttpRequest.newBuilder(uri).build(),
+                HttpResponse.BodyHandlers.ofString()).body();
+    }
+}`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Empty task list returns zero metrics',
+            run: () => assertDeepEq(fn([], 2, 'JAVA_21_PIN'), { totalTimeMs: 0, pinnedCount: 0, maxConcurrentIo: 0 })
+          },
+          {
+            name: 'JAVA_21_PIN: 4 monitor+I/O tasks on 2 carriers pin carriers (210ms, maxConcurrentIo=2)',
+            run: () => {
+              const tasks = [
+                { id: 'V1', cpuMs: 5, ioMs: 100, inMonitor: true },
+                { id: 'V2', cpuMs: 5, ioMs: 100, inMonitor: true },
+                { id: 'V3', cpuMs: 5, ioMs: 100, inMonitor: true },
+                { id: 'V4', cpuMs: 5, ioMs: 100, inMonitor: true }
+              ];
+              assertDeepEq(fn(tasks, 2, 'JAVA_21_PIN'), { totalTimeMs: 210, pinnedCount: 4, maxConcurrentIo: 2 });
+            }
+          },
+          {
+            name: 'JEP_491_UNMOUNT: same 4 tasks unmount cleanly (110ms, 0 pins, maxConcurrentIo=4)',
+            run: () => {
+              const tasks = [
+                { id: 'V1', cpuMs: 5, ioMs: 100, inMonitor: true },
+                { id: 'V2', cpuMs: 5, ioMs: 100, inMonitor: true },
+                { id: 'V3', cpuMs: 5, ioMs: 100, inMonitor: true },
+                { id: 'V4', cpuMs: 5, ioMs: 100, inMonitor: true }
+              ];
+              assertDeepEq(fn(tasks, 2, 'JEP_491_UNMOUNT'), { totalTimeMs: 110, pinnedCount: 0, maxConcurrentIo: 4 });
+            }
+          },
+          {
+            name: 'Mixed workload: non-monitor & zero-IO tasks do not pin under JAVA_21_PIN',
+            run: () => {
+              const tasks = [
+                { id: 'V1', cpuMs: 10, ioMs: 50, inMonitor: false },
+                { id: 'V2', cpuMs: 10, ioMs: 0, inMonitor: true },
+                { id: 'V3', cpuMs: 10, ioMs: 80, inMonitor: true },
+                { id: 'V4', cpuMs: 10, ioMs: 40, inMonitor: false }
+              ];
+              assertDeepEq(fn(tasks, 2, 'JAVA_21_PIN'), { totalTimeMs: 100, pinnedCount: 1, maxConcurrentIo: 3 });
+            }
+          }
+        ])
+      },
+      2: {
+        fnName: 'createScopedContext',
+        starter: `function createScopedContext() {
+  // BUG: Mutable shared map never restores previous scope on throw/exit,
+  // and forkChild reads the live mutable map instead of an immutable snapshot!
+  const map = {};
+  return {
+    get(key) {
+      return map[key];
+    },
+    where(key, val, fn) {
+      map[key] = val;
+      return fn();
+    },
+    forkChild(fn) {
+      return Promise.resolve().then(() => fn({ get: (k) => map[k] }));
+    }
+  };
+}`,
+        hints: [
+          'Store `let currentScope = Object.freeze(Object.create(null));` instead of a mutable map.',
+          'In `where(key, val, fn)`, clone `currentScope` into a new frozen object with `next[key] = val`, swap `currentScope = next`, and restore `currentScope = prev` inside `finally`.',
+          'In `forkChild(fn)`, capture `const snapshot = currentScope;` synchronously, then inside `Promise.resolve().then(...)` swap `currentScope = snapshot` around `fn(childCtx)` in `try/finally`.'
+        ],
+        solution: `function createScopedContext() {
+  let currentScope = Object.freeze(Object.create(null));
+
+  function makeReader(scopeObj) {
+    return Object.freeze({
+      get(key) {
+        return Object.prototype.hasOwnProperty.call(scopeObj, key) ? scopeObj[key] : undefined;
+      }
+    });
+  }
+
+  return {
+    get(key) {
+      return Object.prototype.hasOwnProperty.call(currentScope, key) ? currentScope[key] : undefined;
+    },
+    where(key, val, fn) {
+      const prev = currentScope;
+      const next = Object.create(null);
+      for (const k of Object.keys(prev)) {
+        next[k] = prev[k];
+      }
+      next[key] = val;
+      currentScope = Object.freeze(next);
+      try {
+        return fn();
+      } finally {
+        currentScope = prev;
+      }
+    },
+    forkChild(fn) {
+      const snapshot = currentScope;
+      const childReader = makeReader(snapshot);
+      return Promise.resolve().then(() => {
+        const prev = currentScope;
+        currentScope = snapshot;
+        try {
+          return fn(childReader);
+        } finally {
+          currentScope = prev;
+        }
+      });
+    }
+  };
+}`,
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        kotlinEquivalent: `public final class TenantContext {
+    public static final ScopedValue<String> TENANT_ID = ScopedValue.newInstance();
+    public static final ScopedValue<String> TRACE_ID  = ScopedValue.newInstance();
+}
+
+// Controller / filter binds immutable scope; auto-cleans even on exception:
+ScopedValue.where(TenantContext.TENANT_ID, "acme")
+    .where(TenantContext.TRACE_ID, traceId)
+    .call(() -> {
+        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+            // Child virtual threads inherit TENANT_ID & TRACE_ID in O(1)!
+            var orders = scope.fork(() -> orderClient.fetch(TenantContext.TENANT_ID.get()));
+            var quota  = scope.fork(() -> quotaClient.fetch(TenantContext.TENANT_ID.get()));
+            scope.join().throwIfFailed();
+            return new Dashboard(orders.get(), quota.get());
+        }
+    });`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Immutable API: no set(), unbound returns undefined, where() cleans up on return',
+            run: () => {
+              const ctx = fn();
+              assertEq(typeof ctx.set, 'undefined', 'ScopedValue must not expose mutable set()');
+              assertEq(ctx.get('tenant'), undefined);
+              const res = ctx.where('tenant', 'acme', () => ctx.get('tenant'));
+              assertEq(res, 'acme');
+              assertEq(ctx.get('tenant'), undefined, 'Outer scope must return to undefined after exit');
+            }
+          },
+          {
+            name: 'Nested shadowing and exception safety: restores prior binding on throw',
+            run: () => {
+              const ctx = fn();
+              ctx.where('tenant', 'outer', () => {
+                ctx.where('role', 'admin', () => {
+                  assertEq(ctx.get('tenant'), 'outer');
+                  assertEq(ctx.get('role'), 'admin');
+                  let threw = false;
+                  try {
+                    ctx.where('tenant', 'shadowed', () => {
+                      assertEq(ctx.get('tenant'), 'shadowed');
+                      throw new Error('boom');
+                    });
+                  } catch (e) {
+                    threw = true;
+                  }
+                  assertEq(threw, true);
+                  assertEq(ctx.get('tenant'), 'outer', 'Outer tenant must be restored after throw');
+                  assertEq(ctx.get('role'), 'admin', 'Sibling binding role must stay intact');
+                });
+                assertEq(ctx.get('role'), undefined, 'Inner role must be cleared');
+                assertEq(ctx.get('tenant'), 'outer');
+              });
+              assertEq(ctx.get('tenant'), undefined);
+            }
+          },
+          {
+            name: 'forkChild propagates immutable snapshot even after outer where() exits or shadows',
+            run: async () => {
+              const ctx = fn();
+              let childA, childB;
+              ctx.where('tenant', 'acme', () => {
+                ctx.where('trace', 't-100', () => {
+                  childA = ctx.forkChild(() => `${ctx.get('tenant')}:${ctx.get('trace')}`);
+                  ctx.where('tenant', 'beta', () => {
+                    childB = ctx.forkChild(async (childScope) => {
+                      await new Promise((r) => setTimeout(r, 10));
+                      return `${childScope.get('tenant')}:${childScope.get('trace')}`;
+                    });
+                  });
+                });
+              });
+              assertEq(ctx.get('tenant'), undefined);
+              assertEq(await childA, 'acme:t-100', 'Child A must still read acme:t-100 after where() exited');
+              assertEq(await childB, 'beta:t-100', 'Child B must read shadowed beta:t-100 after await');
+              assertEq(ctx.get('tenant'), undefined, 'Caller scope remains clean after children complete');
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'structuredShutdownOnFailure',
+        starter: `async function structuredShutdownOnFailure(tasks) {
+  // BUG: Uses raw Promise.all with dummy tokens — never cancels siblings on first failure!
+  return Promise.all(tasks.map((taskFn) => taskFn({ aborted: false, onAbort: () => {} })));
+}`,
+        hints: [
+          'Maintain shared `let cancelled = false;` and a list of abort callbacks `const listeners = [];`.',
+          'Create a `token` per task with `get aborted() { return cancelled; }` and `onAbort(cb)` (invoke `cb()` immediately if already cancelled).',
+          'Run all `(async () => taskFn(token))()` in parallel, trigger `shutdown()` inside `.catch(err)` on the first failure, wait for `Promise.all` of all wrapped promises, then `if (hasError) throw firstError;`.'
+        ],
+        solution: `async function structuredShutdownOnFailure(tasks) {
+  if (!tasks || tasks.length === 0) return [];
+  let cancelled = false;
+  const listeners = [];
+
+  function triggerShutdown() {
+    if (cancelled) return;
+    cancelled = true;
+    while (listeners.length > 0) {
+      const cb = listeners.shift();
+      try {
+        cb();
+      } catch (_) {}
+    }
+  }
+
+  function createToken() {
+    return {
+      get aborted() {
+        return cancelled;
+      },
+      onAbort(cb) {
+        if (cancelled) {
+          try { cb(); } catch (_) {}
+        } else {
+          listeners.push(cb);
+        }
+      }
+    };
+  }
+
+  const results = new Array(tasks.length);
+  let hasError = false;
+  let firstError = null;
+
+  const wrapped = tasks.map((taskFn, idx) => {
+    const token = createToken();
+    return (async () => taskFn(token))()
+      .then((val) => {
+        results[idx] = val;
+      })
+      .catch((err) => {
+        if (!hasError) {
+          hasError = true;
+          firstError = err;
+          triggerShutdown();
+        }
+      });
+  });
+
+  await Promise.all(wrapped);
+  if (hasError) throw firstError;
+  return results;
+}`,
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        kotlinEquivalent: `public OrderBundle fetchOrderBundle(String orderId) throws Exception {
+    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+        Subtask<Order> orderTask   = scope.fork(() -> orderRepo.findById(orderId));
+        Subtask<Payment> payTask   = scope.fork(() -> paymentClient.getStatus(orderId));
+        Subtask<Shipping> shipTask = scope.fork(() -> shippingClient.track(orderId));
+
+        scope.join()           // Interrupts remaining subtasks on 1st exception & waits
+             .throwIfFailed(); // Rethrows original cause cleanly
+
+        return new OrderBundle(orderTask.get(), payTask.get(), shipTask.get());
+    }
+}`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Empty task array returns []',
+            run: async () => assertDeepEq(await fn([]), [])
+          },
+          {
+            name: 'All succeed concurrently and preserve exact input order',
+            run: async () => {
+              const t0 = Date.now();
+              const res = await fn([
+                async () => { await new Promise((r) => setTimeout(r, 35)); return 'first'; },
+                async () => { await new Promise((r) => setTimeout(r, 5)); return 'second'; },
+                async () => { await new Promise((r) => setTimeout(r, 20)); return 'third'; }
+              ]);
+              const elapsed = Date.now() - t0;
+              assertDeepEq(res, ['first', 'second', 'third']);
+              assertEq(elapsed < 55, true, `Expected concurrent execution < 55ms, took ${elapsed}ms`);
+            }
+          },
+          {
+            name: 'First failure cancels all sibling tokens immediately and waits for cleanup',
+            run: async () => {
+              let sibling1Cleaned = false;
+              let sibling2Cleaned = false;
+              let sibling1Token = null;
+              let sibling2Token = null;
+              const t0 = Date.now();
+              let caught = null;
+
+              try {
+                await fn([
+                  async () => {
+                    await new Promise((r) => setTimeout(r, 10));
+                    throw new Error('DB_TIMEOUT');
+                  },
+                  (token) => new Promise((resolve) => {
+                    sibling1Token = token;
+                    const timer = setTimeout(() => resolve('late1'), 250);
+                    token.onAbort(() => {
+                      if (typeof clearTimeout === 'function') clearTimeout(timer);
+                      sibling1Cleaned = true;
+                      resolve('cancelled1');
+                    });
+                  }),
+                  (token) => new Promise((resolve) => {
+                    sibling2Token = token;
+                    const timer = setTimeout(() => resolve('late2'), 250);
+                    token.onAbort(() => {
+                      if (typeof clearTimeout === 'function') clearTimeout(timer);
+                      sibling2Cleaned = true;
+                      resolve('cancelled2');
+                    });
+                  })
+                ]);
+              } catch (e) {
+                caught = e;
+              }
+
+              const elapsed = Date.now() - t0;
+              assertEq(caught && caught.message, 'DB_TIMEOUT', 'Must throw first failure');
+              assertEq(sibling1Token && sibling1Token.aborted, true, 'Sibling 1 token must be aborted');
+              assertEq(sibling2Token && sibling2Token.aborted, true, 'Sibling 2 token must be aborted');
+              assertEq(sibling1Cleaned, true, 'Sibling 1 cleanup callback must run');
+              assertEq(sibling2Cleaned, true, 'Sibling 2 cleanup callback must run');
+              assertEq(elapsed < 120, true, `Expected fail-fast < 120ms, took ${elapsed}ms`);
+            }
+          },
+          {
+            name: 'Reports the earliest error when multiple subtasks fail',
+            run: async () => {
+              let caught = null;
+              let slowAborted = false;
+              try {
+                await fn([
+                  async () => { await new Promise((r) => setTimeout(r, 25)); throw new Error('SECOND_ERR'); },
+                  async () => { await new Promise((r) => setTimeout(r, 5)); throw new Error('FIRST_ERR'); },
+                  (token) => new Promise((resolve) => {
+                    const timer = setTimeout(resolve, 200);
+                    token.onAbort(() => { if (typeof clearTimeout === 'function') clearTimeout(timer); slowAborted = true; resolve(); });
+                  })
+                ]);
+              } catch (e) {
+                caught = e;
+              }
+              assertEq(caught && caught.message, 'FIRST_ERR');
+              assertEq(slowAborted, true);
+            }
+          }
+        ])
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. On JDK 24+ (with JEP 491 enabled), which blocking operation still pins a virtual thread to its carrier OS thread?',
+        code: `Thread.startVirtualThread(() -> {\n    synchronized (lock) { socket.read(); } // vs native JNI / <clinit>\n});`,
+        options: [
+          'Blocking on network socket I/O inside a synchronized block holding a monitor lock.',
+          'Waiting to acquire an already contended synchronized monitor lock from another virtual thread.',
+          'Executing a blocking callback inside a JNI native frame or class static initializer.',
+          'Parking on Semaphore.acquire() or ReentrantLock.lock() inside an active virtual thread worker task.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): JEP 491 moved monitor ownership onto virtual threads, so blocking I/O inside synchronized unmounts cleanly on JDK 24+.',
+          'WRONG (B): Under JEP 491, virtual threads waiting to enter a contended synchronized monitor also unmount rather than pinning carriers.',
+          'CORRECT (C): Native C frames (JNI/FFM upcalls) and class initialization (<clinit>) cannot be frozen onto heap StackChunks, so they still pin.',
+          'WRONG (D): Semaphore and ReentrantLock use LockSupport.park(), which has unmounted virtual threads cleanly since Java 21.'
+        ]
+      },
+      {
+        stem: '2. Why is wrapping Virtual Threads inside Executors.newFixedThreadPool(100, Thread.ofVirtual().factory()) a production anti-pattern?',
+        code: `ExecutorService bad = Executors.newFixedThreadPool(100, Thread.ofVirtual().factory());`,
+        options: [
+          'Pooling retains ThreadLocal state across tasks and defeats lightweight per-task virtual thread isolation.',
+          'Virtual threads always throw IllegalStateException whenever submitted through any standard Java ExecutorService interface.',
+          'FixedThreadPool forces virtual threads to allocate native ten-megabyte OS call stacks on startup.',
+          'Pooling virtual threads silently converts every blocking socket call into a busy spin-wait loop.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Virtual threads cost ~hundreds of bytes; pooling them leaks ThreadLocals across unrelated tasks and caps concurrency. Spawn 1 VT per task and use Semaphore for downstream limits.',
+          'WRONG (B): Executors.newVirtualThreadPerTaskExecutor() itself implements ExecutorService and is the standard API.',
+          'WRONG (C): Virtual threads use dynamically sized heap StackChunks regardless of how they are launched.',
+          'WRONG (D): Pooling does not convert socket blocking into spin loops; it simply misuses virtual threads as if they were expensive OS threads.'
+        ]
+      },
+      {
+        stem: '3. Why does ScopedValue scale far better than InheritableThreadLocal across 1,000,000 virtual threads?',
+        code: `ScopedValue.where(TENANT, tenantId).call(() -> runFanOut());`,
+        options: [
+          'ScopedValue writes context into CPU hardware registers so JVM heap memory is never allocated.',
+          'ScopedValue bindings are immutable, auto-unbound on scope exit, and shared in O(1) without copying.',
+          'ScopedValue automatically serializes all virtual threads onto a single carrier thread for safety.',
+          'ScopedValue mutates a global static HashMap protected by a single JVM-wide read-write lock.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): ScopedValue bindings live in lightweight JVM heap/carrier snapshots, not dedicated CPU hardware registers.',
+          'CORRECT (B): Because ScopedValue is immutable and lexically bounded, StructuredTaskScope children read the parent snapshot in O(1) with zero map cloning and guaranteed cleanup.',
+          'WRONG (C): ScopedValue imposes zero single-carrier serialization; millions of virtual threads read their snapshots in parallel.',
+          'WRONG (D): A global locked map would cause massive contention and mix tenant contexts across concurrent requests.'
+        ]
+      },
+      {
+        stem: '4. In StructuredTaskScope.ShutdownOnFailure, what happens immediately when the first forked subtask throws an exception?',
+        code: `try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {\n    var a = scope.fork(this::fetchOrders);\n    var b = scope.fork(this::fetchPayments);\n    scope.join().throwIfFailed();\n}`,
+        options: [
+          'The JVM terminates the entire application process immediately without running any finally blocks.',
+          'Remaining sibling subtasks continue running detached in the background after scope.close() exits.',
+          'The scope interrupts remaining sibling subtasks immediately and join() waits until they unwind.',
+          'throwIfFailed() suppresses the first exception whenever another sibling subtask succeeds later.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): The JVM does not exit; structured concurrency propagates the exception normally and runs finally cleanup blocks.',
+          'WRONG (B): StructuredTaskScope enforces zero orphan threads—try-with-resources close() never exits while child virtual threads remain active.',
+          'CORRECT (C): ShutdownOnFailure calls shutdown() to interrupt all sibling virtual threads immediately, and join() awaits clean unwinding before throwIfFailed() rethrows.',
+          'WRONG (D): ShutdownOnFailure fails fast on the first subtask error and propagates it regardless of sibling outcomes.'
+        ]
+      },
+      {
+        stem: '5. A service runs 5,000 CPU-heavy BCrypt password hashes using Executors.newVirtualThreadPerTaskExecutor() on an 8-core box. What happens?',
+        code: `try (var exec = Executors.newVirtualThreadPerTaskExecutor()) {\n    requests.forEach(req -> exec.submit(() -> BCrypt.hashpw(req.pw(), salt)));\n}`,
+        options: [
+          'Throughput scales linearly to 5,000x because virtual threads bypass physical CPU core limits.',
+          'The JVM automatically offloads pure Java BCrypt loops onto GPU compute cores for parallelism.',
+          'Throughput stays bounded by the 8 carrier cores while excess runnable threads add scheduling overhead.',
+          'Virtual threads auto-unmount every millisecond during pure CPU math to boost total hash speed.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): Virtual threads increase concurrency for blocking I/O wait, never physical CPU core count.',
+          'WRONG (B): Project Loom schedules virtual threads on CPU carrier threads, not GPUs.',
+          'CORRECT (C): Pure CPU computation never blocks or unmounts, so at most 8 hashes run simultaneously across the 8 carrier cores while 5,000 runnable tasks add queue/memory overhead.',
+          'WRONG (D): Virtual threads are not time-sliced to boost CPU speed; unmounting happens at blocking I/O/park points and cannot create extra CPU cycles.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_21',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

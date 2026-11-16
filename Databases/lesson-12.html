@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 12: Connection Pooling (PgBouncer), Timeouts &amp; Production App Integration</title>
+  <link rel="stylesheet" href="assets/course.css" />
+</head>
+<body data-lesson-id="lesson-12">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="master-plan.html">
+        <span class="brand-mark">DB</span>
+        <span>
+          Lesson 12 &bull; Pooling, Timeouts &amp; App Safety
+          <span class="brand-sub">Phase 4 &bull; Distributed &amp; Production Ops</span>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <div id="engine-status" class="engine-pill">
+          <span class="engine-dot"></span>
+          <span class="engine-label">Loading SQLite...</span>
+        </div>
+        <a class="btn btn-sm" href="lesson-11.html">&larr; Prev</a>
+        <a class="btn btn-sm" href="master-plan.html">Master Plan</a>
+        <a class="btn btn-sm" href="lesson-13.html">Next &rarr;</a>
+        <button id="theme-toggle" class="btn btn-sm" type="button">Light Mode</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="page-shell">
+    <aside class="sidebar">
+      <div class="sidebar-title">Lesson 12 Contents</div>
+      <ul class="toc-list">
+        <li><a href="#room-bridge">1. 1 App Conn &rarr; 500 Pods</a></li>
+        <li><a href="#pgbouncer">2. Process Overhead &amp; PgBouncer</a></li>
+        <li><a href="#pool-sizing">3. Little&rsquo;s Law &amp; Timeouts</a></li>
+        <li><a href="#app-safety">4. Parameterization &amp; Allow-Lists</a></li>
+        <li><a href="#sandbox">5. Free SQL Sandbox</a></li>
+        <li><a href="#labs">6. Coding Labs (4 Auto-Checked)</a></li>
+        <li><a href="#quizzes">7. Senior Quizzes (6 MCQs)</a></li>
+        <li><a href="#cheatsheet">8. Senior Checklist</a></li>
+      </ul>
+
+      <div class="progress-box">
+        <div class="sidebar-title" style="margin-bottom:0.35rem;">Lesson 12 Progress</div>
+        <div class="progress-bar-track">
+          <div id="lesson-progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <div class="progress-meta">
+          <span id="lesson-progress-text">0/10 completed (0%)</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section class="hero">
+        <div class="meta-row">
+          <span class="badge badge-green">Phase 4 &bull; Lesson 12</span>
+          <span class="badge badge-blue">Production Architecture</span>
+          <span class="badge badge-purple">Room &rarr; SQLite 3.45 &amp; PostgreSQL</span>
+        </div>
+        <h1>Connection Pooling (PgBouncer), Timeouts &amp; Production App Integration</h1>
+        <p class="lead">
+          When 500 Kubernetes pods or 5,000 serverless functions open direct TCP connections to PostgreSQL, the database crashes from RAM exhaustion and context switching before your CPU hits 30%.
+          Master <strong>PgBouncer transaction pooling</strong>, <strong>Little&rsquo;s Law pool sizing</strong>, <strong>fail-fast timeouts</strong>, and <strong>SQL-injection-proof dynamic queries</strong>.
+        </p>
+        <div class="meta-row">
+          <span class="topic-chip">4 Interactive Demos</span>
+          <span class="topic-chip">1 Open Sandbox</span>
+          <span class="topic-chip">4 Coding Labs (Auto-Graded)</span>
+          <span class="topic-chip">6 Diagnostic Quizzes</span>
+        </div>
+      </section>
+
+      <!-- SECTION 1: ROOM BRIDGE -->
+      <section id="room-bridge" class="section-card">
+        <h2><span class="badge badge-purple">Room Bridge</span> 1. From 1 Local SQLite Connection to 500 Pods Hitting One Database</h2>
+        <p>
+          In Android Room, your app opens a single SQLite database file in-process (one connection pool of 1 writer + a few WAL readers). Network latency is <code>0ms</code>, and you never worry about 5,000 concurrent devices holding TCP sockets open to your phone&rsquo;s SQLite file.
+        </p>
+
+        <div class="callout room">
+          <div class="callout-title">Why &ldquo;Open a Connection Per Request&rdquo; Destroys Backend PostgreSQL</div>
+          <p style="margin:0;">
+            Unlike SQLite (an embedded C library inside your process), PostgreSQL uses a <strong>process-per-connection architecture</strong>: every TCP client connection forks a dedicated OS process (<code>postgres</code> backend) consuming ~5&ndash;10 MB of RAM, private work memory, and snapshot/lock bookkeeping.
+            If 2,500 serverless Lambdas each open 2 connections, PostgreSQL spawns 5,000 OS processes (~35&ndash;50 GB RAM!), thrashing CPU caches and snapshot arrays until the Linux OOM killer terminates the primary!
+          </p>
+        </div>
+      </section>
+
+      <!-- SECTION 2: PGBOUNCER MODES -->
+      <section id="pgbouncer" class="section-card">
+        <h2><span class="badge badge-blue">Core Concept</span> 2. PgBouncer Pooling Modes &amp; Session-State Traps</h2>
+        <p>
+          <strong>PgBouncer</strong> (or RDS Proxy / Supavisor) sits between your 5,000 app sockets and PostgreSQL, multiplexing thousands of mostly-idle client connections onto a small pool of real PostgreSQL backend processes (e.g., <code>default_pool_size = 25</code>).
+        </p>
+
+        <div class="data-table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>PgBouncer Mode</th>
+                <th>When Server Conn Returns to Pool</th>
+                <th>Multiplexing Power</th>
+                <th>What Breaks / Caveats</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>session</code></td>
+                <td>Only when client disconnects.</td>
+                <td>Low (1:1 while client connected).</td>
+                <td>Nothing breaks, but idle Lambda/pod pools still starve DB slots.</td>
+              </tr>
+              <tr>
+                <td><code>transaction</code> (Recommended)</td>
+                <td>Immediately on <code>COMMIT</code> / <code>ROLLBACK</code>!</td>
+                <td><strong>Huge</strong> (5,000 clients &rarr; 25 PG backends).</td>
+                <td>Breaks session-pinned state: <code>SET</code> (use <code>SET LOCAL</code>), <code>LISTEN/NOTIFY</code>, <code>CREATE TEMP TABLE</code>, session advisory locks, and older named prepared statements (unless PgBouncer &ge; 1.21 <code>max_prepared_statements &gt; 0</code>).</td>
+              </tr>
+              <tr>
+                <td><code>statement</code></td>
+                <td>After every single SQL statement.</td>
+                <td>Extreme.</td>
+                <td>Multi-statement <code>BEGIN ... COMMIT</code> transactions are completely disallowed!</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-pgbouncer-matrix">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 1</span> Querying PgBouncer Transaction-Pooling Compatibility</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE pgbouncer_features (
+              feature TEXT PRIMARY KEY,
+              session_mode TEXT NOT NULL,
+              transaction_mode TEXT NOT NULL,
+              senior_fix TEXT NOT NULL
+            ) STRICT;
+            INSERT INTO pgbouncer_features VALUES
+              ('BEGIN ... COMMIT',          'Works', 'Works',       'Keep txns short (< 50ms); no HTTP calls inside txns'),
+              ('SET statement_timeout',     'Works', 'BREAKS!',     'Use SET LOCAL inside txn or ALTER ROLE defaults'),
+              ('CREATE TEMP TABLE',         'Works', 'BREAKS!',     'Use CTEs or ON COMMIT DROP inside explicit txns'),
+              ('LISTEN / NOTIFY',           'Works', 'BREAKS!',     'Use dedicated direct/session connection for listeners'),
+              ('pg_try_advisory_lock',      'Works', 'BREAKS!',     'Switch to pg_try_advisory_xact_lock()'),
+              ('Prepared Statements',       'Works', 'Needs >=1.21','Enable max_prepared_statements in PgBouncer 1.21+');
+          </script>
+          <textarea class="sql-editor" spellcheck="false">SELECT feature, session_mode, transaction_mode, senior_fix
+FROM pgbouncer_features
+ORDER BY CASE WHEN transaction_mode = 'Works' THEN 1 ELSE 0 END, feature;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 3: LITTLE'S LAW & TIMEOUTS -->
+      <section id="pool-sizing" class="section-card">
+        <h2><span class="badge badge-green">Math &amp; Resilience</span> 3. Pool Sizing (Little&rsquo;s Law) &amp; Essential Timeouts</h2>
+        <p>
+          Counterintuitively, <strong>increasing PostgreSQL&rsquo;s pool size from 30 to 500 almost always makes throughput WORSE</strong> due to CPU context switching and spinlock/snapshot contention.
+          By <strong>Little&rsquo;s Law</strong> (<code>L = &lambda; &times; W</code>), if an 8-vCPU NVMe database executes queries in <code>W = 2ms</code> on average, just <code>L = 20</code> active connections have a theoretical ceiling of <code>20 / 0.002 = 10,000 QPS</code> (target ~50&ndash;70% utilization in practice for queueing headroom and network RTT!).
+        </p>
+
+        <div class="callout senior">
+          <div class="callout-title">The Classic <code>cores &times; 2 + spindles</code> Rule: Myth vs Reality</div>
+          <p style="margin:0;">
+            You&rsquo;ll often hear the old formula <code>pool_size = (CPU_cores &times; 2) + effective_spindle_count</code>. That rule was written for <strong>one app process on spinning HDDs</strong>. On modern NVMe cloud SSDs (0 spindles, high IOPS) with <strong>50 microservices pods</strong>, the real rule is: keep the <em>total active connections across the entire cluster</em> inside PgBouncer&rsquo;s <code>default_pool_size</code> around <code>2&ndash;4 &times; DB_vCPUs</code> (e.g., 16&ndash;32 for an 8-vCPU DB), while <code>max_client_conn</code> absorbs thousands of idle app sockets (or use RDS Proxy / Supavisor for serverless fleets).
+          </p>
+        </div>
+
+        <div class="code-demo" data-demo-id="demo-littles-law">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-blue">Runnable Demo 2</span> Pool Sizing, RAM Savings &amp; Little&rsquo;s Law Calculator</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE app_fleets (
+              fleet_name TEXT PRIMARY KEY,
+              pods INTEGER NOT NULL,
+              conns_per_pod INTEGER NOT NULL,
+              pgbouncer_pool INTEGER NOT NULL,
+              avg_query_ms REAL NOT NULL
+            ) STRICT;
+            INSERT INTO app_fleets VALUES
+              ('checkout-api',  80, 10, 20, 2.0),
+              ('lambda-webhooks', 1500, 1, 15, 4.0),
+              ('analytics-worker', 12, 5, 6, 25.0);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- Assume ~9 MB RAM per direct PostgreSQL backend process:
+SELECT
+  fleet_name,
+  pods * conns_per_pod AS client_sockets,
+  pgbouncer_pool AS pg_backends,
+  (pods * conns_per_pod) * 9 AS direct_ram_mb,
+  pgbouncer_pool * 9 AS pooled_ram_mb,
+  ROUND(pgbouncer_pool * 1000.0 / avg_query_ms, 0) AS max_qps_littles_law
+FROM app_fleets
+ORDER BY client_sockets DESC;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+
+        <h3>The Essential Production Timeouts (Including PostgreSQL 17 <code>transaction_timeout</code>)</h3>
+        <pre><code>-- PostgreSQL: Bake defensive timeouts directly onto the app database role!
+ALTER ROLE app_writer SET statement_timeout = '5s';
+ALTER ROLE app_writer SET lock_timeout = '2s';
+ALTER ROLE app_writer SET idle_in_transaction_session_timeout = '15s';
+ALTER ROLE app_writer SET transaction_timeout = '30s'; -- PG 17+: caps total BEGIN..COMMIT time even across many fast queries!
+
+-- App connection string: connect_timeout=3 &amp; tcp_keepalives_idle=60 (plus pool maxLifetime &lt; NAT timeout!)
+-- SQLite / Room equivalent for local write contention:
+-- PRAGMA journal_mode = WAL;
+-- PRAGMA busy_timeout = 5000;</code></pre>
+
+        <div class="code-demo" data-demo-id="demo-pg-stat-activity">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-red">Runnable Demo 3</span> Triaging <code>idle in transaction</code> Zombie Sessions</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE pg_stat_activity_sim (
+              pid INTEGER PRIMARY KEY,
+              app_name TEXT NOT NULL,
+              state TEXT NOT NULL,
+              xact_age_sec INTEGER NOT NULL,
+              query_age_sec INTEGER NOT NULL,
+              query_preview TEXT NOT NULL
+            ) STRICT;
+            INSERT INTO pg_stat_activity_sim VALUES
+              (4101, 'checkout-api', 'active', 0, 0, 'UPDATE wallets SET ...'),
+              (4102, 'admin-script', 'idle in transaction', 1840, 1840, 'BEGIN; SELECT * FROM orders ...'),
+              (4103, 'bi-export',    'active', 120, 120, 'SELECT * FROM events ORDER BY ...'),
+              (4104, 'checkout-api', 'idle', 0, 0, '');
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- Why is pid=4102 ("idle in transaction" for 30 mins) so dangerous?
+-- It holds an open MVCC snapshot that prevents VACUUM from cleaning dead tuples across the DB!
+SELECT
+  pid,
+  app_name,
+  state,
+  xact_age_sec,
+  CASE
+    WHEN state = 'idle in transaction' AND xact_age_sec > 15 THEN 'KILL: Blocks VACUUM & holds locks!'
+    WHEN state = 'active' AND query_age_sec > 5 THEN 'ALERT: Exceeds 5s statement_timeout'
+    ELSE 'Healthy'
+  END AS triage_action,
+  query_preview
+FROM pg_stat_activity_sim
+WHERE state != 'idle'
+ORDER BY xact_age_sec DESC;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 4: PARAMETERIZATION & ALLOW-LISTS -->
+      <section id="app-safety" class="section-card">
+        <h2><span class="badge badge-red">Security</span> 4. Parameterized Queries &amp; Allow-Listed Dynamic Sorting</h2>
+        <p>
+          Bind parameters (<code>$1, $2</code> in PostgreSQL; <code>?</code> in SQLite) separate SQL syntax from user-supplied data values, completely neutralizing classic SQL injection.
+          <strong>Hidden traps:</strong> You <em>cannot</em> parameterize table names, column names, or sort directions (<code>ORDER BY $1</code> sorts by a literal constant!). Map API <code>?sort=...</code> keys through a strict <strong>server-side allow-list</strong>. Also: while <code>ORDER BY CASE ...</code> below is injection-safe in pure SQL, it blocks B-Tree index ordering on huge tables&mdash;in backend code, map an enum allow-list directly to pre-written static <code>ORDER BY</code> queries, use <code>= ANY($1)</code> for dynamic <code>IN</code> arrays, escape <code>%</code>/<code>_</code> in <code>LIKE</code> patterns, and use <code>format('%I', ident)</code> / <code>quote_ident()</code> if dynamic identifiers are unavoidable.
+        </p>
+
+        <div class="code-demo" data-demo-id="demo-allowlist-sort">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-green">Runnable Demo 4</span> Safe Allow-Listed Dynamic <code>ORDER BY</code> in Pure SQL</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Example</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE products (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              price_cents INTEGER NOT NULL,
+              rating REAL NOT NULL
+            ) STRICT;
+            CREATE TABLE api_params (sort_key TEXT NOT NULL) STRICT;
+            INSERT INTO products VALUES
+              (1, 'Mechanical Keyboard', 14900, 4.8),
+              (2, 'USB-C Hub',           3900,  4.2),
+              (3, '4K Monitor',          49900, 4.9);
+            INSERT INTO api_params VALUES ('price_desc');
+          </script>
+          <textarea class="sql-editor" spellcheck="false">-- Try changing 'price_desc' in api_params (or imagine attacker sending '1; DROP TABLE products;--'):
+-- The CASE allow-list safely maps known keys and falls back to id ASC on any unknown input!
+SELECT p.id, p.name, p.price_cents, p.rating
+FROM products p
+CROSS JOIN api_params req
+ORDER BY
+  CASE WHEN req.sort_key = 'price_asc'   THEN p.price_cents END ASC,
+  CASE WHEN req.sort_key = 'price_desc'  THEN p.price_cents END DESC,
+  CASE WHEN req.sort_key = 'rating_desc' THEN p.rating      END DESC,
+  p.id ASC;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 5: INTERACTIVE SANDBOX -->
+      <section id="sandbox" class="section-card">
+        <h2><span class="badge badge-blue">Playground</span> 5. Free SQL Sandbox (Production Telemetry &amp; Pool Math)</h2>
+        <p>
+          Explore <code>pg_stat_activity_sim</code> and <code>app_fleets</code> to test pool sizing formulas or timeout audits.
+        </p>
+        <div class="code-demo" data-demo-id="demo-sandbox">
+          <div class="code-demo-header">
+            <span class="code-demo-title"><span class="badge badge-green">Live Sandbox</span> Production Ops DB</span>
+            <div>
+              <button class="btn btn-primary btn-sm" type="button" data-action="run-demo">Run Query (&#8984;/Ctrl+Enter)</button>
+              <button class="btn btn-sm" type="button" data-action="reset-demo">Reset</button>
+            </div>
+          </div>
+          <script type="text/sql" class="demo-setup">
+            CREATE TABLE pg_stat_activity_sim (
+              pid INTEGER PRIMARY KEY,
+              app_name TEXT NOT NULL,
+              state TEXT NOT NULL,
+              xact_age_sec INTEGER NOT NULL,
+              waiting_clients INTEGER NOT NULL
+            ) STRICT;
+            INSERT INTO pg_stat_activity_sim VALUES
+              (101, 'api', 'idle in transaction', 95, 14),
+              (102, 'api', 'active', 2, 0),
+              (103, 'etl', 'active', 45, 3);
+          </script>
+          <textarea class="sql-editor" spellcheck="false">SELECT pid, app_name, state, xact_age_sec, waiting_clients
+FROM pg_stat_activity_sim
+ORDER BY waiting_clients DESC, xact_age_sec DESC;</textarea>
+          <div class="output-pane hidden"></div>
+        </div>
+      </section>
+
+      <!-- SECTION 6: HANDS-ON CODING LABS -->
+      <section id="labs" class="section-card">
+        <h2><span class="badge badge-green">Hands-On Labs</span> 6. Coding Practice (Run, Auto-Verify, Hints &amp; Final Answers)</h2>
+        <p>
+          Solve each production integration lab and click <strong>Check Answer</strong>.
+        </p>
+
+        <div class="lab-card" data-lab-id="lab-1"></div>
+        <div class="lab-card" data-lab-id="lab-2"></div>
+        <div class="lab-card" data-lab-id="lab-3"></div>
+        <div class="lab-card" data-lab-id="lab-4"></div>
+      </section>
+
+      <!-- SECTION 7: QUIZZES -->
+      <section id="quizzes" class="section-card">
+        <h2><span class="badge badge-pink">Knowledge Checks</span> 7. Senior-Level Pooling, Timeouts &amp; Security Quizzes</h2>
+        <p>
+          Verify your production database ops instincts across all 6 scenarios.
+        </p>
+
+        <div class="quiz-card" data-quiz-id="quiz-1"></div>
+        <div class="quiz-card" data-quiz-id="quiz-2"></div>
+        <div class="quiz-card" data-quiz-id="quiz-3"></div>
+        <div class="quiz-card" data-quiz-id="quiz-4"></div>
+        <div class="quiz-card" data-quiz-id="quiz-5"></div>
+        <div class="quiz-card" data-quiz-id="quiz-6"></div>
+      </section>
+
+      <!-- SECTION 8: CHEATSHEET -->
+      <section id="cheatsheet" class="section-card">
+        <h2><span class="badge badge-blue">Summary</span> 8. Lesson 12 Senior Engineering Checklist</h2>
+        <ul>
+          <li>Put PgBouncer (or RDS Proxy) in <code>transaction</code> pooling mode in front of PostgreSQL whenever running pods/serverless fleets.</li>
+          <li>Never rely on session state (<code>SET</code>, <code>CREATE TEMP TABLE</code>, <code>LISTEN</code>, session advisory locks) through a transaction pooler.</li>
+          <li>Size the backend PostgreSQL pool near <code>2&ndash;4 &times; CPU cores</code> using Little&rsquo;s Law&mdash;never 500+ active Postgres processes.</li>
+          <li>Set <code>connect_timeout</code>, <code>statement_timeout</code>, <code>lock_timeout</code>, and <code>idle_in_transaction_session_timeout</code> on every app DB role (and <code>PRAGMA busy_timeout</code> on SQLite).</li>
+          <li>Use bind parameters for values and strict server-side allow-lists for dynamic column names and <code>ORDER BY</code> directions.</li>
+        </ul>
+        <div style="margin-top:1.25rem;display:flex;gap:0.75rem;flex-wrap:wrap;">
+          <a class="btn" href="lesson-11.html">&larr; Lesson 11</a>
+          <a class="btn" href="master-plan.html">Master Plan</a>
+          <a class="btn btn-primary" href="lesson-13.html">Next: Lesson 13 (Replication, HA, Failover &amp; PITR) &rarr;</a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.COURSE_LABS = {
+      "lab-1": {
+        title: "Lab 1: Find Idle-in-Transaction & Runaway Query Offenders",
+        difficulty: "Lab 1 of 4 \u2022 Telemetry Triage",
+        promptHtml: `
+          <p>Your SRE team captured a snapshot of <code>pg_stat_activity_sim(pid, app_name, state, xact_age_sec, query_age_sec, waiting_clients)</code> during a latency spike.</p>
+          <p>Write a triage <code>SELECT</code> query that surfaces ONLY actionable offenders:</p>
+          <ul>
+            <li>Return columns: <code>pid</code>, <code>app_name</code>, <code>state</code>, <code>xact_age_sec</code>, <code>severity</code>.</li>
+            <li>Set <code>severity</code> to <code>'CRITICAL'</code> when <code>state = 'idle in transaction' AND xact_age_sec &gt;= 60</code>.</li>
+            <li>Set <code>severity</code> to <code>'HIGH'</code> when <code>state = 'active' AND query_age_sec &gt;= 30</code>.</li>
+            <li>Exclude all healthy/short/idle sessions that don&rsquo;t match either rule.</li>
+            <li>Order by <code>waiting_clients DESC, xact_age_sec DESC</code>.</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE pg_stat_activity_sim (
+            pid INTEGER PRIMARY KEY,
+            app_name TEXT NOT NULL,
+            state TEXT NOT NULL,
+            xact_age_sec INTEGER NOT NULL,
+            query_age_sec INTEGER NOT NULL,
+            waiting_clients INTEGER NOT NULL
+          ) STRICT;
+          INSERT INTO pg_stat_activity_sim VALUES
+            (201, 'checkout-api', 'active', 1, 1, 0),
+            (202, 'refund-worker', 'idle in transaction', 320, 320, 12),
+            (203, 'bi-dashboard', 'active', 75, 75, 2),
+            (204, 'auth-service', 'idle', 0, 0, 0),
+            (205, 'legacy-cron', 'idle in transaction', 90, 90, 0),
+            (206, 'checkout-api', 'idle in transaction', 10, 10, 0);
+        `,
+        starterSql: `-- Return (pid, app_name, state, xact_age_sec, severity) for CRITICAL/HIGH offenders:\nSELECT pid FROM pg_stat_activity_sim;\n`,
+        hints: [
+          "Filter in <code>WHERE</code> for <code>(state = 'idle in transaction' AND xact_age_sec &gt;= 60) OR (state = 'active' AND query_age_sec &gt;= 30)</code>.",
+          "Use a <code>CASE</code> expression to assign <code>'CRITICAL'</code> vs <code>'HIGH'</code> as <code>severity</code>.",
+          "Sort by <code>waiting_clients DESC, xact_age_sec DESC</code> (note: <code>waiting_clients</code> can be in <code>ORDER BY</code> without being in <code>SELECT</code>)."
+        ],
+        solutionSql: `SELECT
+  pid,
+  app_name,
+  state,
+  xact_age_sec,
+  CASE
+    WHEN state = 'idle in transaction' AND xact_age_sec >= 60 THEN 'CRITICAL'
+    ELSE 'HIGH'
+  END AS severity
+FROM pg_stat_activity_sim
+WHERE (state = 'idle in transaction' AND xact_age_sec >= 60)
+   OR (state = 'active' AND query_age_sec >= 30)
+ORDER BY waiting_clients DESC, xact_age_sec DESC;`,
+        solutionExplanationHtml: `
+          <p>PID <code>202</code> (<code>idle in transaction</code> 320s, blocking 12 clients) comes first as <code>CRITICAL</code>, followed by PID <code>203</code> (75s active query, 2 waiters) as <code>HIGH</code>, and PID <code>205</code> (90s idle-in-tx, 0 waiters) as <code>CRITICAL</code>. Healthy PIDs 201, 204, and 206 are excluded.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            checks.push({ label: "Query returns a result set", passed: res.length > 0 });
+            if (res.length === 0) return { passed: false, checks };
+
+            const last = res[res.length - 1];
+            const cols = last.columns.map((c) => c.toLowerCase());
+            const colsOk =
+              cols.length === 5 &&
+              cols[0] === "pid" &&
+              cols[1] === "app_name" &&
+              cols[2] === "state" &&
+              cols[3] === "xact_age_sec" &&
+              cols[4] === "severity";
+            checks.push({
+              label: "Columns match (pid, app_name, state, xact_age_sec, severity)",
+              passed: colsOk,
+              detail: `Got: ${last.columns.join(", ")}`
+            });
+
+            const expected = [
+              [202, "refund-worker", "idle in transaction", 320, "CRITICAL"],
+              [203, "bi-dashboard", "active", 75, "HIGH"],
+              [205, "legacy-cron", "idle in transaction", 90, "CRITICAL"]
+            ];
+            const match =
+              last.values.length === 3 &&
+              expected.every((row, i) => row.every((val, j) => last.values[i][j] === val));
+            checks.push({
+              label: "Exact 3 offenders returned in order (202, 203, 205)",
+              passed: match,
+              detail: `Got: ${JSON.stringify(last.values)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-2": {
+        title: "Lab 2: Pool Sizing & RAM Savings Audit (Little's Law)",
+        difficulty: "Lab 2 of 4 \u2022 Capacity Planning",
+        promptHtml: `
+          <p>The pre-seeded <code>services(service_name, pods, conns_per_pod, avg_query_ms, pgbouncer_pool_size)</code> table lists backend services connecting to Postgres.</p>
+          <p>Write an audit query assuming <strong>10 MB RAM per direct PostgreSQL backend</strong> (and without relying on copied formulas):</p>
+          <ul>
+            <li>Return columns: <code>service_name</code>, <code>total_client_conns</code>, <code>direct_pg_ram_mb</code>, <code>pooled_pg_ram_mb</code>, and <code>max_theoretical_qps</code> (integer rounded capacity via Little&rsquo;s Law <code>L / W</code> where <code>W</code> is in seconds).</li>
+            <li>Filter ONLY services where pooling achieves <strong>&gt;2&times; multiplexing</strong> (<code>total_client_conns &gt; pgbouncer_pool_size * 2</code>).</li>
+            <li>Order by <code>total_client_conns DESC</code>.</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE services (
+            service_name TEXT PRIMARY KEY,
+            pods INTEGER NOT NULL,
+            conns_per_pod INTEGER NOT NULL,
+            avg_query_ms REAL NOT NULL,
+            pgbouncer_pool_size INTEGER NOT NULL
+          ) STRICT;
+          INSERT INTO services VALUES
+            ('orders-api',     100, 8,  2.0, 20),
+            ('serverless-fn', 2000, 1,  5.0, 25),
+            ('admin-portal',     2, 4, 10.0, 10);
+        `,
+        starterSql: `-- Compute client connections, direct vs pooled RAM (10 MB/conn), and Little's Law max QPS:\nSELECT service_name FROM services;\n`,
+        hints: [
+          "Compute <code>pods * conns_per_pod AS total_client_conns</code> and multiply by <code>10</code> for <code>direct_pg_ram_mb</code>.",
+          "Wrap <code>ROUND(pgbouncer_pool_size * 1000.0 / avg_query_ms, 0)</code> in <code>CAST(... AS INTEGER)</code> for clean integer QPS.",
+          "Filter <code>WHERE (pods * conns_per_pod) > pgbouncer_pool_size * 2</code> (excludes <code>admin-portal</code> which has 8 client conns vs pool 10)."
+        ],
+        solutionSql: `SELECT
+  service_name,
+  pods * conns_per_pod AS total_client_conns,
+  pods * conns_per_pod * 10 AS direct_pg_ram_mb,
+  pgbouncer_pool_size * 10 AS pooled_pg_ram_mb,
+  CAST(ROUND(pgbouncer_pool_size * 1000.0 / avg_query_ms, 0) AS INTEGER) AS max_theoretical_qps
+FROM services
+WHERE (pods * conns_per_pod) > pgbouncer_pool_size * 2
+ORDER BY total_client_conns DESC;`,
+        solutionExplanationHtml: `
+          <p><code>serverless-fn</code> drops from 20,000 MB direct RAM down to 250 MB with 25 backend slots still capable of 5,000 QPS; <code>orders-api</code> drops from 8,000 MB to 200 MB while sustaining 10,000 QPS.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            checks.push({ label: "Query returns a result set", passed: res.length > 0 });
+            if (res.length === 0) return { passed: false, checks };
+
+            const last = res[res.length - 1];
+            const cols = last.columns.map((c) => c.toLowerCase());
+            const colsOk =
+              cols.length === 5 &&
+              cols[0] === "service_name" &&
+              cols[1] === "total_client_conns" &&
+              cols[2] === "direct_pg_ram_mb" &&
+              cols[3] === "pooled_pg_ram_mb" &&
+              cols[4] === "max_theoretical_qps";
+            checks.push({
+              label: "Columns match expected 5 names",
+              passed: colsOk,
+              detail: `Got: ${last.columns.join(", ")}`
+            });
+
+            const expected = [
+              ["serverless-fn", 2000, 20000, 250, 5000],
+              ["orders-api", 800, 8000, 200, 10000]
+            ];
+            const match =
+              last.values.length === 2 &&
+              expected.every((row, i) => row.every((val, j) => last.values[i][j] === val));
+            checks.push({
+              label: "Exact RAM & Little's Law QPS calculations verified",
+              passed: match,
+              detail: `Got: ${JSON.stringify(last.values)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-3": {
+        title: "Lab 3: Audit SQL Patterns That Break Under PgBouncer Transaction Pooling",
+        difficulty: "Lab 3 of 4 \u2022 PgBouncer Readiness",
+        promptHtml: `
+          <p>Before migrating services onto PgBouncer <code>pool_mode = transaction</code>, scan raw query logs in <code>app_queries(id, service_name, sql_pattern)</code> (there are NO pre-flagged boolean helper columns&mdash;inspect the SQL text itself!):</p>
+          <ul>
+            <li>Columns: <code>id</code>, <code>service_name</code>, <code>sql_pattern</code>, <code>blocker_reason</code></li>
+            <li>Detect and classify incompatible patterns (case-insensitive):
+              <ul>
+                <li>Contains <code>SET </code> without <code>LOCAL</code> (i.e. session-level <code>SET</code>) &rarr; <code>'session_set'</code></li>
+                <li>Contains <code>CREATE TEMP TABLE</code> &rarr; <code>'temp_table'</code></li>
+                <li>Contains <code>LISTEN </code> &rarr; <code>'listen_notify'</code></li>
+              </ul>
+            </li>
+            <li>Exclude safe queries (<code>BEGIN; ... COMMIT;</code>, <code>SET LOCAL ...</code>, parameterized <code>SELECT</code>) and order by <code>id ASC</code>.</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE app_queries (
+            id INTEGER PRIMARY KEY,
+            service_name TEXT NOT NULL,
+            sql_pattern TEXT NOT NULL
+          ) STRICT;
+          INSERT INTO app_queries VALUES
+            (1, 'billing',  'BEGIN; UPDATE accounts ... COMMIT;'),
+            (2, 'reporting','SET work_mem = ''256MB'';'),
+            (3, 'realtime', 'LISTEN order_events;'),
+            (4, 'etl',      'CREATE TEMP TABLE scratch (...);'),
+            (5, 'auth',     'SELECT id FROM users WHERE email=$1'),
+            (6, 'rls-api',  'BEGIN; SET LOCAL app.tenant_id = ''t1''; SELECT * FROM invoices; COMMIT;');
+        `,
+        starterSql: `-- Inspect sql_pattern text directly to flag queries incompatible with PgBouncer transaction pooling:\nSELECT id, service_name, sql_pattern FROM app_queries;\n`,
+        hints: [
+          "Inspect <code>upper(sql_pattern)</code> using <code>LIKE</code>: watch out for row 6 which uses safe <code>SET LOCAL</code> rather than session <code>SET</code>!",
+          "Match <code>SET</code> safely with <code>upper(sql_pattern) LIKE 'SET %' AND upper(sql_pattern) NOT LIKE 'SET LOCAL%'</code> (or check <code>NOT LIKE '%SET LOCAL%'</code>).",
+          "Use a <code>CASE</code> expression for <code>blocker_reason</code> and filter out rows where <code>blocker_reason</code> would be <code>NULL</code>."
+        ],
+        solutionSql: `WITH classified AS (
+  SELECT
+    id,
+    service_name,
+    sql_pattern,
+    CASE
+      WHEN upper(sql_pattern) LIKE '%CREATE TEMP TABLE%' THEN 'temp_table'
+      WHEN upper(sql_pattern) LIKE '%LISTEN %' THEN 'listen_notify'
+      WHEN upper(sql_pattern) LIKE '%SET %' AND upper(sql_pattern) NOT LIKE '%SET LOCAL%' THEN 'session_set'
+    END AS blocker_reason
+  FROM app_queries
+)
+SELECT id, service_name, sql_pattern, blocker_reason
+FROM classified
+WHERE blocker_reason IS NOT NULL
+ORDER BY id ASC;`,
+        solutionExplanationHtml: `
+          <p>Session <code>SET work_mem</code> leaks across pooled transactions (unlike safe <code>SET LOCAL</code> in row 6!); <code>CREATE TEMP TABLE</code> vanishes on backend rotation; and <code>LISTEN</code> requires a dedicated non-transaction-pooled connection.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          const db = new SQL.Database();
+          try {
+            db.run(setupSql);
+            const res = db.exec(userSql);
+            checks.push({ label: "Query returns a result set", passed: res.length > 0 });
+            if (res.length === 0) return { passed: false, checks };
+
+            const last = res[res.length - 1];
+            const cols = last.columns.map((c) => c.toLowerCase());
+            const colsOk =
+              cols.length === 4 &&
+              cols[0] === "id" &&
+              cols[1] === "service_name" &&
+              cols[2] === "sql_pattern" &&
+              cols[3] === "blocker_reason";
+            checks.push({
+              label: "Columns match (id, service_name, sql_pattern, blocker_reason)",
+              passed: colsOk,
+              detail: `Got: ${last.columns.join(", ")}`
+            });
+
+            const expected = [
+              [2, "reporting", "session_set"],
+              [3, "realtime", "listen_notify"],
+              [4, "etl", "temp_table"]
+            ];
+            const match =
+              last.values.length === 3 &&
+              expected.every((r, i) => last.values[i][0] === r[0] && last.values[i][1] === r[1] && last.values[i][3] === r[2]);
+            checks.push({
+              label: "Flags exact 3 incompatible queries (IDs 2, 3, 4) while passing safe SET LOCAL (ID 6)",
+              passed: match,
+              detail: `Got: ${JSON.stringify(last.values)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          } finally {
+            db.close();
+          }
+        }
+      },
+
+      "lab-4": {
+        title: "Lab 4: Safe Allow-Listed Dynamic Sorting Without SQL Injection",
+        difficulty: "Lab 4 of 4 \u2022 Injection-Safe SQL",
+        promptHtml: `
+          <p>An API endpoint receives a user-supplied <code>sort_key</code> inside <code>active_request(sort_key)</code> (seeded initially as <code>'price_asc'</code>) to sort <code>catalog_items(id, name, price_cents, rating)</code>.</p>
+          <p>Write a single <code>SELECT</code> returning <code>(id, name, price_cents, rating)</code> sorted safely via an explicit allow-list:</p>
+          <ul>
+            <li><code>'price_asc'</code> &rarr; <code>price_cents ASC</code></li>
+            <li><code>'price_desc'</code> &rarr; <code>price_cents DESC</code></li>
+            <li><code>'rating_desc'</code> &rarr; <code>rating DESC</code></li>
+            <li>Any unknown or malicious input (e.g., <code>'1; DROP TABLE catalog_items;--'</code>) &rarr; safely falls back to <code>id ASC</code>!</li>
+          </ul>
+        `,
+        setupSql: `
+          CREATE TABLE catalog_items (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            price_cents INTEGER NOT NULL,
+            rating REAL NOT NULL
+          ) STRICT;
+          CREATE TABLE active_request (sort_key TEXT NOT NULL) STRICT;
+          INSERT INTO catalog_items VALUES
+            (1, 'Standing Desk', 59900, 4.7),
+            (2, 'Mousepad',       1900, 4.3),
+            (3, 'Ergo Chair',    44900, 4.9);
+          INSERT INTO active_request VALUES ('price_asc');
+        `,
+        starterSql: `-- Return (id, name, price_cents, rating) ordered safely using active_request.sort_key:\nSELECT c.id, c.name, c.price_cents, c.rating\nFROM catalog_items c\nCROSS JOIN active_request r\nORDER BY c.id ASC;\n`,
+        hints: [
+          "Put separate typed <code>CASE</code> branches in <code>ORDER BY</code> so integer and real columns never coerce into mixed types.",
+          "Example branch: <code>CASE WHEN r.sort_key = 'price_asc' THEN c.price_cents END ASC, CASE WHEN r.sort_key = 'price_desc' THEN c.price_cents END DESC</code>.",
+          "End the <code>ORDER BY</code> list with <code>c.id ASC</code> as the deterministic fallback &amp; tie-breaker."
+        ],
+        solutionSql: `SELECT c.id, c.name, c.price_cents, c.rating
+FROM catalog_items c
+CROSS JOIN active_request r
+ORDER BY
+  CASE WHEN r.sort_key = 'price_asc'   THEN c.price_cents END ASC,
+  CASE WHEN r.sort_key = 'price_desc'  THEN c.price_cents END DESC,
+  CASE WHEN r.sort_key = 'rating_desc' THEN c.rating      END DESC,
+  c.id ASC;`,
+        solutionExplanationHtml: `
+          <p>Each <code>CASE</code> expression evaluates to <code>NULL</code> unless its exact allow-listed key matches, leaving only the matching sort expression active&mdash;and falling back cleanly to <code>c.id ASC</code> on unexpected or adversarial strings.</p>
+        `,
+        verify: function (SQL, userSql, setupSql) {
+          const checks = [];
+          function testSort(sortKey) {
+            const db = new SQL.Database();
+            try {
+              db.run(setupSql);
+              db.run("UPDATE active_request SET sort_key = ?;", [sortKey]);
+              const res = db.exec(userSql);
+              if (res.length === 0) return null;
+              return res[res.length - 1];
+            } finally {
+              db.close();
+            }
+          }
+          try {
+            const r1 = testSort("price_asc");
+            const colsOk = r1 && r1.columns.map((c) => c.toLowerCase()).join(",") === "id,name,price_cents,rating";
+            checks.push({ label: "Columns are (id, name, price_cents, rating)", passed: Boolean(colsOk) });
+
+            const idsAsc = r1 ? r1.values.map((v) => v[0]) : [];
+            checks.push({
+              label: "sort_key='price_asc' returns IDs [2, 3, 1]",
+              passed: JSON.stringify(idsAsc) === JSON.stringify([2, 3, 1]),
+              detail: `Got IDs: ${JSON.stringify(idsAsc)}`
+            });
+
+            const r2 = testSort("price_desc");
+            const idsDesc = r2 ? r2.values.map((v) => v[0]) : [];
+            checks.push({
+              label: "sort_key='price_desc' returns IDs [1, 3, 2]",
+              passed: JSON.stringify(idsDesc) === JSON.stringify([1, 3, 2]),
+              detail: `Got IDs: ${JSON.stringify(idsDesc)}`
+            });
+
+            const r3 = testSort("rating_desc");
+            const idsRating = r3 ? r3.values.map((v) => v[0]) : [];
+            checks.push({
+              label: "sort_key='rating_desc' returns IDs [3, 1, 2]",
+              passed: JSON.stringify(idsRating) === JSON.stringify([3, 1, 2]),
+              detail: `Got IDs: ${JSON.stringify(idsRating)}`
+            });
+
+            const r4 = testSort("1; DROP TABLE catalog_items;--");
+            const idsFallback = r4 ? r4.values.map((v) => v[0]) : [];
+            checks.push({
+              label: "Malicious payload falls back safely to id ASC [1, 2, 3]",
+              passed: JSON.stringify(idsFallback) === JSON.stringify([1, 2, 3]),
+              detail: `Got IDs: ${JSON.stringify(idsFallback)}`
+            });
+
+            return { passed: checks.every((c) => c.passed), checks };
+          } catch (err) {
+            checks.push({ label: "Query executes cleanly", passed: false, detail: err.message });
+            return { passed: false, checks };
+          }
+        }
+      }
+    };
+
+    window.COURSE_QUIZZES = {
+      "quiz-1": {
+        tag: "PostgreSQL Process Model",
+        questionHtml: "An AWS Lambda function scales up to 4,000 concurrent invocations, and each invocation opens a direct TCP connection to an 8-vCPU PostgreSQL instance (32 GB RAM) without PgBouncer or RDS Proxy. What happens?",
+        options: [
+          {
+            labelHtml: "PostgreSQL handles 4,000 connections cleanly using lightweight coroutines inside one process.",
+            correct: false,
+            whyHtml: "PostgreSQL uses OS processes (one backend process per client connection), NOT lightweight coroutines or a shared thread pool."
+          },
+          {
+            labelHtml: "4,000 OS backend processes exhaust RAM, thrash CPUs, and trigger <code>too many clients</code>.",
+            correct: true,
+            whyHtml: "4,000 OS processes instantly consume tens of gigabytes of RAM and flood CPU scheduling + ProcArray snapshot scans. Put PgBouncer / RDS Proxy in transaction pooling mode in front of Postgres!"
+          },
+          {
+            labelHtml: "PostgreSQL automatically switches client handling to embedded SQLite WAL mode under load.",
+            correct: false,
+            whyHtml: "PostgreSQL never switches storage or connection engines dynamically."
+          },
+          {
+            labelHtml: "Total query throughput scales linearly up toward 4,000&times; single-connection QPS capacity.",
+            correct: false,
+            whyHtml: "Beyond ~2&ndash;4&times; CPU core count, adding more active connections degrades throughput sharply due to lock &amp; CPU contention."
+          }
+        ]
+      },
+
+      "quiz-2": {
+        tag: "PgBouncer Transaction Pooling",
+        questionHtml: "You switch PgBouncer from <code>session</code> mode to <code>transaction</code> mode. Immediately, a background report job starts failing or leaking configuration onto unrelated requests. Which pattern is incompatible with transaction pooling?",
+        options: [
+          {
+            labelHtml: "Session-level <code>SET work_mem</code>, <code>TEMP TABLE</code>, or <code>LISTEN/NOTIFY</code> across transactions.",
+            correct: true,
+            whyHtml: "When PgBouncer returns the backend server connection to the pool after <code>COMMIT</code>, any session-level <code>SET</code> leaks into the next client's transaction, and <code>TEMP TABLE</code>/<code>LISTEN</code> state vanishes onto a different backend! Use <code>SET LOCAL</code> inside transactions and dedicated session connections for <code>LISTEN</code>."
+          },
+          {
+            labelHtml: "Explicit multi-statement blocks like <code>BEGIN; UPDATE ...; INSERT ...; COMMIT;</code>",
+            correct: false,
+            whyHtml: "Standard multi-statement transactions work natively in PgBouncer <code>transaction</code> mode because the server connection stays pinned until <code>COMMIT</code> or <code>ROLLBACK</code>."
+          },
+          {
+            labelHtml: "Using <code>INSERT ... RETURNING id</code> clauses inside single-statement writes.",
+            correct: false,
+            whyHtml: "<code>RETURNING</code> is part of a single SQL statement and works identically in all pooling modes."
+          },
+          {
+            labelHtml: "Parameterized <code>WHERE</code> predicates using positional placeholders like <code>$1</code>.",
+            correct: false,
+            whyHtml: "Bound query parameters are safe in transaction pooling (and PgBouncer 1.21+ even multiplexes protocol-level prepared statements when <code>max_prepared_statements &gt; 0</code>)."
+          }
+        ]
+      },
+
+      "quiz-3": {
+        tag: "Pool Sizing & Little's Law",
+        questionHtml: "Your 16-vCPU NVMe PostgreSQL database serves queries averaging <code>2ms</code>. Your 40 backend pods each have a pool size of <code>25</code> (= <code>1,000</code> direct DB connections), and p99 latency is terrible during spikes. Why should you REDUCE the Postgres backend pool (via PgBouncer) to ~<code>32&ndash;64</code> connections?",
+        options: [
+          {
+            labelHtml: "PostgreSQL stops executing queries whenever total open connections exceed fifty.",
+            correct: false,
+            whyHtml: "Postgres allows higher <code>max_connections</code>, though performance degrades severely when hundreds of backends are active simultaneously."
+          },
+          {
+            labelHtml: "PgBouncer cannot multiplex more than 32 incoming client sockets concurrently.",
+            correct: false,
+            whyHtml: "PgBouncer uses lightweight async event I/O (<code>libevent</code>) and easily holds 10,000+ client sockets while keeping only 32&ndash;64 backend connections open to Postgres."
+          },
+          {
+            labelHtml: "Smaller pools disable MVCC snapshot visibility checks across concurrent queries.",
+            correct: false,
+            whyHtml: "MVCC snapshots are always active, and having fewer concurrent transactions actually makes snapshot scanning faster!"
+          },
+          {
+            labelHtml: "40 active connections already hit 20k QPS; 1,000 just cause CPU/spinlock thrashing.",
+            correct: true,
+            whyHtml: "Only 16 CPU cores can actually execute instructions simultaneously. Queuing excess requests neatly inside PgBouncer while keeping 32&ndash;64 Postgres backends hot in CPU cache dramatically improves both throughput and p99 latency."
+          }
+        ]
+      },
+
+      "quiz-4": {
+        tag: "Defensive Timeouts",
+        questionHtml: "An engineer runs <code>BEGIN; SELECT * FROM users LIMIT 1;</code> in a debugging session or buggy microservice that forgets to <code>COMMIT</code>, leaving the session <code>idle in transaction</code> for 4 hours. Why does this threaten the entire production database?",
+        options: [
+          {
+            labelHtml: "It locks every row in <code>users</code>, blocking all concurrent reads and writes.",
+            correct: false,
+            whyHtml: "A plain <code>SELECT</code> only takes <code>ACCESS SHARE</code> and does not block reads or normal writes on <code>users</code>."
+          },
+          {
+            labelHtml: "It purges unshipped WAL segments before streaming replicas can apply them.",
+            correct: false,
+            whyHtml: "Long transactions delay vacuuming/checkpoint cleanup rather than deleting WAL prematurely."
+          },
+          {
+            labelHtml: "It pins the MVCC horizon, blocking <code>AUTOVACUUM</code> from cleaning dead tuples cluster-wide.",
+            correct: true,
+            whyHtml: "As long as any transaction stays open, PostgreSQL cannot delete row versions newer than that transaction's snapshot anywhere in the database! Setting <code>idle_in_transaction_session_timeout = '15s'</code> automatically terminates zombie transactions."
+          },
+          {
+            labelHtml: "It triggers automatic failover and promotes a read replica to primary.",
+            correct: false,
+            whyHtml: "An idle-in-transaction session never triggers failover."
+          }
+        ]
+      },
+
+      "quiz-5": {
+        tag: "SQLite Production Integration",
+        questionHtml: "When running embedded SQLite in WAL mode on a multi-threaded mobile app or single-node backend service, why should every connection execute <code>PRAGMA busy_timeout = 5000;</code>?",
+        options: [
+          {
+            labelHtml: "It lets multiple threads commit concurrent writes to the SQLite file in parallel.",
+            correct: false,
+            whyHtml: "SQLite still allows only 1 writer at a time even in WAL mode."
+          },
+          {
+            labelHtml: "SQLite defaults to <code>0ms</code> (instant <code>SQLITE_BUSY</code>); <code>5000</code> retries up to 5s.",
+            correct: true,
+            whyHtml: "Most SQLite writes finish in microseconds to a few milliseconds. Setting <code>PRAGMA busy_timeout = 5000</code> eliminates transient <code>SQLITE_BUSY</code> errors by letting SQLite retry briefly until the current writer commits."
+          },
+          {
+            labelHtml: "It enables <code>STRICT</code> column type checking across every table in the database.",
+            correct: false,
+            whyHtml: "<code>STRICT</code> is a per-table DDL keyword, unrelated to <code>busy_timeout</code>."
+          },
+          {
+            labelHtml: "It skips <code>fsync()</code> durability flushes so concurrent WAL commits return faster.",
+            correct: false,
+            whyHtml: "<code>PRAGMA synchronous</code> controls <code>fsync()</code> behavior; <code>busy_timeout</code> only controls lock wait duration."
+          }
+        ]
+      },
+
+      "quiz-6": {
+        tag: "SQL Injection & Dynamic Queries",
+        questionHtml: "A developer wants to safely support user-chosen sorting (<code>?sort=price</code> vs <code>?sort=name</code>) and writes <code>SELECT * FROM products ORDER BY $1</code>, binding <code>\"price\"</code> as parameter <code>$1</code>. What happens?",
+        options: [
+          {
+            labelHtml: "PostgreSQL safely binds the identifier and sorts rows by the <code>price</code> column.",
+            correct: false,
+            whyHtml: "Bind parameters (<code>$1</code>) can ONLY represent literal data values, never SQL identifiers like column or table names!"
+          },
+          {
+            labelHtml: "It creates a SQL injection hole whenever untrusted sort strings are passed.",
+            correct: false,
+            whyHtml: "Parameterized <code>$1</code> is actually injection-safe&mdash;it just doesn't work functionally as a column identifier, tempting devs to fall back to unsafe string concatenation unless they know the allow-list pattern."
+          },
+          {
+            labelHtml: "<code>$1</code> acts as constant string <code>'price'</code>, skipping sorting; map via an allow-list.",
+            correct: true,
+            whyHtml: "<code>ORDER BY 'price'</code> sorts every row by the identical constant string <code>'price'</code>, which does no sorting at all! Always use a server-side enum/dictionary or explicit SQL <code>CASE</code> allow-list for dynamic columns and sort directions."
+          },
+          {
+            labelHtml: "PostgreSQL invalidates and drops the B-tree index on the <code>price</code> column.",
+            correct: false,
+            whyHtml: "Parameterization never alters or drops indexes."
+          }
+        ]
+      }
+    };
+  </script>
+  <script src="assets/sql-asm.js"></script>
+  <script src="assets/course-engine.js"></script>
+</body>
+</html>

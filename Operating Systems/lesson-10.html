@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 10: I/O Subsystem, Block Layer, epoll &amp; io_uring — OS Mastery (2027)</title>
+  <link rel="stylesheet" href="assets/os-course.css" />
+  <style>
+    .ring-row {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 4px;
+      margin: 0.5rem 0 0.85rem;
+    }
+    .ring-slot {
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 0.42rem 0.25rem;
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      background: var(--bg-card);
+      color: var(--text-muted);
+    }
+    .ring-slot.pending { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+    .ring-slot.done { border-color: var(--green); background: var(--green-soft); color: var(--text); }
+    .sim-divider {
+      border-top: 1px dashed var(--border-strong);
+      margin: 1.25rem 0;
+      padding-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">LESSON 10</span>
+        <span>I/O Subsystem, Block Layer, epoll &amp; io_uring</span>
+      </div>
+      <nav class="nav-links">
+        <a href="lesson-09.html">&larr; Lesson 09</a>
+        <a href="master-plan.html">Master Plan</a>
+        <a href="#mental-model">Mental Model</a>
+        <a href="#c-kernel">C &amp; Kernel</a>
+        <a href="#android-bridge">Android Bridge</a>
+        <a href="#labs">Code Labs (3)</a>
+        <a href="#quiz">Quiz (6)</a>
+        <a href="lesson-11.html">Lesson 11 &rarr;</a>
+        <button id="themeToggle" class="btn btn-sm" type="button">Theme</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="badge b-concept">PHASE 4: I/O, STORAGE, FILESYSTEMS &amp; NETWORKING</span>
+      <h1>Lesson 10: I/O Subsystem, Block Layer, <code>epoll</code> &amp; <code>io_uring</code></h1>
+      <p>
+        Every tap on an Android touchscreen, network packet, or NVMe/UFS flash read crosses the boundary between
+        hardware devices and OS queues. Master <strong>DMA + IOMMU</strong> scatter-gather transfers, Linux's scalable
+        <strong><code>blk-mq</code></strong> multi-queue block layer, the exact state machine behind <strong><code>epoll</code></strong>
+        (Level vs Edge Triggered) powering Android's <code>Looper</code>, and shared-memory zero-syscall <strong><code>io_uring</code></strong>.
+      </p>
+      <div class="score-strip">
+        <span class="pill" id="labProgressPill">Labs Passed: 0 / 3</span>
+        <span class="pill" id="quizProgressPill">Quiz Score: 0 / 6</span>
+        <button id="markLessonComplete" class="btn btn-green btn-sm" type="button">Mark Lesson 10 Complete</button>
+      </div>
+    </section>
+
+    <!-- MODULE 1: MENTAL MODEL + SIMULATOR -->
+    <section id="mental-model" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-concept">01 // MENTAL MODEL &amp; INTERACTIVE SIMULATOR</span>
+          <h2>Hardware DMA, <code>blk-mq</code>, Event Readiness &amp; Shared I/O Rings</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>1. DMA + IOMMU &amp; Linux <code>blk-mq</code></h3>
+          <p><strong>PIO &rarr; DMA + Scatter-Gather:</strong> Instead of the CPU copying bytes from device registers (Programmed I/O), the OS hands the NVMe/UFS/NIC controller a scatter-gather descriptor ring of physical RAM pages; the DMA engine transfers megabytes directly to DRAM and fires one completion IRQ.</p>
+          <p><strong>IOMMU:</strong> Translates Device Virtual Addresses (IOVA) to Physical Addresses so a buggy/malicious PCIe/USB device cannot DMA-overwrite kernel memory.</p>
+          <p><strong><code>blk-mq</code>:</strong> Replaces Linux's old single-spinlock block queue with <strong>per-CPU software staging queues</strong> (merging contiguous sectors) feeding <strong>hardware dispatch queues</strong> mapped directly to NVMe/UFS submission queues.</p>
+        </div>
+
+        <div class="card">
+          <h3>2. <code>epoll</code> (LT vs ET) &amp; <code>io_uring</code></h3>
+          <p><strong>Why <code>epoll</code> Beats <code>select/poll</code>:</strong> <code>select</code>/<code>poll</code> copy and scan all <code>N</code> file descriptors on every syscall (O(N)). <code>epoll_ctl</code> registers FDs once into a kernel red-black tree, and waitqueue callbacks append ready FDs to an O(1) ready list returned by <code>epoll_wait()</code>.</p>
+          <p><strong>Level-Triggered (LT) vs Edge-Triggered (<code>EPOLLET</code>):</strong> LT notifies as long as unread bytes remain in the socket buffer. <code>EPOLLET</code> notifies <em>only</em> on a <code>not-ready &rarr; ready</code> transition—so failing to drain until <code>EAGAIN</code> hangs the socket forever!</p>
+          <p><strong><code>io_uring</code>:</strong> Maps two lock-free ring buffers (Submission Queue <strong>SQ</strong> &amp; Completion Queue <strong>CQ</strong>) between <code>EL0</code> and <code>EL1</code>. With <code>IORING_SETUP_SQPOLL</code>, a kernel thread polls the SQ—zero syscalls per I/O!</p>
+        </div>
+      </div>
+
+      <h3 style="margin:1.25rem 0 0.4rem;">Interactive Simulator A: <code>epoll</code> Level-Triggered vs Edge-Triggered (<code>EPOLLET</code>)</h3>
+      <p style="margin:0; font-size:0.89rem; color:var(--text-muted);">Observe how partial reads cause a silent hang bug in <code>EPOLLET</code> mode if your event loop fails to drain until <code>EAGAIN</code>.</p>
+
+      <div class="sim-box">
+        <div class="sim-controls">
+          <button class="btn btn-primary btn-sm" id="epollModeBtn" type="button">Mode: Level-Triggered (LT)</button>
+          <button class="btn btn-sm" id="epollArriveBtn" type="button">+64B Packet Arrives</button>
+          <button class="btn btn-amber btn-sm" id="epollPartialBtn" type="button">read(32B) [Partial!]</button>
+          <button class="btn btn-green btn-sm" id="epollDrainBtn" type="button">Drain Until EAGAIN</button>
+          <button class="btn btn-primary btn-sm" id="epollWaitBtn" type="button">Call epoll_wait()</button>
+        </div>
+        <div class="sim-grid">
+          <div class="reg-panel">
+            <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">SOCKET KERNEL BUFFER</div>
+            <div class="reg-row"><span>Mode</span><span id="epModeVal" class="reg-val">LT (Default)</span></div>
+            <div class="reg-row"><span>Unread Bytes</span><span id="epBytesVal" class="reg-val">0 B</span></div>
+            <div class="reg-row"><span>Edge Latched?</span><span id="epEdgeVal" class="reg-val">No</span></div>
+            <div class="reg-row"><span>epoll_wait()</span><span id="epRetVal" class="reg-val">IDLE</span></div>
+          </div>
+          <div class="reg-panel">
+            <div style="font-weight:700; margin-bottom:0.4rem; color:var(--text-muted);">DIAGNOSIS</div>
+            <div id="epExplain" style="font-family:var(--font-sans); font-size:0.84rem; color:var(--text);">
+              Click <strong>+64B Packet Arrives</strong> to simulate incoming TCP data on the socket.
+            </div>
+          </div>
+        </div>
+
+        <div class="sim-divider">
+          <h3 style="margin:0 0 0.4rem;">Interactive Simulator B: <code>io_uring</code> Shared SQ &amp; CQ Ring Buffers</h3>
+          <p style="margin:0 0 0.65rem; font-size:0.86rem; color:var(--text-muted);">User space advances <code>sqTail</code> and reads <code>cqHead</code>; kernel advances <code>sqHead</code> and posts completions at <code>cqTail</code>.</p>
+          <div class="sim-controls">
+            <button class="btn btn-primary btn-sm" id="urPushReadBtn" type="button">App: Submit SQE (READ)</button>
+            <button class="btn btn-primary btn-sm" id="urPushFsyncBtn" type="button">App: Submit SQE (FSYNC)</button>
+            <button class="btn btn-amber btn-sm" id="urKernelStepBtn" type="button">Kernel: Process Batch (2)</button>
+            <button class="btn btn-green btn-sm" id="urReapBtn" type="button">App: Reap 1 CQE</button>
+            <button class="btn btn-sm" id="urResetBtn" type="button">Reset Rings</button>
+          </div>
+          <div style="font-family:var(--font-mono); font-size:0.78rem; color:var(--text-muted);" id="sqHeader">SUBMISSION QUEUE (SQ) — head=0, tail=0</div>
+          <div class="ring-row" id="sqTrack"></div>
+          <div style="font-family:var(--font-mono); font-size:0.78rem; color:var(--text-muted);" id="cqHeader">COMPLETION QUEUE (CQ) — head=0, tail=0, overflow=0</div>
+          <div class="ring-row" id="cqTrack"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 2: C & KERNEL REALITY -->
+    <section id="c-kernel" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-kernel">02 // C &amp; KERNEL REALITY</span>
+          <h2>Correct <code>EPOLLET</code> Drain Loops &amp; <code>io_uring</code> Memory Barriers</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>epoll_et_drain.c — Non-Blocking Edge-Triggered Read Loop</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code1">Copy</button>
+          </div>
+          <pre class="code" id="code1">// Socket MUST be O_NONBLOCK when registered with EPOLLET!
+for (;;) {
+  ssize_t n = read(fd, buf, sizeof(buf));
+  if (n &gt; 0) {
+    process_bytes(buf, n);
+    continue; // Keep draining! Returning early risks permanent hang!
+  }
+  if (n == 0) {
+    close_peer(fd); // EOF
+    break;
+  }
+  if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    break; // Kernel buffer is now empty; next arrival will trigger edge!
+  }
+  if (errno == EINTR) continue;
+  handle_error(fd);
+  break;
+}</pre>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-header">
+            <span>iouring_submit.c — Shared Ring Producer/Consumer Barriers</span>
+            <button class="btn btn-sm copy-btn" type="button" data-copy="code2">Copy</button>
+          </div>
+          <pre class="code" id="code2">// User space (EL0) submitting an SQE into mmap'd io_uring rings
+uint32_t tail = *sq-&gt;ktail;
+struct io_uring_sqe *sqe = &amp;sq-&gt;sqes[tail &amp; *sq-&gt;kring_mask];
+sqe-&gt;opcode = IORING_OP_READ;
+sqe-&gt;fd = target_fd;
+sqe-&gt;addr = (uint64_t)buf;
+sqe-&gt;len = 4096;
+sqe-&gt;user_data = req_id;
+
+// Release barrier ensures SQE fields are visible BEFORE tail increments!
+__atomic_store_n(sq-&gt;ktail, tail + 1, __ATOMIC_RELEASE);
+
+// If IORING_SETUP_SQPOLL is active &amp; thread isn't sleeping, 0 syscalls!
+// Otherwise batch-notify kernel once for N SQEs:
+io_uring_enter(ring_fd, submitted, 0, 0, NULL);</pre>
+        </div>
+      </div>
+
+      <div class="callout green">
+        <strong>Why Memory Ordering Matters in <code>io_uring</code> &amp; <code>blk-mq</code>:</strong><br/>
+        <code>io_uring</code> rings are lockless Single-Producer/Single-Consumer queues shared directly across the user/kernel boundary. Without <code>__ATOMIC_RELEASE</code> when writing <code>sqTail</code> (and <code>__ATOMIC_ACQUIRE</code> when reading <code>cqTail</code>), weak-ordered ARM64 CPUs could reorder the tail pointer store ahead of the SQE payload writes—causing the kernel to read stale/uninitialized SQEs!
+      </div>
+    </section>
+
+    <!-- MODULE 3: ANDROID BRIDGE -->
+    <section id="android-bridge" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-android">03 // ANDROID INTERNALS BRIDGE</span>
+          <h2>Android <code>Looper</code> + <code>MessageQueue</code> Uses <code>epoll_wait()</code> + <code>eventfd</code></h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>Inside <code>nativePollOnce()</code> on Every Android UI Thread</h3>
+          <p><strong>No Busy-Waiting:</strong> When your app's Main Thread has no pending <code>Handler</code> messages or <code>Choreographer</code> VSync frames, it calls <code>MessageQueue.nativePollOnce(ptr, timeoutMillis)</code>, which invokes <code>Looper::pollInner()</code> in C++ (<code>libutils</code>).</p>
+          <p><strong><code>epoll_wait()</code> + <code>eventfd</code>:</strong> The native <code>Looper</code> sleeps in <code>epoll_wait()</code> watching: (1) <code>mWakeEventFd</code> (an <code>eventfd</code> written to via <code>write(8 bytes)</code> whenever another thread calls <code>Handler.post()</code>), and (2) InputDispatcher socket/pipe FDs for touch events.</p>
+          <p><strong>ANR Root Cause:</strong> If your main thread blocks inside a synchronous disk read or Binder call instead of returning to <code>epoll_wait()</code> within 5s, InputDispatcher's pipe fills/times out &rarr; Android raises an <strong>ANR</strong>.</p>
+        </div>
+
+        <div class="card">
+          <h3>UFS Flash <code>blk-mq</code> Merging &amp; <code>io_uring</code> on Android</h3>
+          <p><strong>UFS 4.0 &amp; <code>blk-mq</code>:</strong> Android phones use UFS flash with deep hardware command queues (32+ tags). Merging adjacent 4KB SQLite/Dex reads in <code>blk-mq</code> reduces UFS command overhead and boosts sequential bandwidth while keeping latency low via I/O schedulers like <code>mq-deadline</code> or <code>kyber</code>.</p>
+          <p><strong><code>io_uring</code> &amp; Seccomp:</strong> While <code>io_uring</code> gives massive throughput wins for database/media engines, untrusted Android app sandboxes historically restricted <code>io_uring_setup</code> in <code>seccomp-bpf</code> due to kernel attack-surface hardening, whereas privileged system daemons (like <code>apexd</code> / <code>update_engine</code> / native servers) can leverage async I/O rings safely.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODULE 4: RUNNABLE CODE PRACTICE LABS -->
+    <section id="labs" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-lab">04 // RUNNABLE CODE PRACTICE LABS</span>
+          <h2>Hands-On <code>epoll</code>, <code>io_uring</code> &amp; <code>blk-mq</code> Labs</h2>
+        </div>
+      </div>
+
+      <!-- LAB 1 -->
+      <div class="lab-card" id="lab1">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 1 OF 3 // EPOLL LEVEL vs EDGE TRIGGERED</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>epollStep(fdStates, interested, mode)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Emit ready FDs under <code>"LT"</code> or <code>"ET"</code> (<code>EPOLLET</code>) edge-transition semantics.</p>
+          </div>
+          <span class="lab-status" id="lab1-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong><br/>
+          &bull; <code>fdStates</code>: map object <code>{ [fd]: { ready: boolean, prevReady: boolean } }</code>.<br/>
+          &bull; <code>interested</code>: array of FD keys registered in this <code>epoll</code> instance.<br/>
+          &bull; <code>mode</code>: <code>"LT"</code> (Level-Triggered) or <code>"ET"</code> (Edge-Triggered).<br/>
+          &bull; For each <code>fd</code> in <code>interested</code>: if <code>!fdStates[fd]</code>, skip it. Otherwise:<br/>
+          &nbsp;&nbsp;&bull; In <code>"LT"</code> mode: emit <code>fd</code> if <code>fdStates[fd].ready === true</code>.<br/>
+          &nbsp;&nbsp;&bull; In <code>"ET"</code> mode: emit <code>fd</code> <strong>only</strong> if <code>fdStates[fd].ready === true &amp;&amp; fdStates[fd].prevReady === false</code> (rising edge).<br/>
+          &nbsp;&nbsp;&bull; Always update <code>fdStates[fd].prevReady = Boolean(fdStates[fd].ready)</code> after checking.<br/>
+          &bull; Return the array of emitted FDs in the order checked.
+        </div>
+
+        <textarea class="editor-area" id="lab1-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(1)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(1)">Hint (<span id="lab1-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(1)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(1)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab1-output"></div>
+        <div class="hint-box" id="lab1-hints"></div>
+        <div class="solution-box" id="lab1-solution"></div>
+      </div>
+
+      <!-- LAB 2 -->
+      <div class="lab-card" id="lab2">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 2 OF 3 // IO_URING RING CONSUMER &amp; PRODUCER</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>ioUringProcess(sqRing, cqRing, maxBatch, executeOp)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Consume SQEs across power-of-2 ring wraparound without clobbering unread CQEs.</p>
+          </div>
+          <span class="lab-status" id="lab2-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong><br/>
+          &bull; <code>sqRing</code>: <code>{ head, tail, mask, entries }</code> (ring capacity = <code>mask + 1</code>).<br/>
+          &bull; <code>cqRing</code>: <code>{ head, tail, mask, entries, overflow }</code>.<br/>
+          &bull; Loop while <code>processed &lt; maxBatch &amp;&amp; sqRing.head !== sqRing.tail</code>:<br/>
+          &nbsp;&nbsp;1. Read <code>sqe = sqRing.entries[sqRing.head &amp; sqRing.mask]</code> and increment <code>sqRing.head++</code>.<br/>
+          &nbsp;&nbsp;2. Execute <code>cqe = executeOp(sqe)</code> and increment <code>processed++</code>.<br/>
+          &nbsp;&nbsp;3. If CQ has space (<code>(cqRing.tail - cqRing.head) &lt; (cqRing.mask + 1)</code>), write <code>cqRing.entries[cqRing.tail &amp; cqRing.mask] = cqe</code> and increment <code>cqRing.tail++</code>.<br/>
+          &nbsp;&nbsp;4. Else CQ is full: increment <code>cqRing.overflow++</code> without overwriting unread CQEs.<br/>
+          &bull; Return <code>processed</code>.
+        </div>
+
+        <textarea class="editor-area" id="lab2-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(2)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(2)">Hint (<span id="lab2-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(2)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(2)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab2-output"></div>
+        <div class="hint-box" id="lab2-hints"></div>
+        <div class="solution-box" id="lab2-solution"></div>
+      </div>
+
+      <!-- LAB 3 -->
+      <div class="lab-card" id="lab3">
+        <div class="lab-header">
+          <div>
+            <span class="badge b-lab">LAB 3 OF 3 // BLK-MQ SECTOR MERGING</span>
+            <h3 style="margin:0.35rem 0 0.25rem;">Implement <code>blkMqMergeAndDispatch(requests, maxMergeBytes)</code></h3>
+            <p style="margin:0; font-size:0.87rem; color:var(--text-muted);">Sort block requests by sector and coalesce contiguous same-direction I/O up to <code>maxMergeBytes</code>.</p>
+          </div>
+          <span class="lab-status" id="lab3-status">Not Run</span>
+        </div>
+
+        <div class="callout" style="margin:0.6rem 0 0.9rem; font-size:0.84rem;">
+          <strong>Specification:</strong> Each request in <code>requests</code> is <code>{ id, op: "READ"|"WRITE", sector, bytes }</code> (1 sector = 512 bytes, <code>bytes</code> is a positive multiple of 512).<br/>
+          1. Do not mutate input array or objects. Sort a copy by <code>sector</code> ascending (preserving original order on equal sector).<br/>
+          2. Coalesce adjacent sorted requests into batches <code>{ op, startSector, totalBytes, ids }</code> whenever:<br/>
+          &nbsp;&nbsp;&bull; <code>curr.op === prev.op</code><br/>
+          &nbsp;&nbsp;&bull; <code>prev.startSector + (prev.totalBytes / 512) === curr.sector</code> (strictly contiguous)<br/>
+          &nbsp;&nbsp;&bull; <code>prev.totalBytes + curr.bytes &lt;= maxMergeBytes</code><br/>
+          3. Return the array of merged dispatch descriptors.
+        </div>
+
+        <textarea class="editor-area" id="lab3-code" spellcheck="false"></textarea>
+        <div class="lab-toolbar">
+          <button class="btn btn-primary btn-sm" type="button" onclick="runLab(3)">Run &amp; Check</button>
+          <button class="btn btn-sm" type="button" onclick="revealNextHint(3)">Hint (<span id="lab3-hint-count">0/3</span>)</button>
+          <button class="btn btn-sm" type="button" onclick="toggleSolution(3)">Show Final Answer</button>
+          <button class="btn btn-sm" type="button" onclick="resetLab(3)">Reset</button>
+        </div>
+        <div class="lab-output" id="lab3-output"></div>
+        <div class="hint-box" id="lab3-hints"></div>
+        <div class="solution-box" id="lab3-solution"></div>
+      </div>
+    </section>
+
+    <!-- MODULE 5: QUIZ -->
+    <section id="quiz" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-quiz">05 // CODE &amp; ARCHITECTURE QUIZZES</span>
+          <h2>Diagnostic Multiple Choice (6 Questions)</h2>
+        </div>
+      </div>
+      <div id="quizContainer"></div>
+    </section>
+
+    <!-- MODULE 6: SENIOR BAR -->
+    <section id="senior-bar" class="module">
+      <div class="module-head">
+        <div>
+          <span class="badge b-senior">06 // SENIOR BAR, REAL CLI &amp; CAPSTONE LINK</span>
+          <h2>Live Block Queue, <code>epoll</code> &amp; <code>io_uring</code> Forensics</h2>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="code-wrap">
+          <div class="code-header"><span>Real Linux / Android I/O Inspection CLI</span><button class="btn btn-sm copy-btn" type="button" data-copy="cli1">Copy</button></div>
+          <pre class="code" id="cli1"># 1. Inspect block device queue depth, await latency &amp; merge rate (r/s, rrqm/s)
+iostat -xz 1
+
+# 2. Check max mergeable request size &amp; scheduler on NVMe / UFS
+cat /sys/block/nvme0n1/queue/max_sectors_kb
+cat /sys/block/nvme0n1/queue/scheduler
+
+# 3. Trace epoll_wait wakeups on an Android Looper thread
+strace -e epoll_pwait,read,write -p &lt;tid&gt;
+
+# 4. Check kernel io_uring support / sysctl restriction
+cat /proc/sys/kernel/io_uring_disabled</pre>
+        </div>
+
+        <div class="card">
+          <h3>Senior Engineer Mastery Checklist</h3>
+          <ul class="checklist">
+            <li><input type="checkbox" /> <span>I can explain how DMA scatter-gather + IOMMU eliminates CPU byte-copying while isolating peripheral memory access.</span></li>
+            <li><input type="checkbox" /> <span>I understand why <code>blk-mq</code> splits software staging queues from hardware dispatch queues for NVMe/UFS scaling.</span></li>
+            <li><input type="checkbox" /> <span>I can explain Android <code>Looper::pollInner</code> (<code>epoll_wait</code> + <code>eventfd</code>) and why <code>EPOLLET</code> hangs if you don't drain until <code>EAGAIN</code>.</span></li>
+            <li><input type="checkbox" /> <span>I can trace <code>io_uring</code> SQ/CQ ring head/tail memory barriers and why <code>IORING_SETUP_SQPOLL</code> achieves zero-syscall I/O.</span></li>
+          </ul>
+          <div class="callout green" style="margin-top:0.85rem; margin-bottom:0; font-size:0.84rem;">
+            <strong>Next Step:</strong> Ready for <strong>Lesson 11 (VFS, Ext4, F2FS &amp; Crash Consistency)</strong>? Continue to <a href="lesson-11.html">Lesson 11 &rarr;</a> or return to <a href="master-plan.html">Master Plan</a>.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="lesson-nav-bottom">
+      <a href="lesson-09.html" class="btn">&larr; Lesson 09: MGLRU, ZRAM &amp; LMKD</a>
+      <a href="master-plan.html" class="btn">Master Plan</a>
+      <a href="lesson-11.html" class="btn btn-primary">Lesson 11: VFS, Ext4, F2FS &amp; Crash Consistency &rarr;</a>
+    </div>
+  </main>
+
+  <script src="assets/os-course.js"></script>
+  <script>
+    /* ============================================================
+       SIMULATOR A: EPOLL LT VS ET
+       ============================================================ */
+    (function () {
+      let mode = "LT";
+      let unreadBytes = 0;
+      let prevReady = false;
+      let edgeLatched = false;
+
+      function renderEpoll(retText, explainHtml) {
+        document.getElementById("epollModeBtn").textContent = mode === "LT" ? "Mode: Level-Triggered (LT)" : "Mode: Edge-Triggered (EPOLLET)";
+        document.getElementById("epModeVal").textContent = mode === "LT" ? "LT (Level)" : "ET (EPOLLET)";
+        document.getElementById("epBytesVal").textContent = `${unreadBytes} B`;
+        document.getElementById("epEdgeVal").textContent = edgeLatched ? "YES (Pending)" : "No";
+        document.getElementById("epRetVal").textContent = retText;
+        document.getElementById("epExplain").innerHTML = explainHtml;
+      }
+
+      document.getElementById("epollModeBtn").addEventListener("click", () => {
+        mode = mode === "LT" ? "ET" : "LT";
+        edgeLatched = unreadBytes > 0 && !prevReady;
+        renderEpoll("MODE SWITCHED", `Switched to <strong>${mode}</strong>. ${mode === "ET" ? "ET only triggers on 0 -> >0 byte transitions!" : "LT triggers whenever unreadBytes > 0."}`);
+      });
+
+      document.getElementById("epollArriveBtn").addEventListener("click", () => {
+        const wasEmpty = unreadBytes === 0;
+        unreadBytes += 64;
+        if (wasEmpty) edgeLatched = true;
+        renderEpoll("DATA ARRIVED", `64B arrived (total <code>${unreadBytes}B</code>). ${wasEmpty ? "Rising edge (0 -> >0) latched!" : "Buffer was already non-empty."}`);
+      });
+
+      document.getElementById("epollPartialBtn").addEventListener("click", () => {
+        if (unreadBytes === 0) {
+          renderEpoll("EAGAIN", "Socket buffer is empty (0B). <code>read()</code> returned <code>-1 (EAGAIN)</code>.");
+          return;
+        }
+        const readAmt = Math.min(32, unreadBytes);
+        unreadBytes -= readAmt;
+        renderEpoll(`READ ${readAmt}B`, `App read ${readAmt}B, leaving <strong>${unreadBytes}B still in kernel buffer</strong>. Now click <strong>Call epoll_wait()</strong>!`);
+      });
+
+      document.getElementById("epollDrainBtn").addEventListener("click", () => {
+        unreadBytes = 0;
+        prevReady = false;
+        edgeLatched = false;
+        renderEpoll("DRAINED (EAGAIN)", "Drained all bytes until <code>EAGAIN</code>! Socket returned to non-ready state so future packets will fire a fresh edge.");
+      });
+
+      document.getElementById("epollWaitBtn").addEventListener("click", () => {
+        const isReady = unreadBytes > 0;
+        let fired = false;
+        if (mode === "LT") {
+          fired = isReady;
+        } else {
+          fired = edgeLatched || (isReady && !prevReady);
+          edgeLatched = false;
+        }
+        prevReady = isReady;
+
+        if (fired) {
+          renderEpoll("RETURNED [EPOLLIN]", `<code>epoll_wait()</code> returned <strong>EPOLLIN</strong>! (${unreadBytes}B waiting). Try reading only 32B and calling <code>epoll_wait()</code> again.`);
+        } else if (mode === "ET" && unreadBytes > 0) {
+          renderEpoll("BLOCKED FOREVER! (HUNG)", `<span style="color:var(--red); font-weight:700;">BUG REPRODUCED:</span> ${unreadBytes}B remain unread in kernel, but <code>EPOLLET</code> already delivered the rising edge and won't wake up again!`);
+        } else {
+          renderEpoll("SLEEPING (0 events)", "Buffer is empty (0B). Thread sleeps cleanly until next packet.");
+        }
+      });
+
+      renderEpoll("IDLE", "Click <strong>+64B Packet Arrives</strong> to simulate incoming TCP data.");
+    })();
+
+    /* ============================================================
+       SIMULATOR B: IO_URING SQ/CQ RING BUFFER
+       ============================================================ */
+    (function () {
+      const SIZE = 8;
+      const MASK = 7;
+      let sqHead = 0, sqTail = 0, cqHead = 0, cqTail = 0, cqOverflow = 0, nextReq = 1;
+      let sqEntries = Array(SIZE).fill(null);
+      let cqEntries = Array(SIZE).fill(null);
+
+      function renderRings() {
+        document.getElementById("sqHeader").textContent = `SUBMISSION QUEUE (SQ) — head=${sqHead}, tail=${sqTail}, pending=${sqTail - sqHead}`;
+        document.getElementById("cqHeader").textContent = `COMPLETION QUEUE (CQ) — head=${cqHead}, tail=${cqTail}, ready=${cqTail - cqHead}, overflow=${cqOverflow}`;
+
+        const sqHtml = [];
+        for (let i = 0; i < SIZE; i++) {
+          let active = false;
+          for (let p = sqHead; p < sqTail; p++) if ((p & MASK) === i) active = true;
+          const item = sqEntries[i];
+          sqHtml.push(`<div class="ring-slot ${active ? "pending" : ""}"><div>[${i}]</div><div>${active && item ? item.op + "#" + item.id : "-"}</div></div>`);
+        }
+        document.getElementById("sqTrack").innerHTML = sqHtml.join("");
+
+        const cqHtml = [];
+        for (let i = 0; i < SIZE; i++) {
+          let active = false;
+          for (let p = cqHead; p < cqTail; p++) if ((p & MASK) === i) active = true;
+          const item = cqEntries[i];
+          cqHtml.push(`<div class="ring-slot ${active ? "done" : ""}"><div>[${i}]</div><div>${active && item ? "OK#" + item.id : "-"}</div></div>`);
+        }
+        document.getElementById("cqTrack").innerHTML = cqHtml.join("");
+      }
+
+      function pushSqe(op) {
+        if (sqTail - sqHead >= SIZE) return;
+        sqEntries[sqTail & MASK] = { id: nextReq++, op };
+        sqTail++;
+        renderRings();
+      }
+
+      document.getElementById("urPushReadBtn").addEventListener("click", () => pushSqe("RD"));
+      document.getElementById("urPushFsyncBtn").addEventListener("click", () => pushSqe("FS"));
+      document.getElementById("urKernelStepBtn").addEventListener("click", () => {
+        let n = 0;
+        while (n < 2 && sqHead !== sqTail) {
+          const sqe = sqEntries[sqHead & MASK];
+          sqHead++;
+          n++;
+          if (cqTail - cqHead < SIZE) {
+            cqEntries[cqTail & MASK] = { id: sqe.id, res: 4096 };
+            cqTail++;
+          } else {
+            cqOverflow++;
+          }
+        }
+        renderRings();
+      });
+      document.getElementById("urReapBtn").addEventListener("click", () => {
+        if (cqHead !== cqTail) cqHead++;
+        renderRings();
+      });
+      document.getElementById("urResetBtn").addEventListener("click", () => {
+        sqHead = sqTail = cqHead = cqTail = cqOverflow = 0;
+        nextReq = 1;
+        sqEntries = Array(SIZE).fill(null);
+        cqEntries = Array(SIZE).fill(null);
+        renderRings();
+      });
+      renderRings();
+    })();
+
+    /* ============================================================
+       LESSON 10 CONFIG: LABS & QUIZZES
+       ============================================================ */
+    window.LESSON_CONFIG = {
+      num: "10",
+      labs: {
+        1: {
+          fnName: "epollStep",
+          starter: `function epollStep(fdStates, interested, mode) {
+  const triggered = [];
+  for (const fd of interested) {
+    // TODO: skip missing fdStates[fd], check LT vs ET rising edge, update prevReady
+  }
+  return triggered;
+}`,
+          hints: [
+            "Hint 1: Check const st = fdStates[fd]; if (!st) continue;.",
+            "Hint 2: In \"LT\" mode, trigger whenever st.ready === true. In \"ET\" mode, trigger ONLY when st.ready === true && st.prevReady === false.",
+            "Hint 3: After checking (for both LT and ET), update st.prevReady = Boolean(st.ready); so subsequent polls know the prior readiness state."
+          ],
+          solution: `function epollStep(fdStates, interested, mode) {
+  const triggered = [];
+  for (const fd of interested) {
+    const st = fdStates[fd];
+    if (!st) continue;
+    const isReady = Boolean(st.ready);
+    const wasReady = Boolean(st.prevReady);
+    if (mode === "LT") {
+      if (isReady) triggered.push(fd);
+    } else if (mode === "ET") {
+      if (isReady && !wasReady) triggered.push(fd);
+    }
+    st.prevReady = isReady;
+  }
+  return triggered;
+}`,
+          solutionExplain: "Level-Triggered emits on every poll while ready is true; Edge-Triggered emits only on the false -> true rising edge and stays silent until ready drops back to false and rises again.",
+          tests: function (fn) {
+            const out = [];
+            const ltStates = { 3: { ready: true, prevReady: false }, 5: { ready: false, prevReady: false } };
+            const lt1 = fn(ltStates, [3, 5], "LT");
+            const lt2 = fn(ltStates, [3, 5], "LT");
+            out.push({
+              name: "Level-Triggered keeps firing on every epoll_wait while FD remains ready",
+              pass: JSON.stringify(lt1) === JSON.stringify([3]) && JSON.stringify(lt2) === JSON.stringify([3]),
+              detail: `lt1=${JSON.stringify(lt1)}, lt2=${JSON.stringify(lt2)}`
+            });
+
+            const etStates = { 4: { ready: true, prevReady: false }, 7: { ready: true, prevReady: false } };
+            const et1 = fn(etStates, [4, 7], "ET");
+            const et2 = fn(etStates, [4, 7], "ET"); // still ready -> silent!
+            out.push({
+              name: "Edge-Triggered fires once on false->true transition and goes silent if undrained",
+              pass: JSON.stringify(et1) === JSON.stringify([4, 7]) && et2.length === 0,
+              detail: `et1=${JSON.stringify(et1)}, et2=${JSON.stringify(et2)}`
+            });
+
+            etStates[4].ready = false; // drained until EAGAIN
+            const et3 = fn(etStates, [4, 7], "ET");
+            etStates[4].ready = true;  // new packet arrives
+            const et4 = fn(etStates, [4, 7], "ET");
+            out.push({
+              name: "ET re-arms only after FD drains to ready=false and transitions back to true",
+              pass: et3.length === 0 && JSON.stringify(et4) === JSON.stringify([4]),
+              detail: `et3=${JSON.stringify(et3)}, et4=${JSON.stringify(et4)}`
+            });
+
+            const missStates = { 9: { ready: true, prevReady: false } };
+            const resMiss = fn(missStates, [99, 9], "ET");
+            out.push({
+              name: "Skips unknown FDs safely and ignores unregistered ready FDs",
+              pass: JSON.stringify(resMiss) === JSON.stringify([9]),
+              detail: JSON.stringify(resMiss)
+            });
+            return out;
+          }
+        },
+        2: {
+          fnName: "ioUringProcess",
+          starter: `function ioUringProcess(sqRing, cqRing, maxBatch, executeOp) {
+  let processed = 0;
+  // TODO: consume up to maxBatch SQEs via sqRing.head & sqRing.mask, push CQEs or increment cqRing.overflow
+  return processed;
+}`,
+          hints: [
+            "Hint 1: Loop condition: while (processed < maxBatch && sqRing.head !== sqRing.tail).",
+            "Hint 2: Read sqe = sqRing.entries[sqRing.head & sqRing.mask]; sqRing.head++; processed++; const cqe = executeOp(sqe);.",
+            "Hint 3: CQ capacity is cqRing.mask + 1. If (cqRing.tail - cqRing.head) < (cqRing.mask + 1), store cqRing.entries[cqRing.tail & cqRing.mask] = cqe and increment cqRing.tail++; otherwise increment cqRing.overflow++."
+          ],
+          solution: `function ioUringProcess(sqRing, cqRing, maxBatch, executeOp) {
+  let processed = 0;
+  const cqCap = cqRing.mask + 1;
+  while (processed < maxBatch && sqRing.head !== sqRing.tail) {
+    const sqe = sqRing.entries[sqRing.head & sqRing.mask];
+    sqRing.head++;
+    processed++;
+    const cqe = executeOp(sqe);
+    if ((cqRing.tail - cqRing.head) < cqCap) {
+      cqRing.entries[cqRing.tail & cqRing.mask] = cqe;
+      cqRing.tail++;
+    } else {
+      cqRing.overflow++;
+    }
+  }
+  return processed;
+}`,
+          solutionExplain: "Using power-of-2 bitmask indexing (index & mask) with monotonically advancing head/tail counters handles ring wraparound cleanly and guards against overwriting unread CQEs.",
+          tests: function (fn) {
+            const out = [];
+            const sq = { head: 6, tail: 10, mask: 7, entries: [
+              { id: 3 }, { id: 4 }, null, null, null, null, { id: 1 }, { id: 2 }
+            ]};
+            const cq = { head: 0, tail: 0, mask: 7, entries: Array(8).fill(null), overflow: 0 };
+            const exec = (sqe) => ({ userData: sqe.id, res: sqe.id * 10 });
+
+            const p1 = fn(sq, cq, 3, exec);
+            out.push({
+              name: "Handles wraparound across mask=7 boundary and respects maxBatch=3",
+              pass: p1 === 3 && sq.head === 9 && cq.tail === 3 &&
+                cq.entries[0].userData === 1 && cq.entries[1].userData === 2 && cq.entries[2].userData === 3,
+              detail: `processed=${p1}, sqHead=${sq.head}, cqTail=${cq.tail}`
+            });
+
+            const p2 = fn(sq, cq, 5, exec);
+            out.push({
+              name: "Drains remaining wrapped SQE (#4) and stops cleanly when SQ empty",
+              pass: p2 === 1 && sq.head === 10 && cq.tail === 4 && cq.entries[3].userData === 4,
+              detail: `processed=${p2}, sqHead=${sq.head}, cqTail=${cq.tail}`
+            });
+
+            const fullSq = { head: 0, tail: 2, mask: 3, entries: [{ id: 10 }, { id: 11 }, null, null] };
+            const fullCq = { head: 4, tail: 7, mask: 3, entries: [{ userData: 99 }, { userData: 98 }, { userData: 97 }, { userData: 96 }], overflow: 0 };
+            const p3 = fn(fullSq, fullCq, 4, exec);
+            out.push({
+              name: "CQ full protection prevents overwriting unread CQEs and increments overflow",
+              pass: p3 === 2 && fullCq.tail === 8 && fullCq.overflow === 1 && fullCq.entries[0].userData === 99 && fullCq.entries[3].userData === 10,
+              detail: `overflow=${fullCq.overflow}, cqTail=${fullCq.tail}, slot0=${fullCq.entries[0].userData}`
+            });
+
+            const emptyP = fn(fullSq, fullCq, 4, exec);
+            out.push({
+              name: "Empty SQ returns 0 without mutating CQ",
+              pass: emptyP === 0 && fullCq.overflow === 1,
+              detail: `emptyP=${emptyP}`
+            });
+            return out;
+          }
+        },
+        3: {
+          fnName: "blkMqMergeAndDispatch",
+          starter: `function blkMqMergeAndDispatch(requests, maxMergeBytes) {
+  if (!requests.length) return [];
+  // TODO: sort copy by sector ascending, merge contiguous same-op requests within maxMergeBytes
+}`,
+          hints: [
+            "Hint 1: Copy and index requests: const sorted = requests.map((r, i) => ({ ...r, _i: i })).sort((a, b) => (a.sector - b.sector) || (a._i - b._i));.",
+            "Hint 2: Seed merged = [{ op: sorted[0].op, startSector: sorted[0].sector, totalBytes: sorted[0].bytes, ids: [sorted[0].id] }].",
+            "Hint 3: For each subsequent req, check prev = merged[merged.length - 1]: if prev.op === req.op && prev.startSector + (prev.totalBytes / 512) === req.sector && prev.totalBytes + req.bytes <= maxMergeBytes, append req.id and add req.bytes to prev.totalBytes; else push a new entry."
+          ],
+          solution: `function blkMqMergeAndDispatch(requests, maxMergeBytes) {
+  if (!requests || requests.length === 0) return [];
+  const sorted = requests
+    .map((r, idx) => ({ ...r, _idx: idx }))
+    .sort((a, b) => (a.sector - b.sector) || (a._idx - b._idx));
+
+  const merged = [{
+    op: sorted[0].op,
+    startSector: sorted[0].sector,
+    totalBytes: sorted[0].bytes,
+    ids: [sorted[0].id]
+  }];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const req = sorted[i];
+    const prev = merged[merged.length - 1];
+    const prevEndSector = prev.startSector + (prev.totalBytes / 512);
+    if (
+      prev.op === req.op &&
+      prevEndSector === req.sector &&
+      prev.totalBytes + req.bytes <= maxMergeBytes
+    ) {
+      prev.totalBytes += req.bytes;
+      prev.ids.push(req.id);
+    } else {
+      merged.push({
+        op: req.op,
+        startSector: req.sector,
+        totalBytes: req.bytes,
+        ids: [req.id]
+      });
+    }
+  }
+  return merged;
+}`,
+          solutionExplain: "blk-mq sorts queued requests by LBA sector and merges adjacent same-direction BIOs up to the hardware max_sectors_kb limit, slashing NVMe/UFS command submissions.",
+          tests: function (fn) {
+            const out = [];
+            const reqs1 = [
+              { id: "r2", op: "READ", sector: 108, bytes: 4096 },
+              { id: "r1", op: "READ", sector: 100, bytes: 4096 },
+              { id: "r3", op: "READ", sector: 116, bytes: 4096 }
+            ];
+            const m1 = fn(reqs1, 16384);
+            out.push({
+              name: "Sorts out-of-order contiguous READs and merges into 1 BIO (12KB)",
+              pass: m1.length === 1 && m1[0].startSector === 100 && m1[0].totalBytes === 12288 && JSON.stringify(m1[0].ids) === JSON.stringify(["r1", "r2", "r3"]) && reqs1[0].id === "r2",
+              detail: JSON.stringify(m1)
+            });
+
+            const reqs2 = [
+              { id: "a", op: "READ", sector: 0, bytes: 4096 },
+              { id: "b", op: "WRITE", sector: 8, bytes: 4096 }
+            ];
+            const m2 = fn(reqs2, 32768);
+            out.push({
+              name: "Refuses to merge READ and WRITE even when sectors are contiguous",
+              pass: m2.length === 2 && m2[0].op === "READ" && m2[1].op === "WRITE",
+              detail: JSON.stringify(m2)
+            });
+
+            const reqs3 = [
+              { id: "x1", op: "WRITE", sector: 200, bytes: 4096 },
+              { id: "x2", op: "WRITE", sector: 208, bytes: 4096 },
+              { id: "x3", op: "WRITE", sector: 216, bytes: 4096 }
+            ];
+            const m3 = fn(reqs3, 8192);
+            out.push({
+              name: "Splits merge when totalBytes would exceed maxMergeBytes (8192B)",
+              pass: m3.length === 2 && m3[0].totalBytes === 8192 && JSON.stringify(m3[0].ids) === JSON.stringify(["x1", "x2"]) && m3[1].startSector === 216,
+              detail: JSON.stringify(m3)
+            });
+
+            const m4 = fn([
+              { id: "g1", op: "READ", sector: 10, bytes: 4096 },
+              { id: "g2", op: "READ", sector: 30, bytes: 4096 }
+            ], 65536);
+            const m5 = fn([], 8192);
+            out.push({
+              name: "Non-contiguous sector gap stays separate; empty queue returns []",
+              pass: m4.length === 2 && m5.length === 0,
+              detail: `gapLen=${m4.length}, emptyLen=${m5.length}`
+            });
+            return out;
+          }
+        }
+      },
+      quizzes: [
+        {
+          q: "1. What security vulnerability does the hardware IOMMU prevent when a fast NVMe SSD, GPU, or Thunderbolt peripheral uses DMA?",
+          options: [
+            "A. It prevents user-space JavaScript from running out of heap.",
+            "B. It isolates and translates device DMA addresses (IOVAs) via DMA page tables so a buggy or rogue peripheral cannot DMA-read/overwrite arbitrary physical kernel RAM.",
+            "C. It encrypts SQLite WAL files with SHA-256.",
+            "D. It eliminates the need for `epoll_wait()`."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): IOMMU operates on peripheral bus DMA transactions, not JS garbage collection.",
+            "Correct (B): Without an IOMMU, DMA engines write directly to physical addresses on the memory bus, bypassing CPU MMU protection. The IOMMU enforces per-device page tables restricting DMA to authorized scatter-gather buffers.",
+            "Wrong (C): Storage encryption is handled by inline crypto / `fscrypt`, not IOMMU address translation.",
+            "Wrong (D): IOMMU protects memory transfers; `epoll_wait` handles event readiness."
+          ]
+        },
+        {
+          q: "2. Why did Linux replace the legacy single-queue block layer with `blk-mq` (Multi-Queue Block I/O) for modern NVMe and UFS 4.0 flash?",
+          options: [
+            "A. Legacy spinning disks only had 1 sector.",
+            "B. A single global request-queue spinlock bottlenecked multi-core CPUs trying to feed 1M+ IOPS into NVMe/UFS devices that natively support dozens of parallel hardware submission queues.",
+            "C. `blk-mq` removes the VFS layer completely.",
+            "D. `blk-mq` converts all random writes into read-only pages."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Spinning disks had millions of sectors, just very low IOPS (~150) where one lock didn't hurt.",
+            "Correct (B): Giving each CPU core its own lockless software staging queue (for merging/accounting) mapped to per-queue hardware dispatch contexts eliminates cross-core spinlock contention.",
+            "Wrong (C): VFS and filesystems sit above `blk-mq` and submit `struct bio` requests into it.",
+            "Wrong (D): `blk-mq` dispatches both reads and writes."
+          ]
+        },
+        {
+          q: "3. A server registers a TCP socket in `epoll` with `EPOLLET` (Edge-Triggered). 1,000 bytes arrive, the app calls `read(fd, buf, 256)` once, processes 256 bytes, and loops back to `epoll_wait()`. What happens next if the client waits for a reply?",
+          options: [
+            "A. `epoll_wait()` immediately wakes up again because 744 bytes remain.",
+            "B. Deadlock / hung socket: `epoll_wait()` blocks indefinitely because `EPOLLET` only notifies on new state transitions (`not-ready -> ready`), not remaining buffered bytes.",
+            "C. The kernel automatically closes the socket with `SIGPIPE`.",
+            "D. `read()` automatically drains the rest into swap."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): That describes Level-Triggered (LT), not Edge-Triggered (`EPOLLET`).",
+            "Correct (B): In `EPOLLET`, the edge fired when the socket transitioned from empty to readable. Leaving 744 bytes unread means no new transition occurs unless more data happens to arrive—so the connection hangs forever unless you loop `read()` until `EAGAIN`.",
+            "Wrong (C): `SIGPIPE` occurs when writing to a closed peer socket, not on a partial read.",
+            "Wrong (D): The kernel never discards or swaps unread socket receive buffers silently."
+          ]
+        },
+        {
+          q: "4. How does Android's main UI thread `Looper` sleep with 0% CPU usage and wake up instantly when a background thread calls `Handler.post()`?",
+          options: [
+            "A. It spins in a `while(true)` loop polling `System.nanoTime()`.",
+            "B. `MessageQueue.nativePollOnce()` blocks in `epoll_wait()` on an `eventfd` (`mWakeEventFd`) plus input sockets; `Handler.post()` writes 8 bytes to that `eventfd` to wake the UI thread.",
+            "C. It sends a `SIGKILL` and restarts the Activity.",
+            "D. It uses `io_uring` `SQPOLL` on every Kotlin coroutine."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): Busy-spinning would drain the phone battery in an hour.",
+            "Correct (B): `epoll_wait()` puts the thread to sleep in the kernel (`EL1`) with zero CPU burn; `wake()` writes to `mWakeEventFd`, making it immediately readable and waking `epoll_wait()`.",
+            "Wrong (C): `SIGKILL` terminates the process.",
+            "Wrong (D): Android's `libutils` `Looper` uses `epoll` + `eventfd` (historically `pipe()`), not `io_uring`."
+          ]
+        },
+        {
+          q: "5. What allows `io_uring` with `IORING_SETUP_SQPOLL` to submit and complete thousands of I/O operations with *zero* syscalls on the hot path?",
+          options: [
+            "A. It runs user code inside `EL1` kernel mode.",
+            "B. Submission (SQ) and Completion (CQ) ring buffers live in shared memory (`mmap`) between user space and a kernel poller thread (`sqpoll`), synchronized via atomic head/tail indices + memory barriers.",
+            "C. It disables page tables.",
+            "D. It buffers all writes exclusively in L1 CPU cache."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): User apps stay strictly in `EL0`; privilege isolation is never weakened.",
+            "Correct (B): User space writes SQEs and advances `sqTail` with release semantics in shared memory; the kernel `sqpoll` thread picks them up and writes CQEs into the CQ ring without `SVC`/`SYSCALL` traps.",
+            "Wrong (C): MMU page tables remain fully active (and `mmap` maps the shared rings).",
+            "Wrong (D): L1 cache cannot hold persistent file I/O."
+          ]
+        },
+        {
+          q: "6. In `io_uring`, why must the user-space producer issue a release memory barrier (`smp_store_release` / `__ATOMIC_RELEASE`) when incrementing `sqTail`?",
+          options: [
+            "A. To flush the SSD's internal DRAM cache to NAND.",
+            "B. To guarantee all SQE fields (opcode, fd, addr, len) are globally visible to the kernel consumer *before* the updated `sqTail` index becomes visible on weakly-ordered CPUs like ARM64.",
+            "C. To prevent `epoll_wait()` from returning `EINTR`.",
+            "D. To align buffers to 512-byte disk sectors."
+          ],
+          correct: 1,
+          why: [
+            "Wrong (A): SSD cache flushing requires `FSYNC` / `REQ_PREFLUSH`, not a CPU store barrier.",
+            "Correct (B): On ARM64/weakly-ordered architectures, stores can be reordered. Without a release barrier on `sqTail` (paired with acquire in the kernel), the kernel could see the new `sqTail` and read partially written/stale SQE fields.",
+            "Wrong (C): `EINTR` comes from signal delivery during blocking syscalls.",
+            "Wrong (D): Buffer alignment is unrelated to ring pointer store ordering."
+          ]
+        }
+      ]
+    };
+
+    initOsCourse(window.LESSON_CONFIG);
+  </script>
+</body>
+</html>

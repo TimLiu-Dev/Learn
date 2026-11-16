@@ -1,0 +1,1309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 24 — HikariCP Pool Saturation, @Transactional Boundaries &amp; JPA Locking</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+  <style>
+    .pool-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .conn-slot {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      font-family: var(--mono);
+      font-size: 0.76rem;
+      transition: all 0.18s ease;
+    }
+    .conn-slot.idle {
+      border-color: var(--border);
+      color: var(--text-dim);
+    }
+    .conn-slot.sql {
+      border-color: rgba(16, 185, 129, 0.55);
+      background: rgba(16, 185, 129, 0.12);
+      color: #6ee7b7;
+    }
+    .conn-slot.http-hold {
+      border-color: rgba(244, 63, 94, 0.65);
+      background: rgba(244, 63, 94, 0.14);
+      color: #fda4af;
+    }
+    .conn-title {
+      font-weight: 700;
+      margin-bottom: 3px;
+      color: var(--text);
+    }
+    .arch-diagram {
+      background: #080c15;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      line-height: 1.55;
+      color: #cbd5e1;
+      overflow-x: auto;
+      white-space: pre;
+      margin: 16px 0;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 24 · Part 2 · Java &amp; Spring Boot</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/spring-boot-concurrency.html">Spring Boot Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Part 2 · Java 21–25+ &amp; Spring Boot · Lesson 24</div>
+      <h1>HikariCP Pool Saturation, <code>@Transactional</code> Boundaries &amp; JPA Locking</h1>
+      <p class="hero-sub">
+        Enabling Virtual Threads lets 10,000 requests enter your Spring Boot service concurrently—and slams straight into HikariCP's default <code>maximum-pool-size=10</code>, triggering <code>SQLTransientConnectionException</code>.
+        Learn why HTTP calls inside <code>@Transactional</code> starve your database pool, how to isolate transaction boundaries, and when to choose <code>@Version</code> optimistic locking versus <code>PESSIMISTIC_WRITE</code> or <code>FOR UPDATE SKIP LOCKED</code>.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. HikariCP Pool Visualizer</a>
+        <a class="toc-chip" href="#java-examples">3. Production Java / Spring Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First-Principles Mental Model</div>
+      <h2>Little's Law, Connection Starvation &amp; Row Contention</h2>
+      <p class="section-lead">
+        Before Virtual Threads, Tomcat's 200-thread pool accidentally throttled traffic before it reached PostgreSQL. With <code>spring.threads.virtual.enabled=true</code>
+        (<a href="https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html" target="_blank" rel="noopener">Spring Boot Virtual Threads Reference</a>),
+        thousands of virtual threads arrive simultaneously at a 10-connection HikariCP pool
+        (<a href="https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing" target="_blank" rel="noopener">HikariCP Pool Sizing Guide</a>).
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--rose);">1. Why 10,000 Virtual Threads + Pool=10 Crashes</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            By Little's Law, max throughput is <code>PoolSize / HoldTime</code>. HikariCP defaults to <code>maximum-pool-size=10</code> and <code>connection-timeout=30000ms</code>.<br/><br/>
+            If a transaction runs <strong>5ms of SQL</strong>, 10 connections sustain <code>10 / 0.005s = 2,000 tx/s</code>.
+            If a developer puts a <strong>500ms HTTP call</strong> inside <code>@Transactional</code>, each connection stays checked out for <code>505ms</code>—collapsing throughput to <strong>~19.8 tx/s</strong>.
+            The remaining 9,990 virtual threads block in HikariCP's waiter queue until they throw <code>SQLTransientConnectionException</code>.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">2. ThreadLocal Transactions &amp; <code>@Async</code> Traps</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            Spring binds the active JDBC <code>Connection</code> to the calling thread via <code>ThreadLocal</code> inside <code>TransactionSynchronizationManager</code>.<br/><br/>
+            Calling an <code>@Async</code> method from inside <code>@Transactional</code> hops to a <em>different</em> thread with <strong>no transaction context</strong>—it cannot join or roll back with the parent.
+            Conversely, calling <code>PROPAGATION_REQUIRES_NEW</code> on the same thread checks out a <strong>second</strong> HikariCP connection while holding the first—causing instant self-deadlock if <code>activeParents &gt;= poolSize</code>.
+          </p>
+        </div>
+      </div>
+
+      <div class="arch-diagram">10,000 Virtual Threads (Tomcat / @Async)
+   │
+   ├─[TRAP: RestClient inside @Transactional]──▶ Acquires HikariCP conn BEFORE 500ms HTTP
+   │     └─► 10 conns pinned idle for 500ms ─► Waiter queue explodes ─► SQLTransientConnectionException!
+   │
+   └─[SENIOR: Pre-Fetch HTTP, then TransactionTemplate]
+         1) Virtual thread runs 500ms HTTP (0 DB connections held)
+         2) TransactionTemplate acquires HikariCP conn for 5ms SQL commit ─► 100× pool capacity!</div>
+
+      <h3 style="margin-top: 24px;">JPA Concurrency &amp; Locking Spectrum (<a href="https://docs.spring.io/spring-data/jpa/reference/jpa/locking.html" target="_blank" rel="noopener">Spring Data JPA Locking</a>)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>SQL / JPA Mechanism</th>
+              <th>Contention &amp; Lock Behavior</th>
+              <th>Production Fit</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>No Lock (<code>READ COMMITTED</code>)</strong></td>
+              <td>Plain <code>SELECT</code> then <code>UPDATE</code></td>
+              <td>Two transactions read balance=100 and both write 80; silent lost update / double-spend.</td>
+              <td>Never for read-modify-write state transitions.</td>
+            </tr>
+            <tr>
+              <td><strong><code>@Version</code> Optimistic</strong></td>
+              <td><code>UPDATE ... SET version=v+1 WHERE id=? AND version=v</code></td>
+              <td>Zero DB row locks during read/think time; 0 affected rows throws <code>OptimisticLockingFailureException</code>.</td>
+              <td>Low/moderate contention edits (user profiles, order status, normal accounts).</td>
+            </tr>
+            <tr>
+              <td><strong><code>@Lock(PESSIMISTIC_WRITE)</code></strong></td>
+              <td><code>SELECT ... FOR UPDATE</code></td>
+              <td>Acquires exclusive DB row lock immediately; concurrent writers queue until commit/rollback.</td>
+              <td>Hot rows (flash-sale inventory, central settlement ledgers) where retries thrash.</td>
+            </tr>
+            <tr>
+              <td><strong><code>FOR UPDATE SKIP LOCKED</code></strong></td>
+              <td>Native query with <code>SKIP LOCKED</code> (<a href="https://www.postgresql.org/docs/current/explicit-locking.html" target="_blank" rel="noopener">PostgreSQL Docs</a>)</td>
+              <td>Skips rows currently locked by other workers instead of blocking; zero head-of-line pileup.</td>
+              <td>Concurrent job queues, transactional outbox workers, batch task claiming.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Disable Open Session in View in production:</strong> Set <code>spring.jpa.open-in-view=false</code>. With OSIV enabled (Spring Boot's default), Hibernate keeps a database connection or persistence context tied to the entire HTTP request lifecycle—masking N+1 queries and extending HikariCP pressure into controller JSON serialization.
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive HikariCP Connection Pool Visualizer</div>
+      <h2>HTTP-Inside-<code>@Transactional</code> vs. Pre-Fetch Boundary</h2>
+      <p class="section-lead">
+        Simulate a 4-connection HikariCP pool (<code>acquireTimeout = 250ms</code>) hit by concurrent virtual-thread checkout requests.
+        Watch connections stall for 500ms in Mode A versus holding connections for just 5ms in Mode B.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="inside">HTTP Inside @Transactional (500ms hold)</button>
+            <button class="btn" data-mode="outside">Pre-Fetch Outside @Transactional (5ms hold)</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn" id="sim-burst">+ Burst 8 Requests</button>
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-label">
+              <span>HIKARICP POOL (4 PHYSICAL DB CONNECTIONS)</span>
+              <span id="sim-clock">t = 0ms</span>
+            </div>
+            <div class="pool-grid" id="pool-slots"></div>
+
+            <div class="lane-row">
+              <div class="lane-label"><span>Virtual Thread Waiter Queue (FIFO)</span><span id="queue-count-label">0 waiting</span></div>
+              <div class="timeline-track" id="lane-waiters"></div>
+            </div>
+
+            <div class="lane-row">
+              <div class="lane-label"><span>External HTTP I/O (Off-Pool Virtual Threads in Mode B)</span><span id="http-count-label">0 in flight</span></div>
+              <div class="timeline-track" id="lane-http"></div>
+            </div>
+
+            <div class="registers-grid">
+              <div class="reg-card"><div class="reg-name">Active Conns</div><div class="reg-val" id="stat-active" style="color:var(--accent);">0 / 4</div></div>
+              <div class="reg-card"><div class="reg-name">Committed TX</div><div class="reg-val" id="stat-ok" style="color:var(--green);">0</div></div>
+              <div class="reg-card"><div class="reg-name">Pool Timeouts</div><div class="reg-val" id="stat-timeout" style="color:var(--rose);">0</div></div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              8 virtual-thread requests queued. Click <strong>Step →</strong> or <strong>▶ Play</strong> (or <strong>+ Burst 8 Requests</strong>) to watch pool behavior.
+            </div>
+          </div>
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">HIKARICP &amp; TRANSACTION TRACE LOG</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="java-examples">
+      <div class="section-tag">Part 03 · Production Java 21–25+ &amp; Spring Boot</div>
+      <h2>Junior Traps vs. Senior Patterns in Spring Boot</h2>
+      <p class="section-lead">
+        Keep transactions microsecond-short, isolate external HTTP calls outside JDBC boundaries, and choose the right locking primitive for your contention profile.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: External HTTP Inside <code>@Transactional</code> vs. Split Boundary (<code>TransactionTemplate</code>)</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Holding JDBC Conn During RestClient</span></div>
+<pre>@Service
+public class CheckoutService {
+    @Transactional // Acquires HikariCP conn BEFORE HTTP!
+    public Order placeOrder(OrderCmd cmd) {
+        var auth = restClient.post()
+            .uri("https://psp.example/authorize")
+            .body(cmd.payment())
+            .retrieve()
+            .body(AuthResult.class); // 500ms network wait!
+        return orderRepo.save(Order.create(cmd, auth));
+    }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Pre-Fetch Outside + TransactionTemplate</span></div>
+<pre>@Service
+public class CheckoutService {
+    private final TransactionTemplate txTemplate;
+
+    public Order placeOrder(OrderCmd cmd) {
+        // 1. Virtual thread parks on HTTP; 0 DB conns held!
+        var auth = restClient.post()
+            .uri("https://psp.example/authorize")
+            .body(cmd.payment())
+            .retrieve()
+            .body(AuthResult.class);
+
+        // 2. Short, deterministic ~5ms DB transaction
+        return txTemplate.execute(status ->
+            orderRepo.save(Order.create(cmd, auth))
+        );
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: <code>@Version</code> Optimistic Retry Loop vs. <code>@Lock(PESSIMISTIC_WRITE)</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Retrying Inside Same @Transactional</span></div>
+<pre>// BUG 1: No @Version -> silent lost update!
+// BUG 2: Catching OptimisticLockingFailureException INSIDE
+// @Transactional reuses a stale persistence context &amp; rolled-back TX!
+@Transactional
+public void debit(UUID id, long amount) {
+    for (int i = 0; i &lt; 3; i++) {
+        try {
+            var acct = repo.findById(id).orElseThrow();
+            acct.debit(amount);
+            repo.saveAndFlush(acct);
+            return;
+        } catch (OptimisticLockingFailureException ignored) {}
+    }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Fresh TX Per Retry OR Pessimistic Lock</span></div>
+<pre>// Option A: @Version with fresh TransactionTemplate per attempt
+public void debitOptimistic(UUID id, long amount) {
+    for (int attempt = 0; attempt &lt; 5; attempt++) {
+        try {
+            txTemplate.executeWithoutResult(s -> {
+                var acct = repo.findById(id).orElseThrow();
+                acct.debit(amount); // checks balance &gt;= amount
+            }); // commit executes UPDATE ... WHERE version = ?
+            return;
+        } catch (OptimisticLockingFailureException ex) {
+            if (attempt == 4) throw ex;
+        }
+    }
+}
+// Option B (Hot SKU): @Lock(LockModeType.PESSIMISTIC_WRITE)
+// SELECT ... FOR UPDATE serializes writers without retry storms.</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: Concurrent Worker Job Claiming with <code>FOR UPDATE SKIP LOCKED</code></h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Plain SELECT or Blocking FOR UPDATE</span></div>
+<pre>// Trap A: Plain SELECT lets 10 pods read the SAME row!
+// Trap B: Plain FOR UPDATE makes 49 workers block on worker 1's lock!
+@Query(value = """
+    SELECT * FROM outbox_jobs
+    WHERE status = 'PENDING'
+    ORDER BY created_at LIMIT 1
+    FOR UPDATE
+    """, nativeQuery = true)
+Optional&lt;OutboxJob&gt; findNextBlocking();</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: SKIP LOCKED Claim in Short TX</span></div>
+<pre>@Query(value = """
+    SELECT * FROM outbox_jobs
+    WHERE status = 'PENDING'
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+    """, nativeQuery = true)
+Optional&lt;OutboxJob&gt; lockNextPendingSkipLocked();
+
+// Inside TransactionTemplate:
+// 1. lockNextPendingSkipLocked() -> skips rows locked by peers
+// 2. mark status = 'CLAIMED', worker_id = :podId
+// 3. commit in &lt;5ms, then run slow external HTTP outside TX!</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Write code below and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>). Starter code intentionally fails tests until you fix the concurrency or locking bug.</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 24.1 · HIKARICP POOL SATURATION</span>
+            <h3 style="margin:8px 0 4px;">Bounded HikariPool with FIFO Waiter Queue &amp; Leak Detection</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>HikariPool(maxSize, acquireTimeoutMs, leakThresholdMs)</code> with FIFO handoff, <code>SQLTransientConnectionException</code> timeout, and leak tracking.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>acquire()</code>: if <code>inUse &lt; maxSize</code>, increment <code>inUse</code> and return a lease <code>{ id }</code>; otherwise enqueue in FIFO <code>waiters</code> and reject with an Error named <code>SQLTransientConnectionException</code> if <code>acquireTimeoutMs</code> elapses before handoff.<br/>
+          • <code>release(conn)</code>: mark <code>conn.released = true</code>, and if <code>waiters.length &gt; 0</code>, shift the oldest waiter, mark it settled, and hand off a fresh lease (keeping <code>inUse</code> bounded).<br/>
+          • If <code>leakThresholdMs &gt; 0</code> and a lease is still unreleased after <code>leakThresholdMs</code>, increment <code>this.leaksDetected++</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_24_1_hikari_pool.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 24.2 · @VERSION OPTIMISTIC LOCKING</span>
+            <h3 style="margin:8px 0 4px;">Optimistic CAS Update &amp; Bounded Retry Loop</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>optimisticVersionRetry(repo, accountId, debitAmount, maxRetries)</code> so 10 concurrent debits never lose updates or go below zero.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          APIs: <code>await repo.findById(accountId)</code> returns <code>{ id, balance, version }</code>; <code>await repo.saveWithVersionCheck(accountId, newBalance, expectedVersion)</code> throws <code>OptimisticLockError</code> on version mismatch.<br/>
+          • Re-read fresh state on every retry; throw <code>InsufficientFundsError</code> immediately (no retry!) if <code>balance &lt; debitAmount</code>.<br/>
+          • Retry only on <code>err.name === 'OptimisticLockError'</code> up to <code>maxRetries</code> times; rethrow once exhausted.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_24_2_optimistic_version.js</span><span>10 concurrent debits + double-spend guard</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 24.3 · FOR UPDATE SKIP LOCKED</span>
+            <h3 style="margin:8px 0 4px;">Concurrent Worker Job Claimer (<code>SKIP LOCKED</code>)</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>claimNextJobSkipLocked(rows, workerId)</code> simulating PostgreSQL <code>FOR UPDATE SKIP LOCKED</code>.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          Each row has <code>{ id, status, lockedBy }</code>. Scan <code>rows</code> in order for the first row with <code>status === 'PENDING'</code> and <code>lockedBy === null</code>, set <code>row.lockedBy = workerId</code> and <code>row.status = 'CLAIMED'</code>, and return a copy <code>{ ...row }</code> (or <code>null</code> if none available).
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_24_3_skip_locked.js</span><span>PostgreSQL FOR UPDATE SKIP LOCKED simulation</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in length so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Primary Sources, Reference Link &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Read
+          <a href="https://docs.spring.io/spring-data/jpa/reference/jpa/locking.html" target="_blank" rel="noopener">Spring Data JPA Reference: Locking &amp; Transactions</a>
+          and review the
+          <a href="../reference/spring-boot-concurrency.html">Spring Boot Concurrency &amp; Database Contention Cheat Sheet</a>.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"Why does REQUIRES_NEW inside @Transactional risk pool deadlock?"</em> or <em>"How do I size HikariCP for 200 virtual-thread microservices?"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0023-spring-mvc-virtual-threads-vs-webflux.html">← Prev: Lesson 23</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0025-spring-events-outbox-kafka-consumers.html">Next: Lesson 25 →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    // =========================================================================
+    // Part 2: Interactive HikariCP Connection Pool Visualizer
+    // =========================================================================
+    const SIM_CONFIG = {
+      poolSize: 4,
+      acquireTimeoutMs: 250,
+      stepMs: 50,
+      sqlMs: 5,
+      httpMs: 500
+    };
+
+    let simMode = 'inside';
+    let simTimer = null;
+    let simState = null;
+
+    function createInitialSimState() {
+      const conns = Array.from({ length: SIM_CONFIG.poolSize }, (_, idx) => ({
+        id: idx + 1,
+        reqId: null,
+        phase: 'IDLE',
+        remainingMs: 0
+      }));
+      return {
+        clockMs: 0,
+        nextReqId: 1,
+        conns,
+        waiters: [],
+        httpInFlight: [],
+        completed: 0,
+        timeouts: 0,
+        logs: []
+      };
+    }
+
+    function addSimLog(type, msg) {
+      simState.logs.push({ t: simState.clockMs, type, msg });
+      if (simState.logs.length > 80) simState.logs.shift();
+    }
+
+    function enqueueBurst(count = 8) {
+      for (let i = 0; i < count; i++) {
+        const reqId = simState.nextReqId++;
+        if (simMode === 'inside') {
+          simState.waiters.push({ id: reqId, waitedMs: 0 });
+        } else {
+          simState.httpInFlight.push({ id: reqId, remainingMs: SIM_CONFIG.httpMs });
+        }
+      }
+      if (simMode === 'inside') {
+        addSimLog('warn', `Burst: +${count} virtual threads entered @Transactional and requested HikariCP connections.`);
+      } else {
+        addSimLog('good', `Burst: +${count} virtual threads started 500ms RestClient HTTP calls (0 DB conns held).`);
+      }
+      dispatchIdleConnections();
+      renderSim();
+    }
+
+    function dispatchIdleConnections() {
+      for (const conn of simState.conns) {
+        if (conn.phase === 'IDLE' && simState.waiters.length > 0) {
+          const req = simState.waiters.shift();
+          conn.reqId = req.id;
+          if (simMode === 'inside') {
+            conn.phase = 'HTTP_HOLD';
+            conn.remainingMs = SIM_CONFIG.httpMs + SIM_CONFIG.sqlMs;
+            addSimLog('warn', `Conn-${conn.id} leased to VT-${req.id} (holds conn across 500ms HTTP + 5ms SQL).`);
+          } else {
+            conn.phase = 'SQL_ONLY';
+            conn.remainingMs = SIM_CONFIG.sqlMs;
+            addSimLog('good', `Conn-${conn.id} leased to VT-${req.id} for 5ms SQL commit.`);
+          }
+        }
+      }
+    }
+
+    function stepSim() {
+      const hasWork =
+        simState.conns.some((c) => c.phase !== 'IDLE') ||
+        simState.waiters.length > 0 ||
+        simState.httpInFlight.length > 0;
+
+      if (!hasWork) {
+        stopSimPlay();
+        return;
+      }
+
+      simState.clockMs += SIM_CONFIG.stepMs;
+
+      // 1. Advance external HTTP in Mode B (outside @Transactional)
+      if (simState.httpInFlight.length > 0) {
+        const stillHttp = [];
+        for (const h of simState.httpInFlight) {
+          h.remainingMs -= SIM_CONFIG.stepMs;
+          if (h.remainingMs <= 0) {
+            simState.waiters.push({ id: h.id, waitedMs: 0 });
+          } else {
+            stillHttp.push(h);
+          }
+        }
+        simState.httpInFlight = stillHttp;
+      }
+
+      // 2. Advance active HikariCP connections
+      for (const conn of simState.conns) {
+        if (conn.phase !== 'IDLE') {
+          conn.remainingMs -= SIM_CONFIG.stepMs;
+          if (conn.remainingMs <= 0) {
+            const doneReq = conn.reqId;
+            conn.reqId = null;
+            conn.phase = 'IDLE';
+            conn.remainingMs = 0;
+            simState.completed++;
+            addSimLog('good', `VT-${doneReq} committed & returned Conn-${conn.id} to HikariCP.`);
+          }
+        }
+      }
+
+      // 3. Hand off freed connections FIFO BEFORE expiring waiters
+      dispatchIdleConnections();
+
+      // 4. Advance remaining waiters and timeout after 250ms
+      const nextWaiters = [];
+      for (const w of simState.waiters) {
+        w.waitedMs += SIM_CONFIG.stepMs;
+        if (w.waitedMs >= SIM_CONFIG.acquireTimeoutMs) {
+          simState.timeouts++;
+          addSimLog('bad', `SQLTransientConnectionException: VT-${w.id} timed out waiting ${SIM_CONFIG.acquireTimeoutMs}ms for Conn!`);
+        } else {
+          nextWaiters.push(w);
+        }
+      }
+      simState.waiters = nextWaiters;
+
+      // In Mode B, any burst waiters added this tick can finish 5ms SQL cleanly if conns are free
+      dispatchIdleConnections();
+      if (simMode === 'outside') {
+        // In Mode B each connection finishes 5ms SQL within the 50ms tick, draining rapidly!
+        let drained = 0;
+        while (simState.conns.some((c) => c.phase === 'SQL_ONLY' && c.remainingMs <= SIM_CONFIG.stepMs)) {
+          for (const conn of simState.conns) {
+            if (conn.phase === 'SQL_ONLY') {
+              const doneReq = conn.reqId;
+              conn.reqId = null;
+              conn.phase = 'IDLE';
+              conn.remainingMs = 0;
+              simState.completed++;
+              drained++;
+              if (drained <= 4) {
+                addSimLog('good', `VT-${doneReq} finished 5ms SQL on Conn-${conn.id} & released immediately.`);
+              }
+            }
+          }
+          if (simState.waiters.length > 0) {
+            dispatchIdleConnections();
+          } else {
+            break;
+          }
+        }
+        if (drained > 4) {
+          addSimLog('good', `...and ${drained - 4} more virtual threads committed in 5ms batches with 0 timeouts!`);
+        }
+      }
+
+      renderSim();
+
+      const stillActive =
+        simState.conns.some((c) => c.phase !== 'IDLE') ||
+        simState.waiters.length > 0 ||
+        simState.httpInFlight.length > 0;
+      if (!stillActive) {
+        stopSimPlay();
+      }
+    }
+
+    function renderSim() {
+      document.getElementById('sim-clock').textContent = `t = ${simState.clockMs}ms`;
+
+      const poolEl = document.getElementById('pool-slots');
+      poolEl.innerHTML = simState.conns.map((c) => {
+        if (c.phase === 'IDLE') {
+          return `<div class="conn-slot idle"><div class="conn-title">Conn-${c.id}</div><div>IDLE (Ready)</div></div>`;
+        }
+        if (c.phase === 'HTTP_HOLD') {
+          return `<div class="conn-slot http-hold"><div class="conn-title">Conn-${c.id} · VT-${c.reqId}</div><div>HTTP HOLD (${c.remainingMs}ms)</div></div>`;
+        }
+        return `<div class="conn-slot sql"><div class="conn-title">Conn-${c.id} · VT-${c.reqId}</div><div>SQL TX (${c.remainingMs}ms)</div></div>`;
+      }).join('');
+
+      const waiterTrack = document.getElementById('lane-waiters');
+      waiterTrack.innerHTML = simState.waiters.length === 0
+        ? '<div class="slot idle">Queue Empty</div>'
+        : simState.waiters.map((w) => `<div class="slot ${w.waitedMs >= 150 ? 'bad' : 'sw'}">VT-${w.id} (${w.waitedMs}ms)</div>`).join('');
+      document.getElementById('queue-count-label').textContent = `${simState.waiters.length} waiting`;
+
+      const httpTrack = document.getElementById('lane-http');
+      httpTrack.innerHTML = simState.httpInFlight.length === 0
+        ? '<div class="slot idle">No off-pool HTTP calls</div>'
+        : simState.httpInFlight.map((h) => `<div class="slot io">VT-${h.id} HTTP (${h.remainingMs}ms)</div>`).join('');
+      document.getElementById('http-count-label').textContent = `${simState.httpInFlight.length} in flight`;
+
+      const activeCount = simState.conns.filter((c) => c.phase !== 'IDLE').length;
+      document.getElementById('stat-active').textContent = `${activeCount} / ${SIM_CONFIG.poolSize}`;
+      document.getElementById('stat-ok').textContent = String(simState.completed);
+      document.getElementById('stat-timeout').textContent = String(simState.timeouts);
+
+      const logEl = document.getElementById('sim-log');
+      if (simState.logs.length === 0) {
+        logEl.innerHTML = '<div class="trace-line">Ready. Click Step → or ▶ Play.</div>';
+      } else {
+        logEl.innerHTML = simState.logs.map((entry) =>
+          `<div class="trace-line ${entry.type}">[${entry.t}ms] ${ConcurrencyEngine.escapeHtml(entry.msg)}</div>`
+        ).join('');
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      const verdict = document.getElementById('sim-verdict');
+      if (simState.timeouts > 0) {
+        verdict.className = 'callout danger';
+        verdict.innerHTML = `<strong>Pool Exhaustion Reproduced:</strong> <code>${simState.timeouts}</code> virtual threads threw <code>SQLTransientConnectionException</code> because 4 connections were held idle during 500ms HTTP calls!`;
+      } else if (simState.completed >= 8 && simState.waiters.length === 0 && simState.httpInFlight.length === 0) {
+        verdict.className = 'callout tip';
+        verdict.innerHTML = `<strong>100× Pool Efficiency:</strong> All <code>${simState.completed}</code> requests committed with <strong>0 timeouts</strong>—external HTTP never touched HikariCP.`;
+      } else {
+        verdict.className = 'callout tip';
+        verdict.innerHTML = simMode === 'inside'
+          ? 'Mode A: Virtual threads acquire a HikariCP connection <strong>before</strong> calling external HTTP (500ms hold).'
+          : 'Mode B: Virtual threads finish 500ms HTTP <strong>outside</strong> <code>@Transactional</code>, holding HikariCP for just 5ms.';
+      }
+    }
+
+    function stopSimPlay() {
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+      }
+      document.getElementById('sim-play').textContent = '▶ Play';
+    }
+
+    function resetSim() {
+      stopSimPlay();
+      simState = createInitialSimState();
+      enqueueBurst(8);
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        simMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-burst').addEventListener('click', () => enqueueBurst(8));
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      if (simTimer) {
+        stopSimPlay();
+      } else {
+        const empty =
+          simState.conns.every((c) => c.phase === 'IDLE') &&
+          simState.waiters.length === 0 &&
+          simState.httpInFlight.length === 0;
+        if (empty) resetSim();
+        document.getElementById('sim-play').textContent = '⏸ Pause';
+        simTimer = setInterval(stepSim, 420);
+      }
+    });
+    resetSim();
+
+    // =========================================================================
+    // Part 4: 3 Runnable Code Practice Labs
+    // =========================================================================
+    const LABS = {
+      1: {
+        fnName: 'HikariPool',
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        starter: `class HikariPool {
+  constructor(maxSize, acquireTimeoutMs, leakThresholdMs = 0) {
+    this.maxSize = maxSize;
+    this.acquireTimeoutMs = acquireTimeoutMs;
+    this.leakThresholdMs = leakThresholdMs;
+    this.inUse = 0;
+    this.waiters = [];
+    this.leaksDetected = 0;
+    this.nextConnId = 0;
+  }
+
+  async acquire() {
+    // BUG: Ignores maxSize, never queues waiters FIFO, never throws SQLTransientConnectionException,
+    // and never starts a leak detection timer!
+    this.inUse++;
+    return { id: ++this.nextConnId, released: false };
+  }
+
+  release(conn) {
+    if (!conn || conn.released) return;
+    conn.released = true;
+    this.inUse = Math.max(0, this.inUse - 1);
+  }
+
+  async withConnection(fn) {
+    const conn = await this.acquire();
+    try {
+      return await fn(conn);
+    } finally {
+      this.release(conn);
+    }
+  }
+}`,
+        hints: [
+          'In `acquire()`, if `this.inUse < this.maxSize`, increment `this.inUse`, create the lease via a helper `_issueLease()`, and return it immediately.',
+          'Otherwise return `new Promise((resolve, reject) => { ... })`: push `{ resolve, reject, settled: false }` into `this.waiters` (FIFO), and schedule `setTimeout` for `this.acquireTimeoutMs` that checks `if (waiter.settled) return;`, removes the waiter, and rejects with `err.name = "SQLTransientConnectionException"`.',
+          'In `release(conn)`, set `conn.released = true` first. If `this.waiters.length > 0`, `shift()` the oldest waiter, set `waiter.settled = true`, and `waiter.resolve(this._issueLease())` without decrementing `inUse`. For leak detection, schedule `setTimeout` in `_issueLease()` when `leakThresholdMs > 0` that increments `this.leaksDetected++` only if `!conn.released`.'
+        ],
+        solution: `class HikariPool {
+  constructor(maxSize, acquireTimeoutMs, leakThresholdMs = 0) {
+    this.maxSize = maxSize;
+    this.acquireTimeoutMs = acquireTimeoutMs;
+    this.leakThresholdMs = leakThresholdMs;
+    this.inUse = 0;
+    this.waiters = [];
+    this.leaksDetected = 0;
+    this.nextConnId = 0;
+  }
+
+  _issueLease() {
+    const conn = { id: ++this.nextConnId, released: false };
+    if (this.leakThresholdMs > 0) {
+      setTimeout(() => {
+        if (!conn.released) {
+          this.leaksDetected++;
+        }
+      }, this.leakThresholdMs);
+    }
+    return conn;
+  }
+
+  acquire() {
+    if (this.inUse < this.maxSize) {
+      this.inUse++;
+      return Promise.resolve(this._issueLease());
+    }
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, settled: false };
+      this.waiters.push(waiter);
+      setTimeout(() => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        const idx = this.waiters.indexOf(waiter);
+        if (idx !== -1) this.waiters.splice(idx, 1);
+        const err = new Error(
+          \`SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after \${this.acquireTimeoutMs}ms.\`
+        );
+        err.name = 'SQLTransientConnectionException';
+        reject(err);
+      }, this.acquireTimeoutMs);
+    });
+  }
+
+  release(conn) {
+    if (!conn || conn.released) return;
+    conn.released = true;
+    if (this.waiters.length > 0) {
+      const waiter = this.waiters.shift();
+      waiter.settled = true;
+      waiter.resolve(this._issueLease());
+    } else {
+      this.inUse = Math.max(0, this.inUse - 1);
+    }
+  }
+
+  async withConnection(fn) {
+    const conn = await this.acquire();
+    try {
+      return await fn(conn);
+    } finally {
+      this.release(conn);
+    }
+  }
+}`,
+        kotlinEquivalent: `# application.yml (Spring Boot + PostgreSQL + Virtual Threads)
+spring:
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    hikari:
+      maximum-pool-size: 20           # Size to DB CPU/IOPS, NOT virtual thread count!
+      connection-timeout: 5000         # Fail fast with SQLTransientConnectionException
+      leak-detection-threshold: 10000  # Warn stack trace if held >10s (e.g. HTTP inside @Transactional)
+  jpa:
+    open-in-view: false                # Release HikariCP connection before controller JSON write`,
+        tests: async (PoolCls) => runTestCases([
+          {
+            name: 'Bounds inUse to maxSize and hands off connections in strict FIFO order',
+            run: async () => {
+              const pool = new PoolCls(2, 200);
+              const c1 = await pool.acquire();
+              const c2 = await pool.acquire();
+              assertEq(pool.inUse, 2, 'Pool should cap active connections at maxSize=2');
+
+              const order = [];
+              const p1 = pool.acquire().then((c) => { order.push(1); return c; });
+              const p2 = pool.acquire().then((c) => { order.push(2); return c; });
+              const p3 = pool.acquire().then((c) => { order.push(3); return c; });
+
+              pool.release(c1);
+              const w1 = await p1;
+              assertEq(pool.inUse, 2, 'Handoff must keep inUse at 2');
+
+              pool.release(c2);
+              const w2 = await p2;
+              pool.release(w1);
+              const w3 = await p3;
+              pool.release(w2);
+              pool.release(w3);
+
+              assertDeepEq(order, [1, 2, 3], 'Waiters must wake in strict FIFO order');
+              assertEq(pool.inUse, 0, 'All connections released -> inUse must return to 0');
+            }
+          },
+          {
+            name: 'Burst holding connections 100ms under 35ms timeout throws SQLTransientConnectionException',
+            run: async () => {
+              const pool = new PoolCls(2, 35);
+              const outcomes = await Promise.allSettled(
+                Array.from({ length: 5 }, () =>
+                  pool.withConnection(async () => {
+                    await new Promise((r) => setTimeout(r, 100));
+                    return 'ok';
+                  })
+                )
+              );
+              const fulfilled = outcomes.filter((o) => o.status === 'fulfilled');
+              const rejected = outcomes.filter((o) => o.status === 'rejected');
+              assertEq(fulfilled.length, 2, 'Only maxSize=2 requests should fit before timeout');
+              assertEq(rejected.length, 3, '3 queued requests must time out');
+              for (const r of rejected) {
+                const msg = `${r.reason.name} ${r.reason.message}`;
+                assertEq(msg.includes('SQLTransientConnectionException'), true, 'Must throw SQLTransientConnectionException');
+              }
+              assertEq(pool.inUse, 0, 'Pool must return to 0 inUse after burst settles');
+            }
+          },
+          {
+            name: 'Pre-fetch pattern (5ms DB hold) clears 10 concurrent requests with 0 timeouts',
+            run: async () => {
+              const pool = new PoolCls(2, 200);
+              const res = await Promise.all(
+                Array.from({ length: 10 }, (_, idx) =>
+                  pool.withConnection(async () => {
+                    await new Promise((r) => setTimeout(r, 5));
+                    return idx;
+                  })
+                )
+              );
+              assertEq(res.length, 10);
+              assertEq(pool.inUse, 0);
+            }
+          },
+          {
+            name: 'Detects connection leak when held past leakThresholdMs, and cancels timer on release',
+            run: async () => {
+              const pool = new PoolCls(1, 200, 30);
+              const c1 = await pool.acquire();
+              await new Promise((r) => setTimeout(r, 65));
+              assertEq(pool.leaksDetected, 1, 'Expected 1 leak when connection held past 30ms');
+              pool.release(c1);
+
+              const c2 = await pool.acquire();
+              await new Promise((r) => setTimeout(r, 5));
+              pool.release(c2);
+              await new Promise((r) => setTimeout(r, 45));
+              assertEq(pool.leaksDetected, 1, 'Releasing before threshold must cancel leak timer');
+            }
+          }
+        ])
+      },
+      2: {
+        fnName: 'optimisticVersionRetry',
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        starter: `async function optimisticVersionRetry(repo, accountId, debitAmount, maxRetries = 15) {
+  // BUG: Reads once and never retries OptimisticLockError!
+  const row = await repo.findById(accountId);
+  if (row.balance < debitAmount) {
+    const err = new Error('InsufficientFundsError');
+    err.name = 'InsufficientFundsError';
+    throw err;
+  }
+  return await repo.saveWithVersionCheck(accountId, row.balance - debitAmount, row.version);
+}`,
+        hints: [
+          'Wrap the read-check-save sequence in `for (let attempt = 0; attempt <= maxRetries; attempt++)` so each retry calls `await repo.findById(accountId)` for a fresh balance and version.',
+          'Before saving, check `if (row.balance < debitAmount)` and throw an error with `err.name = "InsufficientFundsError"` immediately without retrying.',
+          'Catch errors around `saveWithVersionCheck`: only continue the loop if `err && err.name === "OptimisticLockError" && attempt < maxRetries`; otherwise rethrow `err`.'
+        ],
+        solution: `async function optimisticVersionRetry(repo, accountId, debitAmount, maxRetries = 15) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const row = await repo.findById(accountId);
+    if (row.balance < debitAmount) {
+      const err = new Error('InsufficientFundsError: balance too low');
+      err.name = 'InsufficientFundsError';
+      throw err;
+    }
+    try {
+      return await repo.saveWithVersionCheck(accountId, row.balance - debitAmount, row.version);
+    } catch (err) {
+      if (err && err.name === 'OptimisticLockError' && attempt < maxRetries) {
+        continue;
+      }
+      throw err;
+    }
+  }
+}`,
+        kotlinEquivalent: `@Entity
+public class Account {
+    @Id private UUID id;
+    private long balance;
+    @Version private long version; // Hibernate appends WHERE version = ?
+}
+
+// Service boundary: each retry opens a FRESH transaction & persistence context
+public Account debitWithRetry(UUID accountId, long amount) {
+    for (int attempt = 0; attempt <= 5; attempt++) {
+        try {
+            return txTemplate.execute(status -> {
+                Account acct = accountRepo.findById(accountId).orElseThrow();
+                if (acct.getBalance() < amount) throw new InsufficientFundsException();
+                acct.setBalance(acct.getBalance() - amount);
+                return accountRepo.saveAndFlush(acct);
+            });
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            if (attempt == 5) throw ex;
+        }
+    }
+    throw new IllegalStateException("Unreachable");
+}`,
+        tests: async (fn) => {
+          function createVersionedRepo(initialBalance) {
+            const store = {
+              'acct-1': { id: 'acct-1', balance: initialBalance, version: 0 }
+            };
+            let seq = 0;
+            const delay = () => new Promise((r) => setTimeout(r, ((++seq * 7) % 5) + 1));
+            return {
+              findById: async (id) => {
+                await delay();
+                const r = store[id];
+                return { ...r };
+              },
+              saveWithVersionCheck: async (id, newBalance, expectedVersion) => {
+                await delay();
+                const cur = store[id];
+                if (cur.version !== expectedVersion) {
+                  const err = new Error(`OptimisticLockError: expected v${expectedVersion}, found v${cur.version}`);
+                  err.name = 'OptimisticLockError';
+                  throw err;
+                }
+                cur.balance = newBalance;
+                cur.version += 1;
+                return { ...cur };
+              },
+              peek: (id) => ({ ...store[id] })
+            };
+          }
+
+          return runTestCases([
+            {
+              name: '10 concurrent $10 debits on $150 balance converge to $50 and version 10',
+              run: async () => {
+                const repo = createVersionedRepo(150);
+                await Promise.all(
+                  Array.from({ length: 10 }, () => fn(repo, 'acct-1', 10, 25))
+                );
+                const finalRow = repo.peek('acct-1');
+                assertEq(finalRow.balance, 50, 'Lost update occurred in optimistic debits!');
+                assertEq(finalRow.version, 10, 'Version should equal 10 successful updates');
+              }
+            },
+            {
+              name: '10 concurrent $25 debits on $100 allow exactly 4 debits (zero double-spend)',
+              run: async () => {
+                const repo = createVersionedRepo(100);
+                const settled = await Promise.allSettled(
+                  Array.from({ length: 10 }, () => fn(repo, 'acct-1', 25, 25))
+                );
+                const ok = settled.filter((s) => s.status === 'fulfilled');
+                const fail = settled.filter((s) => s.status === 'rejected');
+                assertEq(ok.length, 4, 'Exactly 4 debits of $25 fit in $100');
+                assertEq(fail.length, 6, '6 debits must fail with InsufficientFundsError');
+                assertEq(fail.every((f) => f.reason.name === 'InsufficientFundsError'), true);
+                assertEq(repo.peek('acct-1').balance, 0, 'Balance must never go negative');
+                assertEq(repo.peek('acct-1').version, 4);
+              }
+            },
+            {
+              name: 'Exhausting maxRetries propagates OptimisticLockError cleanly',
+              run: async () => {
+                let saveCalls = 0;
+                const alwaysConflictRepo = {
+                  findById: async () => ({ id: 'acct-1', balance: 100, version: 0 }),
+                  saveWithVersionCheck: async () => {
+                    saveCalls++;
+                    const err = new Error('OptimisticLockError');
+                    err.name = 'OptimisticLockError';
+                    throw err;
+                  }
+                };
+                let caught = null;
+                try {
+                  await fn(alwaysConflictRepo, 'acct-1', 10, 2);
+                } catch (e) {
+                  caught = e;
+                }
+                assertEq(caught !== null && caught.name === 'OptimisticLockError', true);
+                assertEq(saveCalls, 3, 'maxRetries=2 should make 1 initial + 2 retries = 3 attempts');
+              }
+            }
+          ]);
+        }
+      },
+      3: {
+        fnName: 'claimNextJobSkipLocked',
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        starter: `function claimNextJobSkipLocked(rows, workerId) {
+  // BUG: Picks first PENDING row without checking lockedBy === null or setting lock!
+  const row = rows.find((r) => r.status === 'PENDING');
+  return row ? { ...row } : null;
+}`,
+        hints: [
+          'Filter for a row where BOTH `r.status === "PENDING"` AND `r.lockedBy === null` (skipping rows currently locked by other open transactions).',
+          'Mutate the matched row in-place to simulate acquiring the X-lock and claiming it: `row.lockedBy = workerId; row.status = "CLAIMED";`.',
+          'Return `{ ...row }` so callers receive the claimed snapshot, or `null` if no unlocked pending row remains.'
+        ],
+        solution: `function claimNextJobSkipLocked(rows, workerId) {
+  const row = rows.find((r) => r.status === 'PENDING' && r.lockedBy === null);
+  if (!row) return null;
+  row.lockedBy = workerId;
+  row.status = 'CLAIMED';
+  return { ...row };
+}`,
+        kotlinEquivalent: `public interface OutboxJobRepository extends JpaRepository<OutboxJob, Long> {
+    @Query(value = """
+        SELECT * FROM outbox_jobs
+        WHERE status = 'PENDING'
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+        """, nativeQuery = true)
+    Optional<OutboxJob> lockNextPendingSkipLocked();
+}
+
+// Executed inside TransactionTemplate (~3ms):
+Optional<OutboxJob> claimed = txTemplate.execute(status ->
+    outboxRepo.lockNextPendingSkipLocked().map(job -> {
+        job.markClaimedBy(workerId);
+        return job;
+    })
+);`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Skips PENDING rows locked by another transaction (lockedBy !== null)',
+            run: () => {
+              const rows = [
+                { id: 1, status: 'PENDING', lockedBy: 'worker-A' },
+                { id: 2, status: 'PENDING', lockedBy: null }
+              ];
+              const claimed = fn(rows, 'worker-B');
+              assertEq(claimed !== null, true);
+              assertEq(claimed.id, 2, 'Must skip locked row 1 and claim row 2');
+              assertEq(claimed.lockedBy, 'worker-B');
+              assertEq(claimed.status, 'CLAIMED');
+              assertEq(rows[0].lockedBy, 'worker-A', 'Locked row 1 must stay untouched');
+            }
+          },
+          {
+            name: '12 workers racing on 10 pending jobs claim 10 distinct IDs and 2 nulls',
+            run: () => {
+              const rows = Array.from({ length: 10 }, (_, i) => ({
+                id: i + 1,
+                status: 'PENDING',
+                lockedBy: null
+              }));
+              const claimedIds = [];
+              let nulls = 0;
+              for (let w = 1; w <= 12; w++) {
+                const job = fn(rows, `worker-${w}`);
+                if (job === null) nulls++;
+                else claimedIds.push(job.id);
+              }
+              assertEq(claimedIds.length, 10);
+              assertEq(new Set(claimedIds).size, 10, 'Every worker must claim a distinct job');
+              assertEq(nulls, 2);
+            }
+          },
+          {
+            name: 'Skips DONE and CLAIMED rows; returns null when nothing eligible exists',
+            run: () => {
+              const rows = [
+                { id: 1, status: 'DONE', lockedBy: null },
+                { id: 2, status: 'CLAIMED', lockedBy: 'worker-1' },
+                { id: 3, status: 'PENDING', lockedBy: 'worker-2' }
+              ];
+              assertEq(fn(rows, 'worker-3'), null);
+            }
+          },
+          {
+            name: 'Rolled-back row (lockedBy reset to null) becomes claimable again',
+            run: () => {
+              const rows = [{ id: 9, status: 'PENDING', lockedBy: 'worker-1' }];
+              assertEq(fn(rows, 'worker-2'), null);
+              rows[0].lockedBy = null; // simulate worker-1 rollback
+              const reclaimed = fn(rows, 'worker-2');
+              assertEq(reclaimed.id, 9);
+              assertEq(reclaimed.lockedBy, 'worker-2');
+            }
+          }
+        ])
+      }
+    };
+
+    // =========================================================================
+    // Part 5: 5 Senior Multiple-Choice Quizzes (Balanced Option Word Counts)
+    // =========================================================================
+    const QUIZZES = [
+      {
+        stem: '1. You enable spring.threads.virtual.enabled=true in Spring Boot. Under a 5,000-request burst, requests fail with SQLTransientConnectionException while CPU sits at 8%. Why?',
+        code: `spring.threads.virtual.enabled=true\n# Default HikariCP settings left unchanged (maximum-pool-size=10)`,
+        options: [
+          'Virtual threads cannot park on JDBC sockets, pinning carrier threads until Tomcat overflows.',
+          'Massive virtual-thread concurrency floods HikariCP\'s ten-connection pool, triggering thirty-second connection acquire timeouts.',
+          'Spring Boot automatically caps virtual threads at ten workers per process by default.',
+          'JVM garbage collection pauses all virtual threads whenever PostgreSQL opens ten parallel connections.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Standard JDBC socket I/O unmounts virtual threads cleanly; CPU at 8% with SQLTransientConnectionException points to pool exhaustion, not carrier pinning.',
+          'CORRECT (B): Virtual threads remove Tomcat\'s worker cap, letting thousands of requests slam HikariCP\'s default 10-connection limit until 30s connectionTimeout expires.',
+          'WRONG (C): Spring Boot\'s virtual-thread executor spawns an unbounded virtual thread per task without a 10-thread cap.',
+          'WRONG (D): Opening 10 PostgreSQL connections is normal and does not trigger JVM stop-the-world GC pauses across virtual threads.'
+        ]
+      },
+      {
+        stem: '2. A checkout service calls restClient.post() (500ms latency) inside a @Transactional method backed by HikariCP (pool size 10). What is the ceiling throughput?',
+        code: `@Transactional\npublic Order checkout(Req req) {\n    var pay = restClient.post().uri("/charge").body(req).retrieve().body(Pay.class);\n    return orderRepo.save(Order.paid(req, pay));\n}`,
+        options: [
+          'About 2,000 tx/s because HikariCP releases the idle JDBC connection during HTTP waits.',
+          'About 20 tx/s because each 500ms HTTP call holds a pooled connection idle.',
+          'About 500 tx/s because Spring Boot multiplexes all pending transactions onto one socket.',
+          'Unlimited throughput because virtual threads transparently share a single JDBC transaction per core.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): @Transactional acquires and binds the JDBC connection at method entry and holds it until commit/rollback—never releasing it mid-method.',
+          'CORRECT (B): By Little\'s Law (PoolSize / HoldTime), 10 connections held for ~0.5s each yield at most 10 / 0.5 = 20 transactions per second.',
+          'WRONG (C): Spring Boot does not multiplex unrelated HTTP transactions over one JDBC socket; each active transaction needs its own connection.',
+          'WRONG (D): JDBC connections are stateful and single-transaction-per-connection; virtual threads cannot share one uncommitted transaction.'
+        ]
+      },
+      {
+        stem: '3. Inside a @Transactional method, you save an Order and call auditService.writeLog(orderId) annotated with @Async. What happens when save() fails afterward?',
+        code: `@Transactional\npublic void placeOrder(Order o) {\n    orderRepo.save(o);\n    auditService.writeLog(o.getId()); // @Async on another bean\n    throw new IllegalStateException("payment failed");\n}`,
+        options: [
+          'Spring propagates the parent ThreadLocal JDBC connection into the @Async thread and rolls back.',
+          'The @Async method runs on another thread without the transaction, committing audit logs anyway.',
+          'Spring AOP throws an exception immediately whenever any @Transactional method invokes an @Async bean.',
+          'The @Async executor pauses execution until the parent transaction commits its changes to disk.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): TransactionSynchronizationManager binds connections via ThreadLocal, which does not automatically propagate transactions into @Async worker threads.',
+          'CORRECT (B): The @Async call runs on a separate thread outside the parent transaction; it commits independently (or fails FK lookup) even if the parent rolls back.',
+          'WRONG (C): Spring permits calling @Async beans from @Transactional methods with no compile-time or AOP exception—making the bug silent.',
+          'WRONG (D): @Async submits immediately to the TaskExecutor; to run only after commit, use @TransactionalEventListener(phase = AFTER_COMMIT).'
+        ]
+      },
+      {
+        stem: '4. When should a senior engineer replace @Version optimistic locking with @Lock(LockModeType.PESSIMISTIC_WRITE) on a hot inventory row?',
+        code: `@Lock(LockModeType.PESSIMISTIC_WRITE)\n@Query("select i from Inventory i where i.sku = :sku")\nOptional<Inventory> findForUpdate(String sku);`,
+        options: [
+          'When high write contention causes constant optimistic retry storms and wasted database work.',
+          'Whenever a table has more than ten columns or uses PostgreSQL MVCC snapshots.',
+          'When read-only analytics queries need lock-free access without waiting for concurrent write transactions.',
+          'Whenever you want Spring Data JPA to skip opening a database transaction completely.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Under heavy contention on a single SKU, optimistic @Version causes N-1 writers to roll back and retry repeatedly; SELECT ... FOR UPDATE serializes them cleanly.',
+          'WRONG (B): Column count and MVCC support are orthogonal to optimistic vs. pessimistic lock selection.',
+          'WRONG (C): PESSIMISTIC_WRITE acquires exclusive write locks; read-only queries under MVCC already avoid blocking without adding FOR UPDATE.',
+          'WRONG (D): PESSIMISTIC_WRITE requires an active database transaction so the row lock stays held until commit or rollback.'
+        ]
+      },
+      {
+        stem: '5. Fifty worker threads poll a PostgreSQL outbox_jobs table concurrently. Why choose FOR UPDATE SKIP LOCKED over plain FOR UPDATE?',
+        code: `SELECT * FROM outbox_jobs\nWHERE status = 'PENDING'\nORDER BY created_at\nFOR UPDATE SKIP LOCKED\nLIMIT 1;`,
+        options: [
+          'Plain FOR UPDATE blocks peers behind locked rows; SKIP LOCKED claims distinct jobs immediately.',
+          'SKIP LOCKED disables ACID isolation so two workers safely process each job in parallel.',
+          'Plain FOR UPDATE returns empty sets forever, whereas SKIP LOCKED creates automatic database indexes.',
+          'SKIP LOCKED executes queries outside HikariCP connections so workers never consume pooled DB slots.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Plain FOR UPDATE forces 49 workers to block on the first locked row (and then re-check/fail), whereas SKIP LOCKED jumps straight to the next unlocked job.',
+          'WRONG (B): SKIP LOCKED preserves ACID row locking—each locked row belongs exclusively to one worker transaction, never two.',
+          'WRONG (C): Plain FOR UPDATE blocks waiting rather than returning empty forever, and SKIP LOCKED does not create database indexes.',
+          'WRONG (D): Every SQL statement still checks out a normal HikariCP connection for the duration of the short claim transaction.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_24',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

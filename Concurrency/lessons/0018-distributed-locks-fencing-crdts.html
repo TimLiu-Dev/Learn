@@ -1,0 +1,1051 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 18 — Distributed Locks, Fencing Tokens, Outbox &amp; Conflict Resolution</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Lesson 18 · Phase 6 · Distributed Concurrency</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/concurrency-cheat-sheet.html">Cheat Sheet</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Phase 6 · Lesson 18 · Distributed State &amp; Sync</div>
+      <h1>Distributed Locks, Fencing Tokens, Outbox &amp; Conflict Resolution</h1>
+      <p class="hero-sub">
+        A single-node mutex cannot span an unreliable network: processes suffer stop-the-world GC pauses, packets arrive out of order, and device wall clocks drift.
+        Learn how leases with monotonic fencing tokens, optimistic CAS (ETags/versions), the Transactional Outbox, Vector Clocks, and state-based CRDTs replace fragile lock illusions with provable invariants.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#simulator">2. Fencing &amp; Vector Clock Visualizer</a>
+        <a class="toc-chip" href="#kotlin-examples">3. Kotlin &amp; Android Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>Why a Single-Node Mutex Cannot Span a Network</h2>
+      <p class="section-lead">
+        Inside one JVM process, <strong>mutual exclusion</strong> relies on shared memory and a reliable hardware/OS scheduler. Across a network, there is no shared memory, packets delay arbitrarily, and a client holding a lease can freeze mid-request during a JVM garbage-collection pause
+        (<a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html" target="_blank" rel="noopener">Kleppmann: How to do distributed locking</a>).
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--rose);">The Lease-Only Illusion (GC Pause Race)</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            1. Worker A acquires a 5s lease from a lock service.<br/>
+            2. Worker A freezes for 12s (stop-the-world GC or OS swap). Its lease expires.<br/>
+            3. Worker B legitimately acquires a new lease and writes <code>v2</code>.<br/>
+            4. Worker A wakes up, still believing it holds the lock, and overwrites storage with stale <code>v1</code> — a distributed <strong>race condition</strong>!
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--green);">The Storage-Verified Fix (Fencing Tokens)</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            Every granted lease carries a strictly increasing <strong>fencing token</strong> (<code>1, 2, 3...</code>).<br/><br/>
+            The lock service does <em>not</em> enforce safety by itself — the <strong>storage layer</strong> tracks <code>lastSeenToken</code> and rejects any write with <code>token &lt;= lastSeenToken</code>. When Worker A wakes up with Token #1, storage rejects it because Token #2 already committed.
+          </p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 24px;">Distributed Coordination &amp; Conflict Resolution Primitives</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Mechanism</th>
+              <th>Core Guarantee</th>
+              <th>Primary Failure Mode Avoided</th>
+              <th>When to Choose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Lease + Fencing Token</strong></td>
+              <td>Storage rejects stale writes (<code>token &lt;= lastSeenToken</code>)</td>
+              <td>GC pauses &amp; delayed network packets corrupting exclusive writes</td>
+              <td>Leader election, singleton batch jobs, exclusive storage writes</td>
+            </tr>
+            <tr>
+              <td><strong>Optimistic CAS (Version / ETag)</strong></td>
+              <td>Conditional write: <code>UPDATE ... WHERE version = :v</code> or HTTP <code>If-Match</code></td>
+              <td>Lost updates under concurrent edits without holding a distributed lock</td>
+              <td>REST APIs, Room/backend row updates with low-to-moderate contention</td>
+            </tr>
+            <tr>
+              <td><strong>Transactional Outbox</strong></td>
+              <td>Domain row + outbox event commit in one local ACID transaction</td>
+              <td>Dual-write split-brain (DB commits, Kafka/FCM publish crashes)</td>
+              <td>Reliable event publishing, offline sync queues in Room + WorkManager</td>
+            </tr>
+            <tr>
+              <td><strong>Vector Clocks</strong></td>
+              <td>Partial causal order: <code>BEFORE</code>, <code>AFTER</code>, <code>EQUAL</code>, <code>CONCURRENT</code></td>
+              <td>NTP wall-clock skew causing Last-Write-Wins (LWW) to drop newer edits</td>
+              <td>Multi-device offline sync needing explicit conflict detection</td>
+            </tr>
+            <tr>
+              <td><strong>State-Based CRDTs (PN-Counter)</strong></td>
+              <td>Join-semilattice merge: commutative, associative, idempotent</td>
+              <td>Out-of-order syncs, duplicate retries, and disconnected offline writes</td>
+              <td>Distributed counters, likes, inventory deltas, collaborative state</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Why Physical Clocks Fail LWW:</strong> Relying on <code>System.currentTimeMillis()</code> for Last-Write-Wins assumes synchronized clocks across nodes. NTP step-backs and mobile clock drift mean a later edit can carry an earlier timestamp and vanish silently. Use <strong>Vector Clocks</strong> to detect true concurrency, or <strong>CRDTs</strong> (<a href="https://hal.inria.fr/inria-00555588/document" target="_blank" rel="noopener">Shapiro et al., 2011</a>) when concurrent updates can merge mathematically without coordination.
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="section-tag">Part 02 · Interactive Distributed Systems Visualizer</div>
+      <h2>Fencing Token &amp; Vector Clock Visualizer</h2>
+      <p class="section-lead">
+        Switch between scenarios or step through each distributed event. Watch a GC-paused worker wake up with an expired lease and get rejected by storage because Worker B already wrote with Fencing Token #2, or trace how Vector Clocks detect concurrent offline conflicts.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="fenced">1. Fencing Token (Safe)</button>
+            <button class="btn" data-mode="unfenced">2. No Fencing Token (Corruption)</button>
+            <button class="btn" data-mode="vclock">3. Vector Clock Conflict &amp; Merge</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-action">⚡ Jump to Wake-Up / Conflict</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="lane-row">
+              <div class="lane-label"><span id="lane-a-label">Worker A (Lease Holder #1)</span><span id="sim-step-counter">Tick 0 / 0</span></div>
+              <div class="timeline-track" id="lane-a"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span id="lane-b-label">Worker B (Lease Holder #2)</span><span id="lane-b-sub">Peer Node</span></div>
+              <div class="timeline-track" id="lane-b"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span id="lane-s-label">Storage / Sync Coordinator</span><span id="lane-s-sub">Authoritative State</span></div>
+              <div class="timeline-track" id="lane-s"></div>
+            </div>
+            <div class="registers-grid">
+              <div class="reg-card"><div class="reg-name" id="reg1-name">Storage Value</div><div class="reg-val" id="reg1-val" style="color:var(--green);">v0</div></div>
+              <div class="reg-card"><div class="reg-name" id="reg2-name">Storage lastSeenToken</div><div class="reg-val" id="reg2-val" style="color:var(--accent);">0</div></div>
+              <div class="reg-card"><div class="reg-name" id="reg3-name">Active Lease / Relation</div><div class="reg-val" id="reg3-val" style="color:var(--purple);">FREE</div></div>
+            </div>
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Click <strong>Step →</strong>, <strong>⚡ Jump to Wake-Up / Conflict</strong>, or <strong>▶ Play</strong> to trace the distributed timeline.
+            </div>
+          </div>
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">DISTRIBUTED EXECUTION TRACE</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="kotlin-examples">
+      <div class="section-tag">Part 03 · Production Kotlin &amp; Android</div>
+      <h2>Junior Traps vs. Senior Patterns in Kotlin</h2>
+      <p class="section-lead">
+        Move mutual exclusion checks to the authoritative storage boundary, pair local Room writes with a Transactional Outbox, and merge offline-first counters cleanly with CRDTs.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: Distributed Lock Without Fencing vs. Monotonic Fencing Token at Storage</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Client-Trusted Lock Only</span></div>
+<pre>suspend fun processBillingBatch(batchId: String) {
+    if (!redisLock.tryAcquire("billing:$batchId", ttl = 5.seconds)) return
+    // If JVM hits a 12s GC pause here, lease expires!
+    // Another node acquires lock and commits v2.
+    // This node wakes up and blindly overwrites v2 with stale v1:
+    storageDao.overwriteBatchResult(batchId, computeResult())
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Storage Enforces Monotonic Token</span></div>
+<pre>suspend fun processBillingBatch(batchId: String) {
+    val lease = lockService.acquireWithToken("billing:$batchId", ttl = 5.seconds)
+        ?: return
+    val result = computeResult()
+    // SQL: UPDATE batches SET payload = :p, last_token = :tok
+    //      WHERE id = :id AND last_token &lt; :tok
+    val rowsUpdated = storageDao.writeIfNewerToken(
+        id = batchId, payload = result, fencingToken = lease.token
+    )
+    if (rowsUpdated == 0) throw StaleFencingTokenException(lease.token)
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: Optimistic Concurrency with Version / ETag <code>409 Conflict</code> Retry</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Blind PUT Overwrites Peer Edits</span></div>
+<pre>suspend fun renameNote(noteId: String, title: String) {
+    val remote = api.getNote(noteId)
+    // No If-Match ETag or version check:
+    // Any edit made by another device in between is silently clobbered!
+    api.putNote(noteId, remote.copy(title = title))
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: ETag CAS + Bounded Conflict Retry</span></div>
+<pre>suspend fun renameNote(noteId: String, title: String): NoteDto {
+    repeat(3) { attempt -&gt;
+        val current = api.getNote(noteId) // carries version / ETag
+        val res = api.putNoteIfMatch(
+            id = noteId,
+            ifMatch = current.etag,
+            body = current.copy(title = title)
+        )
+        if (res.isSuccessful) return res.body()!!
+        if (res.code() != 409) throw HttpException(res)
+        delay((50L shl attempt)) // reload latest state and rebase edit
+    }
+    throw OptimisticLockConflictException(noteId)
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: G-Counter / PN-Counter CRDT Merge for Offline Sync</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: LWW Scalar Overwrites Offline Increments</span></div>
+<pre>data class LikeState(val count: Int, val updatedAtMs: Long)
+
+fun mergeLikes(local: LikeState, remote: LikeState): LikeState {
+    // Device A added +3 offline, Device B added +2 offline.
+    // LWW picks one timestamp and loses the other device's likes!
+    return if (remote.updatedAtMs &gt; local.updatedAtMs) remote else local
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: PN-Counter Element-Wise Max Merge</span></div>
+<pre>data class PnCounter(val p: Map&lt;String, Long&gt;, val n: Map&lt;String, Long&gt;) {
+    fun value(): Long = p.values.sum() - n.values.sum()
+    fun merge(other: PnCounter): PnCounter {
+        val keysP = p.keys + other.p.keys
+        val keysN = n.keys + other.n.keys
+        return PnCounter(
+            p = keysP.associateWith { maxOf(p[it] ?: 0L, other.p[it] ?: 0L) },
+            n = keysN.associateWith { maxOf(n[it] ?: 0L, other.n[it] ?: 0L) }
+        ) // Commutative, associative, and idempotent across retries!
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip">
+        <strong>Transactional Outbox Pattern (Android Room + Backend):</strong> Never update SQLite/PostgreSQL in one call and publish to Kafka or enqueue a network request outside the transaction. Instead, write both the entity mutation and an <code>OutboxEventEntity</code> row inside one atomic <code>@Transaction</code> (Room) or SQL <code>BEGIN...COMMIT</code>; a background relay (WorkManager / Debezium) reads pending outbox rows and marks them dispatched idempotently.
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Implement all three distributed primitives below and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>). Starter code contains an intentional concurrency flaw you must fix.</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 18.1 · LEASE MANAGER &amp; FENCED STORAGE</span>
+            <h3 style="margin:8px 0 4px;"><code>FencedStorageCoordinator</code>: Monotonic Fencing Tokens</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Prevent a GC-paused worker with an expired lease from corrupting storage after a newer worker commits.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>acquireLease(workerId, ttlMs)</code>: Grants a lease only if no active lease exists or <code>this.now &gt;= this.activeLease.expiresAt</code>. Issues strictly monotonic <code>token</code> (1, 2, 3...) and returns <code>{ granted: true, workerId, token, expiresAt }</code>; otherwise returns <code>{ granted: false, holder, token: null }</code>.<br/>
+          • <code>advanceTime(ms)</code>: Advances simulated clock <code>this.now += ms</code>.<br/>
+          • <code>write(token, value)</code>: Storage rejects stale or duplicate tokens where <code>typeof token !== 'number' || token &lt;= this.lastSeenToken</code>, returning <code>{ ok: false, reason: 'STALE_TOKEN', lastSeenToken: this.lastSeenToken, value: this.value }</code>. Otherwise updates <code>lastSeenToken</code> and <code>value</code> and returns <code>{ ok: true, token, value }</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_18_1_fenced_storage.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 18.2 · CAUSAL ORDERING</span>
+            <h3 style="margin:8px 0 4px;"><code>compareVectorClocks</code> &amp; <code>mergeVectorClocks</code></h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Detect causal precedence vs. true concurrent conflicts across sparse node clocks, and merge clocks cleanly.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>compareVectorClocks(vcA, vcB)</code>: Compare over the <em>union</em> of keys from both objects (missing keys default to <code>0</code>). Return <code>'EQUAL'</code>, <code>'BEFORE'</code> (A &lt; B), <code>'AFTER'</code> (A &gt; B), or <code>'CONCURRENT'</code>.<br/>
+          • <code>mergeVectorClocks(vcA, vcB)</code>: Return a new object mapping each key in the union to <code>Math.max(aVal, bVal)</code> without mutating inputs. Keep <code>compareVectorClocks.merge = mergeVectorClocks;</code> at the bottom.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_18_2_vector_clocks.js</span><span>Causal partial order + join</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 18.3 · CONVERGENT REPLICATED DATA TYPE</span>
+            <h3 style="margin:8px 0 4px;"><code>PNCounterCRDT</code>: Commutative, Associative, Idempotent Merge</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Build a distributed Positive-Negative Counter CRDT that converges identically under out-of-order and duplicate syncs.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>new PNCounterCRDT(nodeId)</code>: Tracks per-node <code>this.p</code> (increments) and <code>this.n</code> (decrements) maps.<br/>
+          • <code>increment(delta = 1)</code> / <code>decrement(delta = 1)</code>: Validate <code>delta &gt;= 0</code> and add to <code>this.p[this.nodeId]</code> or <code>this.n[this.nodeId]</code>.<br/>
+          • <code>value()</code>: Returns <code>sum(p) - sum(n)</code>.<br/>
+          • <code>merge(other)</code>: Takes element-wise <code>Math.max</code> across all keys in <code>p</code> and <code>n</code> without mutating <code>other</code>, and returns <code>this</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_18_3_pn_counter_crdt.js</span><span>Offline-first Android sync CRDT</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in length so only real understanding picks the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Read <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html" target="_blank" rel="noopener">Martin Kleppmann: How to do distributed locking</a> for the foundational analysis of GC pauses, clock drift, and storage-side fencing tokens, and review the <a href="../reference/concurrency-cheat-sheet.html">Core Concurrency Cheat Sheet</a> before starting the SyncForge capstone.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"Why isn't a background lease-renewal thread enough to avoid fencing tokens?"</em> or <em>"When should SyncForge pick an ETag 409 retry vs. a PN-Counter CRDT?"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0017-virtual-threads-rate-limiters-circuit-breakers.html">← Lesson 17</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0019-capstone-syncforge-android.html">Capstone 01: SyncForge →</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_SCENARIOS = {
+      fenced: {
+        labels: {
+          a: 'Worker A (Lease #1)',
+          b: 'Worker B (Lease #2)',
+          bSub: 'Acquires after TTL expiry',
+          s: 'Storage Node (Checks token > lastSeenToken)',
+          sSub: 'Authoritative Fence',
+          r1: 'Storage Value',
+          r2: 'lastSeenToken',
+          r3: 'Lease / Fence State'
+        },
+        init: { r1: 'v0', r2: '0', r3: 'FREE', cls3: 'var(--purple)' },
+        conflictIndex: 5,
+        steps: [
+          { a: { cls: 'ta', txt: 'ACQUIRE #1' }, b: { cls: 'idle', txt: 'IDLE' }, s: { cls: 'io', txt: 'GRANT #1' }, r1: 'v0', r2: '0', r3: 'A (#1)', type: '', msg: 't=0s: Lock service grants Worker A lease with Fencing Token #1 (TTL 5s).' },
+          { a: { cls: 'sw', txt: 'GC PAUSE 12s' }, b: { cls: 'idle', txt: 'WAIT' }, s: { cls: 'sw', txt: 'TTL EXPIRES' }, r1: 'v0', r2: '0', r3: 'EXPIRED', type: 'warn', msg: 't=5s: Worker A freezes in a 12s stop-the-world GC pause; its lease expires!' },
+          { a: { cls: 'sw', txt: 'STILL PAUSED' }, b: { cls: 'tb', txt: 'ACQUIRE #2' }, s: { cls: 'io', txt: 'GRANT #2' }, r1: 'v0', r2: '0', r3: 'B (#2)', type: '', msg: 't=6s: Worker B acquires a fresh lease and receives monotonic Fencing Token #2.' },
+          { a: { cls: 'sw', txt: 'STILL PAUSED' }, b: { cls: 'tb', txt: 'WRITE(v2, #2)' }, s: { cls: 'io', txt: 'COMMIT #2' }, r1: 'v2', r2: '2', r3: 'B (#2)', type: 'good', msg: 't=7s: Storage sees 2 > 0, commits value="v2", and updates lastSeenToken = 2.' },
+          { a: { cls: 'ta', txt: 'GC WAKES UP' }, b: { cls: 'tb', txt: 'DONE' }, s: { cls: 'idle', txt: 'READY' }, r1: 'v2', r2: '2', r3: 'B (#2)', type: 'warn', msg: 't=12s: Worker A wakes from GC pause, still thinking it owns the lock!' },
+          { a: { cls: 'bad', txt: 'WRITE(v1, #1)' }, b: { cls: 'idle', txt: 'DONE' }, s: { cls: 'bad', txt: 'REJECT 1<=2' }, r1: 'v2', r2: '2', r3: 'REJECTED #1', type: 'bad', msg: 't=12s: Worker A sends write(v1, token=1). Storage checks 1 <= lastSeenToken(2) and REJECTS it!' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Fencing Token Prevented Corruption:</strong> Worker A woke up with expired Token #1 and was rejected by storage because Worker B already committed with Token #2. Storage remains <code>v2</code>.' }
+      },
+      unfenced: {
+        labels: {
+          a: 'Worker A (No Token)',
+          b: 'Worker B (No Token)',
+          bSub: 'Acquires after TTL expiry',
+          s: 'Storage Node (Blind Write)',
+          sSub: 'No Token Validation',
+          r1: 'Storage Value',
+          r2: 'Fencing Check',
+          r3: 'Lease Holder'
+        },
+        init: { r1: 'v0', r2: 'OFF', r3: 'FREE' },
+        conflictIndex: 5,
+        steps: [
+          { a: { cls: 'ta', txt: 'ACQUIRE' }, b: { cls: 'idle', txt: 'IDLE' }, s: { cls: 'io', txt: 'LEASE -> A' }, r1: 'v0', r2: 'OFF', r3: 'A', type: '', msg: 't=0s: Worker A acquires an unfenced 5s lease from the lock service.' },
+          { a: { cls: 'sw', txt: 'GC PAUSE 12s' }, b: { cls: 'idle', txt: 'WAIT' }, s: { cls: 'sw', txt: 'TTL EXPIRES' }, r1: 'v0', r2: 'OFF', r3: 'EXPIRED', type: 'warn', msg: 't=5s: Worker A freezes in GC; lock TTL expires.' },
+          { a: { cls: 'sw', txt: 'STILL PAUSED' }, b: { cls: 'tb', txt: 'ACQUIRE' }, s: { cls: 'io', txt: 'LEASE -> B' }, r1: 'v0', r2: 'OFF', r3: 'B', type: '', msg: 't=6s: Worker B acquires the lease cleanly.' },
+          { a: { cls: 'sw', txt: 'STILL PAUSED' }, b: { cls: 'tb', txt: 'WRITE(v2)' }, s: { cls: 'io', txt: 'STORE v2' }, r1: 'v2', r2: 'OFF', r3: 'B', type: 'good', msg: 't=7s: Worker B writes value="v2" to storage.' },
+          { a: { cls: 'ta', txt: 'GC WAKES UP' }, b: { cls: 'tb', txt: 'DONE' }, s: { cls: 'idle', txt: 'READY' }, r1: 'v2', r2: 'OFF', r3: 'B', type: 'warn', msg: 't=12s: Worker A resumes from GC pause without checking elapsed time.' },
+          { a: { cls: 'bad', txt: 'WRITE(v1)' }, b: { cls: 'idle', txt: 'DONE' }, s: { cls: 'bad', txt: 'OVERWRITE v1' }, r1: 'v1 (STALE!)', r2: 'NONE', r3: 'CORRUPTED', type: 'bad', msg: 't=12s: SILENT CORRUPTION! Storage blindly overwrites v2 with stale v1 from Worker A.' }
+        ],
+        finalVerdict: { cls: 'callout danger', html: '<strong>Data Corruption Reproduced:</strong> Without a storage-verified fencing token, an expired lease holder overwrote <code>v2</code> with stale <code>v1</code>.' }
+      },
+      vclock: {
+        labels: {
+          a: 'Device A (Offline Node A)',
+          b: 'Device B (Offline Node B)',
+          bSub: 'Disconnected Peer',
+          s: 'Sync Engine (Compare & Merge)',
+          sSub: 'Causal Partial Order',
+          r1: 'VC(A)',
+          r2: 'VC(B)',
+          r3: 'Comparison'
+        },
+        init: { r1: '{A:0, B:0}', r2: '{A:0, B:0}', r3: 'EQUAL' },
+        conflictIndex: 3,
+        steps: [
+          { a: { cls: 'ta', txt: 'A: BASE' }, b: { cls: 'tb', txt: 'B: BASE' }, s: { cls: 'io', txt: 'SYNCED' }, r1: '{A:0, B:0}', r2: '{A:0, B:0}', r3: 'EQUAL', type: '', msg: 'Both devices start synchronized at vector clock {A:0, B:0}.' },
+          { a: { cls: 'ta', txt: 'EDIT (+A)' }, b: { cls: 'idle', txt: 'OFFLINE' }, s: { cls: 'idle', txt: 'PARTITIONED' }, r1: '{A:1, B:0}', r2: '{A:0, B:0}', r3: 'AFTER (A>B)', type: '', msg: 'Device A edits offline -> increments A counter to {A:1, B:0}.' },
+          { a: { cls: 'idle', txt: 'OFFLINE' }, b: { cls: 'tb', txt: 'EDIT (+B)' }, s: { cls: 'idle', txt: 'PARTITIONED' }, r1: '{A:1, B:0}', r2: '{A:0, B:1}', r3: 'CONCURRENT!', type: 'bad', msg: 'Device B edits offline -> increments B counter to {A:0, B:1}. Neither clock dominates!' },
+          { a: { cls: 'ta', txt: 'PUSH VC(A)' }, b: { cls: 'tb', txt: 'PUSH VC(B)' }, s: { cls: 'sw', txt: 'CONFLICT!' }, r1: '{A:1, B:0}', r2: '{A:0, B:1}', r3: 'CONCURRENT', type: 'warn', msg: 'Sync Engine compares {A:1,B:0} vs {A:0,B:1}: A>B on key A, B>A on key B -> CONCURRENT conflict detected!' },
+          { a: { cls: 'ta', txt: 'MERGE' }, b: { cls: 'tb', txt: 'MERGE' }, s: { cls: 'io', txt: 'MAX -> [1,1]' }, r1: '{A:1, B:1}', r2: '{A:1, B:1}', r3: 'CONVERGED', type: 'good', msg: 'After resolving/merging payload (or CRDT join), both adopt merged clock {A:1, B:1}.' }
+        ],
+        finalVerdict: { cls: 'callout tip', html: '<strong>Causal Conflict Detected &amp; Resolved:</strong> Unlike NTP wall-clock LWW, Vector Clocks flagged <code>{A:1, B:0}</code> vs <code>{A:0, B:1}</code> as <code>CONCURRENT</code> and merged to <code>{A:1, B:1}</code>.' }
+      }
+    };
+
+    let currentSimMode = 'fenced';
+    let simStepIdx = 0;
+    let simTimer = null;
+
+    function resetSim() {
+      if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+      simStepIdx = 0;
+      const sc = SIM_SCENARIOS[currentSimMode];
+      document.getElementById('lane-a-label').textContent = sc.labels.a;
+      document.getElementById('lane-b-label').textContent = sc.labels.b;
+      document.getElementById('lane-b-sub').textContent = sc.labels.bSub;
+      document.getElementById('lane-s-label').textContent = sc.labels.s;
+      document.getElementById('lane-s-sub').textContent = sc.labels.sSub;
+      document.getElementById('reg1-name').textContent = sc.labels.r1;
+      document.getElementById('reg2-name').textContent = sc.labels.r2;
+      document.getElementById('reg3-name').textContent = sc.labels.r3;
+
+      document.getElementById('lane-a').innerHTML = '';
+      document.getElementById('lane-b').innerHTML = '';
+      document.getElementById('lane-s').innerHTML = '';
+      document.getElementById('reg1-val').textContent = sc.init.r1;
+      document.getElementById('reg2-val').textContent = sc.init.r2;
+      document.getElementById('reg3-val').textContent = sc.init.r3;
+      document.getElementById('sim-step-counter').textContent = `Tick 0 / ${sc.steps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step →, ⚡ Jump to Wake-Up / Conflict, or ▶ Play.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through this timeline to observe lease expiry, fencing token enforcement, or vector clock comparisons.';
+    }
+
+    function stepSim() {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) { clearInterval(simTimer); simTimer = null; document.getElementById('sim-play').textContent = '▶ Play'; }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      const appendSlot = (id, slot) => {
+        if (!slot) return;
+        const d = document.createElement('div');
+        d.className = `slot ${slot.cls}`;
+        d.textContent = slot.txt;
+        document.getElementById(id).appendChild(d);
+      };
+      appendSlot('lane-a', s.a);
+      appendSlot('lane-b', s.b);
+      appendSlot('lane-s', s.s);
+
+      document.getElementById('reg1-val').textContent = s.r1;
+      document.getElementById('reg2-val').textContent = s.r2;
+      document.getElementById('reg3-val').textContent = s.r3;
+      document.getElementById('sim-step-counter').textContent = `Tick ${simStepIdx} / ${sc.steps.length}`;
+
+      const logEl = document.getElementById('sim-log');
+      if (simStepIdx === 1) logEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.className = `trace-line ${s.type}`;
+      line.textContent = `[${simStepIdx}] ${s.msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+      }
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-action').addEventListener('click', () => {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx > sc.conflictIndex) resetSim();
+      while (simStepIdx <= sc.conflictIndex && simStepIdx < sc.steps.length) {
+        stepSim();
+      }
+    });
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) { clearInterval(simTimer); simTimer = null; btn.textContent = '▶ Play'; }
+      else { if (simStepIdx >= SIM_SCENARIOS[currentSimMode].steps.length) resetSim(); btn.textContent = '⏸ Pause'; simTimer = setInterval(stepSim, 800); }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'FencedStorageCoordinator',
+        starter: `class FencedStorageCoordinator {
+  constructor(initialValue = null) {
+    this.now = 0;
+    this.nextToken = 0;
+    this.activeLease = null;
+    this.lastSeenToken = 0;
+    this.value = initialValue;
+  }
+
+  advanceTime(ms) {
+    this.now += ms;
+  }
+
+  acquireLease(workerId, ttlMs = 5000) {
+    // BUG: Ignores active lease check and always reuses token 1!
+    this.activeLease = { workerId, token: 1, expiresAt: this.now + ttlMs };
+    return { granted: true, workerId, token: 1, expiresAt: this.activeLease.expiresAt };
+  }
+
+  write(token, value) {
+    // BUG: Storage blindly overwrites without checking token <= this.lastSeenToken!
+    this.value = value;
+    return { ok: true, token, value: this.value };
+  }
+
+  getState() {
+    return {
+      value: this.value,
+      lastSeenToken: this.lastSeenToken,
+      activeLease: this.activeLease,
+      now: this.now
+    };
+  }
+}`,
+        hints: [
+          'In `acquireLease(workerId, ttlMs)`: check if `this.activeLease && this.now < this.activeLease.expiresAt`. If still active, return `{ granted: false, holder: this.activeLease.workerId, token: null }`.',
+          'When granting a lease, increment `this.nextToken += 1` so every lease receives a strictly larger monotonic token, even after expiration.',
+          'In `write(token, value)`: if `typeof token !== "number" || token <= this.lastSeenToken`, return `{ ok: false, reason: "STALE_TOKEN", lastSeenToken: this.lastSeenToken, value: this.value }`. Otherwise update `this.lastSeenToken = token` and `this.value = value`.'
+        ],
+        solution: `class FencedStorageCoordinator {
+  constructor(initialValue = null) {
+    this.now = 0;
+    this.nextToken = 0;
+    this.activeLease = null;
+    this.lastSeenToken = 0;
+    this.value = initialValue;
+  }
+
+  advanceTime(ms) {
+    this.now += ms;
+  }
+
+  acquireLease(workerId, ttlMs = 5000) {
+    if (this.activeLease && this.now < this.activeLease.expiresAt) {
+      return { granted: false, holder: this.activeLease.workerId, token: null };
+    }
+    this.nextToken += 1;
+    this.activeLease = {
+      workerId,
+      token: this.nextToken,
+      expiresAt: this.now + ttlMs
+    };
+    return {
+      granted: true,
+      workerId,
+      token: this.nextToken,
+      expiresAt: this.activeLease.expiresAt
+    };
+  }
+
+  write(token, value) {
+    if (typeof token !== 'number' || token <= this.lastSeenToken) {
+      return {
+        ok: false,
+        reason: 'STALE_TOKEN',
+        lastSeenToken: this.lastSeenToken,
+        value: this.value
+      };
+    }
+    this.lastSeenToken = token;
+    this.value = value;
+    return { ok: true, token, value: this.value };
+  }
+
+  getState() {
+    return {
+      value: this.value,
+      lastSeenToken: this.lastSeenToken,
+      activeLease: this.activeLease,
+      now: this.now
+    };
+  }
+}`,
+        kotlinEquivalent: `class FencedStorageRepository(private val dao: StorageDao) {
+    suspend fun writeWithFence(token: Long, payload: String): Result<Unit> {
+        val updatedRows = dao.compareAndSetWithToken(
+            newPayload = payload,
+            token = token
+        ) // SQL: UPDATE store SET payload = :newPayload, last_token = :token WHERE last_token < :token
+        return if (updatedRows == 1) Result.success(Unit)
+        else Result.failure(StaleFencingTokenException("Rejected stale token $token"))
+    }
+}`,
+        tests: async (Coordinator) => runTestCases([
+          {
+            name: 'Contention: Worker B cannot acquire while Worker A lease is active',
+            run: () => {
+              const coord = new Coordinator('v0');
+              const l1 = coord.acquireLease('worker-A', 5000);
+              assertEq(l1.granted, true);
+              assertEq(l1.token, 1);
+              coord.advanceTime(2500);
+              const l2 = coord.acquireLease('worker-B', 5000);
+              assertEq(l2.granted, false, 'Expected lease denial before TTL expires');
+            }
+          },
+          {
+            name: 'GC Pause Protection: Expired Worker A (token 1) is rejected after Worker B (token 2) commits',
+            run: () => {
+              const coord = new Coordinator('v0');
+              const l1 = coord.acquireLease('worker-A', 5000);
+              coord.advanceTime(6000); // Worker A paused past TTL
+              const l2 = coord.acquireLease('worker-B', 5000);
+              assertEq(l2.granted, true);
+              assertEq(l2.token > l1.token, true, 'Fencing tokens must increase monotonically');
+              const w2 = coord.write(l2.token, 'v2-from-B');
+              assertEq(w2.ok, true);
+              const staleW1 = coord.write(l1.token, 'stale-v1-from-A');
+              assertEq(staleW1.ok, false, 'Storage must reject stale token <= lastSeenToken');
+              assertEq(coord.getState().value, 'v2-from-B');
+              assertEq(coord.getState().lastSeenToken, l2.token);
+            }
+          },
+          {
+            name: 'Idempotency guard: Duplicate writes with the same token are rejected',
+            run: () => {
+              const coord = new Coordinator('init');
+              const l1 = coord.acquireLease('worker-A', 5000);
+              assertEq(coord.write(l1.token, 'first').ok, true);
+              assertEq(coord.write(l1.token, 'second').ok, false, 'Expected token <= lastSeenToken rejection');
+              assertEq(coord.getState().value, 'first');
+            }
+          }
+        ])
+      },
+      2: {
+        fnName: 'compareVectorClocks',
+        starter: `function compareVectorClocks(vcA, vcB) {
+  // BUG: Only checks keys in vcA and treats mismatches as CONCURRENT!
+  for (const key of Object.keys(vcA)) {
+    if ((vcA[key] || 0) !== (vcB[key] || 0)) {
+      return 'CONCURRENT';
+    }
+  }
+  return 'EQUAL';
+}
+
+function mergeVectorClocks(vcA, vcB) {
+  // TODO: Return element-wise Math.max across union of keys
+  return {};
+}
+
+compareVectorClocks.merge = mergeVectorClocks;`,
+        hints: [
+          'Build `const keys = new Set([...Object.keys(vcA || {}), ...Object.keys(vcB || {})])` so keys present only in one clock default to `0`.',
+          'Track two booleans: `let aLess = false; let bLess = false;`. For each key, if `a < b` set `aLess = true`; if `a > b` set `bLess = true`.',
+          'Return `EQUAL` if neither flag is set, `BEFORE` if only `aLess`, `AFTER` if only `bLess`, and `CONCURRENT` if both are true. For `mergeVectorClocks`, map each key in `keys` to `Math.max(a, b)`.'
+        ],
+        solution: `function compareVectorClocks(vcA, vcB) {
+  const aObj = vcA || {};
+  const bObj = vcB || {};
+  const keys = new Set([...Object.keys(aObj), ...Object.keys(bObj)]);
+  let aLess = false;
+  let bLess = false;
+  for (const key of keys) {
+    const aVal = aObj[key] || 0;
+    const bVal = bObj[key] || 0;
+    if (aVal < bVal) aLess = true;
+    else if (aVal > bVal) bLess = true;
+  }
+  if (!aLess && !bLess) return 'EQUAL';
+  if (aLess && !bLess) return 'BEFORE';
+  if (!aLess && bLess) return 'AFTER';
+  return 'CONCURRENT';
+}
+
+function mergeVectorClocks(vcA, vcB) {
+  const aObj = vcA || {};
+  const bObj = vcB || {};
+  const keys = new Set([...Object.keys(aObj), ...Object.keys(bObj)]);
+  const merged = {};
+  for (const key of keys) {
+    merged[key] = Math.max(aObj[key] || 0, bObj[key] || 0);
+  }
+  return merged;
+}
+
+compareVectorClocks.merge = mergeVectorClocks;`,
+        kotlinEquivalent: `enum class CausalOrder { BEFORE, AFTER, EQUAL, CONCURRENT }
+
+fun compareClocks(a: Map<String, Long>, b: Map<String, Long>): CausalOrder {
+    var aLess = false
+    var bLess = false
+    for (k in (a.keys + b.keys)) {
+        val av = a[k] ?: 0L
+        val bv = b[k] ?: 0L
+        if (av < bv) aLess = true else if (av > bv) bLess = true
+    }
+    return when {
+        !aLess && !bLess -> CausalOrder.EQUAL
+        aLess && !bLess -> CausalOrder.BEFORE
+        !aLess && bLess -> CausalOrder.AFTER
+        else -> CausalOrder.CONCURRENT
+    }
+}`,
+        tests: async (fn) => runTestCases([
+          {
+            name: 'Handles sparse clocks as EQUAL ({ A: 2 } vs { A: 2, B: 0 })',
+            run: () => assertEq(fn({ A: 2 }, { A: 2, B: 0 }), 'EQUAL')
+          },
+          {
+            name: 'Detects BEFORE when B has unseen key ({ A: 1 } vs { A: 1, B: 1 })',
+            run: () => assertEq(fn({ A: 1 }, { A: 1, B: 1 }), 'BEFORE')
+          },
+          {
+            name: 'Detects AFTER across multiple nodes ({ A: 2, B: 3 } vs { A: 2, B: 1 })',
+            run: () => assertEq(fn({ A: 2, B: 3 }, { A: 2, B: 1 }), 'AFTER')
+          },
+          {
+            name: 'Detects CONCURRENT offline edits ({ A: 3, B: 1 } vs { A: 2, B: 2 })',
+            run: () => assertEq(fn({ A: 3, B: 1 }, { A: 2, B: 2 }), 'CONCURRENT')
+          },
+          {
+            name: 'mergeVectorClocks computes element-wise max without mutating inputs',
+            run: () => {
+              if (typeof fn.merge !== 'function') throw new Error('Keep compareVectorClocks.merge = mergeVectorClocks;');
+              const a = { A: 3, B: 1 };
+              const b = { A: 2, B: 2, C: 4 };
+              assertDeepEq(fn.merge(a, b), { A: 3, B: 2, C: 4 });
+              assertDeepEq(a, { A: 3, B: 1 });
+              assertDeepEq(b, { A: 2, B: 2, C: 4 });
+            }
+          }
+        ])
+      },
+      3: {
+        fnName: 'PNCounterCRDT',
+        starter: `class PNCounterCRDT {
+  constructor(nodeId) {
+    this.nodeId = nodeId;
+    this.p = {};
+    this.n = {};
+  }
+
+  increment(delta = 1) {
+    if (delta < 0) throw new Error('delta must be non-negative');
+    this.p[this.nodeId] = (this.p[this.nodeId] || 0) + delta;
+  }
+
+  decrement(delta = 1) {
+    if (delta < 0) throw new Error('delta must be non-negative');
+    this.n[this.nodeId] = (this.n[this.nodeId] || 0) + delta;
+  }
+
+  value() {
+    const sum = (m) => Object.values(m).reduce((acc, v) => acc + v, 0);
+    return sum(this.p) - sum(this.n);
+  }
+
+  merge(other) {
+    // BUG: Overwrites counts instead of taking element-wise Math.max (breaks idempotency & concurrency)!
+    for (const k of Object.keys(other.p)) {
+      this.p[k] = (this.p[k] || 0) + other.p[k];
+    }
+    for (const k of Object.keys(other.n)) {
+      this.n[k] = (this.n[k] || 0) + other.n[k];
+    }
+    return this;
+  }
+}`,
+        hints: [
+          'Adding `other.p[k]` to `this.p[k]` fails idempotency: syncing twice doubles the count!',
+          'For each key in `other.p`, set `this.p[k] = Math.max(this.p[k] || 0, other.p[k] || 0)`.',
+          'Apply the exact same element-wise `Math.max` rule for `this.n` and return `this`.'
+        ],
+        solution: `class PNCounterCRDT {
+  constructor(nodeId) {
+    this.nodeId = nodeId;
+    this.p = {};
+    this.n = {};
+  }
+
+  increment(delta = 1) {
+    if (delta < 0) throw new Error('delta must be non-negative');
+    this.p[this.nodeId] = (this.p[this.nodeId] || 0) + delta;
+  }
+
+  decrement(delta = 1) {
+    if (delta < 0) throw new Error('delta must be non-negative');
+    this.n[this.nodeId] = (this.n[this.nodeId] || 0) + delta;
+  }
+
+  value() {
+    const sum = (m) => Object.values(m).reduce((acc, v) => acc + v, 0);
+    return sum(this.p) - sum(this.n);
+  }
+
+  merge(other) {
+    for (const k of Object.keys(other.p || {})) {
+      this.p[k] = Math.max(this.p[k] || 0, other.p[k] || 0);
+    }
+    for (const k of Object.keys(other.n || {})) {
+      this.n[k] = Math.max(this.n[k] || 0, other.n[k] || 0);
+    }
+    return this;
+  }
+}`,
+        kotlinEquivalent: `class PnCounterCrdt(private val nodeId: String) {
+    private val p = mutableMapOf<String, Long>()
+    private val n = mutableMapOf<String, Long>()
+
+    fun increment(delta: Long = 1L) { p[nodeId] = (p[nodeId] ?: 0L) + delta }
+    fun decrement(delta: Long = 1L) { n[nodeId] = (n[nodeId] ?: 0L) + delta }
+    fun value(): Long = p.values.sum() - n.values.sum()
+
+    fun merge(other: PnCounterCrdt) {
+        other.p.forEach { (k, v) -> p[k] = maxOf(p[k] ?: 0L, v) }
+        other.n.forEach { (k, v) -> n[k] = maxOf(n[k] ?: 0L, v) }
+    }
+}`,
+        tests: async (Counter) => runTestCases([
+          {
+            name: 'Idempotency: Merging the same replica state multiple times does not change value',
+            run: () => {
+              const a = new Counter('A');
+              const b = new Counter('B');
+              a.increment(5);
+              b.increment(3);
+              b.decrement(1);
+              a.merge(b);
+              assertEq(a.value(), 7);
+              a.merge(b);
+              a.merge(b);
+              assertEq(a.value(), 7, 'Repeated merges must be idempotent');
+            }
+          },
+          {
+            name: 'Commutativity: A.merge(B) == B.merge(A) with concurrent increments and decrements',
+            run: () => {
+              const a1 = new Counter('A'); a1.increment(10); a1.decrement(2);
+              const b1 = new Counter('B'); b1.increment(4); b1.decrement(5);
+              const a2 = new Counter('A'); a2.increment(10); a2.decrement(2);
+              const b2 = new Counter('B'); b2.increment(4); b2.decrement(5);
+              a1.merge(b1);
+              b2.merge(a2);
+              assertEq(a1.value(), 7);
+              assertEq(b2.value(), 7);
+            }
+          },
+          {
+            name: 'Associativity & out-of-order sync across 3 replicas: (A + B) + C == A + (B + C)',
+            run: () => {
+              const makeSet = () => {
+                const a = new Counter('A'); a.increment(6);
+                const b = new Counter('B'); b.decrement(2);
+                const c = new Counter('C'); c.increment(3); c.decrement(1);
+                return { a, b, c };
+              };
+              const s1 = makeSet();
+              s1.a.merge(s1.b);
+              s1.a.merge(s1.c);
+
+              const s2 = makeSet();
+              s2.b.merge(s2.c);
+              s2.a.merge(s2.b);
+
+              assertEq(s1.a.value(), 6);
+              assertEq(s2.a.value(), 6);
+            }
+          }
+        ])
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. Worker A acquires a 5-second distributed lease, stalls in a 12-second GC pause, then writes to storage after Worker B took the lease. What prevents corruption?',
+        code: `// t=0s: Worker A acquires lease (5s TTL)\n// t=5s..12s: Worker A freezes in GC; Worker B acquires lease & writes v2\n// t=12s: Worker A wakes up and attempts write(v1)`,
+        options: [
+          'Adding longer lease timeouts guarantees Worker A always finishes before Worker B starts.',
+          'Checking monotonic fencing tokens at storage rejects stale writes from paused lease holders.',
+          'Calling System.gc() before acquiring any distributed lease prevents stop-the-world pauses during writes.',
+          'Renewing leases from a background heartbeat thread guarantees Worker A pauses never occur.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Longer TTLs only delay recovery when nodes crash; arbitrary GC pauses or network stalls can still exceed any finite timeout.',
+          'CORRECT (B): Storage tracks lastSeenToken and rejects any write with token <= lastSeenToken, blocking stale writes from paused lease holders.',
+          'WRONG (C): System.gc() is only a hint to the JVM and cannot stop future allocations or OS-level process freezes.',
+          'WRONG (D): A stop-the-world GC pause freezes all JVM threads—including background lease-renewal heartbeats.'
+        ]
+      },
+      {
+        stem: '2. Two Android devices update the same user profile offline and sync using Last-Write-Wins (LWW) with device wall-clock timestamps. What causes silent data loss?',
+        code: `data class Profile(val bio: String, val updatedAtMs: Long) // System.currentTimeMillis()`,
+        options: [
+          'SQLite automatically rolls back offline mutations whenever two devices share identical user identifiers.',
+          'Retrofit strips ISO timestamp headers from HTTP bodies during concurrent background WorkManager uploads.',
+          'NTP clock skew lets older writes carry higher timestamps and overwrite newer writes.',
+          'Wall-clock timestamps enforce strict causal ordering across disconnected mobile nodes without vector clocks.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): Local SQLite stores offline rows normally per device; conflicts happen only during server reconciliation.',
+          'WRONG (B): Retrofit serializes DTO fields untouched; HTTP headers do not strip JSON body timestamps.',
+          'CORRECT (C): Mobile clocks drift and step backward on NTP sync, letting an earlier real-time edit carry a larger timestamp and clobber newer edits.',
+          'WRONG (D): Physical wall-clocks cannot establish causal happens-before ordering across unsynchronized distributed nodes.'
+        ]
+      },
+      {
+        stem: '3. Your backend commits an order to PostgreSQL and then calls kafkaProducer.send(event) outside the transaction. Why is this dual-write pattern unsafe in production?',
+        code: `db.transaction { ordersRepo.insert(order) }\nkafkaProducer.send("orders", OrderCreated(order.id)) // Dual write!`,
+        options: [
+          'Crashes between commit and publish leave state committed without events, breaking downstream consumers.',
+          'Kafka brokers automatically reject any messages published within five milliseconds after a database commit.',
+          'PostgreSQL throws a serialization exception whenever a transaction precedes an asynchronous network socket call.',
+          'Using a Transactional Outbox removes the need for idempotent consumers across distributed message queues.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): There is no atomic two-phase commit between Postgres and Kafka; a crash or timeout after commit drops the event unless persisted in an Outbox table in the same DB transaction.',
+          'WRONG (B): Kafka has no awareness of PostgreSQL commit timing and accepts messages immediately.',
+          'WRONG (C): PostgreSQL transactions complete before kafkaProducer.send runs, so no serialization conflict occurs.',
+          'WRONG (D): Transactional Outbox guarantees at-least-once delivery, which makes idempotent consumers mandatory, not unnecessary.'
+        ]
+      },
+      {
+        stem: '4. Node A holds vector clock {A: 3, B: 1} and Node B holds {A: 2, B: 2}. What does comparing these two vector clocks reveal?',
+        code: `compareVectorClocks({ A: 3, B: 1 }, { A: 2, B: 2 })`,
+        options: [
+          'Node A happened strictly before Node B because Node B holds a higher B counter.',
+          'Node B happened strictly before Node A because Node A holds a higher A counter.',
+          'Both states are identical replicas because the total sum across counters equals four each.',
+          'Both edits are concurrent because neither vector dominates the other across every node entry.'
+        ],
+        correct: 3,
+        why: [
+          'WRONG (A): For A to be BEFORE B, every entry in A must be <= the corresponding entry in B, which fails on key A (3 > 2).',
+          'WRONG (B): For B to be BEFORE A, every entry in B must be <= A, which fails on key B (2 > 1).',
+          'WRONG (C): Vector clocks are compared element-wise, never by summing entries; {3,1} and {2,2} represent distinct histories.',
+          'CORRECT (D): Node A is ahead on A (3 > 2) while Node B is ahead on B (2 > 1), proving neither causally preceded the other (CONCURRENT).'
+        ]
+      },
+      {
+        stem: '5. An offline Android client receives the same PN-Counter replica state packet three times due to WorkManager retries. Why does the counter remain exact?',
+        code: `repeat(3) { localCounter.merge(remoteSnapshot) }`,
+        options: [
+          'WorkManager deduplicates all incoming network payloads automatically using a global distributed transaction coordinator.',
+          'CRDT merges store every delta inside a local queue and discard duplicates via timestamps.',
+          'Taking element-wise maximums across per-replica P and N maps makes merging naturally idempotent.',
+          'PN-Counters synchronize a centralized primary database lock before applying any incoming state merge.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): WorkManager schedules retries with backoff; it has no global transaction coordinator and does not deduplicate server payloads.',
+          'WRONG (B): State-based PN-Counters do not rely on timestamp queues; they merge per-node monotonic maps directly.',
+          'CORRECT (C): Because max(x, x) == x, merging the same state snapshot any number of times produces the exact same P and N maps.',
+          'WRONG (D): CRDTs are designed specifically for coordination-free, lock-free local merges across disconnected replicas.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_18',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>

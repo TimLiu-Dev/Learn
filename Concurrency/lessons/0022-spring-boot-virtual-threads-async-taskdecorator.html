@@ -1,0 +1,1302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 22 — Spring Boot Virtual Threads, @Async Proxy Traps &amp; TaskDecorator</title>
+  <link rel="stylesheet" href="../assets/concurrency-theme.css" />
+  <style>
+    .hop-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    @media (max-width: 720px) {
+      .hop-strip { grid-template-columns: repeat(2, 1fr); }
+    }
+    .hop-node {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: 0.76rem;
+      transition: all 0.18s ease;
+    }
+    .hop-node .hop-title {
+      color: var(--text-muted);
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .hop-node .hop-state {
+      margin-top: 4px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .hop-node.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .hop-node.good {
+      border-color: var(--green);
+      background: var(--green-soft);
+    }
+    .hop-node.bad {
+      border-color: var(--rose);
+      background: var(--rose-soft);
+    }
+    .hop-node.bypass {
+      border-style: dashed;
+      border-color: var(--amber);
+      background: var(--amber-soft);
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="top-left">
+        <a class="back-link" href="../master_plan.html">← Master Plan Legend</a>
+        <strong style="font-size: 0.95rem;">Part 2 · Lesson 22 · Spring Boot Virtual Threads &amp; @Async</strong>
+      </div>
+      <div class="status-pills">
+        <a class="pill" href="../reference/spring-boot-concurrency.html">Spring Boot Reference</a>
+        <span class="pill" id="pill-labs">Labs: 0 / 3</span>
+        <span class="pill" id="pill-quiz">Quiz: 0 / 5</span>
+        <span class="pill" id="pill-complete">In Progress</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">Part 2 · Java &amp; Spring Boot · Lesson 22</div>
+      <h1>Spring Boot Virtual Threads, <code>@Async</code> Proxy Traps &amp; <code>TaskDecorator</code></h1>
+      <p class="hero-sub">
+        Inside <code>spring.threads.virtual.enabled=true</code>: <code>SimpleAsyncTaskExecutor</code> vs <code>ThreadPoolTaskExecutor</code>, why <code>@Async</code> self-invocation silently runs synchronously, <code>TaskDecorator</code> for <code>MDC</code>/<code>SecurityContext</code>, and <code>AsyncUncaughtExceptionHandler</code>.
+      </p>
+      <div class="toc-row">
+        <a class="toc-chip" href="#mental-model">1. Mental Model</a>
+        <a class="toc-chip" href="#visualizer">2. Proxy &amp; MDC Visualizer</a>
+        <a class="toc-chip" href="#spring-patterns">3. Production Java &amp; Spring Patterns</a>
+        <a class="toc-chip" href="#labs">4. Runnable Code Labs (3)</a>
+        <a class="toc-chip" href="#quizzes">5. Senior Quizzes (5)</a>
+        <a class="toc-chip" href="#takeaways">6. Sources &amp; Follow-up</a>
+      </div>
+    </section>
+
+    <section class="section" id="mental-model">
+      <div class="section-tag">Part 01 · First Principles</div>
+      <h2>What <code>spring.threads.virtual.enabled=true</code> Actually Changes</h2>
+      <p class="section-lead">
+        Turning on virtual threads in Spring Boot is a two-line property change, yet four separate runtime layers interact under the hood: auto-configured executors, Spring AOP proxies, <code>ThreadLocal</code> propagation, and exception routing
+        (<a href="https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html" target="_blank" rel="noopener">Spring Boot Task Execution Reference</a>).
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--accent);">1. Auto-Configured Virtual Executors</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            With <code>spring.threads.virtual.enabled=true</code> (Spring Boot 3.2+ on Java 21+), Boot configures:
+            <br/><br/>
+            • <strong>Servlet container (Tomcat/Jetty):</strong> spawns one virtual thread per incoming HTTP request instead of blocking a fixed 200-thread platform pool.<br/>
+            • <strong><code>applicationTaskExecutor</code> (<code>@Async</code>):</strong> switches from <code>ThreadPoolTaskExecutor</code> (pooled platform threads) to <code>SimpleAsyncTaskExecutor</code> with <code>virtualThreads = true</code> (one fresh virtual thread per task; never pooled).<br/><br/>
+            <em>Trap:</em> Defining your own <code>@Bean Executor taskExecutor()</code> disables Boot's auto-configuration via <code>@ConditionalOnMissingBean(Executor.class)</code>!
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0; color:var(--purple);">2. AOP Proxy Boundary &amp; Context Loss</h3>
+          <p style="color:var(--text-muted); margin-bottom:0;">
+            <code>@Async</code> works through a <strong>Spring AOP proxy</strong> wrapped around your bean at startup. External callers hold the proxy reference, so <code>AsyncExecutionInterceptor</code> submits the method to the <code>Executor</code>.
+            <br/><br/>
+            • <strong>Self-invocation bypass:</strong> Inside the bean, <code>this.sendEmailAsync()</code> calls the raw target instance directly, skipping the proxy and running <strong>synchronously</strong> on the HTTP request thread.<br/>
+            • <strong>Context loss:</strong> Neither virtual threads nor platform pools copy SLF4J <code>MDC</code> or Spring <code>SecurityContextHolder</code> automatically. You must bridge them via a <code>TaskDecorator</code> that restores/clears in <code>finally</code>.
+          </p>
+        </div>
+      </div>
+
+      <h3 style="margin-top: 24px;"><code>SimpleAsyncTaskExecutor</code> (Virtual) vs. <code>ThreadPoolTaskExecutor</code> (Platform)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th><code>SimpleAsyncTaskExecutor</code> (Virtual Enabled)</th>
+              <th><code>ThreadPoolTaskExecutor</code> (Default / Custom)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Thread Lifecycle</strong></td>
+              <td>Spawns a new lightweight virtual thread per task; <strong>never pools</strong> (<a href="https://openjdk.org/jeps/444" target="_blank" rel="noopener">JEP 444</a>)</td>
+              <td>Reuses bounded platform OS threads (<code>corePoolSize</code>, <code>maxPoolSize</code>, <code>queueCapacity</code>)</td>
+            </tr>
+            <tr>
+              <td><strong>Blocking I/O Cost</strong></td>
+              <td>Unmounts from carrier OS thread during socket/JDBC wait (cheap)</td>
+              <td>Parks the OS thread (~1 MB stack); pool saturates quickly on slow I/O</td>
+            </tr>
+            <tr>
+              <td><strong>Concurrency Bounding</strong></td>
+              <td>Unbounded by default; apply <code>setConcurrencyLimit(n)</code> or Resilience4j Bulkhead / <code>Semaphore</code></td>
+              <td>Bounded by <code>maxPoolSize</code> + queue (can hit <code>TaskRejectedException</code>)</td>
+            </tr>
+            <tr>
+              <td><strong><code>ThreadLocal</code> / <code>MDC</code> Risk</strong></td>
+              <td>Starts empty on every new virtual thread (silent context loss; avoid heavyweight caches in <code>ThreadLocal</code>)</td>
+              <td>Reused workers keep stale <code>ThreadLocal</code> values across tasks (<strong>context bleed</strong> if <code>finally</code> cleanup is omitted)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 style="margin-top: 24px;"><code>@Async</code> Call Paths &amp; Error Propagation Rules</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Call Pattern &amp; Return Type</th>
+              <th>Who Executes It?</th>
+              <th>Where Do Exceptions Go?</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>External call → <code>@Async CompletableFuture&lt;T&gt;</code></strong></td>
+              <td>AOP proxy → <code>applicationTaskExecutor</code> worker</td>
+              <td>Wrapped in failed future; caller observes via <code>.join()</code> / <code>.get()</code> / <code>.exceptionally()</code></td>
+            </tr>
+            <tr>
+              <td><strong>External call → <code>@Async void</code></strong></td>
+              <td>AOP proxy → <code>applicationTaskExecutor</code> worker</td>
+              <td><strong>Swallowed</strong> by default unless <code>AsyncConfigurer.getAsyncUncaughtExceptionHandler()</code> handles it (<a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html#scheduling-annotation-support-async" target="_blank" rel="noopener">Spring Async Docs</a>)</td>
+            </tr>
+            <tr>
+              <td><strong>Internal <code>this.methodAsync()</code></strong></td>
+              <td><strong>Caller thread synchronously</strong> (proxy bypassed!)</td>
+              <td>Thrown straight into the caller's synchronous stack frame</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Tomcat vs. Downstream Reality:</strong> Even when <code>spring.threads.virtual.enabled=true</code> lets Tomcat accept 10,000 concurrent requests on virtual threads, your database still has a finite HikariCP pool (e.g., <code>maximum-pool-size=20</code>) and downstream APIs have rate limits. Virtual threads prevent <em>Tomcat thread starvation</em>, not <em>connection pool exhaustion</em>.
+      </div>
+    </section>
+
+    <section class="section" id="visualizer">
+      <div class="section-tag">Part 02 · Interactive Spring Proxy &amp; MDC Context Visualizer</div>
+      <h2>Trace AOP Interception, Self-Invocation &amp; <code>TaskDecorator</code> Live</h2>
+      <p class="section-lead">
+        Switch scenarios below and step through how Spring's AOP proxy, <code>TaskDecorator</code>, and worker threads handle <code>MDC.get("traceId")</code> and thread transitions.
+      </p>
+
+      <div class="sim-shell">
+        <div class="sim-controls">
+          <div class="btn-group" id="sim-modes">
+            <button class="btn active" data-mode="no-decorator">Proxy @Async (No TaskDecorator)</button>
+            <button class="btn" data-mode="with-decorator">Proxy @Async (+ TaskDecorator)</button>
+            <button class="btn" data-mode="self-invoke">Self-Invocation (this.sendEmailAsync)</button>
+            <button class="btn" data-mode="pool-bleed">Pooled Worker Bleed (No finally)</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="sim-step">Step →</button>
+            <button class="btn" id="sim-play">▶ Play</button>
+            <button class="btn" id="sim-reset">↺ Reset</button>
+          </div>
+        </div>
+
+        <div class="sim-grid">
+          <div class="lane-box">
+            <div class="hop-strip">
+              <div class="hop-node" id="hop-caller">
+                <div class="hop-title">1. Caller</div>
+                <div class="hop-state" id="hop-caller-state">Idle</div>
+              </div>
+              <div class="hop-node" id="hop-proxy">
+                <div class="hop-title">2. Spring Proxy</div>
+                <div class="hop-state" id="hop-proxy-state">Waiting</div>
+              </div>
+              <div class="hop-node" id="hop-decorator">
+                <div class="hop-title">3. TaskDecorator</div>
+                <div class="hop-state" id="hop-decorator-state">Waiting</div>
+              </div>
+              <div class="hop-node" id="hop-worker">
+                <div class="hop-title">4. Target Exec</div>
+                <div class="hop-state" id="hop-worker-state">Waiting</div>
+              </div>
+            </div>
+
+            <div class="lane-row">
+              <div class="lane-label"><span>Caller Thread (<code>tomcat-vt-7</code>)</span><span id="sim-step-counter">Step 0 / 0</span></div>
+              <div class="timeline-track" id="lane-caller"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Spring AOP + Executor Pipeline</span><span>Dispatch &amp; MDC State</span></div>
+              <div class="timeline-track" id="lane-proxy"></div>
+            </div>
+            <div class="lane-row">
+              <div class="lane-label"><span>Target / Worker Execution</span><span id="lane-worker-name">Idle</span></div>
+              <div class="timeline-track" id="lane-worker"></div>
+            </div>
+
+            <div class="registers-grid">
+              <div class="reg-card"><div class="reg-name">Caller MDC traceId</div><div class="reg-val" id="reg-caller-mdc" style="color:var(--accent);">req-904</div></div>
+              <div class="reg-card"><div class="reg-name">Executing Thread</div><div class="reg-val" id="reg-exec-thread" style="color:var(--purple);">—</div></div>
+              <div class="reg-card"><div class="reg-name">Worker MDC traceId</div><div class="reg-val" id="reg-worker-mdc" style="color:var(--amber);">—</div></div>
+            </div>
+
+            <div class="callout tip" id="sim-verdict" style="margin-top:14px; margin-bottom:0; font-size:0.88rem;">
+              Select a scenario and click <strong>Step →</strong> or <strong>▶ Play</strong> to watch AOP interception and <code>MDC</code> survival.
+            </div>
+          </div>
+
+          <div>
+            <div style="font-family:var(--mono); font-size:0.78rem; color:var(--text-muted); margin-bottom:6px;">SPRING RUNTIME TRACE LOG</div>
+            <div class="trace-log" id="sim-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="spring-patterns">
+      <div class="section-tag">Part 03 · Production Java 21–25+ &amp; Spring Boot</div>
+      <h2>Junior Traps vs. Senior Patterns in Spring Boot</h2>
+      <p class="section-lead">
+        Compare real production failure modes against clean Spring Boot 3.2+/4.x patterns built for virtual threads, observability, and error isolation.
+      </p>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 1: <code>this.sendEmailAsync()</code> Proxy Bypass vs. Collaborator Bean</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Same-Bean Self-Invocation</span></div>
+<pre>@Service
+public class OrderService {
+  public Receipt placeOrder(OrderCmd cmd) {
+    var order = saveOrder(cmd);
+    // Bypasses Spring AOP proxy! Runs synchronously
+    // on the Tomcat request thread and blocks HTTP!
+    this.sendEmailAsync(order.id());
+    return Receipt.from(order);
+  }
+
+  @Async
+  public void sendEmailAsync(String orderId) {
+    smtpClient.sendBlocking(orderId);
+  }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Inject Collaborator Bean</span></div>
+<pre>@Service
+public class OrderService {
+  private final NotificationService notifications;
+
+  public OrderService(NotificationService notifications) {
+    this.notifications = notifications; // Spring AOP proxy
+  }
+
+  public Receipt placeOrder(OrderCmd cmd) {
+    var order = saveOrder(cmd);
+    // Crosses proxy boundary -> runs on virtual @Async thread
+    notifications.sendEmailAsync(order.id());
+    return Receipt.from(order);
+  }
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 2: Custom <code>applicationTaskExecutor</code> Accidentally Disabling Virtual Threads</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: Replacing Boot's Executor Bean</span></div>
+<pre>// application.properties has spring.threads.virtual.enabled=true
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+  // Defining ANY Executor bean triggers
+  // @ConditionalOnMissingBean(Executor.class) -> Boot's
+  // virtual-thread SimpleAsyncTaskExecutor is disabled!
+  @Bean
+  public Executor applicationTaskExecutor() {
+    var pool = new ThreadPoolTaskExecutor();
+    pool.setCorePoolSize(8);
+    pool.initialize();
+    return pool; // Reverts @Async to platform threads!
+  }
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Keep Boot Auto-Config or Customize Builder</span></div>
+<pre>@Configuration
+@EnableAsync
+public class AsyncConfig {
+  // Option A: Let Boot wire SimpleAsyncTaskExecutor and only
+  // register a TaskDecorator + SimpleAsyncTaskExecutorCustomizer:
+  @Bean
+  SimpleAsyncTaskExecutorCustomizer vtCustomizer() {
+    return exec -&gt; {
+      exec.setVirtualThreads(true); // explicit safeguard
+      exec.setConcurrencyLimit(250); // optional backpressure
+    };
+  }
+  // Option B: If registering AsyncConfigurer, also wire
+  // AsyncUncaughtExceptionHandler for void @Async methods!
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0;">Pattern 3: <code>TaskDecorator</code> Copying <code>MDC</code> &amp; <code>SecurityContext</code> + <code>finally</code> Cleanup</h3>
+        <div class="two-col">
+          <div>
+            <div class="compare-head"><span class="tag-bad">✗ JUNIOR TRAP: InheritableThreadLocal or Missing Cleanup</span></div>
+<pre>@Bean
+TaskDecorator brokenDecorator() {
+  return runnable -&gt; {
+    // BUG 1: Captures MDC inside the lambda on the WORKER thread!
+    // BUG 2: No try/finally -> leaks MDC &amp; SecurityContext
+    // onto pooled workers across unrelated user requests!
+    return () -&gt; {
+      MDC.setContextMap(MDC.getCopyOfContextMap());
+      runnable.run();
+    };
+  };
+}</pre>
+          </div>
+          <div>
+            <div class="compare-head"><span class="tag-good">✓ SENIOR PATTERN: Capture on Caller, Restore in finally</span></div>
+<pre>@Bean
+TaskDecorator contextPropagatingDecorator() {
+  return runnable -&gt; {
+    Map&lt;String, String&gt; callerMdc = MDC.getCopyOfContextMap();
+    SecurityContext callerSec = SecurityContextHolder.getContext();
+    return () -&gt; {
+      Map&lt;String, String&gt; prevMdc = MDC.getCopyOfContextMap();
+      SecurityContext prevSec = SecurityContextHolder.getContext();
+      try {
+        if (callerMdc != null) MDC.setContextMap(callerMdc); else MDC.clear();
+        SecurityContextHolder.setContext(callerSec);
+        runnable.run();
+      } finally {
+        if (prevMdc != null) MDC.setContextMap(prevMdc); else MDC.clear();
+        SecurityContextHolder.setContext(prevSec);
+      }
+    };
+  };
+}</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip">
+        <strong>Do Not Forget <code>AsyncUncaughtExceptionHandler</code>:</strong> Whenever an <code>@Async</code> method returns <code>void</code> instead of <code>CompletableFuture&lt;T&gt;</code>, uncaught exceptions never reach the caller. Register an <code>AsyncConfigurer</code> bean overriding <code>getAsyncUncaughtExceptionHandler()</code> to log structured alerts and increment error metrics.
+      </div>
+    </section>
+
+    <section class="section" id="labs">
+      <div class="section-tag">Part 04 · Interactive Offline Coding Labs</div>
+      <h2>Code Practice Lab Suite (Runs Live in Your Browser)</h2>
+      <p class="section-lead">Fix the Spring concurrency flaw in each lab and click <strong>Run &amp; Check Tests</strong> (<code>Cmd/Ctrl + Enter</code>). Every starter intentionally exposes a production bug.</p>
+
+      <article class="lab-card" id="lab-1">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 22.1 · SPRING AOP PROXY DISPATCH</span>
+            <h3 style="margin:8px 0 4px;"><code>SpringProxyDispatcher</code>: External Interception vs. <code>this</code> Self-Invocation</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>SpringProxyDispatcher(targetBean, asyncMethods, executor)</code> to model Spring's <code>AsyncExecutionInterceptor</code>.</p>
+          </div>
+          <span class="lab-status" id="status-lab-1">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>asyncMethods</code> is an Array (or Set) of method names annotated with <code>@Async</code>.<br/>
+          • Return a proxy object exposing every method of <code>targetBean</code>.<br/>
+          • When an <strong>external caller</strong> calls an <code>@Async</code> method on the proxy, dispatch <code>() =&gt; targetBean[name](...args)</code> via <code>executor.submit(fn)</code> and return its Promise.<br/>
+          • Non-async methods must run synchronously with <code>this === targetBean</code> so internal <code>this.asyncMethod()</code> calls bypass the proxy just like real Spring beans!
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_22_1_spring_proxy_dispatcher.js</span><span>Cmd/Ctrl + Enter to Run</span></div>
+          <textarea class="code-editor" id="code-lab-1" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(1)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(1)">💡 Next Hint (<span id="hint-count-1">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(1)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(1)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-1"></div>
+        <div class="drawer" id="hints-lab-1"></div>
+        <div class="drawer" id="answer-lab-1"></div>
+      </article>
+
+      <article class="lab-card" id="lab-2">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 22.2 · TASKDECORATOR CONTEXT PROPAGATION</span>
+            <h3 style="margin:8px 0 4px;"><code>MdcTaskDecorator</code>: Submission Capture &amp; <code>finally</code> Restoration</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>MdcTaskDecorator(mdcStore)</code> returning <code>{ decorate(task) }</code> with leak-free cleanup.</p>
+          </div>
+          <span class="lab-status" id="status-lab-2">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          APIs on <code>mdcStore</code>: <code>getCopyOfContextMap()</code> (returns shallow copy or <code>null</code>), <code>setContextMap(map)</code>, and <code>clear()</code>.<br/>
+          • Capture caller MDC <strong>when <code>decorate(task)</code> is called</strong> (submission time), not when the worker runs.<br/>
+          • Before calling <code>task()</code>, save worker's <code>previous</code> MDC and install caller MDC (or <code>clear()</code> if <code>null</code>).<br/>
+          • In <code>finally</code>, restore <code>previous</code> MDC (or <code>clear()</code> if <code>null</code>) even when <code>task()</code> throws!
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_22_2_mdc_task_decorator.js</span><span>Capture + Restore + Fault Safety</span></div>
+          <textarea class="code-editor" id="code-lab-2" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(2)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(2)">💡 Next Hint (<span id="hint-count-2">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(2)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(2)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-2"></div>
+        <div class="drawer" id="hints-lab-2"></div>
+        <div class="drawer" id="answer-lab-2"></div>
+      </article>
+
+      <article class="lab-card" id="lab-3">
+        <div class="lab-header">
+          <div>
+            <span class="lab-badge">LAB 22.3 · VOID VS FUTURE ERROR HANDLING</span>
+            <h3 style="margin:8px 0 4px;"><code>AsyncBatchAggregator</code>: Capturing Void <code>@Async</code> Exceptions</h3>
+            <p style="margin:0; color:var(--text-muted); font-size:0.93rem;">Implement <code>AsyncBatchAggregator(executor, uncaughtHandler)</code> with <code>invokeVoid</code>, <code>invokeFuture</code>, and <code>runBatch</code>.</p>
+          </div>
+          <span class="lab-status" id="status-lab-3">Not Run</span>
+        </div>
+        <div class="callout" style="font-size:0.89rem;">
+          • <code>invokeVoid(methodName, fn, ...params)</code>: submits to <code>executor.submit(() =&gt; fn(...params))</code>, returns <code>undefined</code> immediately, and routes any sync/async error to <code>uncaughtHandler.handleUncaughtException(err, methodName, params)</code>.<br/>
+          • <code>invokeFuture(methodName, fn, ...params)</code>: returns the Promise from <code>executor.submit</code> directly to the caller (do <strong>not</strong> call <code>uncaughtHandler</code> for future failures).<br/>
+          • <code>async runBatch(tasks)</code>: dispatches all <code>{ type: 'void'|'future', methodName, fn, params }</code> tasks concurrently, awaits all pending void + future executions, and returns an array of settled future entries <code>{ methodName, status, value/reason }</code>.
+        </div>
+        <div class="editor-wrap">
+          <div class="editor-toolbar"><span>lab_22_3_async_batch_aggregator.js</span><span>AsyncUncaughtExceptionHandler + CompletableFuture</span></div>
+          <textarea class="code-editor" id="code-lab-3" spellcheck="false"></textarea>
+        </div>
+        <div class="lab-actions">
+          <button class="btn primary" onclick="runLab(3)">▶ Run &amp; Check Tests</button>
+          <button class="btn" onclick="cycleHint(3)">💡 Next Hint (<span id="hint-count-3">0</span>/3)</button>
+          <button class="btn" onclick="toggleAnswer(3)">👁 Show Final Answer</button>
+          <button class="btn" onclick="resetLab(3)">↺ Reset Starter</button>
+        </div>
+        <div class="test-results" id="results-lab-3"></div>
+        <div class="drawer" id="hints-lab-3"></div>
+        <div class="drawer" id="answer-lab-3"></div>
+      </article>
+    </section>
+
+    <section class="section" id="quizzes">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="section-tag">Part 05 · Senior Interview Traps</div>
+          <h2 style="margin-bottom:4px;">Code Quizzes (Balanced Options · Full Reasoning)</h2>
+          <p class="section-lead" style="margin-bottom:0;">Options are balanced in word count so only Spring &amp; JVM internals pick the right answer.</p>
+        </div>
+        <button class="btn" onclick="resetQuizzes()">↺ Reset All Quizzes</button>
+      </div>
+      <div id="quiz-container" style="margin-top:20px;"></div>
+    </section>
+
+    <section class="section" id="takeaways">
+      <div class="section-tag">Part 06 · Sources, Reference &amp; Teacher Check-In</div>
+      <h2>Primary Sources &amp; Next Steps</h2>
+      <div class="card">
+        <p style="margin-top:0;">
+          <strong>Recommended Primary Source:</strong> Read the <a href="https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html" target="_blank" rel="noopener">Spring Boot Reference: Task Execution and Scheduling</a> and review <a href="../reference/spring-boot-concurrency.html">Spring Boot Concurrency &amp; Database Contention Cheat Sheet</a>.
+        </p>
+        <div class="callout mentor" style="margin-bottom:0;">
+          <strong>Have a question or want deeper intuition?</strong> Ask your AI teacher follow-up questions anytime (e.g., <em>"Why does ScopedValue beat ThreadLocal on virtual threads?"</em> or <em>"How do I debug @Async self-invocation in an existing Spring monolith?"</em>).
+        </div>
+      </div>
+
+      <div class="footer-nav">
+        <a class="btn" href="0021-java-virtual-threads-jep491-scoped-values.html">← Prev: Lesson 21 (Virtual Threads &amp; JEP 491)</a>
+        <a class="btn" href="../master_plan.html">Master Plan Legend</a>
+        <a class="btn primary" href="0023-spring-mvc-virtual-threads-vs-webflux.html">Lesson 23 → (Spring MVC vs. WebFlux)</a>
+      </div>
+    </section>
+  </main>
+
+  <script src="../assets/lesson-engine.js"></script>
+  <script>
+    const SIM_SCENARIOS = {
+      'no-decorator': {
+        steps: [
+          {
+            hop: 'caller', hopState: 'traceId=req-904',
+            caller: { cls: 'ta', txt: 'HTTP IN' },
+            proxy: null, worker: null, workerName: 'Pending',
+            execThread: 'tomcat-vt-7', workerMdc: '—',
+            type: '', msg: 'HTTP request arrives on tomcat-vt-7; Servlet filter sets MDC["traceId"] = "req-904".'
+          },
+          {
+            hop: 'proxy', hopState: 'Intercepted',
+            caller: { cls: 'ta', txt: 'CALL BEAN' },
+            proxy: { cls: 'tb', txt: 'AOP @Async' },
+            worker: null, workerName: 'Queued on Executor',
+            execThread: 'tomcat-vt-7', workerMdc: '—',
+            type: 'good', msg: 'External bean call crosses Spring AOP proxy; AsyncExecutionInterceptor submits task.'
+          },
+          {
+            hop: 'decorator', hopState: 'None (Skipped)',
+            caller: { cls: 'io', txt: 'HTTP 202' },
+            proxy: { cls: 'sw', txt: 'NO DECORATOR' },
+            worker: { cls: 'idle', txt: 'NEW VT' }, workerName: 'vt-task-14 (Clean)',
+            execThread: 'vt-task-14', workerMdc: 'null',
+            type: 'warn', msg: 'SimpleAsyncTaskExecutor spawns fresh vt-task-14. No TaskDecorator -> caller MDC is NOT copied!'
+          },
+          {
+            hop: 'worker', hopState: 'MDC = null!',
+            caller: null,
+            proxy: { cls: 'bad', txt: 'MDC LOST' },
+            worker: { cls: 'bad', txt: 'traceId=null' }, workerName: 'vt-task-14',
+            execThread: 'vt-task-14', workerMdc: 'null',
+            type: 'bad', msg: 'NotificationService logs with traceId=null! Distributed trace correlation is broken.'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout danger',
+          html: '<strong>Context Lost:</strong> The Spring proxy dispatched <code>@Async</code> onto <code>vt-task-14</code>, but without a <code>TaskDecorator</code>, <code>MDC</code> started as <code>null</code>.'
+        }
+      },
+      'with-decorator': {
+        steps: [
+          {
+            hop: 'caller', hopState: 'traceId=req-904',
+            caller: { cls: 'ta', txt: 'HTTP IN' },
+            proxy: null, worker: null, workerName: 'Pending',
+            execThread: 'tomcat-vt-7', workerMdc: '—',
+            type: '', msg: 'HTTP request arrives on tomcat-vt-7 with MDC["traceId"] = "req-904".'
+          },
+          {
+            hop: 'proxy', hopState: 'Intercepted',
+            caller: { cls: 'ta', txt: 'CALL BEAN' },
+            proxy: { cls: 'tb', txt: 'AOP @Async' },
+            worker: null, workerName: 'Submitting',
+            execThread: 'tomcat-vt-7', workerMdc: '—',
+            type: 'good', msg: 'External call enters Spring AOP proxy; proxy invokes executor.execute(runnable).'
+          },
+          {
+            hop: 'decorator', hopState: 'Captured Map',
+            caller: { cls: 'io', txt: 'HTTP 202' },
+            proxy: { cls: 'io', txt: 'MDC SNAPSHOT' },
+            worker: { cls: 'ta', txt: 'INSTALL MDC' }, workerName: 'vt-task-15',
+            execThread: 'vt-task-15', workerMdc: 'req-904',
+            type: 'good', msg: 'TaskDecorator captures {traceId:"req-904"} on caller, then installs it on vt-task-15.'
+          },
+          {
+            hop: 'worker', hopState: 'Run + Clean',
+            caller: null,
+            proxy: { cls: 'io', txt: 'FINALLY CLEAR' },
+            worker: { cls: 'io', txt: 'LOG req-904' }, workerName: 'vt-task-15 (Cleared)',
+            execThread: 'vt-task-15', workerMdc: 'cleared',
+            type: 'good', msg: 'Target method logs traceId=req-904 cleanly; finally block restores/clears worker MDC.'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout tip',
+          html: '<strong>Context Propagated &amp; Cleaned:</strong> <code>TaskDecorator</code> captured <code>traceId=req-904</code> at submission and cleared it in <code>finally</code>.'
+        }
+      },
+      'self-invoke': {
+        steps: [
+          {
+            hop: 'caller', hopState: 'traceId=req-904',
+            caller: { cls: 'ta', txt: 'HTTP IN' },
+            proxy: null, worker: null, workerName: 'Pending',
+            execThread: 'tomcat-vt-7', workerMdc: '—',
+            type: '', msg: 'Controller calls orderProxy.placeOrder() on tomcat-vt-7.'
+          },
+          {
+            hop: 'proxy', hopState: 'placeOrder Sync',
+            caller: { cls: 'ta', txt: 'placeOrder()' },
+            proxy: { cls: 'tb', txt: 'TARGET -> this' },
+            worker: null, workerName: 'Inside target bean',
+            execThread: 'tomcat-vt-7', workerMdc: 'req-904',
+            type: '', msg: 'Proxy delegates placeOrder() to the raw target bean (where `this` is NOT the proxy).'
+          },
+          {
+            hop: 'decorator', hopState: 'BYPASSED!',
+            caller: { cls: 'sw', txt: 'this.send()' },
+            proxy: { cls: 'bad', txt: 'PROXY BYPASS' },
+            worker: { cls: 'bad', txt: 'SYNC ON VT-7' }, workerName: 'tomcat-vt-7 (Blocked!)',
+            execThread: 'tomcat-vt-7', workerMdc: 'req-904',
+            type: 'bad', msg: 'this.sendEmailAsync() skips AOP proxy & executor completely; SMTP blocks tomcat-vt-7 for 800ms!'
+          },
+          {
+            hop: 'worker', hopState: 'HTTP Delayed',
+            caller: { cls: 'bad', txt: 'HTTP +800ms' },
+            proxy: { cls: 'idle', txt: 'NOT USED' },
+            worker: { cls: 'bad', txt: 'SYNC DONE' }, workerName: 'tomcat-vt-7',
+            execThread: 'tomcat-vt-7', workerMdc: 'req-904',
+            type: 'bad', msg: 'HTTP response could not return until sendEmailAsync() finished synchronously.'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout danger',
+          html: '<strong>Self-Invocation Trap:</strong> Calling <code>this.sendEmailAsync()</code> bypassed the Spring AOP proxy and blocked the HTTP request thread!'
+        }
+      },
+      'pool-bleed': {
+        steps: [
+          {
+            hop: 'caller', hopState: 'Req A: req-101',
+            caller: { cls: 'ta', txt: 'REQ A (101)' },
+            proxy: { cls: 'tb', txt: 'TASK A' },
+            worker: { cls: 'ta', txt: 'SET req-101' }, workerName: 'pool-1-thread-1',
+            execThread: 'pool-1-thread-1', workerMdc: 'req-101',
+            type: '', msg: 'Pooled worker pool-1-thread-1 runs Task A and sets MDC["traceId"] = "req-101".'
+          },
+          {
+            hop: 'decorator', hopState: 'No finally!',
+            caller: null,
+            proxy: { cls: 'sw', txt: 'NO CLEANUP' },
+            worker: { cls: 'sw', txt: 'TASK A ENDS' }, workerName: 'pool-1-thread-1 (Dirty!)',
+            execThread: 'pool-1-thread-1', workerMdc: 'req-101 (STALE)',
+            type: 'warn', msg: 'Task A finishes without finally { MDC.clear(); }. pool-1-thread-1 returns to pool dirty!'
+          },
+          {
+            hop: 'caller', hopState: 'Req B: NO MDC',
+            caller: { cls: 'tb', txt: 'REQ B (none)' },
+            proxy: { cls: 'tb', txt: 'TASK B' },
+            worker: { cls: 'idle', txt: 'REUSE T1' }, workerName: 'pool-1-thread-1',
+            execThread: 'pool-1-thread-1', workerMdc: 'req-101 (STALE)',
+            type: 'warn', msg: 'Unrelated background Task B (no traceId) is picked up by pooled pool-1-thread-1.'
+          },
+          {
+            hop: 'worker', hopState: 'CONTEXT BLEED',
+            caller: null,
+            proxy: { cls: 'bad', txt: 'BLEED!' },
+            worker: { cls: 'bad', txt: 'LOGS req-101!' }, workerName: 'pool-1-thread-1',
+            execThread: 'pool-1-thread-1', workerMdc: 'req-101 (BLEED)',
+            type: 'bad', msg: 'Task B logs under Req A’s traceId="req-101"! SecurityContext bleed leaks user auth!'
+          }
+        ],
+        finalVerdict: {
+          cls: 'callout danger',
+          html: '<strong>Thread-Pool Context Bleed:</strong> Omitting <code>finally</code> cleanup poisoned <code>pool-1-thread-1</code> so Task B inherited Req A’s MDC.'
+        }
+      }
+    };
+
+    let currentSimMode = 'no-decorator';
+    let simStepIdx = 0;
+    let simTimer = null;
+
+    function resetHopNodes() {
+      ['caller', 'proxy', 'decorator', 'worker'].forEach((k) => {
+        const el = document.getElementById(`hop-${k}`);
+        el.className = 'hop-node';
+      });
+      document.getElementById('hop-caller-state').textContent = 'Idle';
+      document.getElementById('hop-proxy-state').textContent = 'Waiting';
+      document.getElementById('hop-decorator-state').textContent = 'Waiting';
+      document.getElementById('hop-worker-state').textContent = 'Waiting';
+    }
+
+    function resetSim() {
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        document.getElementById('sim-play').textContent = '▶ Play';
+      }
+      simStepIdx = 0;
+      const sc = SIM_SCENARIOS[currentSimMode];
+      document.getElementById('lane-caller').innerHTML = '';
+      document.getElementById('lane-proxy').innerHTML = '';
+      document.getElementById('lane-worker').innerHTML = '';
+      document.getElementById('lane-worker-name').textContent = 'Idle';
+      document.getElementById('reg-caller-mdc').textContent = currentSimMode === 'pool-bleed' ? 'req-101 / none' : 'req-904';
+      document.getElementById('reg-exec-thread').textContent = '—';
+      document.getElementById('reg-worker-mdc').textContent = '—';
+      document.getElementById('sim-step-counter').textContent = `Step 0 / ${sc.steps.length}`;
+      document.getElementById('sim-log').innerHTML = '<div class="trace-line">Ready. Click Step → or ▶ Play.</div>';
+      const v = document.getElementById('sim-verdict');
+      v.className = 'callout tip';
+      v.innerHTML = 'Step through this scenario to trace Spring AOP proxy interception and <code>MDC</code> propagation.';
+      resetHopNodes();
+    }
+
+    function stepSim() {
+      const sc = SIM_SCENARIOS[currentSimMode];
+      if (simStepIdx >= sc.steps.length) {
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById('sim-play').textContent = '▶ Play';
+        }
+        return;
+      }
+      const s = sc.steps[simStepIdx++];
+      const appendSlot = (id, slot) => {
+        if (!slot) return;
+        const d = document.createElement('div');
+        d.className = `slot ${slot.cls}`;
+        d.textContent = slot.txt;
+        document.getElementById(id).appendChild(d);
+      };
+      appendSlot('lane-caller', s.caller);
+      appendSlot('lane-proxy', s.proxy);
+      appendSlot('lane-worker', s.worker);
+
+      const hopEl = document.getElementById(`hop-${s.hop}`);
+      if (hopEl) {
+        hopEl.className = 'hop-node ' + (s.type === 'bad' ? 'bad' : s.type === 'good' ? 'good' : s.type === 'warn' ? 'bypass' : 'active');
+        document.getElementById(`hop-${s.hop}-state`).textContent = s.hopState;
+      }
+
+      document.getElementById('lane-worker-name').textContent = s.workerName;
+      document.getElementById('reg-exec-thread').textContent = s.execThread;
+      document.getElementById('reg-worker-mdc').textContent = s.workerMdc;
+      document.getElementById('sim-step-counter').textContent = `Step ${simStepIdx} / ${sc.steps.length}`;
+
+      const logEl = document.getElementById('sim-log');
+      if (simStepIdx === 1) logEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.className = `trace-line ${s.type}`;
+      line.textContent = `[${simStepIdx}] ${s.msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+
+      if (simStepIdx === sc.steps.length) {
+        const v = document.getElementById('sim-verdict');
+        v.className = sc.finalVerdict.cls;
+        v.innerHTML = sc.finalVerdict.html;
+      }
+    }
+
+    document.querySelectorAll('#sim-modes button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#sim-modes button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentSimMode = btn.dataset.mode;
+        resetSim();
+      });
+    });
+    document.getElementById('sim-step').addEventListener('click', stepSim);
+    document.getElementById('sim-reset').addEventListener('click', resetSim);
+    document.getElementById('sim-play').addEventListener('click', () => {
+      const btn = document.getElementById('sim-play');
+      if (simTimer) {
+        clearInterval(simTimer);
+        simTimer = null;
+        btn.textContent = '▶ Play';
+      } else {
+        if (simStepIdx >= SIM_SCENARIOS[currentSimMode].steps.length) resetSim();
+        btn.textContent = '⏸ Pause';
+        simTimer = setInterval(stepSim, 800);
+      }
+    });
+    resetSim();
+
+    const LABS = {
+      1: {
+        fnName: 'SpringProxyDispatcher',
+        starter: `function SpringProxyDispatcher(targetBean, asyncMethods, executor) {
+  // BUG: Returns raw targetBean directly with no AOP proxy interception!
+  return targetBean;
+}`,
+        hints: [
+          'Convert `asyncMethods` into a `Set` so lookups are O(1).',
+          'Build a wrapper object (or `Proxy`) exposing all methods from `targetBean`.',
+          'For methods in `asyncSet`, return `(...args) => executor.submit(() => targetBean[name].apply(targetBean, args))`; for non-async methods, return `(...args) => targetBean[name].apply(targetBean, args)` so `this` inside `targetBean` stays the raw target!'
+        ],
+        solution: `function SpringProxyDispatcher(targetBean, asyncMethods, executor) {
+  const asyncSet = new Set(asyncMethods || []);
+  const proxy = {};
+  for (const key of Object.keys(targetBean)) {
+    const val = targetBean[key];
+    if (typeof val === 'function') {
+      if (asyncSet.has(key)) {
+        proxy[key] = (...args) => executor.submit(() => val.apply(targetBean, args));
+      } else {
+        proxy[key] = (...args) => val.apply(targetBean, args);
+      }
+    } else {
+      proxy[key] = val;
+    }
+  }
+  return proxy;
+}`,
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        kotlinEquivalent: `// Spring AOP wraps NotificationService in an AsyncExecutionInterceptor proxy,
+// while OrderService delegates through the injected proxy (not \`this\`!):
+@Service
+public class OrderService {
+  private final NotificationService notifications; // Injected AOP proxy
+
+  public OrderService(NotificationService notifications) {
+    this.notifications = notifications;
+  }
+
+  public void placeOrder(String orderId) {
+    notifications.sendEmailAsync(orderId); // Intercepted -> virtual thread!
+  }
+}`,
+        tests: async (fn) => {
+          function createEnv() {
+            let currentThread = 'http-vt-main';
+            let submits = 0;
+            const log = [];
+            const executor = {
+              submit: (task) => {
+                submits++;
+                const worker = `vt-async-${submits}`;
+                return Promise.resolve().then(() => {
+                  const prev = currentThread;
+                  currentThread = worker;
+                  try { return task(); } finally { currentThread = prev; }
+                });
+              }
+            };
+            const bean = {
+              placeOrder(id) {
+                log.push(`placeOrder:${currentThread}`);
+                // Self-invocation through \`this\` MUST bypass the proxy!
+                return this.sendEmailAsync(id);
+              },
+              sendEmailAsync(id) {
+                log.push(`sendEmail:${currentThread}`);
+                return `sent:${id}@${currentThread}`;
+              },
+              syncStatus() {
+                return `ok@${currentThread}`;
+              }
+            };
+            return { bean, executor, log, getSubmits: () => submits };
+          }
+
+          return runTestCases([
+            {
+              name: 'External call to @Async method dispatches via executor onto worker thread',
+              run: async () => {
+                const env = createEnv();
+                const proxy = fn(env.bean, ['sendEmailAsync'], env.executor);
+                const res = await proxy.sendEmailAsync('ord-7');
+                assertEq(env.getSubmits(), 1, 'Expected executor.submit() to be called once');
+                assertEq(res, 'sent:ord-7@vt-async-1');
+              }
+            },
+            {
+              name: 'External call to non-@Async method runs synchronously without executor',
+              run: () => {
+                const env = createEnv();
+                const proxy = fn(env.bean, ['sendEmailAsync'], env.executor);
+                const res = proxy.syncStatus();
+                assertEq(env.getSubmits(), 0, 'Sync method must not hit executor');
+                assertEq(res, 'ok@http-vt-main');
+              }
+            },
+            {
+              name: 'Self-invocation (this.sendEmailAsync inside placeOrder) bypasses proxy and runs on caller thread',
+              run: () => {
+                const env = createEnv();
+                const proxy = fn(env.bean, ['sendEmailAsync'], env.executor);
+                const res = proxy.placeOrder('ord-9');
+                assertEq(env.getSubmits(), 0, 'Self-invocation must bypass proxy (0 executor submits)');
+                assertDeepEq(env.log, ['placeOrder:http-vt-main', 'sendEmail:http-vt-main']);
+                assertEq(res, 'sent:ord-9@http-vt-main');
+              }
+            },
+            {
+              name: 'Collaborator injection through proxy dispatches async method properly',
+              run: async () => {
+                const env = createEnv();
+                const emailProxy = fn(env.bean, ['sendEmailAsync'], env.executor);
+                const callerBean = { checkout: (id) => emailProxy.sendEmailAsync(id) };
+                const res = await callerBean.checkout('ord-42');
+                assertEq(env.getSubmits(), 1);
+                assertEq(res, 'sent:ord-42@vt-async-1');
+              }
+            }
+          ]);
+        }
+      },
+      2: {
+        fnName: 'MdcTaskDecorator',
+        starter: `function MdcTaskDecorator(mdcStore) {
+  return {
+    decorate(task) {
+      // BUG: Returns task undecorated — caller MDC is lost and worker MDC is never cleaned!
+      return task;
+    }
+  };
+}`,
+        hints: [
+          'Call `const callerCtx = mdcStore.getCopyOfContextMap();` inside `decorate(task)`, before returning the wrapper function.',
+          'Inside the returned wrapper function, save `const prevCtx = mdcStore.getCopyOfContextMap();` first.',
+          'Install `callerCtx` (or `mdcStore.clear()` if null), call `task()` inside `try`, and restore `prevCtx` (or `clear()`) inside `finally`.'
+        ],
+        solution: `function MdcTaskDecorator(mdcStore) {
+  return {
+    decorate(task) {
+      const callerCtx = mdcStore.getCopyOfContextMap();
+      return () => {
+        const prevCtx = mdcStore.getCopyOfContextMap();
+        try {
+          if (callerCtx) mdcStore.setContextMap(callerCtx);
+          else mdcStore.clear();
+          return task();
+        } finally {
+          if (prevCtx) mdcStore.setContextMap(prevCtx);
+          else mdcStore.clear();
+        }
+      };
+    }
+  };
+}`,
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        kotlinEquivalent: `@Bean
+public TaskDecorator mdcTaskDecorator() {
+  return runnable -> {
+    Map<String, String> callerContext = MDC.getCopyOfContextMap();
+    return () -> {
+      Map<String, String> previous = MDC.getCopyOfContextMap();
+      try {
+        if (callerContext != null) MDC.setContextMap(callerContext);
+        else MDC.clear();
+        runnable.run();
+      } finally {
+        if (previous != null) MDC.setContextMap(previous);
+        else MDC.clear();
+      }
+    };
+  };
+}`,
+        tests: async (fn) => {
+          function createMdcEnv() {
+            const threads = { caller: null, worker: null };
+            let active = 'caller';
+            const mdcStore = {
+              getCopyOfContextMap: () => (threads[active] ? { ...threads[active] } : null),
+              setContextMap: (m) => { threads[active] = m ? { ...m } : null; },
+              clear: () => { threads[active] = null; }
+            };
+            const switchTo = (name) => { active = name; };
+            return { mdcStore, switchTo, raw: threads };
+          }
+
+          return runTestCases([
+            {
+              name: 'Captures caller MDC at submission time even if caller clears MDC before worker runs',
+              run: () => {
+                const env = createMdcEnv();
+                const decorator = fn(env.mdcStore);
+                env.mdcStore.setContextMap({ traceId: 'req-555', tenant: 'acme' });
+                const wrapped = decorator.decorate(() => env.mdcStore.getCopyOfContextMap());
+                env.mdcStore.clear(); // Caller finishes request before worker starts
+                env.switchTo('worker');
+                const seen = wrapped();
+                assertDeepEq(seen, { traceId: 'req-555', tenant: 'acme' });
+                assertEq(env.raw.worker, null, 'Worker MDC must be cleared after task completes');
+              }
+            },
+            {
+              name: 'Prevents pooled-thread context bleed onto subsequent undecorated tasks',
+              run: () => {
+                const env = createMdcEnv();
+                const decorator = fn(env.mdcStore);
+                env.mdcStore.setContextMap({ traceId: 'secret-user-1' });
+                let sawDuringTask = null;
+                const wrapped = decorator.decorate(() => { sawDuringTask = env.mdcStore.getCopyOfContextMap(); return 'ok'; });
+                env.switchTo('worker');
+                wrapped();
+                assertDeepEq(sawDuringTask, { traceId: 'secret-user-1' }, 'Task never received caller MDC');
+                assertEq(env.mdcStore.getCopyOfContextMap(), null, 'Stale traceId leaked on pooled worker!');
+              }
+            },
+            {
+              name: 'Exception safety: restores/clears worker MDC in finally even when task throws',
+              run: () => {
+                const env = createMdcEnv();
+                const decorator = fn(env.mdcStore);
+                env.mdcStore.setContextMap({ traceId: 'boom-99' });
+                let sawBeforeThrow = null;
+                const wrapped = decorator.decorate(() => {
+                  sawBeforeThrow = env.mdcStore.getCopyOfContextMap();
+                  throw new Error('DB timeout');
+                });
+                env.switchTo('worker');
+                let threw = false;
+                try { wrapped(); } catch (e) { threw = e.message === 'DB timeout'; }
+                assertEq(threw, true, 'Expected task error to propagate');
+                assertDeepEq(sawBeforeThrow, { traceId: 'boom-99' }, 'Task never received caller MDC before throwing');
+                assertEq(env.raw.worker, null, 'Worker MDC leaked after exception!');
+              }
+            },
+            {
+              name: 'Restores pre-existing thread MDC (e.g., CallerRunsPolicy or nested task)',
+              run: () => {
+                const env = createMdcEnv();
+                const decorator = fn(env.mdcStore);
+                env.mdcStore.setContextMap({ traceId: 'child-task' });
+                const wrapped = decorator.decorate(() => env.mdcStore.getCopyOfContextMap());
+                env.switchTo('worker');
+                env.mdcStore.setContextMap({ traceId: 'host-thread' });
+                const inside = wrapped();
+                assertDeepEq(inside, { traceId: 'child-task' });
+                assertDeepEq(env.mdcStore.getCopyOfContextMap(), { traceId: 'host-thread' }, 'Previous host MDC was not restored');
+              }
+            }
+          ]);
+        }
+      },
+      3: {
+        fnName: 'AsyncBatchAggregator',
+        starter: `function AsyncBatchAggregator(executor, uncaughtHandler) {
+  return {
+    invokeVoid(methodName, fn, ...params) {
+      // BUG: Fire-and-forget silently swallows void @Async exceptions!
+      executor.submit(() => fn(...params)).catch(() => {});
+      return undefined;
+    },
+    invokeFuture(methodName, fn, ...params) {
+      return executor.submit(() => fn(...params));
+    },
+    async runBatch(tasks) {
+      return [];
+    }
+  };
+}`,
+        hints: [
+          'Keep a `pendingVoids` array so `runBatch` (or tests) can await background void tasks cleanly while `invokeVoid` still returns `undefined` immediately.',
+          'In `invokeVoid`, catch any rejection from `executor.submit(() => fn(...params))` and call `uncaughtHandler.handleUncaughtException(err, methodName, params)`.',
+          'In `invokeFuture`, return the Promise directly WITHOUT routing rejections to `uncaughtHandler`; in `runBatch`, dispatch all tasks and await `Promise.allSettled` on both pending voids and futures, returning settled future entries.'
+        ],
+        solution: `function AsyncBatchAggregator(executor, uncaughtHandler) {
+  const pendingVoids = [];
+
+  function invokeVoid(methodName, fn, ...params) {
+    const p = Promise.resolve()
+      .then(() => executor.submit(() => fn(...params)))
+      .catch((err) => {
+        if (uncaughtHandler && typeof uncaughtHandler.handleUncaughtException === 'function') {
+          uncaughtHandler.handleUncaughtException(err, methodName, params);
+        }
+      });
+    pendingVoids.push(p);
+    return undefined;
+  }
+
+  function invokeFuture(methodName, fn, ...params) {
+    return Promise.resolve().then(() => executor.submit(() => fn(...params)));
+  }
+
+  async function runBatch(tasks) {
+    const futureEntries = [];
+    for (const t of tasks || []) {
+      const params = t.params || [];
+      if (t.type === 'void') {
+        invokeVoid(t.methodName, t.fn, ...params);
+      } else {
+        futureEntries.push({
+          methodName: t.methodName,
+          promise: invokeFuture(t.methodName, t.fn, ...params)
+        });
+      }
+    }
+    const settled = await Promise.allSettled(futureEntries.map((f) => f.promise));
+    await Promise.allSettled(pendingVoids.splice(0, pendingVoids.length));
+    return settled.map((res, idx) =>
+      res.status === 'fulfilled'
+        ? { methodName: futureEntries[idx].methodName, status: 'fulfilled', value: res.value }
+        : { methodName: futureEntries[idx].methodName, status: 'rejected', reason: res.reason }
+    );
+  }
+
+  return { invokeVoid, invokeFuture, runBatch };
+}`,
+        productionLabel: 'Equivalent Production Java / Spring Boot Code:',
+        kotlinEquivalent: `@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+  @Override
+  public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+    return (ex, method, params) -> log.error(
+      "Void @Async failure in {} with args={}", method.getName(), Arrays.toString(params), ex
+    );
+  }
+}
+// Returning CompletableFuture<T> lets callers handle failures via CompletableFuture.allOf() / exceptionally().`,
+        tests: async (fn) => {
+          function createExecutor() {
+            return {
+              submit: (task) => new Promise((resolve, reject) => {
+                setTimeout(() => {
+                  try { resolve(task()); } catch (e) { reject(e); }
+                }, 5);
+              })
+            };
+          }
+
+          return runTestCases([
+            {
+              name: 'invokeVoid returns undefined immediately and routes exceptions to uncaughtHandler',
+              run: async () => {
+                const captured = [];
+                const agg = fn(createExecutor(), {
+                  handleUncaughtException: (err, method, params) => captured.push({ msg: err.message, method, params })
+                });
+                const ret = agg.invokeVoid('sendAudit', (id) => { throw new Error(`Audit down for ${id}`); }, 42);
+                assertEq(ret, undefined, 'void @Async must return undefined immediately');
+                await agg.runBatch([]); // flush pending voids or wait via batch
+                await new Promise((r) => setTimeout(r, 20));
+                assertEq(captured.length, 1, 'Expected uncaughtHandler to capture void @Async failure');
+                assertDeepEq(captured[0], { msg: 'Audit down for 42', method: 'sendAudit', params: [42] });
+              }
+            },
+            {
+              name: 'invokeFuture propagates rejection to caller without calling uncaughtHandler',
+              run: async () => {
+                const captured = [];
+                const agg = fn(createExecutor(), {
+                  handleUncaughtException: (err) => captured.push(err)
+                });
+                const ok = await agg.invokeFuture('calcTax', (x) => x * 2, 21);
+                assertEq(ok, 42);
+                let caught = '';
+                try {
+                  await agg.invokeFuture('fetchPrice', async () => { throw new Error('503 Upstream'); });
+                } catch (e) {
+                  caught = e.message;
+                }
+                assertEq(caught, '503 Upstream');
+                assertEq(captured.length, 0, 'CompletableFuture failures must go to caller, not uncaughtHandler');
+              }
+            },
+            {
+              name: 'runBatch aggregates mixed void + future tasks concurrently without losing void errors',
+              run: async () => {
+                const captured = [];
+                const agg = fn(createExecutor(), {
+                  handleUncaughtException: (err, method, params) => captured.push({ msg: err.message, method, params })
+                });
+                const out = await agg.runBatch([
+                  { type: 'void', methodName: 'emitMetric', fn: () => { throw new Error('Metrics down'); }, params: ['cpu'] },
+                  { type: 'future', methodName: 'loadProfile', fn: async (id) => `user-${id}`, params: [7] },
+                  { type: 'future', methodName: 'loadOrders', fn: () => { throw new Error('Orders 500'); }, params: [7] }
+                ]);
+                assertEq(captured.length, 1, 'Void failure inside batch was lost!');
+                assertDeepEq(captured[0], { msg: 'Metrics down', method: 'emitMetric', params: ['cpu'] });
+                assertEq(out.length, 2);
+                assertEq(out[0].methodName, 'loadProfile');
+                assertEq(out[0].status, 'fulfilled');
+                assertEq(out[0].value, 'user-7');
+                assertEq(out[1].methodName, 'loadOrders');
+                assertEq(out[1].status, 'rejected');
+                assertEq(out[1].reason.message, 'Orders 500');
+              }
+            }
+          ]);
+        }
+      }
+    };
+
+    const QUIZZES = [
+      {
+        stem: '1. You set spring.threads.virtual.enabled=true and also define a custom @Bean Executor taskExecutor() returning ThreadPoolTaskExecutor. What happens to @Async methods?',
+        code: `spring.threads.virtual.enabled=true\n\n@Bean\npublic Executor taskExecutor() {\n  return new ThreadPoolTaskExecutor();\n}`,
+        options: [
+          'Spring Boot wraps your ThreadPoolTaskExecutor automatically so every worker pool thread becomes virtual.',
+          'Your custom Executor bean disables auto-configured virtual threads, reverting @Async to platform threads.',
+          'Application startup fails immediately with BeanDefinitionOverrideException because Spring Boot refuses conflicting executor beans.',
+          '@Async methods run on virtual threads while Tomcat HTTP requests revert to platform threads.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): ThreadPoolTaskExecutor always uses pooled platform threads unless configured otherwise; Spring Boot never rewrites a user-defined Executor bean.',
+          'CORRECT (B): TaskExecutionAutoConfiguration is guarded by @ConditionalOnMissingBean(Executor.class), so any custom Executor bean disables Boot’s virtual-thread SimpleAsyncTaskExecutor.',
+          'WRONG (C): There is no override collision because @ConditionalOnMissingBean causes Boot to back off cleanly when your bean exists.',
+          'WRONG (D): Tomcat’s virtual-thread protocol customizer is independent; your custom Executor bean affects @Async while Tomcat still uses virtual threads.'
+        ]
+      },
+      {
+        stem: '2. Inside OrderService, placeOrder() calls this.sendReceiptAsync("u@x.com"). Under load, HTTP latency spikes by 800ms. Why?',
+        code: `@Service\npublic class OrderService {\n  public void placeOrder() { this.sendReceiptAsync("u@x.com"); }\n  @Async public void sendReceiptAsync(String email) { smtp.send(email); }\n}`,
+        options: [
+          'Virtual threads always pin carrier threads whenever @Async methods perform blocking SMTP socket writes.',
+          'Calling this.sendReceiptAsync() bypasses the Spring AOP proxy, executing SMTP synchronously on the caller.',
+          'Spring Boot limits @Async methods returning void to a single sequential global background thread.',
+          'CGLIB proxies cannot intercept public methods unless the class explicitly implements a service interface.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): Virtual threads unmount cleanly during standard blocking socket I/O—and here the call never even reached an @Async worker.',
+          'CORRECT (B): @Async interception happens in the Spring AOP proxy. Calling this.sendReceiptAsync() invokes the raw target instance directly on the HTTP thread.',
+          'WRONG (C): SimpleAsyncTaskExecutor spawns a new virtual thread per external @Async call with no single-thread limit.',
+          'WRONG (D): CGLIB subclasses the target class and intercepts public methods without needing an interface—only self-invocation bypasses it.'
+        ]
+      },
+      {
+        stem: '3. An @Async void syncInventory() method throws an unchecked RuntimeException in production, yet callers and logs show nothing. Why?',
+        code: `@Async\npublic void syncInventory() {\n  throw new IllegalStateException("Inventory API down");\n}`,
+        options: [
+          'JVM virtual threads catch all unchecked runtime exceptions silently unless -XX:+PrintAsyncErrors is enabled.',
+          'Spring\'s proxy wraps void failures into empty CompletableFuture instances that callers forgot to join.',
+          'Void @Async exceptions skip callers and disappear unless you register a custom AsyncUncaughtExceptionHandler.',
+          'Spring @Async converts RuntimeException instances inside void methods into HTTP 204 responses automatically.'
+        ],
+        correct: 2,
+        why: [
+          'WRONG (A): Virtual threads have an UncaughtExceptionHandler like normal threads; no -XX:+PrintAsyncErrors flag exists, and Spring’s AsyncExecutionInterceptor catches Throwable first.',
+          'WRONG (B): When a method returns void, the caller receives nothing—there is no CompletableFuture returned to join.',
+          'CORRECT (C): Spring catches exceptions thrown by void @Async tasks and passes them to AsyncUncaughtExceptionHandler (whose default implementation only logs minimally or gets missed without custom alerting/metrics).',
+          'WRONG (D): @Async runs decoupled from Spring MVC controller response mapping and never generates HTTP status codes.'
+        ]
+      },
+      {
+        stem: '4. You implement TaskDecorator to copy MDC traceId onto pooled workers, omitting try/finally cleanup. What production bug follows?',
+        code: `return runnable -> () -> {\n  MDC.setContextMap(callerContext);\n  runnable.run();\n};`,
+        options: [
+          'MDC throws IllegalStateException on the second task submitted to the same pooled worker.',
+          'Subsequent unrelated tasks reusing that pooled worker inherit stale traceId values from earlier requests.',
+          'Spring rejects any TaskDecorator lambda that fails to call MDC.clear() during bean initialization.',
+          'Worker threads delete the caller request thread\'s MDC map immediately before runnable.run() starts.'
+        ],
+        correct: 1,
+        why: [
+          'WRONG (A): MDC.setContextMap() overwrites the thread’s map without throwing IllegalStateException.',
+          'CORRECT (B): Pooled worker threads survive across tasks; without restoring/clearing MDC in finally, subsequent tasks (or tasks without MDC) inherit stale traceId or SecurityContext data.',
+          'WRONG (C): Spring cannot statically inspect lambda bodies for finally cleanup at startup.',
+          'WRONG (D): MDC uses ThreadLocal storage per thread, so setting it on a worker thread does not erase the caller thread’s map.'
+        ]
+      },
+      {
+        stem: '5. With spring.threads.virtual.enabled=true, Tomcat handles 5,000 concurrent requests that each block 200ms on a 20-connection DB pool. What happens?',
+        code: `spring.threads.virtual.enabled=true\nspring.datasource.hikari.maximum-pool-size=20`,
+        options: [
+          'Tomcat spawns virtual threads cheaply, so requests mount and unmount until HikariCP connection acquisition stalls.',
+          'Tomcat caps virtual threads at 200 per connector, rejecting the remaining 4,800 HTTP connections immediately.',
+          'Virtual threads bypass HikariCP connection limits automatically, opening 5,000 direct TCP sockets to PostgreSQL.',
+          'Tomcat runs every controller on one carrier thread, forcing 5,000 requests into sequential execution.'
+        ],
+        correct: 0,
+        why: [
+          'CORRECT (A): Virtual threads let Tomcat accept all 5,000 requests without OS-thread exhaustion, but HikariCP still enforces max 20 connections—so 4,980 virtual threads park waiting (and may hit connectionTimeout).',
+          'WRONG (B): The 200-thread cap applies to Tomcat’s traditional platform worker pool, not virtual-thread-per-task execution.',
+          'WRONG (C): Virtual threads are still Java threads calling HikariDataSource.getConnection(); they never bypass pool sizing.',
+          'WRONG (D): ForkJoinPool carrier threads match CPU core count (not 1), and virtual threads unmount whenever blocked.'
+        ]
+      }
+    ];
+
+    ConcurrencyEngine.initLessonPage({
+      storageKey: 'cm2027_lesson_22',
+      labs: LABS,
+      quizzes: QUIZZES
+    });
+  </script>
+</body>
+</html>
