@@ -6,12 +6,13 @@ I'm a junior Android developer starting backend from scratch. In 2027 I want to 
 ## Success looks like
 **Part 1 — Junior-to-Mid (L3/L4)**
 - Build, containerize, and deploy a Kotlin + Spring Boot + Postgres service I can explain line by line.
+- Deliver the Part 1 mid-level capstone (**PulseOrder**: mobile order-ahead backend + Android client, `reference/0004-capstone-part1-pulseorder-spec.html`).
 - Run a 45-minute design round for classic problems (URL shortener, notification system, chat, news feed): requirements → estimation → API → data model → high-level design → bottlenecks.
-- Defend the fundamentals: HTTP, SQL & indexes, transactions, caching, queues, load balancing, replication, sharding, consistent hashing, rate limiting, idempotency, auth.
+- Defend the fundamentals: HTTP, SQL & indexes, transactions, caching, queues, load balancing, replication, sharding, consistent hashing, rate limiting, idempotency, auth, real-time delivery, observability.
 
 **Part 2 — Senior**
 - Lead with trade-offs and failure modes: outbox/CDC, sagas, zero-downtime migrations, observability & SLOs, multi-region, consensus, storage-engine internals, Kafka internals.
-- Deliver the capstone architecture (NexusPulse) as a resume showcase.
+- Upgrade PulseOrder into the Part 2 senior capstone (**NexusPulse**: distributed double-entry payment & event ledger mesh, `reference/0002-capstone-nexus-pulse-spec.html`) as a resume showcase.
 
 ## Constraints
 - Primary stack: **Kotlin + Spring Boot**. **Java + Spring Boot on the side** (read/translate snippets) since most Spring docs and job posts use Java.

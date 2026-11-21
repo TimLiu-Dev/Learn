@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compose Compiler &amp; Kotlin Runtime Mental Model · Idiomatic Kotlin</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/answers.js"></script>
+<script src="../assets/lesson.js"></script>
+</head>
+<body>
+<main>
+
+<nav class="top">
+  <a href="../index.html">← Course index</a>
+  <a href="../reference/android.html">Reference: Android &amp; Compose</a>
+  <a href="../reference/modern-kotlin-tooling.html">Reference: Modern Kotlin &amp; Tooling</a>
+</nav>
+
+<p class="kicker">Section 13 · 2027 Modern Kotlin Track · Lesson 13.5</p>
+<h1>Compose Compiler &amp; Kotlin Runtime Mental Model</h1>
+<p class="subtitle">How Kotlin immutability, closure capture, equality contracts, and flows drive Jetpack Compose stability, Strong Skipping, <code>rememberUpdatedState</code>, and <code>snapshotFlow</code>.</p>
+
+<h2>Warm-up: Spaced Retrieval</h2>
+<ol class="recall">
+  <li>Why does mutating an existing list inside a <code>MutableStateFlow</code> (e.g. <code>_state.value.items.add(x)</code>) fail to trigger a new emission?
+    <details><summary>Check</summary><code>StateFlow</code> compares old and new values using structural equality (<code>==</code>). Mutating a list in place keeps the same reference and equal contents compared to itself, so <code>StateFlow</code> conflates the update and emits nothing.</details></li>
+  <li>When should you use <code>remember { derivedStateOf { ... } }</code> in Jetpack Compose?
+    <details><summary>Check</summary>When an upstream state changes at high frequency (like scroll pixel offset) while the derived UI value changes rarely (like a boolean <code>showJumpToTop</code>).</details></li>
+  <li>Why is <code>kotlin.collections.List&lt;T&gt;</code> considered read-only rather than strictly immutable?
+    <details><summary>Check</summary><code>List&lt;T&gt;</code> is an interface without mutation methods, but the underlying runtime instance can still be a <code>MutableList</code> (such as <code>ArrayList</code>) mutated by another reference holder.</details></li>
+</ol>
+
+<h2>The Concept: Kotlin Mechanics Under the Compose Hood</h2>
+
+<h3>1. Stability (<code>@Immutable</code> vs <code>@Stable</code>) &amp; Strong Skipping Mode</h3>
+<p><span class="sidenote">In Kotlin 2.0+, the Compose Compiler lives directly inside the Kotlin repository and enables <strong>Strong Skipping Mode</strong> by default.</span>To skip recomposing a <code>@Composable</code> function whose inputs haven't changed, the Compose compiler classifies every Kotlin parameter type as <strong>stable</strong> or <strong>unstable</strong>:</p>
+<ul>
+  <li><strong>Stable types</strong>: Primitives, <code>String</code>, function types (lambdas), and classes where every property is a <code>val</code> of a stable type (or annotated with <code>@Immutable</code> / <code>@Stable</code>). Compose compares stable parameters using structural equality (<strong><code>old == new</code></strong>).</li>
+  <li><strong>Unstable types</strong>: Any class with a <code>var</code> property (not backed by Compose <code>State</code>), or standard collection interfaces (<code>List&lt;T&gt;</code>, <code>Set&lt;T&gt;</code>, <code>Map&lt;K, V&gt;</code>) unless wrapped in kotlinx <code>ImmutableList&lt;T&gt;</code> or a class annotated <code>@Immutable</code>.</li>
+  <li><strong>Strong Skipping Mode (Kotlin 2.0.20+)</strong>: In classic Compose, a single unstable parameter forced the composable to <em>never</em> skip. With Strong Skipping enabled, Compose compares unstable parameters using referential instance equality (<strong><code>old === new</code></strong>)—skipping recomposition as long as the exact same reference is passed!</li>
+</ul>
+
+<code class="kt-run">data class Article(val id: Int, val title: String)
+
+fun explainSkipBehavior(
+    oldArg: Any,
+    newArg: Any,
+    isStableType: Boolean,
+    strongSkipping: Boolean
+): String = when {
+    isStableType &amp;&amp; oldArg == newArg -&gt; "SKIP (structural == matched)"
+    isStableType -&gt; "RECOMPOSE (structural == changed)"
+    strongSkipping &amp;&amp; oldArg === newArg -&gt; "SKIP (Strong Skipping === matched)"
+    else -&gt; "RECOMPOSE (unstable parameter)"
+}
+
+fun main() {
+    val a1 = Article(1, "Kotlin 2.4")
+    val a2 = Article(1, "Kotlin 2.4") // distinct instance, equal value
+    println("Stable data class: ${explainSkipBehavior(a1, a2, isStableType = true, strongSkipping = true)}")
+
+    val listRef = listOf("Compose", "KMP")
+    println("Unstable List (same ref): ${explainSkipBehavior(listRef, listRef, isStableType = false, strongSkipping = true)}")
+    println("Unstable List (new copy): ${explainSkipBehavior(listRef, listOf("Compose", "KMP"), isStableType = false, strongSkipping = true)}")
+}</code>
+
+<h3>2. Lambda Closure Capture &amp; The <code>rememberUpdatedState</code> Trap</h3>
+<p>In Kotlin, a lambda captures variables from its enclosing lexical scope in a generated closure object. This creates one of the most common Senior Android interview bugs inside <code>LaunchedEffect</code> or <code>DisposableEffect</code>:</p>
+<p>Suppose a composable receives <code>onTimeout: () -&gt; Unit</code> and launches a one-time timer via <code>LaunchedEffect(Unit) { delay(5_000); onTimeout() }</code>. Because the key is <code>Unit</code>, the coroutine does <strong>not</strong> restart when the parent recomposes with a new <code>onTimeout</code> lambda—so after 5 seconds, the coroutine invokes the <strong>stale closure captured on the very first composition</strong>!</p>
+
+<code class="kt-run">import kotlinx.coroutines.*
+
+// Models Compose's rememberUpdatedState<T> mutable holder box
+class UpdatedStateBox&lt;T&gt;(var value: T)
+
+fun main() = runBlocking {
+    var latestUser = "Guest"
+    val initialCallback: () -&gt; String = { "Timeout for $latestUser (captured at start)" }
+
+    // Fix: hold callback inside a state box updated on recomposition
+    val callbackBox = UpdatedStateBox&lt;() -&gt; String&gt;(initialCallback)
+
+    val job = launch {
+        delay(30)
+        // BUG if calling initialCallback() directly; SAFE when reading callbackBox.value()
+        println("Stale closure  : ${initialCallback()}")
+        println("UpdatedStateBox: ${callbackBox.value()}")
+    }
+
+    // Simulate recomposition 10ms later with new user and new callback lambda:
+    delay(10)
+    latestUser = "SeniorEngineer"
+    callbackBox.value = { "Timeout for $latestUser (fresh callback)" }
+    job.join()
+}</code>
+
+<h3>3. <code>derivedStateOf</code> vs <code>snapshotFlow</code></h3>
+<ul>
+  <li><strong><code>derivedStateOf { ... }</code></strong>: Stays inside the synchronous Compose Snapshot world. Combines one or more Compose <code>State&lt;T&gt;</code> objects and only triggers recomposition when the derived result changes.</li>
+  <li><strong><code>snapshotFlow { ... }</code></strong>: Bridges the Compose Snapshot world into a cold Kotlin <strong><code>Flow&lt;T&gt;</code></strong>. Use it inside <code>LaunchedEffect</code> when you need coroutine Flow operators (<code>debounce</code>, <code>filter</code>, <code>flatMapLatest</code>) or suspending side effects (analytics, pagination triggers) driven by Compose UI state. It automatically applies <code>distinctUntilChanged()</code>.</li>
+</ul>
+
+<div class="callout blueprint">
+  <span class="tag">Blank-Page Syntax Blueprint — How to Type It From Memory</span>
+  <code class="kt-show">// 1. Immutable UI State (every field val, update via .copy)
+@Immutable
+data class FeedUiState(val items: List&lt;String&gt; = emptyList(), val loading: Boolean = false)
+
+// 2. Prevent stale lambda capture inside a non-restarting LaunchedEffect
+val currentOnFinished by rememberUpdatedState(onFinished)
+LaunchedEffect(Unit) {
+    delay(3_000L)
+    currentOnFinished() // always invokes latest lambda!
+}
+
+// 3. Bridge Compose state reads into a coroutine Flow pipeline
+LaunchedEffect(listState) {
+    snapshotFlow { listState.firstVisibleItemIndex }
+        .filter { index -&gt; index &gt;= 20 }
+        .collect { index -&gt; viewModel.onScrolledPast(index) }
+}</code>
+</div>
+
+<h2>Quick Check</h2>
+<p class="quiz-score"></p>
+
+<div class="quiz" data-answer="c">
+  <p class="q">1. Under Strong Skipping Mode in the Kotlin 2.0+ Compose Compiler, how does Compose decide whether to skip recomposition when a parameter's type is <strong>unstable</strong> (such as <code>List&lt;String&gt;</code>)?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="Structural equals() on a large List is O(N) and unsafe if the list was mutated in place; Strong Skipping uses === for unstable types.">It calls structural <code>old == new</code> across every element in the list</button></li>
+    <li><button data-key="b" data-why="That was classic Compose behavior prior to Strong Skipping Mode.">It refuses to skip and always recomposes the function unconditionally</button></li>
+    <li><button data-key="c" data-why="Correct: Strong Skipping compares unstable parameters by referential identity (old === new) and stable parameters by structural equality (old == new).">It compares the old and new arguments by referential identity (<code>old === new</code>)</button></li>
+    <li><button data-key="d" data-why="Compose never serializes arguments to JSON for recomposition diffing.">It serializes both objects to bytecode hashes using runtime reflection</button></li>
+  </ul>
+  <p class="explain">Strong Skipping uses <code>===</code> for unstable parameters (fast and safe if you don't mutate in place) and <code>==</code> for stable parameters.</p>
+</div>
+
+<div class="quiz" data-answer="a">
+  <p class="q">2. Why does <code>LaunchedEffect(Unit) { delay(5000); onComplete() }</code> risk a bug if the parent composable recomposes with a new <code>onComplete</code> lambda after 1 second?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="Correct: Because the key is Unit, LaunchedEffect does not restart, so its suspend lambda retains the old onComplete closure captured during the initial composition.">The coroutine keeps the original <code>onComplete</code> closure unless wrapped in <code>rememberUpdatedState</code></button></li>
+    <li><button data-key="b" data-why="LaunchedEffect(Unit) only launches once on entering composition and does not restart on ordinary recompositions.">The coroutine cancels and restarts the 5-second timer on every single recomposition</button></li>
+    <li><button data-key="c" data-why="Kotlin lambdas can be freely captured by suspending blocks without throwing exceptions.">Capturing a function type inside a suspend lambda throws an <code>IllegalStateException</code></button></li>
+    <li><button data-key="d" data-why="LaunchedEffect runs on the UI main dispatcher by default unless switched with withContext.">The lambda runs on a background thread that cannot read main-thread parameters</button></li>
+  </ul>
+  <p class="explain">Whenever a long-lived effect (`LaunchedEffect(Unit)` or `callbackFlow`) outlives individual recompositions, wrap captured callbacks in `rememberUpdatedState`.</p>
+</div>
+
+<div class="quiz" data-answer="d">
+  <p class="q">3. When should you choose <code>snapshotFlow { ... }</code> over <code>remember { derivedStateOf { ... } }</code>?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="derivedStateOf is lighter and synchronous when you only need a derived boolean State<Boolean> for UI rendering.">Whenever you compute a simple synchronous boolean flag to toggle a button</button></li>
+    <li><button data-key="b" data-why="snapshotFlow must be collected inside a coroutine (like LaunchedEffect), not called directly as a synchronous value.">Whenever you want to avoid launching any coroutines inside your composable</button></li>
+    <li><button data-key="c" data-why="Both derivedStateOf and snapshotFlow skip duplicate consecutive emissions.">Only when you want duplicate unchanged values to re-trigger downstream logic</button></li>
+    <li><button data-key="d" data-why="Correct: snapshotFlow converts Compose State reads into a cold Kotlin Flow so you can apply operators like debounce, filter, and flatMapLatest or trigger suspending side effects.">When you need Flow operators like <code>debounce</code> or suspending side effects on Compose state</button></li>
+  </ul>
+  <p class="explain">Use <code>derivedStateOf</code> for synchronous UI state derivation in composition; use <code>snapshotFlow</code> when you need asynchronous Flow operators or coroutine side effects.</p>
+</div>
+
+<div class="quiz" data-answer="b">
+  <p class="q">4. What contract do you promise the Compose compiler when you annotate a Kotlin class with <code>@Immutable</code>?</p>
+  <ul class="options">
+    <li><button data-key="a" data-why="@Immutable is a compile-time stability contract for Compose; it does not freeze memory at the JVM level.">The JVM garbage collector pins the instance in read-only native memory</button></li>
+    <li><button data-key="b" data-why="Correct: @Immutable promises that all publicly accessible properties will never change after construction and that equals() is consistent.">All public properties never change after construction and <code>equals()</code> is consistent</button></li>
+    <li><button data-key="c" data-why="@Stable allows observable mutable state; @Immutable strictly promises zero post-construction state changes.">Properties may mutate freely as long as they notify a listener interface</button></li>
+    <li><button data-key="d" data-why="@Immutable can be applied to regular classes and interfaces as well as data classes.">The class must contain only primitive <code>Int</code> and <code>Long</code> fields</button></li>
+  </ul>
+  <p class="explain"><code>@Immutable</code> is a stronger promise than <code>@Stable</code>: once constructed, no public property of the instance will ever return a different value.</p>
+</div>
+
+<h2>Practice: Hands-On Exercises</h2>
+
+<section class="exercise">
+  <span class="type">Exercise 1 · Write from blank</span>
+  <h3>Compose Stability Judge &amp; Closure-Safe Effect Runner</h3>
+  <p>Implement three pure-Kotlin components modeling how Compose handles stability, updated state capture, and distinct snapshot streams:</p>
+  <ol>
+    <li><code>class UpdatedStateHolder&lt;T&gt;(var current: T)</code>: a mutable box modeling <code>rememberUpdatedState</code>, with <code>fun update(newValue: T)</code>.</li>
+    <li><code>enum class SkipResult { SKIP_STRUCTURAL, SKIP_REFERENTIAL, RECOMPOSE }</code> and <code>fun evaluateRecomposition(prev: Any, next: Any, isStable: Boolean, strongSkipping: Boolean): SkipResult</code> using a guarded or multi-condition <code>when</code>:
+      <ul>
+        <li>If <code>isStable</code> and <code>prev == next</code> → <code>SkipResult.SKIP_STRUCTURAL</code></li>
+        <li>If <code>isStable</code> (and not equal) → <code>SkipResult.RECOMPOSE</code></li>
+        <li>If <code>!isStable</code> and <code>strongSkipping</code> and <code>prev === next</code> → <code>SkipResult.SKIP_REFERENTIAL</code></li>
+        <li>Otherwise → <code>SkipResult.RECOMPOSE</code></li>
+      </ul>
+    </li>
+    <li><code>fun &lt;T&gt; simulatedSnapshotFlow(snapshots: List&lt;T&gt;): Flow&lt;T&gt;</code> that emits the items of <code>snapshots</code> as a cold <code>Flow</code> while filtering out consecutive duplicates via <code>distinctUntilChanged()</code>.</li>
+  </ol>
+  <code class="kt-run">import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+
+// Write UpdatedStateHolder<T>, SkipResult, evaluateRecomposition, and simulatedSnapshotFlow above main:
+
+fun main() = runBlocking {
+    val holder = UpdatedStateHolder { "Initial" }
+    val deferred = async {
+        delay(20)
+        holder.current()
+    }
+    delay(5)
+    holder.update { "Updated after recomposition" }
+    check(deferred.await() == "Updated after recomposition")
+
+    val listA = listOf("A", "B")
+    val listB = listOf("A", "B")
+    check(evaluateRecomposition("ok", "ok", isStable = true, strongSkipping = true) == SkipResult.SKIP_STRUCTURAL)
+    check(evaluateRecomposition(listA, listA, isStable = false, strongSkipping = true) == SkipResult.SKIP_REFERENTIAL)
+    check(evaluateRecomposition(listA, listB, isStable = false, strongSkipping = true) == SkipResult.RECOMPOSE)
+
+    val scrollIndices = simulatedSnapshotFlow(listOf(0, 0, 1, 1, 1, 2, 2)).toList()
+    check(scrollIndices == listOf(0, 1, 2))
+    println("All Compose runtime mental model checks passed: $scrollIndices")
+}</code>
+  <ul class="checklist">
+    <li><label><input type="checkbox"><span><code>UpdatedStateHolder</code> lets the running coroutine read the latest lambda without restarting</span></label></li>
+    <li><label><input type="checkbox"><span><code>evaluateRecomposition</code> uses <code>==</code> for stable types and <code>===</code> for unstable types under Strong Skipping</span></label></li>
+    <li><label><input type="checkbox"><span><code>simulatedSnapshotFlow</code> deduplicates consecutive identical states with <code>distinctUntilChanged()</code></span></label></li>
+  </ul>
+  <details class="hint"><summary>Hint 1: UpdatedStateHolder</summary>Declare <code>class UpdatedStateHolder&lt;T&gt;(var current: T) { fun update(newValue: T) { current = newValue } }</code>.</details>
+  <details class="hint"><summary>Hint 2: evaluateRecomposition &amp; simulatedSnapshotFlow</summary>In <code>evaluateRecomposition</code>, check <code>isStable &amp;&amp; prev == next</code>, then <code>isStable</code>, then <code>strongSkipping &amp;&amp; prev === next</code>. For <code>simulatedSnapshotFlow</code>, return <code>snapshots.asFlow().distinctUntilChanged()</code>.</details>
+</section>
+
+<section class="exercise">
+  <span class="type">Exercise 2 · Refactor</span>
+  <h3>Fix the In-Place State Mutation &amp; Stale Effect Closure</h3>
+  <p>This code suffers from two classic Android bugs:</p>
+  <ol>
+    <li><code>CartUiState</code> uses a <code>var</code> and a <code>MutableList&lt;String&gt;</code> mutated in place—so <code>StateFlow</code> thinks the state never changed (<code>old == new</code> is true on the same mutated reference!) and drops emissions.</li>
+    <li><code>AutoSaveWorker.start</code> captures the initial <code>onSave</code> callback parameter directly instead of reading from its <code>callbackHolder: StateBox&lt;() -&gt; String&gt;</code>.</li>
+  </ol>
+  <p>Refactor <code>CartUiState</code> into a deeply read-only <code>data class CartUiState(val items: List&lt;String&gt; = emptyList(), val checkedOut: Boolean = false)</code> updated via <code>_state.update { it.copy(...) }</code>, and fix <code>AutoSaveWorker</code> so it invokes the latest callback in <code>callbackHolder.value</code>.</p>
+  <code class="kt-run">import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+
+class StateBox&lt;T&gt;(var value: T)
+
+// BUG 1: Mutable properties mutated in place break StateFlow & Compose diffing!
+data class CartUiState(
+    val items: MutableList&lt;String&gt; = mutableListOf(),
+    var checkedOut: Boolean = false
+)
+
+class CartController {
+    private val _state = MutableStateFlow(CartUiState())
+    val state: StateFlow&lt;CartUiState&gt; = _state.asStateFlow()
+
+    fun addItem(item: String) {
+        // Refactor to immutable copy update:
+        _state.value.items.add(item)
+    }
+
+    fun markCheckedOut() {
+        // Refactor to immutable copy update:
+        _state.value.checkedOut = true
+    }
+}
+
+class AutoSaveWorker( initialOnSave: () -&gt; String) {
+    private val callbackHolder = StateBox(initialOnSave)
+
+    fun updateOnSave(newOnSave: () -&gt; String) {
+        callbackHolder.value = newOnSave
+    }
+
+    // BUG 2: Captures a snapshot of callbackHolder.value before delay instead of reading inside delay!
+    suspend fun runOnce(): String {
+        val captured = callbackHolder.value
+        delay(20)
+        return captured()
+    }
+}
+
+fun main() = runBlocking {
+    val controller = CartController()
+    val firstRef = controller.state.value
+    controller.addItem("Pixel Watch")
+    controller.markCheckedOut()
+    val secondRef = controller.state.value
+
+    check(firstRef !== secondRef) { "Bug 1: State must produce a new immutable instance via copy()!" }
+    check(firstRef.items.isEmpty() &amp;&amp; secondRef.items == listOf("Pixel Watch") &amp;&amp; secondRef.checkedOut)
+
+    val worker = AutoSaveWorker { "Saved v1" }
+    val resultDeferred = async { worker.runOnce() }
+    delay(5)
+    worker.updateOnSave { "Saved v2" }
+    check(resultDeferred.await() == "Saved v2") { "Bug 2: Worker invoked stale captured callback!" }
+    println("Fixed immutable Compose state and fresh callback capture!")
+}</code>
+  <ul class="checklist">
+    <li><label><input type="checkbox"><span>Changed <code>CartUiState</code> to use <code>val items: List&lt;String&gt; = emptyList()</code> and <code>val checkedOut: Boolean = false</code></span></label></li>
+    <li><label><input type="checkbox"><span>Updated <code>_state</code> with <code>_state.update { it.copy(items = it.items + item) }</code> and <code>_state.update { it.copy(checkedOut = true) }</code></span></label></li>
+    <li><label><input type="checkbox"><span>Read <code>callbackHolder.value()</code> <em>after</em> <code>delay(20)</code> completes</span></label></li>
+  </ul>
+  <details class="hint"><summary>Hint 1: Immutable CartUiState</summary>Replace <code>MutableList&lt;String&gt;</code> with <code>List&lt;String&gt; = emptyList()</code> and <code>var checkedOut</code> with <code>val checkedOut: Boolean = false</code>. In <code>addItem</code>, write <code>_state.update { it.copy(items = it.items + item) }</code>.</details>
+  <details class="hint"><summary>Hint 2: Fresh callback invocation</summary>In <code>AutoSaveWorker.runOnce()</code>, remove <code>val captured = callbackHolder.value</code> before <code>delay(20)</code> and call <code>return callbackHolder.value()</code> after <code>delay(20)</code>.</details>
+</section>
+
+<div class="source">
+  <span class="tag">Primary source</span>
+  <p><a href="https://developer.android.com/develop/ui/compose/performance/stability">Android Developers: Stability in Jetpack Compose</a>, <a href="https://developer.android.com/develop/ui/compose/performance/stability/strongskipping">Strong Skipping Mode</a>, and <a href="https://developer.android.com/develop/ui/compose/side-effects">Side-effects in Compose (rememberUpdatedState &amp; snapshotFlow)</a>.</p>
+</div>
+
+<div class="ask">
+  <span class="tag">Stuck or curious?</span>
+  <p>Ask your teacher in the workspace: “Why does passing a ViewModel method reference like <code>onAction = viewModel::onBookmarkClicked</code> avoid unstable lambda recompositions in Compose?”</p>
+</div>
+
+<nav class="lesson-nav">
+  <a href="0069-contracts-r8-binary-compat.html">← 13.4 Staff Internals: Contracts, @PublishedApi &amp; R8</a>
+  <a href="0072-multi-module-explicit-api-di.html">13.6 Multi-Module Architecture, explicitApi() &amp; Pure-Kotlin DI →</a>
+</nav>
+
+</main>
+</body>
+</html>

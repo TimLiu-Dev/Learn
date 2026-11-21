@@ -22,3 +22,11 @@ What was run (all real; captures/ holds the raw output):
                          L40W/{diff_base,gr_kotlin,gr_java,fix_kotlin,ci,final/{start,steps}} and
                          L40W/src/{CacheRace.*,err/,bisect/}; lib.sh fixes author/dates (reproducible hashes)
                          and sets GIT_CONFIG_GLOBAL=/dev/null so no global git config is read or written.
+
+v6 additions (2026-11):
+  Part 3 "Branching and releases" (part id "rel"; CI stays id "p3" but is labelled Part 4, so saved progress still matches).
+  scripts/release_demo.sh  tag / hotfix / push-tags transcript -> captures/release_out.txt
+                           (bash scripts/release_demo.sh L40W > captures/release_out.txt 2>&1; L40W needs only scripts/lib.sh;
+                           it sets HOME to L40W/home, so no personal git config is read)
+  release/Toggle.kt/.java  feature-flag example, output in captures/toggle_out.txt (run with ../bin/run.sh)
+  practice/{p1,p2,rel,p3}  in-page practices; cq/ code-quiz snippets. Verify: python3 ../bin/pg_check.py ../l40

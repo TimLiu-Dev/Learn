@@ -1,10 +1,10 @@
-# Universal Mid-Tech LeetCode 103 Glossary
+# Universal Mid-Tech LeetCode 116 Glossary
 
-Canonical terminology, precise definitions, and shared vocabulary for algorithmic patterns, complexity boundaries, and runtime mechanics across all lessons.
+Canonical terminology, precise definitions, and shared vocabulary for algorithmic patterns, complexity boundaries, and runtime mechanics across all 116 lessons.
 
-> **Rule:** Terms are added progressively as concepts are anchored in lessons. Definitions stay tight (1–2 sentences) capturing what the concept *is* and what to avoid confusing it with.
+> **Rule:** Definitions stay tight (1–2 sentences) capturing what the concept *is* and what to avoid confusing it with.
 
-## Terms
+## Core Complexity & Runtime Mechanics
 
 - **Amortized O(1) Time**: Constant average cost per operation over a sequence of operations, even though occasional table resizing/rehashing costs `O(N)`. *Avoid saying "guaranteed worst-case O(1)" for standard hash tables.*
 - **Auxiliary Space**: Extra memory allocated temporarily by an algorithm beyond the input itself (excluding output storage unless specified). *Avoid confusing with total memory footprint, which includes the input.*
@@ -16,3 +16,22 @@ Canonical terminology, precise definitions, and shared vocabulary for algorithmi
 - **Input Mutation**: Modifying the caller-owned array or object passed into a function (for example, sorting `nums` in place), which can break caller assumptions or cause shared-state bugs. *Always ask the interviewer whether mutating the input array is acceptable before sorting in place.*
 - **Loop Invariant**: A property that holds true before and after every iteration of a loop (for example, *"every element in `nums[0..i-1]` is unique and stored in `seen`"*), proving correctness at termination.
 - **Space-Time Trade-Off**: Deliberately spending extra auxiliary memory (such as an `O(N)` `HashSet` or `HashMap`) to eliminate repeated linear scans and drop time complexity (for example, from `O(N²)` down to `O(N)`).
+
+## Pattern & Data-Structure Vocabulary
+
+- **Sliding Window Invariant**: Maintaining a contiguous `[left..right]` range whose validity condition holds by advancing `right` greedily and shrinking `left` whenever the constraint breaks. *Avoid resetting `left` backward to `right`, which degrades runtime back to `O(N²)`.*
+- **Prefix Sum**: Precomputing `prefix[i] = sum(nums[0..i-1])` so any contiguous subarray sum `nums[l..r]` evaluates in `O(1)` via `prefix[r+1] - prefix[l]`. *Prefer Prefix Sum + HashMap over Sliding Window whenever negative numbers are present.*
+- **Monotonic Stack / Deque**: A LIFO stack (or double-ended queue) that evicts elements violating strict monotonicity before pushing, resolving Next Greater/Smaller queries or sliding window extrema in amortized `O(N)` time. *Store indices rather than raw values whenever distances or window expiry bounds matter.*
+- **Dummy Sentinel Node**: A placeholder `ListNode(0)` prepended before the head of a linked list so head insertions, deletions, and splices follow identical `.next` pointer logic without special-case null branches. *Always return `dummy.next` rather than `dummy`.*
+- **Floyd's Tortoise and Hare**: Two linked-list pointers advancing at speeds `1x` (`slow`) and `2x` (`fast`) to detect cycles in `O(1)` space or locate the list midpoint in a single pass. *Remember to sever `slow.next = null` when splitting a list before reversing and zipping.*
+- **Lower-Bound / Upper-Bound Binary Search**: Finding the first index where a monotonic predicate turns `true` (`bisect_left` / `right = mid`) or past the last match (`bisect_right`), rather than stopping at the first arbitrary hit. *Always compute `left + (right - left) / 2` to prevent 32-bit signed integer overflow.*
+- **Binary Search on Answer**: Binary searching over the continuous or integer range of possible answers `[minAns..maxAns]` using an `O(N)` feasibility check `canFinish(mid)` when the answer space itself is monotonic. *Do not confuse with binary searching the unsorted input array directly.*
+- **Pre-Order vs. Post-Order Tree DFS**: Top-down DFS (`pre-order`) passes constraints from parent to child (such as `(min, max)` BST bounds or `maxSoFar`), whereas bottom-up DFS (`post-order`) aggregates child return values upward (such as height, diameter, LCA, or max path sum).
+- **Trie (Prefix Tree)**: A multi-way character tree sharing common string prefixes so `insert`, `search`, and `startsWith` execute in `O(L)` time independent of dictionary size `N`. *Keep `isEnd` flags separate from child maps so `"app"` and `"apple"` coexist cleanly.*
+- **Topological Sort (Kahn's BFS)**: Ordering nodes in a Directed Acyclic Graph (DAG) by tracking each node's `indegree` and repeatedly peeling zero-indegree nodes from a FIFO queue. *If fewer than `V` nodes are processed, the graph contains a cycle.*
+- **Union-Find (Disjoint Set Union)**: Tracking connected components and detecting undirected cycles in near-`O(1)` amortized (`O(α(N))`) time using `parent[]` with **path compression** and **union by rank/size**. *Avoid using Union-Find for directed cycle detection where Kahn's BFS or 3-color DFS is required.*
+- **Dijkstra's Algorithm**: Finding shortest paths in graphs with **non-negative** edge weights using a Min-Heap ordered by cumulative distance `(dist, node)`. *Never use standard unweighted BFS when edges have positive weights, and never use Dijkstra with negative edge weights.*
+- **Backtracking (`Choose → Explore → Unchoose`)**: Depth-first decision-tree search that appends a candidate, recurses on remaining choices, and restores mutable state (`removeLast` / `visited[r][c] = false`) upon return. *Sort inputs and skip `nums[i] == nums[i-1]` at the same tree depth when deduplicating combinations.*
+- **Memoization vs. Tabulation**: Top-down DP (`memoization`) caches recursive subproblem results on demand, whereas bottom-up DP (`tabulation`) fills a table iteratively from base cases to enable `O(1)` rolling-variable space compression.
+- **0/1 vs. Unbounded Knapsack**: In `0/1` Knapsack (each item used at most once, e.g., `#416`), iterate capacity **backward** (`target downTo num`) in 1D DP; in Unbounded Knapsack (unlimited reuse, e.g., `#322`), iterate capacity **forward** (`coin..amount`).
+- **Kadane's & Dual-Extremum Reset**: Tracking the optimal subarray ending at index `i` (`max(num, cur + num)`) in `O(N)` time and `O(1)` space; for products (`#152`), track both `curMax` and `curMin` so negative pairs flip sign into a new maximum.

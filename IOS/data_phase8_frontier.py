@@ -1794,7 +1794,7 @@ runTests()""",
         "title": "Xcode Cloud & Multi-Channel Release Engineering",
         "subtitle": "Apple's native Xcode Cloud (ci_post_clone.sh), headless xcodebuild + xcresulttool, phased App Store rollouts, and Fastlane vs. Xcode Cloud.",
         "prev_url": "0059-storekit2-and-passkeys.html",
-        "next_url": "0061-capstone-portfolio-blueprint.html",
+        "next_url": "0061-result-builders-and-viewbuilder.html",
         "cheatsheet_url": "../reference/2027-frontier-cheatsheet.html",
         "cheatsheet_title": "2027 Frontier Cheatsheet",
         "android_anchor_html": """
@@ -1915,7 +1915,7 @@ runTests()""",
             {"title": "Apple Developer: Xcode Cloud Overview & Custom Build Scripts", "url": "https://developer.apple.com/documentation/xcode/xcode-cloud", "desc": "Configuring ci_post_clone.sh, workflows, and automatic TestFlight distribution."},
             {"title": "Apple Developer: Release a Version Update in Phases", "url": "https://developer.apple.com/help/app-store-connect/update-your-app/release-a-version-update-in-phases/", "desc": "Official 7-day App Store phased rollout documentation."}
         ],
-        "coaching_prompt": "You've conquered all 12 lessons of the 2027 Senior iOS Frontier! Proceed to Milestone 9.1 to assemble the complete PulseFlow Enterprise Capstone."
+        "coaching_prompt": "You've conquered all 12 lessons of the 2027 Senior iOS Frontier! Next up is Phase 9: Advanced SwiftUI DSL, Graphics, CloudKit & Tooling, starting with Result Builders & @ViewBuilder Mechanics!"
     }
 ]
 

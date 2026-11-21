@@ -57,7 +57,7 @@ public class Practice {
             return left;
         }
 
-private Expr atom() {
+        private Expr atom() {
             String t = next();
             if (t == null) throw new CalcError("expected a number or '(' but found end of input");
             if (t.equals("(")) {

@@ -43,3 +43,16 @@
 - Expanded all 49 lessons that previously had only 1–2 quizzes (`0000`, `0013`–`0056`, `0062`–`0065`) by adding 91 balanced Senior-level quizzes so every single lesson (`0000`–`0070`) has `>= 3` quizzes, and fixed the partial starter leak in `0054-ex2`.
 - Wired `0065 -> 0066 -> 0067 -> 0068 -> 0069 -> 0070 -> ../index.html`, updated `index.html`, `CURRICULUM.md`, `RESOURCES.md`, `GLOSSARY.md`, and added 10 verified model answers (`0066-ex1`..`0070-ex2`) to `assets/answers.js` (71 lessons, 143 total exercises).
 - See `learning-records/0007-section13-modern-kotlin-modules.md` for details and post-edit verification counts.
+
+## Session 0008 (2026-11-21) · 2027 Senior Kotlin Audit, New Modules (`0071–0072`) & Blank-Page Authoring Upgrades
+- Kept all 4 Pillars intact (including Spring Boot Backend `0058` as a full Capstone).
+- Added 2 new 2027 Senior Kotlin & Android modules in Section 13:
+  - `lessons/0071-compose-compiler-runtime-kotlin.html` (`13.5`: Compose Compiler & Kotlin Runtime Mental Model — `@Immutable`/`@Stable`, Strong Skipping Mode `===` vs `==`, lambda closure capture, `rememberUpdatedState`, and `snapshotFlow`)
+  - `lessons/0072-multi-module-explicit-api-di.html` (`13.6`: Multi-Module Architecture, `explicitApi()` & Pure-Kotlin DI — `internal` module boundaries, `kotlin { explicitApi() }`, `api` vs `implementation`, and scoped `AppGraph` + assisted `fun interface` factories)
+  - Wired `0069 -> 0071 -> 0072 -> 0070 -> ../index.html` and updated `0070-review-2027-android-mastery.html` (`R13`), `reference/android.html`, and `reference/modern-kotlin-tooling.html`.
+- Upgraded all teaching lessons across the entire course (`0001`–`0072`) for the learner's *"can read some Kotlin, unable to write it"* profile:
+  - Added tailored **Blank-Page Syntax Blueprints** (`.callout.blueprint`) to all 59 teaching lessons (`0001`–`0072`).
+  - Added 40 live runnable `<code class="kt-run">` **Interactive Concept Labs** across Sections 3–11 (`0013`–`0060`) so every teaching lesson in the course has runnable concept examples before exercises.
+  - Populated `expectedOutput` on all 46 previously unchecked `-ex1` ("Write from blank") exercises in `assets/answers.js`, and upgraded `assets/lesson.js` to detect unmodified starter code so clicking **▶ Run & Check** on an untouched starter never awards a false green pass.
+  - Added `debounce`/`distinctUntilChanged`/`flatMapLatest` and `.stateIn(WhileSubscribed(5_000))` explanations to `0052` and `0053` before `0054` (`10.R`), expanded all Review lessons (`R3`–`R13`) to `>= 4` recall prompts and `>= 4` quizzes, and rebalanced all 17 length-skewed quizzes.
+- See `learning-records/0008-senior-2027-expansion-and-blank-page-upgrade.md` for full verification metrics (73 lessons, 147 verified exercises, 253 balanced quizzes).

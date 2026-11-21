@@ -6,6 +6,5 @@ fun page(page: Int, size: Int): List<String> =
     cache.getOrPut("books") { books.drop(page * size).take(size) }
 
 fun main() {
-    println(page(1, 2))
-    println(page(2, 2))
+    println("${page(1, 2)} ${page(2, 2)}")
 }

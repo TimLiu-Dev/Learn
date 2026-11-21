@@ -14,7 +14,16 @@ import re
 import json
 import sys
 sys.path.append('scripts')
-from lesson_builder import extract_method_name, build_stubs, build_solutions, build_hints, build_quiz, extract_test_cases
+from lesson_builder import (
+    extract_method_name,
+    build_stubs,
+    build_solutions,
+    build_hints,
+    build_quiz,
+    extract_test_cases,
+    enrich_approaches,
+    build_non_code_solution,
+)
 
 def render_lesson_v2(p):
     num_str = f"{p['num']:04d}"
@@ -23,19 +32,34 @@ def render_lesson_v2(p):
     category = p['category']
     diff = p['difficulty']
     pass_label = p.get('pass_label', 'Pass 2A')
-    prev_file = p.get('prev_file', 'master-plan.html')
-    next_file = p.get('next_file', 'master-plan.html')
+    prev_file = p.get('prev_file', '../master-plan.html')
+    next_file = p.get('next_file', '../master-plan.html')
+    if prev_file == 'master-plan.html':
+        prev_file = '../master-plan.html'
+    if next_file == 'master-plan.html':
+        next_file = '../master-plan.html'
     prev_num = p['num'] - 1
     next_num = p['num'] + 1
     lc_slug = p.get('lc_slug', title.lower().replace(' ', '-').replace("'", ""))
-    lc_url = f"https://leetcode.com/problems/{lc_slug}/"
+    leetcode_only = {"maximum-average-subarray-i", "number-of-recent-calls", "simple-bank-system", "keys-and-rooms"}
+    if p.get('nc_url'):
+        lc_url = p['nc_url']
+    elif lc_slug in leetcode_only:
+        lc_url = f"https://leetcode.com/problems/{lc_slug}/"
+    else:
+        nc_slug = "time-based-key-value-store" if str(lc_id).lower() == "custom" or lc_slug == "in-memory-key-value-store-ttl" else lc_slug
+        lc_url = f"https://neetcode.io/problems/{nc_slug}/question?list=allNC"
+    prev_label = "Curriculum Hub" if prev_num < 1 else f"Prev #{prev_num}"
+    next_label = "Curriculum Hub" if next_file == '../master-plan.html' else f"Next #{next_num}"
 
     method_name = extract_method_name(p)
     stubs = build_stubs(p, method_name)
     solutions = build_solutions(p)
     hints = build_hints(p)
-    quiz_questions = build_quiz(p)
-    test_cases = extract_test_cases(p)
+    quiz_questions = p.get('quiz_questions') or build_quiz(p)
+    test_cases = p.get('test_cases') or extract_test_cases(p)
+    approaches = enrich_approaches(p)
+    non_code = build_non_code_solution(p)
 
     # Clean raw LaTeX strings from plain_english and notes
     def clean_latex(text):
@@ -108,14 +132,30 @@ def render_lesson_v2(p):
       </div>
       <div class="flex items-center gap-2">
         <a href="{prev_file}" class="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs font-mono text-slate-300 hover:text-white transition-colors flex items-center gap-1.5" title="Previous Problem">
-          <span>&larr;</span> <span class="hidden sm:inline">Prev #{prev_num}</span>
+          <span>&larr;</span> <span class="hidden sm:inline">{prev_label}</span>
         </a>
         <a href="../master-plan.html" class="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs font-mono text-slate-300 hover:text-white transition-colors hidden lg:flex items-center gap-1">
           <span>Master Plan</span>
         </a>
         <a href="{next_file}" class="px-3 py-1.5 rounded-lg bg-emerald-500 text-slate-950 font-bold text-xs font-mono hover:bg-emerald-400 transition-colors flex items-center gap-1.5" title="Next Problem">
-          <span class="hidden sm:inline">Next #{next_num}</span> <span>&rarr;</span>
+          <span class="hidden sm:inline">{next_label}</span> <span>&rarr;</span>
         </a>
+      </div>
+    </div>
+    <!-- Quick-Jump Anchor Bar -->
+    <div class="border-t border-slate-800/80 mt-2.5 pt-2 overflow-x-auto custom-scrollbar">
+      <div class="max-w-7xl mx-auto flex items-center gap-4 text-xs font-mono text-slate-400 whitespace-nowrap">
+        <span class="text-slate-500 font-bold uppercase tracking-wider text-[10px]">Jump to:</span>
+        <a href="#section-0" class="hover:text-emerald-400 transition-colors font-bold text-slate-300">0. Problem</a>
+        <a href="#sketchpad-section" class="hover:text-teal-400 transition-colors font-bold text-teal-300">✏️ Whiteboard</a>
+        <a href="#section-1" class="hover:text-emerald-400 transition-colors">1. Mental Model</a>
+        <a href="#section-2" class="hover:text-emerald-400 transition-colors">2. Naive vs Optimal</a>
+        <a href="#section-2-5" class="hover:text-amber-300 transition-colors font-bold text-amber-400">2.5 Solution &amp; Pseudocode</a>
+        <a href="#section-3" class="hover:text-emerald-400 transition-colors">3. Trace Table</a>
+        <a href="#section-4" class="hover:text-emerald-400 transition-colors">4. Pocock Stepper</a>
+        <a href="#section-5" class="hover:text-emerald-400 transition-colors font-bold text-indigo-400">5. Code &amp; Practice</a>
+        <a href="#section-6" class="hover:text-emerald-400 transition-colors">6. Interview Script</a>
+        <a href="#section-7" class="hover:text-emerald-400 transition-colors">7. Quiz &amp; Recall</a>
       </div>
     </div>
   </header>
@@ -127,16 +167,15 @@ def render_lesson_v2(p):
       <div class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-5">
         <div>
           <div class="flex items-center gap-2 text-xs font-mono text-amber-400 font-semibold mb-1">
-            <span>{pass_label.upper()} &bull; LESSON {p['num']} OF 103</span>
+            <span>{pass_label.upper()} &bull; LESSON {p['num']} OF 116</span>
             <span>&bull;</span>
             <span class="text-slate-400">CATEGORY: {category}</span>
           </div>
-          <h2 class="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">LeetCode #{lc_id}: {title}</h2>
+          <h2 class="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">Problem #{lc_id}: {title}</h2>
         </div>
         <div class="flex items-center gap-3">
-          <a href="{lc_url}" target="_blank" rel="noopener noreferrer" class="px-3.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 text-xs font-mono font-semibold transition-colors flex items-center gap-1.5">
-            <span>Official LC #{lc_id}</span>
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+          <a href="{lc_url}" target="_blank" rel="noopener noreferrer" class="px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-mono font-bold transition-colors flex items-center gap-1.5 shadow-sm">
+            <span>View on NeetCode ↗</span>
           </a>
         </div>
       </div>
@@ -345,6 +384,70 @@ def render_lesson_v2(p):
       </div>
     </section>
 
+    <!-- Section 2.5: Non-Code Solution Blueprint & Language-Agnostic Pseudocode -->
+    <section id="section-2-5" class="rounded-2xl border border-amber-500/30 bg-slate-900/70 p-6 sm:p-8 space-y-6 shadow-xl">
+      <div class="border-b border-slate-800 pb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <span class="text-xs font-mono text-amber-400 uppercase tracking-wider font-semibold">Section 2.5 &bull; Pre-Trace Algorithm Blueprint</span>
+          <h3 class="text-xl sm:text-2xl font-bold text-white mt-1">Non-Code Solution Explanation &amp; Whiteboard Pseudocode</h3>
+          <p class="text-xs text-slate-400 mt-1">Master the step-by-step logic and state variables in plain English before tracing or writing code.</p>
+        </div>
+        <span class="px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs font-mono font-bold">
+          Language-Agnostic Blueprint
+        </span>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- State & Data Structure Setup -->
+        <div class="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+          <div class="flex items-center gap-2 text-xs font-mono font-bold text-cyan-400 uppercase tracking-wider">
+            <span class="w-2 h-2 rounded-full bg-cyan-400"></span>
+            1. State &amp; Data Structure Setup
+          </div>
+          <p class="text-xs text-slate-400 leading-relaxed">Variables and containers maintained during execution:</p>
+          <ul class="space-y-2.5 text-xs text-slate-300">
+"""
+    for st_name, st_role in non_code.get('state_setup', []):
+        h += f"""            <li class="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800/80">
+              <strong class="text-emerald-400 font-mono block mb-0.5">{clean_latex(st_name)}</strong>
+              <span class="text-slate-300 leading-relaxed">{clean_latex(st_role)}</span>
+            </li>\n"""
+
+    h += f"""          </ul>
+        </div>
+
+        <!-- Step-by-Step Plain-English Algorithm -->
+        <div class="lg:col-span-2 p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+          <div class="flex items-center gap-2 text-xs font-mono font-bold text-emerald-400 uppercase tracking-wider">
+            <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+            2. Step-by-Step Non-Code Algorithm Walkthrough
+          </div>
+          <div class="space-y-3">
+"""
+    for step_title, step_body in non_code.get('walkthrough_steps', []):
+        h += f"""            <div class="p-3.5 rounded-xl bg-slate-900/70 border border-slate-800/80 space-y-1">
+              <div class="text-xs font-mono font-bold text-amber-300">{clean_latex(step_title)}</div>
+              <p class="text-xs sm:text-sm text-slate-300 leading-relaxed">{clean_latex(step_body)}</p>
+            </div>\n"""
+
+    h += f"""          </div>
+        </div>
+      </div>
+
+      <!-- Clean Language-Agnostic Pseudocode Card -->
+      <div class="p-5 rounded-xl bg-slate-950 border border-amber-500/30 space-y-3">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-mono font-bold text-amber-400 uppercase tracking-wider">3. Clean Whiteboard Pseudocode (Syntax-Free)</span>
+          <span class="text-[11px] font-mono text-slate-500">Direct blueprint for Trace Table &amp; Code</span>
+        </div>
+        <pre class="p-4 rounded-xl bg-slate-900/90 border border-slate-800 text-xs font-mono text-emerald-300 overflow-x-auto leading-relaxed">"""
+    for idx_p, pline in enumerate(non_code.get('pseudocode_lines', []), 1):
+        h += f"""<span class="text-slate-600 select-none mr-3">{idx_p:02d}</span>{html.escape(pline)}\n"""
+    h += f"""</pre>
+        <p class="text-xs text-slate-400 leading-relaxed">{non_code.get('bridge_note', '')}</p>
+      </div>
+    </section>
+
     <!-- Section 3: Concrete Step-by-Step Trace Table -->
     <section id="section-3" class="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 sm:p-8 space-y-6">
       <div class="border-b border-slate-800 pb-4">
@@ -389,7 +492,7 @@ def render_lesson_v2(p):
         <div class="flex items-center gap-2">
 """
     for pr in st.get('presets', []):
-        h += f"""          <button onclick="{pr.get('onclick', '')}" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-300">{pr.get('label', '')}</button>\n"""
+        h += f"""          <button onclick="{html.escape(pr.get('onclick', ''), quote=True)}" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-300">{pr.get('label', '')}</button>\n"""
 
     h += f"""        </div>
       </div>
@@ -397,7 +500,7 @@ def render_lesson_v2(p):
       <!-- Custom Input Bar -->
       <div class="flex items-center gap-3 p-3 rounded-xl bg-slate-950 border border-slate-800">
         <label for="custom-input" class="text-xs font-mono text-slate-400 whitespace-nowrap">Input:</label>
-        <input id="custom-input" type="text" value="{st.get('default_input', '')}" class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1 text-xs font-mono text-white focus:outline-none focus:border-emerald-500">
+        <input id="custom-input" type="text" value="{html.escape(st.get('default_input', ''), quote=True)}" class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1 text-xs font-mono text-white focus:outline-none focus:border-emerald-500">
         <button onclick="handleCustomInput()" class="px-3 py-1 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs font-mono transition-colors">Apply</button>
       </div>
 
@@ -466,8 +569,8 @@ def render_lesson_v2(p):
         <!-- Approach Tabs Selector -->
         <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs font-mono">
 """
-    app_count = len(p.get('approaches', []))
-    for idx, app in enumerate(p.get('approaches', [])):
+    app_count = len(approaches)
+    for idx, app in enumerate(approaches):
         app_num = idx + 1
         is_last = (app_num == app_count)
         name = app.get('name', f'Approach {app_num}')
@@ -479,7 +582,7 @@ def render_lesson_v2(p):
     h += f"""        </div>
       </div>
 """
-    for idx, app in enumerate(p.get('approaches', [])):
+    for idx, app in enumerate(approaches):
         app_num = idx + 1
         hidden_cls = "" if app_num == app_count else "hidden"
         name = app.get('name', f'Approach {app_num}')
@@ -685,7 +788,7 @@ def render_lesson_v2(p):
         <ol class="text-xs sm:text-sm text-slate-300 space-y-2 list-decimal list-inside leading-relaxed">
           <li><strong>Step 1 (Immediate):</strong> Close this browser tab and write the solution on paper from memory.</li>
           <li><strong>Step 2 (24 Hours):</strong> Re-read Section 1 ({p.get('mental_model', {}).get('analogy_title', 'Mental Concept')}) and articulate the mental switch out loud.</li>
-          <li><strong>Step 3 (48 Hours):</strong> Open LeetCode #{lc_id} cold. Code the solution in under 10 minutes without any hints.</li>
+          <li><strong>Step 3 (48 Hours):</strong> Open <a href="{lc_url}" target="_blank" rel="noopener noreferrer" class="text-emerald-400 underline font-semibold">NeetCode #{lc_id} ↗</a> cold. Code the solution in under 10 minutes without any hints.</li>
         </ol>
 
         <div class="pt-2 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
@@ -909,6 +1012,27 @@ def render_lesson_v2(p):
       renderStepper();
     }}
 
+    {st.get('js_custom_input', '''function handleCustomInput() {{
+      const el = document.getElementById('custom-input');
+      if (!el) return;
+      const raw = el.value.trim();
+      if (!raw) return;
+      try {{
+        const parsed = JSON.parse('[' + raw + ']');
+        if (typeof loadPreset === 'function') {{
+          loadPreset.apply(null, parsed);
+          return;
+        }}
+        if (typeof buildSteps === 'function') {{
+          buildSteps.apply(null, parsed);
+          stepperReset();
+          return;
+        }}
+      }} catch (_) {{}}
+      if (typeof loadPreset === 'function') loadPreset(raw);
+      else if (typeof buildSteps === 'function') {{ buildSteps(raw); stepperReset(); }}
+    }}''')}
+
     function togglePlay() {{
       const btn = document.getElementById('btn-play');
       if (!btn) return;
@@ -933,7 +1057,7 @@ def render_lesson_v2(p):
 
     // ---------------- SOLUTION TABS LOGIC ----------------
     function switchApproach(num) {{
-      const total = {len(p.get('approaches', []))};
+      const total = {len(approaches)};
       for (let n = 1; n <= total; n++) {{
         const block = document.getElementById(`approach-${{n}}`);
         const tab = document.getElementById(`tab-app-${{n}}`);
@@ -966,7 +1090,7 @@ def render_lesson_v2(p):
       }};
     }}
 
-    for (let a = 1; a <= {len(p.get('approaches', []))}; a++) {{
+    for (let a = 1; a <= {len(approaches)}; a++) {{
       window[`switchLangApp${{a}}`] = makeLangSwitcher(a);
     }}
 
@@ -1042,6 +1166,7 @@ def render_lesson_v2(p):
       LessonRuntime.PracticeArena.init({{
         problemId: '{num_str}',
         methodName: '{method_name}',
+        {f"ioType: '{p['io_type']}'," if p.get('io_type') else ""}
         starterStubs: {json.dumps(stubs)},
         modelSolutions: {json.dumps(solutions)},
         hints: {json.dumps(hints)},

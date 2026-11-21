@@ -24,6 +24,10 @@
   Production-grade Swift SQLite toolkit for concurrent database access, migrations, and observation. Use for: high-throughput offline-first persistence beyond SwiftData's limits.
 - [swift-format (apple/swift-format)](https://github.com/swiftlang/swift-format)
   Official Swift toolchain formatter and linter. Use for: automated CI style gates and Xcode Build Tool Plugins.
+- [Apple Developer: Swift Charts, Canvas & DocC](https://developer.apple.com/documentation/charts)
+  Official Apple references for declarative high-density charting, immediate-mode graphics, and DocC documentation catalogs. Use for: telemetry dashboards and internal SDK docs.
+- [Apple Developer: CKSyncEngine (CloudKit)](https://developer.apple.com/documentation/cloudkit/cksyncengine)
+  Modern Apple sync engine managing change tokens, batching, and record conflicts. Use for: zero-backend multi-device iCloud sync.
 
 ## Wisdom (Communities)
 

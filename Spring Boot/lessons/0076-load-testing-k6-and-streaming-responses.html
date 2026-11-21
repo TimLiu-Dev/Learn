@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0076: Load Testing (k6) &amp; Memory-Safe Streaming (StreamingResponseBody)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 3 • Phase 15: Production Telemetry, Async Pools &amp; Performance Verification</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21/25</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0076 • Stage 3 • Phase 15</span>
+    <h1 style="margin-top: 8px;">Load Testing with <code>k6</code> &amp; Memory-Safe Streaming (<code>StreamingResponseBody</code>)</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: A junior engineer assumes a Spring Boot endpoint is fast because it returned HTTP 200 in 8ms in Postman. A senior engineer proves it holds <strong>P99 &lt; 250ms under 500 virtual users</strong> before shipping—and ensures heavy report exports never crash the JVM with <code>OutOfMemoryError</code> by streaming rows straight to the HTTP socket via <strong><code>StreamingResponseBody</code></strong>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://grafana.com/docs/k6/latest/using-k6/thresholds/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Grafana k6 Official Docs: Thresholds &amp; Load Scenarios</a> and <a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/web/servlet/mvc/method/annotation/StreamingResponseBody.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring Framework Javadoc: StreamingResponseBody</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Android Mental Model Bridge</div>
+    <p style="margin-bottom: 0;">
+      Just as Android's Macrobenchmark + Perfetto measures P95/P99 frame jank instead of trusting one tap in an emulator, <strong>Grafana k6</strong> drives realistic concurrent HTTP load against your Dockerized Spring Boot service and fails CI automatically if P99 latency or error rate crosses your threshold.
+    </p>
+  </div>
+
+  <h2>1. Why Averages Lie &amp; How <code>k6</code> Catches Pool Starvation Early</h2>
+  <p>
+    Running a single `curl` request tells you nothing about HikariCP pool exhaustion, lock contention, or GC pauses. With a 25-line JavaScript `k6` script (`k6 run load-test.js`), you ramp up concurrent Virtual Users (`vus`), define automated pass/fail SLO gates (`http_req_duration: ['p(99)&lt;250']`, `http_req_failed: ['rate&lt;0.01']`), and watch HikariCP / Actuator metrics in real time.
+  </p>
+
+  <h2>2. Stopping OOM Crashes on Exports: <code>StreamingResponseBody</code> + JDBC Streaming</h2>
+  <p>
+    Never load 200,000 database rows into a <code>List&lt;OrderDto&gt;</code> or <code>ByteArrayOutputStream</code> in heap memory before returning a CSV/JSON export! Instead:
+  </p>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li>Return <code>ResponseEntity&lt;StreamingResponseBody&gt;</code> so Spring writes chunks incrementally to the HTTP output stream with $O(1)$ constant heap usage (~8KB buffer).</li>
+    <li>Detach JPA entities (or use <code>JdbcTemplate.queryForStream(...)</code> / keyset pagination) and flush periodically while respecting client disconnects.</li>
+  </ul>
+
+  <h2>3. Production Implementation (k6 Threshold Script &amp; StreamingResponseBody)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">k6 P99 Load Gate &amp; O(1)-Memory StreamingResponseBody Controller</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 21/25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>// load-test.js (run with: k6 run load-test.js)
+// import http from 'k6/http';
+// import { check } from 'k6';
+// export const options = {
+//   stages: [{ duration: '30s', target: 200 }, { duration: '1m', target: 200 }],
+//   thresholds: { http_req_failed: ['rate&lt;0.01'], http_req_duration: ['p(99)&lt;250'] }
+// };
+
+@RestController
+public class OrderExportController {
+
+    @GetMapping(value = "/api/v1/orders/export", produces = "text/csv")
+    public ResponseEntity&lt;StreamingResponseBody&gt; exportCsv(OrderExportService exportService) {
+        StreamingResponseBody body = outputStream -&gt; {
+            try (var writer = new BufferedWriter(new OutputStreamWriter(outputStream, StandardCharsets.UTF_8))) {
+                writer.write("id,status,total_cents\n");
+                exportService.streamRows(row -&gt; {
+                    writer.write(row.id() + "," + row.status() + "," + row.totalCents() + "\n");
+                });
+                writer.flush();
+            }
+        };
+        return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"orders.csv\"")
+            .body(body);
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>@RestController
+class OrderExportController(private val exportService: OrderExportService) {
+
+    @GetMapping("/api/v1/orders/export", produces = ["text/csv"])
+    fun exportCsv(): ResponseEntity&lt;StreamingResponseBody&gt; {
+        val body = StreamingResponseBody { outputStream -&gt;
+            outputStream.bufferedWriter(Charsets.UTF_8).use { writer -&gt;
+                writer.write("id,status,total_cents\n")
+                exportService.streamRows { row -&gt;
+                    writer.write("${row.id},${row.status},${row.totalCents}\n")
+                }
+                writer.flush()
+            }
+        }
+        return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"orders.csv\"")
+            .body(body)
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to test your understanding of load testing gates and constant-memory streaming.</p>
+
+  <div class="quiz-card" id="q0076_1" data-explanation="Building a 500MB List or ByteArrayOutputStream inside a 1GB Kubernetes pod triggers OutOfMemoryError (or container Exit Code 137) as soon as two users click Export simultaneously. StreamingResponseBody writes rows incrementally in O(1) memory.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Why does returning <code>byte[]</code> from an endpoint that exports 300,000 orders cause production pod crashes under concurrent downloads?</div>
+    <div class="quiz-code-snippet"><pre><code>@GetMapping("/orders/export")
+public byte[] exportAll() { // ❌ Buffers entire 300,000-row CSV in JVM heap!</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Buffering huge exports in heap multiplies memory across concurrent downloads and triggers OOMKilled crashes.">
+        Buffering entire multi-megabyte exports in JVM heap causes OOMKilled container crashes under concurrent users.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Spring MVC serializes byte[] responses natively; the failure is excessive JVM heap allocation.">
+        Spring MVC rejects byte[] return types over HTTP unless wrapped inside a Kotlin coroutine Flow.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. StreamingResponseBody uses chunked HTTP transfer encoding, whereas byte[] triggers heap allocation spikes.">
+        Returning byte[] disables PostgreSQL connection pooling inside HikariCP for the entire Kubernetes pod.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Client browsers and mobile apps accept chunked or byte[] downloads identically.">
+        Web browsers refuse to download CSV files unless the server returns an empty 204 response.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0076_2" data-explanation="k6 thresholds (e.g. http_req_duration: ['p(99)<250']) turn performance expectations into automated exit-code assertions in CI so latency regressions fail the build before reaching production.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">What happens when a <code>k6</code> load test finishes and a configured threshold like <code>http_req_duration: ['p(99)&lt;250']</code> is violated?</div>
+    <div class="quiz-code-snippet"><pre><code>export const options = {
+  thresholds: { http_req_duration: ['p(99)&lt;250'], http_req_failed: ['rate&lt;0.01'] }
+};</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. k6 is a client load generator and never modifies application JVM flags or Kubernetes replicas.">
+        k6 automatically scales up your Kubernetes Deployment replica count to lower server tail latency.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Threshold failures cause k6 to exit with a non-zero exit code so CI pipelines fail automatically.">
+        k6 fails the run with a non-zero exit code, automatically breaking the CI/CD performance gate.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. k6 logs the breach and exits non-zero; it does not patch Spring Boot YAML files.">
+        k6 rewrites your application.yml HikariCP pool size and commits a pull request automatically.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Averages and P99 metrics measure completed requests; k6 never cancels database transactions.">
+        k6 sends a SIGKILL signal to PostgreSQL so slow queries abort before reaching 250ms.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0076_3" data-explanation="Even if the HTTP response uses StreamingResponseBody, calling repository.findAll() eagerly materializes every @Entity into a giant ArrayList AND pins them in Hibernate's first-level persistence context! Always pair StreamingResponseBody with keyset paging or JdbcTemplate/JPA Stream + detach.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">You switched to <code>StreamingResponseBody</code>, yet exporting 500,000 rows still throws <code>OutOfMemoryError</code> because you called <code>orderRepo.findAll()</code> inside the lambda. Why?</div>
+    <div class="quiz-code-snippet"><pre><code>StreamingResponseBody body = out -&gt; {
+    for (Order o : orderRepo.findAll()) { ... } // ❌ Why did heap still explode?
+};</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. OutputStreamWriter buffers only a tiny 8KB chunk in memory.">
+        OutputStreamWriter allocates a separate 100MB direct byte buffer for every single written CSV line.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. HTTP chunked transfer encoding works cleanly on both HTTP/1.1 and HTTP/2.">
+        Tomcat buffers the entire StreamingResponseBody output in RAM unless HTTP/1.1 keep-alive is disabled.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! findAll() still loads all 500,000 entities into an ArrayList and Hibernate's L1 persistence context.">
+        JpaRepository.findAll() still loads all 500,000 entities into JVM memory before streaming begins.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. UTF-8 string encoding takes minimal memory compared to 500,000 managed JPA entity graphs.">
+        StandardCharsets.UTF_8 doubles the size of every ASCII character stored inside PostgreSQL tables.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Implement an $O(1)$-heap CSV streaming controller returning <code>ResponseEntity&lt;StreamingResponseBody&gt;</code> and writing chunks directly to <code>outputStream</code>.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0076-lab"
+       data-starter-java="package com.nexus.export;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
+import java.util.stream.Stream;
+
+public class ExportEndpoint {
+    public static ResponseEntity&lt;StreamingResponseBody&gt; streamCsv(Stream&lt;String&gt; rows) {
+        // TODO 1: Create a StreamingResponseBody lambda writing each row + &quot;\n&quot; to outputStream, then flush()
+        // TODO 2: Return ResponseEntity.ok().body(body)
+        return null;
+    }
+}"
+       data-starter-kotlin="package com.nexus.export
+
+import org.springframework.http.ResponseEntity
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody
+import java.util.stream.Stream
+
+object ExportEndpoint {
+    fun streamCsv(rows: Stream&lt;String&gt;): ResponseEntity&lt;StreamingResponseBody&gt; {
+        // TODO 1: Create StreamingResponseBody writing each row + &quot;\n&quot; to outputStream, then flush()
+        // TODO 2: Return ResponseEntity.ok().body(body)
+        throw NotImplementedError()
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0076</span>
+        <span class="practice-title">O(1)-Memory StreamingResponseBody Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 21/25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0076-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Construct a <code>StreamingResponseBody</code> lambda that wraps <code>outputStream</code> in a writer, iterates <code>rows</code> writing each line, calls <code>writer.flush()</code>, and returns <code>ResponseEntity.ok().body(body)</code>.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.nexus.export;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
+import java.util.stream.Stream;
+
+public class ExportEndpoint {
+    public static ResponseEntity&lt;StreamingResponseBody&gt; streamCsv(Stream&lt;String&gt; rows) {
+        // TODO 1: Create a StreamingResponseBody lambda writing each row + &quot;\n&quot; to outputStream, then flush()
+        // TODO 2: Return ResponseEntity.ok().body(body)
+        return null;
+    }
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Define StreamingResponseBody</div>
+        <div>Use <code>StreamingResponseBody body = outputStream -&gt; { ... };</code> (or <code>StreamingResponseBody { outputStream -&gt; ... }</code> in Kotlin).</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Stream &amp; Flush Rows</div>
+        <div>Wrap <code>outputStream</code> in a <code>BufferedWriter</code>, iterate <code>rows.forEach(...)</code>, and call <code>writer.flush()</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Return ResponseEntity</div>
+        <div>Return <code>ResponseEntity.ok().body(body)</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 21/25 Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.export;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
+import java.util.stream.Stream;
+
+public class ExportEndpoint {
+    public static ResponseEntity&lt;StreamingResponseBody&gt; streamCsv(Stream&lt;String&gt; rows) {
+        StreamingResponseBody body = outputStream -&gt; {
+            try (var writer = new BufferedWriter(new OutputStreamWriter(outputStream, StandardCharsets.UTF_8))) {
+                rows.forEach(line -&gt; {
+                    try { writer.write(line + "\n"); } catch (Exception e) { throw new RuntimeException(e); }
+                });
+                writer.flush();
+            }
+        };
+        return ResponseEntity.ok().body(body);
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.export
+
+import org.springframework.http.ResponseEntity
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody
+import java.util.stream.Stream
+
+object ExportEndpoint {
+    fun streamCsv(rows: Stream&lt;String&gt;): ResponseEntity&lt;StreamingResponseBody&gt; {
+        val body = StreamingResponseBody { outputStream -&gt;
+            outputStream.bufferedWriter(Charsets.UTF_8).use { writer -&gt;
+                rows.forEach { line -&gt; writer.write("$line\n") }
+                writer.flush()
+            }
+        }
+        return ResponseEntity.ok().body(body)
+    }
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Pairing a database cursor/stream with <code>StreamingResponseBody</code> keeps heap allocation flat regardless of export size, while <code>k6</code> thresholds prevent P99 regressions from slipping past CI.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"Why does Spring MVC execute StreamingResponseBody on a separate async task executor, and how do you configure spring.mvc.async.request-timeout so large downloads don't time out after 30 seconds?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0052-boot4-native-opentelemetry-and-lgtm-stack.html" class="btn btn-secondary">← Previous: Lesson 0052</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0081-spring-async-thread-pools-and-task-decorator.html" class="btn btn-primary">Next: Lesson 0081 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0076 (Stage 3: Production Engineering)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0076-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "StreamingResponseBody Lambda Implemented",
+    passed: /StreamingResponseBody/.test(code) && /outputStream/.test(code),
+    error: "Must create a StreamingResponseBody writing to outputStream."
+  });
+  tests.push({
+    name: "Stream Rows & Flush Writer",
+    passed: /rows/.test(code) && /\.flush\s*\(\s*\)/.test(code),
+    error: "Must write each row from rows and call writer.flush()."
+  });
+  tests.push({
+    name: "Return ResponseEntity.ok().body(...)",
+    passed: /ResponseEntity\.ok\s*\(\s*\)\.body\s*\(/.test(code),
+    error: "Must return ResponseEntity.ok().body(body)."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

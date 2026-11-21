@@ -11,6 +11,7 @@ Transition from a junior Android engineer to an autonomous, high-impact Senior i
 - Production observability & reliability: MetricKit telemetry (hang rate, thermal, dirty memory), Apple Unified Logging (`os.Logger`), crash symbolication (dSYM), and Privacy Manifests (`PrivacyInfo.xcprivacy`).
 - Completion of a flagship, Senior-grade capstone app featuring modular architecture, offline sync with vector clocks / conflict resolution, WidgetKit, MetricKit telemetry, and CI/CD automation.
 - 2027 Senior iOS frontier readiness: Swift 6.2/6.3 Approachable Concurrency (`nonisolated(nonsending)`, `Mutex`), zero-copy/ownership primitives (`~Copyable`, `InlineArray`, `Span<T>`), Objective-C legacy interoperability, TCA vs. `@Observable` UDF trade-offs, FileManager/Data Protection & direct SQLite/GRDB, XCFramework binary distribution, `swift-format`/SwiftLint/Test Plans, iOS 26 Liquid Glass & `.xcstrings` localization, `FoundationModels` & Core ML, `AppIntents`, `StoreKit 2`/Passkeys, and Xcode Cloud.
+- Advanced SwiftUI DSL & Apple ecosystem mastery: `@resultBuilder`/`@ViewBuilder` desugaring, `ScrollView`/`List` performance & `PreferenceKey`, `Swift Charts` & 120fps `Canvas`, adaptive `NavigationSplitView`/custom `Transition`/`Transferable`, first-party `CloudKit`/`CKSyncEngine` sync, and `DocC`/`#Preview`/SwiftUI Inspector workflows.
 
 ## Constraints
 - Accelerate through Android/Kotlin parallels, but rigorously expose Apple platform internals (e.g., ARC retain trees vs JVM GC, Darwin kernel jetsam vs Android low-memory killer, dyld vs ART runtime).
@@ -19,4 +20,4 @@ Transition from a junior Android engineer to an autonomous, high-impact Senior i
 ## Out of scope
 - Cross-platform wrappers (React Native, Flutter, KMP) — pure native Apple platform mastery.
 - Game development frameworks (SpriteKit, Metal shaders) outside standard UI rendering and CoreAnimation.
-- Obsolete/deprecated `roadmap.sh/ios` tooling (Carthage, CocoaPods authoring, RxSwift, Storyboards/XIBs/IBOutlets, Alamofire, SwiftUI `NavigationView`, Tailor).
+- Obsolete/deprecated `roadmap.sh/ios` tooling (Carthage, CocoaPods authoring, RxSwift, Storyboards/XIBs/IBOutlets, Alamofire, SwiftUI `NavigationView`, Tailor) and server-side Swift (`Vapor`, `Hummingbird`, `SwiftNIO`) or legacy SwiftUI wrappers (`@ObservedObject`, `@StateObject`, `@EnvironmentObject`).

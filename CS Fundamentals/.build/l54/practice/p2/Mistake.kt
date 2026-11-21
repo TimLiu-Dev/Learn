@@ -44,7 +44,7 @@ class Parser(private val tokens: List<String>) {
         return left
     }
 
-private fun atom(): Expr {
+    private fun atom(): Expr {
         val t = next() ?: throw CalcError("expected a number or '(' but found end of input")
         return when {
             t == "(" -> expr().also { if (next() != ")") throw CalcError("expected ')'") }

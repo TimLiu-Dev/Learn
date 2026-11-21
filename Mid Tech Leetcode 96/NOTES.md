@@ -1,17 +1,17 @@
 # NOTES & Architectural Decisions
 
-## 1. File Naming Standard: Dual Indexing (103 Problems)
+## 1. File Naming Standard: Dual Indexing (116 Problems)
 All lessons follow chronological dual indexing:
-`./lessons/{0001-0103}-lc{LeetCode#}-{slug}.html`
-- **Core Set (`0001`–`0096`)**: Preserved intact so spaced-retrieval pairs (`#933→#362`, `#191→#338`, `#435→#452`, `#417→#130`, `#207→#210`) and existing URLs/localStorage keys never break.
-- **2027 Mid-Level Additions (`0097`–`0103`)**:
-  - `0097-lc88-merge-sorted-array.html` (Pass 1 — Reverse 3-pointer in-place merge)
-  - `0098-lc359-logger-rate-limiter.html` (Pass 1 — Timestamp HashMap deduplication)
-  - `0099-lc53-maximum-subarray.html` (Pass 2A — Kadane's 1D DP/greedy reset)
-  - `0100-lc48-rotate-image.html` (Pass 2A — Transpose + reflect in-place matrix geometry)
-  - `0101-lc79-word-search.html` (Pass 2B — Karat #1 grid DFS + visited backtracking)
-  - `0102-lc399-evaluate-division.html` (Pass 2B — Fintech weighted ratio graph BFS/DFS)
-  - `0103-lc5-longest-palindromic-substring.html` (Pass 2B — Outward two-pointer center expansion)
+`./lessons/{0001-0116}-lc{ID#}-{slug}.html`
+- **Core Set (`0001`–`0096`)**: Preserved intact so spaced-retrieval pairs (`#933→#362`, `#191→#338`, `#435→#452`, `#417→#130`, `#207→#210`) and existing URLs/localStorage keys never break. Low-ROI/redundant entries (`#0003`, `#0020`, `#0021`, `#0022`, `#0053`, `#0065`, `#0077`) are tagged `Optional / Low-ROI` in `master-plan.html`.
+- **2027 Mid-Level Additions (`0097`–`0116`)**:
+  - `0097`–`0110`: `#88`, `#359`, `#53`, `#48`, `#79`, `#399`, `#5`, `#271`, `#230`, `#105`, `#621`, `#55`, `#416`, `#91`
+  - `0111-lc528-random-pick-with-weight.html` (Pass 2B — Prefix Sum + lower-bound binary search)
+  - `0112-lc34-find-first-and-last-position-of-element-in-sorted-array.html` (Pass 2A — Dual biased binary search)
+  - `0113-lc2-add-two-numbers.html` (Pass 2A — Dummy-head digit carry addition)
+  - `0114-lc143-reorder-list.html` (Pass 2B — Mid-split + reverse + in-place zip)
+  - `0115-lc152-maximum-product-subarray.html` (Pass 2B — Dual-extremum curMax/curMin DP)
+  - `0116-lc1091-shortest-path-in-binary-matrix.html` (Pass 2B — 8-directional BFS shortest path)
 
 ## 2. Shared `/teach` Component Architecture (`./assets/`)
 - `./assets/lesson-theme.css`: Shared typography (`Plus Jakarta Sans` + `JetBrains Mono`), dark-mode Tufte-meets-Pocock surfaces, custom scrollbars, code editor & quiz feedback states, and print rules.
@@ -28,6 +28,7 @@ All lessons follow chronological dual indexing:
 - **Whiteboard**: Collapsible vector sketchpad.
 - **Section 1**: Mental Model ("Explain Like I'm 12"), "A-Ha!" Switch, Pattern Trigger, and Sister Problems.
 - **Section 2**: Naive Trap (Red) vs Optimal Breakthrough (Green) + Asymptotic Trade-off Matrix.
+- **Section 2.5**: Non-Code Solution Explanation & Language-Agnostic Whiteboard Pseudocode (State Setup, Step-by-Step Plain-English Walkthrough, and Clean Syntax-Free Pseudocode).
 - **Section 3**: Concrete Variable Trace Table.
 - **Section 4**: Interactive Visual Stepper (Presets, Custom Input, Prev/Next/Play/Reset, Memory Inspector, Synced Pseudocode).
 - **Section 5**: Multi-Approach Code Examples (`Kotlin → Python → Java`) + **Runnable Code Practice Arena** (Cold Stub, Test Suite + Custom Case, 3 Progressive Hints, Final Answer).

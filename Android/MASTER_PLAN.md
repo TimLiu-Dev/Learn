@@ -39,7 +39,9 @@ This curriculum follows the **2026/2027 Google Modern Android Architecture (Now 
 
 ---
 
-## 2. Master Curriculum Index (72 Lessons)
+## 2. Master Curriculum Index (72 Lessons — Optimal Learning Sequence)
+
+> **Recommended Learning Order:** Phases I–VI (`0001–0049`) $\rightarrow$ Phase VII: 2027 Senior Frontier & KMP (`0061–0072`) $\rightarrow$ Phase VIII: The Capstone Project "Aether" (`0050–0055`) $\rightarrow$ Phase IX: Career Acceleration & Senior System Design (`0056–0060`). Every lesson's **Next / Previous** navigation links follow this exact progression.
 
 ```mermaid
 flowchart TD
@@ -48,9 +50,9 @@ flowchart TD
     P3 --> P4["Phase IV: Data, Network & Offline-First<br/>(Lessons 0030–0038)"]
     P4 --> P5["Phase V: Multi-Module Architecture<br/>(Lessons 0039–0043)"]
     P5 --> P6["Phase VI: Profiling, Security & Optimization<br/>(Lessons 0044–0049)"]
-    P6 --> P7["Phase VII: Capstone Project: Aether<br/>(Lessons 0050–0055)"]
-    P7 --> P8["Phase VIII: Career & System Design<br/>(Lessons 0056–0060)"]
-    P8 --> P9["Phase IX: 2027 Senior Frontier & KMP<br/>(Lessons 0061–0072)"]
+    P6 --> P9["Phase VII: 2027 Senior Frontier & KMP<br/>(Lessons 0061–0072)"]
+    P9 --> P7["Phase VIII: Capstone Project: Aether<br/>(Lessons 0050–0055)"]
+    P7 --> P8["Phase IX: Career & System Design<br/>(Lessons 0056–0060)"]
 ```
 
 ---
@@ -159,11 +161,11 @@ flowchart TD
 *Scaling codebases to dozens of engineers with fast compilation and strict boundaries.*
 
 - **[Lesson 0039: Enterprise Multi-Module Architecture (Feature vs Core)](lessons/0039-enterprise-multi-module-architecture.html)**  
-  *Concepts:* Decoupled feature modules, strict dependency inversion, pure `:core:model`.
+  *Concepts:* Decoupled feature modules, strict dependency inversion, `api` vs `implementation` ABI compilation avoidance, pure `:core:model`.
 - **[Lesson 0040: Gradle Version Catalogs (libs.versions.toml)](lessons/0040-gradle-version-catalogs.html)**  
   *Concepts:* Centralized dependency management, version catalogs, bundles, plugin aliases.
 - **[Lesson 0041: Gradle Convention Plugins with build-logic](lessons/0041-gradle-convention-plugins-build-logic.html)**  
-  *Concepts:* Included build `build-logic`, custom Kotlin DSL convention plugins replacing duplicate build scripts.
+  *Concepts:* Included build `build-logic`, custom Kotlin DSL convention plugins, Gradle Configuration Cache, Project Isolation.
 - **[Lesson 0042: Static Code Analysis & Code Health: Detekt & Lint](lessons/0042-static-analysis-detekt-lint.html)**  
   *Concepts:* Detekt, custom Compose lint rules, blocking dirty pull requests automatically in CI.
 - **[Lesson 0043: Automated CI/CD Pipelines with GitHub Actions](lessons/0043-ci-cd-github-actions.html)**  
@@ -177,7 +179,7 @@ flowchart TD
 - **[Lesson 0044: Android Performance Profiling: CPU & Systrace](lessons/0044-android-performance-profiling-cpu-systrace.html)**  
   *Concepts:* Android Studio CPU Profiler, Perfetto system traces, custom trace sections, 8.3ms frame budget.
 - **[Lesson 0045: Baseline Profiles & Jetpack Macrobenchmark](lessons/0045-baseline-profiles-macrobenchmark.html)**  
-  *Concepts:* Ahead-of-time (AOT) compilation, generating baseline profiles with Macrobenchmark for 40%+ faster cold starts.
+  *Concepts:* Ahead-of-time (AOT) compilation, Macrobenchmark, `ReportDrawnWhen` (TTFD), Jetpack App Startup (`androidx.startup.Initializer`).
 - **[Lesson 0046: Memory Leak Detection with LeakCanary](lessons/0046-memory-leak-detection-leakcanary.html)**  
   *Concepts:* Garbage collection mechanics, GC roots, tracking retained Activity instances with LeakCanary.
 - **[Lesson 0047: Android Hardware Security & Biometrics](lessons/0047-android-hardware-security-biometrics.html)**  
@@ -189,42 +191,8 @@ flowchart TD
 
 ---
 
-### Phase VII: The Capstone Project: "Aether" (Lessons 0050–0055)
-*Building the resume-defining, job-winning portfolio project.*
-
-- **[Lesson 0050: Aether: Multi-Module Architecture & System Blueprint](lessons/0050-aether-architecture-specifications.html)**  
-  *Deliverable:* Architecture design document, 8-module dependency graph, API specs, database schema.
-- **[Lesson 0051: Aether: Core Infrastructure & Design System Modules](lessons/0051-aether-core-designsystem-modules.html)**  
-  *Deliverable:* `:core:designsystem`, `:core:network`, `:core:database`, `:core:model` with convention plugins.
-- **[Lesson 0052: Aether: Real-Time Telemetry & Offline Cache Engine](lessons/0052-aether-realtime-telemetry-room-sync.html)**  
-  *Deliverable:* Live WebSocket price streams + Room database cache + WorkManager sync worker.
-- **[Lesson 0053: Aether: Interactive Candlestick Canvas & Biometric Vault](lessons/0053-aether-features-charts-biometric-vault.html)**  
-  *Deliverable:* Markets dashboard, interactive candlestick charts, portfolio tracker, biometric vault.
-- **[Lesson 0054: Aether: Automated Testing Suite (MockK, Turbine, Maestro)](lessons/0054-aether-testing-suite-mockk-turbine-maestro.html)**  
-  *Deliverable:* Comprehensive unit tests (MockK/Turbine), Robolectric UI tests, Maestro E2E test scripts.
-- **[Lesson 0055: Aether: Production Hardening, Baseline Profiles & CI/CD](lessons/0055-aether-production-hardening-release.html)**  
-  *Deliverable:* Baseline profiles bundled, R8 optimization, GitHub Actions CI/CD shipping release AAB.
-
----
-
-### Phase VIII: Career Acceleration & Senior System Design (Lessons 0056–0060)
-*Translating your skills into offers at top tech companies.*
-
-- **[Lesson 0056: Android System Design Interviews: Framework & Execution](lessons/0056-android-system-design-interviews-framework.html)**  
-  *Concepts:* 4-Phase System Design rubric (Scope, Architecture, Deep Dives, Tradeoffs).
-- **[Lesson 0057: Android OS Internals Deep Dive for Interviews](lessons/0057-android-os-internals-deep-dive.html)**  
-  *Concepts:* Zygote process forking, Binder IPC, Looper / Handler / MessageQueue, Choreographer VSYNC.
-- **[Lesson 0058: Junior-to-Mid/Senior Transition: Production Ownership & Code Reviews](lessons/0058-junior-to-senior-production-ownership.html)**  
-  *Concepts:* Pull request best practices, staff-level code reviews, risk mitigation, and production incident response.
-- **[Lesson 0059: Resume Crafting & GitHub Portfolio Showcase](lessons/0059-resume-crafting-portfolio-showcase.html)**  
-  *Concepts:* XYZ / STAR formula resume bullets, GitHub README portfolio polish with demo videos and architecture diagrams.
-- **[Lesson 0060: Live Coding & Technical Defense Tactics](lessons/0060-live-coding-interview-tactics.html)**  
-  *Concepts:* Thinking out loud, proactive edge-case testing, accepting hints, and handling behavioral leadership scenarios.
-
----
-
-### Phase IX: 2027 Senior Frontier — Platform Mandates, Trust, Observability, KMP & Production Surfaces (Lessons 0061–0072)
-*Closing every gap between `roadmap.sh/android` and 2027 Senior Android + Kotlin Multiplatform engineering.*
+### Phase VII: 2027 Senior Frontier — Platform Mandates, Trust, Observability, KMP & Production Surfaces (Lessons 0061–0072)
+*Closing every gap between `roadmap.sh/android` and 2027 Senior Android + Kotlin Multiplatform engineering before building the Capstone.*
 
 - **[Lesson 0061: Android 16/17 Mandates: 16 KB Pages & Adaptive Resizability](lessons/0061-android-16-17-mandates-16kb-adaptive.html)**  
   *Concepts:* 16 KB ELF page alignment (Feb 2027 Play Store block), Android 17 mandatory large-screen resizability ($\ge 600\text{dp}$), `WindowSizeClass`.
@@ -247,9 +215,43 @@ flowchart TD
 - **[Lesson 0070: Rich Media Engineering: Jetpack Media3 (ExoPlayer) & CameraX Pipelines](lessons/0070-media3-exoplayer-camerax-architecture.html)**  
   *Concepts:* Single `ExoPlayer` instance pooling, `CacheDataSource` pre-warming for vertical feeds, `MediaSessionService`, and `CameraX` concurrent UseCases.
 - **[Lesson 0071: System Surfaces: Jetpack Glance App Widgets & Android 16/17 Live Updates](lessons/0071-jetpack-glance-widgets-live-updates.html)**  
-  *Concepts:* `GlanceAppWidget` (`RemoteViews` composition tree), `GlanceStateDefinition` with DataStore, `ActionCallback`, and `Notification.ProgressStyle` Live Updates.
+  *Concepts:* `GlanceAppWidget` (`RemoteViews` composition tree), `GlanceStateDefinition` with DataStore, `ActionCallback`, FCM Data-only push wakeups, and `Notification.ProgressStyle` Live Updates.
 - **[Lesson 0072: Production Rollouts: Feature Flags, Remote Config & Analytics Architecture](lessons/0072-feature-flags-analytics-experimentation-scale.html)**  
   *Concepts:* Multi-module `:core:featureflag` evaluation, local QA override panels, atomic cold-start flag snapshots, and decoupled `:core:analytics` pipelines.
+
+---
+
+### Phase VIII: The Capstone Project: "Aether" (Lessons 0050–0055)
+*Building the resume-defining, job-winning portfolio project.*
+
+- **[Lesson 0050: Aether: Multi-Module Architecture & System Blueprint](lessons/0050-aether-architecture-specifications.html)**  
+  *Deliverable:* Architecture design document, 8-module dependency graph, API specs, database schema.
+- **[Lesson 0051: Aether: Core Infrastructure & Design System Modules](lessons/0051-aether-core-designsystem-modules.html)**  
+  *Deliverable:* `:core:designsystem`, `:core:network`, `:core:database`, `:core:model` with convention plugins.
+- **[Lesson 0052: Aether: Real-Time Telemetry & Offline Cache Engine](lessons/0052-aether-realtime-telemetry-room-sync.html)**  
+  *Deliverable:* Live WebSocket price streams + Room database cache + WorkManager sync worker.
+- **[Lesson 0053: Aether: Interactive Candlestick Canvas & Biometric Vault](lessons/0053-aether-features-charts-biometric-vault.html)**  
+  *Deliverable:* Markets dashboard, interactive candlestick charts, portfolio tracker, biometric vault.
+- **[Lesson 0054: Aether: Automated Testing Suite (MockK, Turbine, Maestro)](lessons/0054-aether-testing-suite-mockk-turbine-maestro.html)**  
+  *Deliverable:* Comprehensive unit tests (MockK/Turbine), Robolectric UI tests, Maestro E2E test scripts.
+- **[Lesson 0055: Aether: Production Hardening, Baseline Profiles & CI/CD](lessons/0055-aether-production-hardening-release.html)**  
+  *Deliverable:* Baseline profiles bundled, R8 optimization, GitHub Actions CI/CD shipping release AAB.
+
+---
+
+### Phase IX: Career Acceleration & Senior System Design (Lessons 0056–0060)
+*Translating your skills into offers at top tech companies.*
+
+- **[Lesson 0056: Android System Design Interviews: Framework & Execution](lessons/0056-android-system-design-interviews-framework.html)**  
+  *Concepts:* 4-Phase System Design rubric (Scope, Architecture, Deep Dives, Tradeoffs).
+- **[Lesson 0057: Android OS Internals Deep Dive for Interviews](lessons/0057-android-os-internals-deep-dive.html)**  
+  *Concepts:* Zygote process forking, Binder IPC, Looper / Handler / MessageQueue, Choreographer VSYNC.
+- **[Lesson 0058: Junior-to-Mid/Senior Transition: Production Ownership & Code Reviews](lessons/0058-junior-to-senior-production-ownership.html)**  
+  *Concepts:* Pull request best practices, staff-level code reviews, risk mitigation, and production incident response.
+- **[Lesson 0059: Resume Crafting & GitHub Portfolio Showcase](lessons/0059-resume-crafting-portfolio-showcase.html)**  
+  *Concepts:* XYZ / STAR formula resume bullets, GitHub README portfolio polish with demo videos and architecture diagrams.
+- **[Lesson 0060: Live Coding & Technical Defense Tactics](lessons/0060-live-coding-interview-tactics.html)**  
+  *Concepts:* Thinking out loud, proactive edge-case testing, accepting hints, and handling behavioral leadership scenarios.
 
 ---
 

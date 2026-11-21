@@ -66,7 +66,7 @@ To be evaluated and hired as a **Senior iOS Developer**, you must operate across
 
 ## 3. Curriculum Syllabus & Lesson Sequence
 
-The curriculum is structured into 9 progressive phases (60 lessons + flagship capstone) designed to take you from Android fundamentals to 2027 Senior iOS mastery.
+The curriculum is structured into 10 progressive phases (66 lessons + flagship capstone) designed to take you from Android fundamentals to 2027 Senior iOS mastery.
 
 ### Phase 1: Swift Compiler & Language Internals
 - **Lesson 1.1**: The Swift Type System, Mutability & Optionals (Memory layout of Optionals, Spare Bit Optimization, Transitive Value Immutability, mutating semantics, and the Law of Exclusivity.)
@@ -144,22 +144,31 @@ The curriculum is structured into 9 progressive phases (60 lessons + flagship ca
 - **Lesson 8.11**: Monetization & Passwordless Auth: StoreKit 2 & Passkeys (Async JWS-verified StoreKit 2 subscriptions, Transaction.updates listeners, local .storekit testing, and AuthenticationServices Passkeys.)
 - **Lesson 8.12**: Xcode Cloud & Multi-Channel Release Engineering (Apple's native Xcode Cloud (ci_post_clone.sh), headless xcodebuild + xcresulttool, phased App Store rollouts, and Fastlane vs. Xcode Cloud.)
 
-### Phase 9: Capstone Portfolio Project ('PulseFlow Enterprise')
-- **Milestone 9.1**: Capstone Showcase: PulseFlow Enterprise Architecture (The definitive, interview-winning 2027 portfolio project: multi-package SPM & XCFramework, SwiftData/SQLite, Swift 6.3 concurrency, AppIntents, FoundationModels, StoreKit 2, and MetricKit telemetry.)
+### Phase 9: Advanced SwiftUI DSL, Graphics, CloudKit & Tooling
+- **Lesson 9.1**: Result Builders (@resultBuilder) & @ViewBuilder Mechanics (How buildBlock, buildOptional, buildEither, and buildArray desugar SwiftUI DSLs—and how to author custom type-safe builders.)
+- **Lesson 9.2**: High-Performance ScrollView, Lazy Containers & PreferenceKey (List vs LazyVStack memory trade-offs, scrollPosition/scrollTargetBehavior, .visualEffect, onScrollGeometryChange, and PreferenceKey upward flow.)
+- **Lesson 9.3**: Swift Charts, Canvas & 120fps Custom Graphics (Declarative BarMark/LineMark/AreaMark & vectorized LinePlot, interactive chartXSelection, and immediate-mode Canvas + TimelineView.)
+- **Lesson 9.4**: Adaptive Navigation, Custom Transitions & Transferable Drag-Drop (NavigationSplitView & adaptive Tab/TabSection, ViewThatFits & AnyLayout, the Transition protocol, and Transferable drag-and-drop.)
+- **Lesson 9.5**: First-Party Cloud Sync: CloudKit & CKSyncEngine (CKDatabase private/shared zones, CKSyncEngine state tokens & batching, SwiftData CloudKit schema constraints, and serverRecordChanged conflict resolution.)
+- **Lesson 9.6**: DocC Documentation, #Preview Workflows & SwiftUI Inspector (Authoring interactive DocC catalogs for SPM/XCFrameworks, fast mocked #Preview macros (@Previewable), and Instruments SwiftUI Inspector profiling.)
+
+### Phase 10: Capstone Portfolio Project ('PulseFlow Enterprise')
+- **Milestone 10.1**: Capstone Showcase: PulseFlow Enterprise Architecture (The definitive, interview-winning 2027 portfolio project: multi-package SPM & XCFramework, SwiftData/SQLite/CloudKit, Swift 6.3 concurrency, Swift Charts/Canvas, AppIntents, FoundationModels, DocC, StoreKit 2, and MetricKit telemetry.)
 ---
+
 
 
 
 ## 4. The Senior Capstone Project Specification ("PulseFlow Enterprise")
 
 ### Architecture & Key Senior Deliverables
-1. **Multi-Module SPM + Binary SDK Architecture**: Completely decoupled modules (`FeatureAuth`, `FeatureDashboard`, `CoreNetwork`, `CoreDatabase`, `DesignSystem`, `Telemetry`) with zero circular dependencies, static linkage for sub-400ms launch times, and a distributable `XCFramework` boundary (`PulseAnalyticsSDK`).
+1. **Multi-Module SPM + Binary SDK Architecture**: Completely decoupled modules (`FeatureAuth`, `FeatureDashboard`, `CoreNetwork`, `CoreDatabase`, `DesignSystem`, `Telemetry`) with zero circular dependencies, static linkage for sub-400ms launch times, and a distributable `XCFramework` boundary (`PulseAnalyticsSDK`) documented with `DocC`.
 2. **Swift 6.3 Strict & Approachable Concurrency**: Compiled under strict data-race safety with zero warnings, `Mutex` for fast synchronous critical sections, `~Copyable` resource guards, and actor-isolated background data ingestion.
-3. **Resilient Offline-First Engine**: Protected sandbox storage (`FileProtectionType`) paired with SwiftData (`VersionedSchema`) / SQLite/GRDB sync queues and deterministic conflict resolution.
+3. **Resilient Offline-First & CloudKit Sync**: Protected sandbox storage (`FileProtectionType`) paired with SwiftData (`VersionedSchema`) / SQLite/GRDB sync queues and `CKSyncEngine` conflict resolution.
 4. **Custom Copy-on-Write & Zero-Copy Storage**: Custom CoW data structures utilizing `isKnownUniquelyReferenced` alongside `InlineArray` and `Span<T>` on tight telemetry loops.
-5. **System Intelligence, On-Device AI & Liquid Glass UI**: WidgetKit + `AppIntents` (`AppEntity`), `FoundationModels` (`@Generable` triage), Passkeys auth, `StoreKit 2` entitlements, and `.xcstrings` localization.
+5. **120fps SwiftUI DSL, Charts, System Intelligence & On-Device AI**: Custom `@ViewBuilder` DSLs, `Swift Charts` + `Canvas`, adaptive `NavigationSplitView`, WidgetKit + `AppIntents` (`AppEntity`), `FoundationModels` (`@Generable` triage), Passkeys auth, `StoreKit 2` entitlements, and `.xcstrings` localization.
 6. **Telemetry & Production Observability**: MetricKit (`MXMetricManager`) reporting hang rates, CPU consumption, and dirty memory metrics, paired with `os.Logger` structured subsystems.
-7. **Comprehensive Test Suite & CI/CD**: >85% unit test coverage via Swift Testing (`@Test`/`#expect`), `.xctestplan` randomized + TSan matrices, `swift-format` + SwiftLint gates, and automated Xcode Cloud / GitHub Actions + Fastlane pipelines.
+7. **Comprehensive Test Suite & CI/CD**: >85% unit test coverage via Swift Testing (`@Test`/`#expect`), `.xctestplan` randomized + TSan matrices, `swift-format` + SwiftLint gates, `#Preview` isolation, and automated Xcode Cloud / GitHub Actions + Fastlane pipelines.
 
 ---
 
@@ -253,5 +262,12 @@ Every lesson follows this rigorous Senior pedagogical feedback loop:
   - [ ] Lesson 8.10: AppIntents, Siri, Spotlight & System Intelligence
   - [ ] Lesson 8.11: Monetization & Passwordless Auth: StoreKit 2 & Passkeys
   - [ ] Lesson 8.12: Xcode Cloud & Multi-Channel Release Engineering
-- [ ] **Phase 9: Capstone Portfolio Project ('PulseFlow Enterprise')**
-  - [ ] Milestone 9.1: Capstone Showcase: PulseFlow Enterprise Architecture
+- [ ] **Phase 9: Advanced SwiftUI DSL, Graphics, CloudKit & Tooling**
+  - [ ] Lesson 9.1: Result Builders (@resultBuilder) & @ViewBuilder Mechanics
+  - [ ] Lesson 9.2: High-Performance ScrollView, Lazy Containers & PreferenceKey
+  - [ ] Lesson 9.3: Swift Charts, Canvas & 120fps Custom Graphics
+  - [ ] Lesson 9.4: Adaptive Navigation, Custom Transitions & Transferable Drag-Drop
+  - [ ] Lesson 9.5: First-Party Cloud Sync: CloudKit & CKSyncEngine
+  - [ ] Lesson 9.6: DocC Documentation, #Preview Workflows & SwiftUI Inspector
+- [ ] **Phase 10: Capstone Portfolio Project ('PulseFlow Enterprise')**
+  - [ ] Milestone 10.1: Capstone Showcase: PulseFlow Enterprise Architecture

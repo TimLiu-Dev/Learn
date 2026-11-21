@@ -1,8 +1,8 @@
 # Teaching Notes
 
 - **Learner Profile & Target Bar (2027 Roadmap):**
-  - **Junior Android developer** who can read some Kotlin, transitioning to active writing, debugging, and production architecture in **Java 25 LTS** and **Spring Boot 4.0 / Spring Framework 7.0**.
-  - Needs Kotlin-to-Java mental-model bridging early (`0074`), deliberate coding from scratch, and production debugging intuition rather than passive reading.
+  - **Junior Android developer** who can read some Kotlin (currently unable to read or write Java from scratch), transitioning to active writing, debugging, and production architecture in **Java 25 LTS** and **Spring Boot 4.0 / Spring Framework 7.0** on Linux production servers.
+  - Needs Kotlin-to-Java grammar & mental-model bridging early (`0074` Ground-Zero Syntax Decoder + 39 Android/Kotlin bridge callouts across core Java and Spring lessons), deliberate coding from scratch, and production debugging intuition rather than passive reading.
 - **Explicit Interactive Lesson Requirements (Mandatory in Every Coding Lesson HTML):**
   1. **Production Code Examples:** Minimum 3 code blocks per lesson contrasting naive/buggy code (or Kotlin traps), under-the-hood mechanics, and idiomatic Java 25 solutions.
   2. **Runnable & Checkable In-HTML Code Practices (`assets/workbench.js`):**

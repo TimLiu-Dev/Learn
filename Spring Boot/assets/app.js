@@ -188,6 +188,26 @@
     }
   }
 
+  // Strip starter instruction comments and TODO lines so untouched starter templates never auto-pass
+  function stripStarterComments(rawCode, starterCode) {
+    if (!rawCode) return '';
+    const starterCommentLines = new Set(
+      (starterCode || '')
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith('//') || l.startsWith('#') || l.startsWith('<!--') || l.startsWith('/*') || l.startsWith('*'))
+    );
+    return rawCode
+      .split(/\r?\n/)
+      .map((line) => {
+        const trimmed = line.trim();
+        if (starterCommentLines.has(trimmed)) return '';
+        if (/^(?:\/\/|#|<!--|\*).*TODO/i.test(trimmed)) return '';
+        return line.replace(/(?:\/\/|#)\s*TODO.*$/i, '').replace(/<!--\s*TODO[\s\S]*?-->/gi, '');
+      })
+      .join('\n');
+  }
+
   // --- 3. In-Browser Test Execution Simulation Engine ---
   function executePracticeVerification(practiceId, code, lang, consoleEl, container) {
     if (!consoleEl) return;
@@ -203,18 +223,21 @@
 
     // Look up registered validator for this practice lab
     const validator = window.practiceValidators && window.practiceValidators[practiceId];
+    const starterAttr = lang === 'kotlin' ? 'starterKotlin' : 'starterJava';
+    const starterCode = (container && container.dataset && container.dataset[starterAttr]) || '';
+    const cleanCode = stripStarterComments(code, starterCode);
     let testResults = [];
 
     if (typeof validator === 'function') {
       try {
-        testResults = validator(code, lang);
+        testResults = validator(cleanCode, lang);
       } catch (e) {
         testResults = [
           { name: 'Execution Safety Check', passed: false, error: 'Runtime error in test runner: ' + e.message }
         ];
       }
     } else {
-      testResults = defaultFallbackTests(code);
+      testResults = defaultFallbackTests(cleanCode);
     }
 
     // Render results line by line with slight terminal delay simulation
@@ -280,6 +303,7 @@
       const record = JSON.parse(localStorage.getItem(PROGRESS_STORAGE_KEY) || '{}');
       record[practiceId] = true;
       localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(record));
+      localStorage.setItem('sb_mastery_done_' + practiceId, 'true');
       updateProgressUI();
     } catch (e) {
       console.error(e);
@@ -291,7 +315,8 @@
       const record = JSON.parse(localStorage.getItem(PROGRESS_STORAGE_KEY) || '{}');
       document.querySelectorAll('[data-progress-badge]').forEach((el) => {
         const id = el.dataset.progressBadge;
-        if (record[id]) {
+        const isDone = Boolean(record[id]) || localStorage.getItem('sb_mastery_done_' + id) === 'true';
+        if (isDone) {
           el.className = 'badge badge-status completed';
           el.textContent = 'Completed ✓';
         }

@@ -117,3 +117,23 @@ _Avoid_: Hardcoding duplicate dependency version strings across multiple `build.
 **R8 Shrinking & Obfuscation**:
 Android's release build optimizer (`isMinifyEnabled = true`) that strips unreachable code (tree shaking), renames classes/fields to short identifiers (`a.b`), and optimizes bytecode; requires compile-time codegen (`@Serializable`, KSP) or explicit `@Keep` rules when using reflection.
 _Avoid_: Unannotated reflection DTOs that work in `debug` but deserialize `null` in `release`
+
+**Strong Skipping Mode (Compose Compiler)**:
+The Kotlin 2.0.20+ Compose Compiler mode where stable parameters skip recomposition via structural equality (`old == new`) and unstable parameters skip via referential identity (`old === new`).
+_Avoid_: Mutating `MutableList` properties in place inside UI state objects
+
+**`rememberUpdatedState`**:
+A Compose state-holder helper that updates an internal reference box on every recomposition so long-lived coroutines (`LaunchedEffect(Unit)`) always invoke the latest callback lambda without restarting the effect.
+_Avoid_: Capturing raw callback parameters directly inside non-restarting `LaunchedEffect(Unit)` blocks
+
+**`snapshotFlow`**:
+A bridge function that observes Compose Snapshot `State<T>` reads inside its block and emits changes as a cold Kotlin `Flow<T>` with automatic `distinctUntilChanged()` deduplication.
+_Avoid_: Triggering suspending network/analytics side effects directly inside synchronous `derivedStateOf` blocks
+
+**Explicit API Mode (`kotlin { explicitApi() }`)**:
+A Kotlin compiler mode for shared and multi-module libraries that requires explicit visibility modifiers (`public`/`internal`) and explicit return types on every public declaration.
+_Avoid_: Accidental `public` exposure of internal implementation classes or silent ABI breaks from inferred return types
+
+**Assisted Factory (`fun interface` DI Factory)**:
+A single-abstract-method factory interface pre-bound to long-lived singletons in a Dependency Injection graph while accepting caller-supplied runtime arguments (such as screen navigation IDs).
+_Avoid_: Passing runtime navigation IDs through global mutable singletons

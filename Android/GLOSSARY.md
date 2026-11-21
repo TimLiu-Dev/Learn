@@ -66,9 +66,9 @@ Canonical terminology, architectural definitions, and runtime mental models acro
 
 ## 5. Multi-Module Build Engineering, Profiling & Security (Phases V–VI)
 
-- **Feature vs. Core Module Dependency Rule**: `:feature:*` modules depend **only** on `:core:*` modules (`:core:data`, `:core:domain`, `:core:designsystem`, `:core:model`) and **never** on sibling `:feature:*` modules—preventing circular dependencies and maximizing Gradle parallel compilation and build cache hits.
-- **Gradle Convention Plugins (`build-logic`)**: Reusable Kotlin DSL plugins (`AndroidLibraryComposeConventionPlugin`) in an included build that centralize `compileSdk`, Kotlin compiler options, Compose flags, and Detekt/Lint config across 20+ modules.
-- **Baseline Profiles & Jetpack Macrobenchmark**: Ahead-of-Time (AOT) compilation profiles (`baseline-prof.txt`) generated via `BaselineProfileRule` that instruct ART/Cloud Profiles to pre-compile critical startup and scrolling code paths at install time, cutting cold startup latency by 30–40%+.
+- **Feature vs. Core Module Dependency Rule & ABI Compilation Avoidance**: `:feature:*` modules depend **only** on `:core:*` modules (`:core:data`, `:core:domain`, `:core:designsystem`, `:core:model`) and **never** on sibling `:feature:*` modules. Using `implementation` instead of `api` hides transitive dependencies from consumers' compile classpaths so internal changes do not alter the module's public ABI or trigger downstream recompilation.
+- **Gradle Convention Plugins (`build-logic`), Project Isolation & Configuration Cache**: Reusable Kotlin DSL plugins (`AndroidLibraryComposeConventionPlugin`) in an included build that centralize `compileSdk`, Kotlin compiler options, Compose flags, and Detekt/Lint config across 20+ modules, enabling parallel Project Isolation and serialized Configuration Cache task graphs.
+- **Baseline Profiles, Macrobenchmark, `ReportDrawnWhen` & Jetpack App Startup**: Ahead-of-Time (AOT) compilation profiles (`baseline-prof.txt`) generated via `BaselineProfileRule` that instruct ART/Cloud Profiles to pre-compile critical startup and scrolling code paths at install time, paired with `ReportDrawnWhen` for accurate Time-To-Full-Display (TTFD) tracking and `androidx.startup.Initializer` to eliminate cold-start `ContentProvider` bloat.
 - **R8 Full Mode (`android.enableR8.fullMode=true`)**: Aggressive whole-program shrinking, tree-shaking, class merging, and obfuscation; requires explicit `-keep` rules only for reflection or JNI entry points (largely avoided when using KSP and `kotlinx.serialization`).
 - **Android Keystore (`StrongBox` / TEE) & `BiometricPrompt.CryptoObject`**: Hardware-backed cryptographic key storage where private/AES keys never enter application process RAM in plaintext and require biometric user presence at the hardware gate to unlock a `Cipher`.
 
@@ -86,6 +86,6 @@ Canonical terminology, architectural definitions, and runtime mental models acro
 - **Jetpack Media3 (`ExoPlayer`) & `CameraX`**:
   - **Media3**: Unified media playback architecture supporting single-player pooling, `CacheDataSource` pre-warming for vertical video feeds, and background `MediaSessionService`.
   - **CameraX**: Lifecycle-aware camera pipeline (`Preview`, `ImageCapture`, `ImageAnalysis`, `VideoCapture` UseCases) handling device-specific Camera2 quirks and HDR automatically.
-- **Jetpack Glance & Android 16/17 Live Updates**:
+- **Jetpack Glance, FCM Data Push & Android 16/17 Live Updates**:
   - **Glance**: Declarative framework (`GlanceAppWidget`) that translates a special `androidx.glance` Composition tree into system `RemoteViews` for home-screen and lock-screen widgets.
-  - **Live Updates (Promoted Ongoing Notifications)**: Android 16/17 high-visibility lock-screen and status-bar progress notifications (`Notification.ProgressStyle`) for rideshare, delivery, navigation, and live financial alerts.
+  - **Live Updates (Promoted Ongoing Notifications)**: Android 16/17 high-visibility lock-screen and status-bar progress notifications (`Notification.ProgressStyle`) for rideshare, delivery, navigation, and live financial alerts, driven in the background by FCM data-only payloads (`FirebaseMessagingService.onMessageReceived`).

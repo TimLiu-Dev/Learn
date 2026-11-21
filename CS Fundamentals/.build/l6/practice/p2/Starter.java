@@ -62,7 +62,7 @@ public class Practice {
             Battery b = new Battery(100, 10);
             b.recharge();
             b.recharge();
-            boolean setter = java.util.Arrays.stream(Battery.class.getDeclaredMethods()).anyMatch(m -> m.getName().equals("setRecharges"));
+            boolean setter = java.util.Arrays.stream(Battery.class.getDeclaredMethods()).anyMatch(m -> m.getName().equals("setRecharges") && !java.lang.reflect.Modifier.isPrivate(m.getModifiers()));
             return b.getRecharges() + " " + b.getLevel() + (setter ? " has a setter" : " no setter");
         });
     }

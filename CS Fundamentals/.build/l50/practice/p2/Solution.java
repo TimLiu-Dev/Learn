@@ -27,6 +27,7 @@ public class Practice {
         check("no subset reaches the target", List.of(), () -> subsetSums(List.of(5, 6), 4));
         check("target 0 has one answer, the empty subset", List.of(List.of()), () -> subsetSums(List.of(1, 2), 0));
         check("every answer is a separate list", List.of(List.of(1, 2, 3), List.of(1, 5), List.of(2, 4), List.of(6)), () -> subsetSums(List.of(1, 2, 3, 4, 5, 6), 6));
+        // 2^40 subsets: without the pruning break this check runs for about an hour. If the run stalls here, stop it.
         check("pruning makes 2 to the 40 subsets fast", List.of(List.of(1, 2), List.of(3)), () -> subsetSums(IntStream.rangeClosed(1, 40).boxed().toList(), 3));
     }
 

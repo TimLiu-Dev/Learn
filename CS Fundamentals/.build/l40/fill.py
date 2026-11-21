@@ -107,6 +107,19 @@ for key, a, b in [("clean_amend", "=== AMEND", "=== FIXUP"), ("clean_fixup", "==
                   ("clean_cherry", "=== CHERRY", None)]:
     S[key] = term(sec("clean_out.txt", a, b))
 S["bisect"] = term([l for l in load("bisect_out.txt") if l.strip()])
+# ---- Part "rel": branching and releases ----
+S["rel_tag"] = term(sec("release_out.txt", "=== TAG", "=== TRUNK"))
+S["rel_trunk"] = term(sec("release_out.txt", "=== TRUNK", "=== HOTFIX"))
+h = sec("release_out.txt", "=== HOTFIX", "=== PUSH")
+k_main = h.index("$ git switch main")
+k_fixed = [k for k, l in enumerate(h) if l == "$ cat Greeter.kt"][1]
+S["rel_hotfix"] = term(h[:k_main])
+S["rel_merge"] = term(h[k_main:k_fixed])
+S["rel_resolve"] = term(h[k_fixed:])
+S["rel_push"] = term(sec("release_out.txt", "=== PUSH", "=== LOG"))
+S["rel_log"] = term(sec("release_out.txt", "=== LOG"))
+S["toggle_kt"] = raw(sec("toggle_out.txt", "===== Toggle.kt", "===== Toggle.java"))
+S["toggle_jv"] = raw(sec("toggle_out.txt", "===== Toggle.java"))
 # ---- Part 3: CI ----
 S["ci_out"] = term([l for l in load("ci_out.txt") if l.strip()])
 red = load("kt_build_red.txt")

@@ -233,6 +233,24 @@ function resetCodeFill(labId) {
   if (fb) fb.style.display = 'none';
 }
 
+function decodeHtmlEntityText(str) {
+  const txt = document.createElement('textarea');
+  txt.innerHTML = str;
+  return txt.value;
+}
+
+function revealCodeFill(labId) {
+  const card = document.getElementById(labId);
+  if (!card) return;
+  card.querySelectorAll('.code-blank').forEach(input => {
+    const first = (input.dataset.answers || '').split('|')[0] || '';
+    input.value = decodeHtmlEntityText(first);
+    input.classList.remove('fail');
+    input.classList.add('pass');
+  });
+  checkCodeFill(labId);
+}
+
 /* 6. Active Fill-in-the-Trace-Table Evaluator */
 function normalizeTrace(str) {
   return String(str || '')

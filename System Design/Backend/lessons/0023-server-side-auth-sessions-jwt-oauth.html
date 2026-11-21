@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0023: Server-Side Auth — The Other Half of Your Login Screen</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    details.java-side { margin: 1rem 0 1.5rem 0; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-surface); }
+    details.java-side summary { cursor: pointer; padding: 0.7rem 1rem; font-weight: 600; font-size: 0.92rem; color: var(--text-secondary); }
+    details.java-side pre { margin: 0; border-radius: 0 0 var(--radius-md) var(--radius-md); }
+    ol.steps li { margin-bottom: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="page-container">
+    <nav class="top-nav">
+      <a href="../master-plan.html" class="nav-brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+        <span>Back to Master Plan</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../master-plan.html">Master Plan</a></li>
+        <li><a href="../reference/0003-backend-foundations-cheatsheet.html">Foundations Cheat Sheet</a></li>
+        <li><a href="../reference/0004-capstone-part1-pulseorder-spec.html">Part 1 Capstone</a></li>
+      </ul>
+    </nav>
+
+    <header>
+      <div class="badge-group">
+        <span class="badge badge-benchmark">Module 0023</span>
+        <span class="badge badge-mid">Part 1 · Phase 0: Build It</span>
+        <span class="badge badge-senior">Junior → Mid</span>
+        <span class="badge badge-big">~25 min</span>
+      </div>
+      <h1>Server-Side Auth: The Other Half of Your Login Screen</h1>
+      <p style="font-size: 1.15rem;">
+        On Android you've built login screens, saved tokens in EncryptedSharedPreferences or DataStore, and attached <code>Authorization: Bearer &lt;token&gt;</code> in an OkHttp interceptor. In this lesson you build the server side: <strong>store passwords safely, issue short-lived JWT access tokens + rotating refresh tokens, and tell 401 apart from 403.</strong>
+      </p>
+    </header>
+
+    <section>
+      <h2>1. Four decisions every backend makes</h2>
+      <div class="table-wrapper"><table>
+        <thead><tr><th>Question</th><th>Wrong answer</th><th>Right answer &amp; standard</th></tr></thead>
+        <tbody>
+          <tr><td><strong>1. How do we store passwords?</strong></td><td>Plaintext, encrypted, or a fast hash like SHA-256 (GPUs try billions/sec)</td><td>A slow, salted, adaptive hash: <strong>Argon2id</strong> (OWASP's primary pick) or <strong>bcrypt</strong> with cost &ge; 10 (<a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html">OWASP Password Storage Cheat Sheet</a>).</td></tr>
+          <tr><td><strong>2. Session ID or JWT?</strong></td><td>Long-lived JWTs that never expire</td><td><strong>Server session</strong> (random ID in DB/Redis: easy to revoke, one lookup per request) <em>or</em> a <strong>short-lived JWT</strong> (5–15 min, verified by signature with zero DB lookups) paired with a revocable <strong>refresh token</strong> (<a href="https://www.rfc-editor.org/rfc/rfc7519">RFC 7519</a>).</td></tr>
+          <tr><td><strong>3. How do we protect refresh tokens on a phone?</strong></td><td>One permanent refresh token forever</td><td><strong>Refresh token rotation</strong> (<a href="https://www.rfc-editor.org/rfc/rfc9700">RFC 9700 §4.14</a>): each refresh issues a new token and invalidates the old one. If an already-used token arrives again, revoke the whole token family.</td></tr>
+          <tr><td><strong>4. How does a third-party or SSO login work on Android?</strong></td><td>Embedded WebView or sending raw passwords</td><td><strong>Authorization Code + PKCE</strong> in the system browser / Custom Tabs (<a href="https://www.rfc-editor.org/rfc/rfc8252">RFC 8252</a>, <a href="https://www.rfc-editor.org/rfc/rfc7636">RFC 7636</a>). OpenID Connect (OIDC) layers an ID token on top.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="callout callout-note">
+        <div class="callout-title">401 Unauthorized vs 403 Forbidden (RFC 9110)</div>
+        <p><strong>401</strong> means <em>"I don't know who you are"</em> (missing, malformed, or expired token — triggers your OkHttp <code>Authenticator</code> to refresh). <strong>403</strong> means <em>"I know who you are, and you aren't allowed"</em> (customer #7 asking for customer #8's order, or a customer calling a <code>/staff/*</code> route). Refreshing the token won't fix a 403 (<a href="https://www.rfc-editor.org/rfc/rfc9110#section-15.5.2">RFC 9110 §15.5</a>).</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Inside a JWT: never read the payload before verifying the signature</h2>
+      <p>A JWT is three Base64URL strings joined by dots: <code>header.payload.signature</code> (<a href="https://www.rfc-editor.org/rfc/rfc7519#section-3">RFC 7519 §3</a>).</p>
+<pre><code>// header                              // payload
+{"alg":"HS256","typ":"JWT"}            {"sub":"42","role":"CUSTOMER","aud":"pulseorder","exp":1795000900}</code></pre>
+      <p>Anyone can decode the middle part — it's encoded, not encrypted. What stops an attacker from changing <code>"sub":"42"</code> to <code>"sub":"1"</code> is the <strong>signature</strong> across <code>header + "." + payload</code>. Your verifier must check, in order:</p>
+      <ol>
+        <li>The token has three parts and valid JSON in header and payload.</li>
+        <li><code>header.alg</code> matches the algorithm you expect (never trust <code>"alg":"none"</code>).</li>
+        <li>The signature computed with your server's key equals the token's signature.</li>
+        <li><code>payload.exp</code> is in the future and <code>payload.aud</code> matches your service.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>3. Spring Security in 25 lines</h2>
+      <p>With <code>spring-boot-starter-oauth2-resource-server</code>, Spring validates the <code>Authorization: Bearer</code> JWT before your controller runs and injects the verified token:</p>
+<pre><code>@Configuration
+class SecurityConfig(@Value("\${app.jwt.secret}") private val secret: String) {
+
+    @Bean fun passwordEncoder(): PasswordEncoder = BCryptPasswordEncoder()   // or Argon2PasswordEncoder
+
+    @Bean fun jwtDecoder(): JwtDecoder =
+        NimbusJwtDecoder.withSecretKey(SecretKeySpec(secret.toByteArray(), "HmacSHA256"))
+            .macAlgorithm(MacAlgorithm.HS256).build()
+
+    @Bean fun filterChain(http: HttpSecurity): SecurityFilterChain = http
+        .csrf { it.disable() }
+        .sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }
+        .authorizeHttpRequests {
+            it.requestMatchers("/auth/**", "/menu").permitAll()
+              .anyRequest().authenticated()
+        }
+        .oauth2ResourceServer { it.jwt {} }
+        .build()
+}
+
+// Inside OrderController — check ownership so user 7 cannot read user 8's order:
+@GetMapping("/orders/{id}")
+fun get(@PathVariable id: Long, @AuthenticationPrincipal jwt: Jwt): ResponseEntity&lt;Order&gt; {
+    val order = repo.findByIdOrNull(id) ?: return ResponseEntity.notFound().build()
+    if (order.userId != jwt.subject.toLong()) return ResponseEntity.status(403).build()
+    return ResponseEntity.ok(order)
+}</code></pre>
+      <details class="java-side">
+        <summary>☕ Java on the side: ownership check in the controller</summary>
+<pre><code>@GetMapping("/orders/{id}")
+public ResponseEntity&lt;Order&gt; get(@PathVariable long id, @AuthenticationPrincipal Jwt jwt) {
+    Order order = repo.findById(id).orElse(null);
+    if (order == null) return ResponseEntity.notFound().build();
+    if (order.userId() != Long.parseLong(jwt.getSubject())) return ResponseEntity.status(403).build();
+    return ResponseEntity.ok(order);
+}</code></pre>
+      </details>
+    </section>
+
+    <section>
+      <h2>4. Practice: write a JWT verifier</h2>
+      <p>Implement <code>verifyToken(token, opts)</code> using the starter's toy <code>sign(input, secret)</code> helper (real systems use HMAC-SHA256 or RSA/ECDSA). Return either <code>{ valid: true, sub, role }</code> or <code>{ valid: false, reason }</code> with one of the exact reasons listed in the starter.</p>
+      <div id="sandbox-0023"></div>
+    </section>
+
+    <section>
+      <h2>5. Check yourself</h2>
+      <div id="quiz-0023-a"></div>
+      <div id="quiz-0023-b"></div>
+      <div id="quiz-0023-c"></div>
+    </section>
+
+    <section>
+      <h2>6. Do it for real (on your machine)</h2>
+      <ol class="steps">
+        <li>Add <code>org.springframework.boot:spring-boot-starter-oauth2-resource-server</code> to <code>build.gradle.kts</code>, and add a <code>users</code> table migration: <code>id</code>, <code>email UNIQUE</code>, <code>password_hash</code>, <code>role</code>.</li>
+        <li>Add <code>SecurityConfig</code> above and a small <code>/auth/signup</code> + <code>/auth/login</code> controller that hashes passwords with <code>passwordEncoder.encode(raw)</code>, verifies with <code>passwordEncoder.matches(raw, hash)</code>, and signs a 15-minute HS256 JWT with <code>NimbusJwtEncoder</code>.</li>
+        <li>Test all three status codes with curl:
+<pre><code>curl -i localhost:8080/orders/1                                    # 401 (no token)
+curl -i localhost:8080/orders/1 -H "Authorization: Bearer $USER2"  # 403 (belongs to user 1)
+curl -i localhost:8080/orders/1 -H "Authorization: Bearer $USER1"  # 200</code></pre></li>
+        <li><strong>Android bonus:</strong> in your app, attach the access token in an OkHttp <code>Interceptor</code>, and implement OkHttp's <code>Authenticator</code> interface so a <strong>401</strong> automatically calls <code>POST /auth/refresh</code> and retries the request once (<a href="https://square.github.io/okhttp/recipes/#handling-authentication-kt-java">OkHttp: Handling Authentication</a>).</li>
+        <li><strong>Java on the side:</strong> write the <code>SecurityConfig</code> class in your Java project and verify the same three curls.</li>
+      </ol>
+      <div class="callout callout-tip">
+        <div class="callout-title">✓ Win condition</div>
+        <p><code>select password_hash from users;</code> shows a <code>$2a$...</code> bcrypt hash (never a raw password), and the three curls return 401, 403, and 200.</p>
+      </div>
+      <div class="callout callout-tip">
+        <div class="callout-title">🏗 Capstone milestone (PulseOrder M3)</div>
+        <p>Add signup/login, hashed passwords, 15-minute access tokens, rotating refresh tokens in Postgres, and scope every order endpoint to the authenticated user (403 for someone else's order; staff role required for <code>/staff/*</code>). See the <a href="../reference/0004-capstone-part1-pulseorder-spec.html">capstone spec</a>.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>7. Primary source &amp; where this sits</h2>
+      <ul>
+        <li><strong>Read next (primary):</strong> <a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html">OWASP Password Storage Cheat Sheet</a> and <a href="https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html">OWASP JWT for Java Cheat Sheet</a>.</li>
+        <li><strong>Reference:</strong> <a href="https://www.rfc-editor.org/rfc/rfc7519">RFC 7519 (JWT)</a> · <a href="https://www.rfc-editor.org/rfc/rfc9700">RFC 9700 (OAuth 2.0 Security BCP)</a> · <a href="https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html">Spring Security: OAuth2 Resource Server JWT</a></li>
+        <li><strong>roadmap.sh nodes covered:</strong> Security, Federated Identity, Gatekeeper (recognize).</li>
+        <li><strong>Previous:</strong> <a href="0022-transactions-and-isolation-levels.html">0022 Transactions &amp; Isolation</a> · <strong>Next:</strong> <a href="0024-docker-and-deploy-first-service.html">0024 Docker &amp; Deploy</a></li>
+      </ul>
+    </section>
+
+    <footer class="page-footer">
+      <div class="agent-help-box">
+        <p style="margin-bottom: 0.5rem;"><strong>Ask your teacher:</strong> unsure how refresh token rotation works in a database table? Ask for the schema.</p>
+        <p style="margin-bottom: 0;">Good follow-ups: <em>"When should I use RS256 (public/private key) instead of HS256?"</em> · <em>"How do I handle clock skew on exp?"</em> · <em>"What happens if two parallel requests on Android both get 401 and try to refresh?"</em></p>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
+        <span>Backend System Design // Part 1 · Phase 0</span>
+        <span>Local Workspace: <code>Backend/</code></span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/code-runner.js"></script>
+  <script>
+    const eq = (actual, expected, label) => {
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(label + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual));
+    };
+    function toySign(input, secret) {
+      let h = 2166136261;
+      const s = input + '|' + secret;
+      for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+      return 'sig_' + (h >>> 0).toString(16);
+    }
+    function makeToken(headerObj, payloadObj, secret) {
+      const h = encodeURIComponent(JSON.stringify(headerObj));
+      const p = encodeURIComponent(JSON.stringify(payloadObj));
+      const sig = secret === null ? '' : toySign(h + '.' + p, secret);
+      return h + '.' + p + '.' + sig;
+    }
+
+    new CodeRunner('sandbox-0023', {
+      id: 'lesson0023_jwt_verifier',
+      successMessage: 'Your verifier checks structure, algorithm, signature, expiry, and audience in order — before trusting any claim.',
+      starterCode: `
+// Toy MAC (real systems use HMAC-SHA256 / RS256). Same (input, secret) -> same signature string.
+function sign(headerDotPayload, secret) {
+  let h = 2166136261;
+  const s = headerDotPayload + '|' + secret;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return 'sig_' + (h >>> 0).toString(16);
+}
+
+// Each part (header, payload) is URL-encoded JSON: decode with JSON.parse(decodeURIComponent(part)).
+// opts = { secret, now, audience }
+// Return { valid: true, sub, role } OR { valid: false, reason }
+// Reasons in check order: 'MALFORMED' | 'ALG_NOT_ALLOWED' | 'BAD_SIGNATURE' | 'EXPIRED' | 'WRONG_AUDIENCE'
+function verifyToken(token, opts) {
+  // TODO:
+  // 1. Must split on '.' into exactly 3 parts, and header + payload must parse as JSON objects -> else 'MALFORMED'
+  // 2. header.alg must equal 'HS256' (reject 'none' or anything else)                           -> else 'ALG_NOT_ALLOWED'
+  // 3. sign(parts[0] + '.' + parts[1], opts.secret) must equal parts[2]                         -> else 'BAD_SIGNATURE'
+  // 4. typeof payload.exp === 'number' && opts.now < payload.exp                                -> else 'EXPIRED'
+  // 5. payload.aud === opts.audience                                                            -> else 'WRONG_AUDIENCE'
+  // 6. return { valid: true, sub: payload.sub, role: payload.role }
+  return { valid: false, reason: 'NOT_IMPLEMENTED' };
+}
+`,
+      solutionCode: `
+function sign(headerDotPayload, secret) {
+  let h = 2166136261;
+  const s = headerDotPayload + '|' + secret;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return 'sig_' + (h >>> 0).toString(16);
+}
+
+function verifyToken(token, opts) {
+  if (typeof token !== 'string') return { valid: false, reason: 'MALFORMED' };
+  const parts = token.split('.');
+  if (parts.length !== 3) return { valid: false, reason: 'MALFORMED' };
+
+  let header, payload;
+  try {
+    header = JSON.parse(decodeURIComponent(parts[0]));
+    payload = JSON.parse(decodeURIComponent(parts[1]));
+  } catch (e) {
+    return { valid: false, reason: 'MALFORMED' };
+  }
+  if (!header || typeof header !== 'object' || !payload || typeof payload !== 'object') {
+    return { valid: false, reason: 'MALFORMED' };
+  }
+  if (header.alg !== 'HS256') return { valid: false, reason: 'ALG_NOT_ALLOWED' };
+
+  const expectedSig = sign(parts[0] + '.' + parts[1], opts.secret);
+  if (parts[2] !== expectedSig) return { valid: false, reason: 'BAD_SIGNATURE' };
+
+  if (typeof payload.exp !== 'number' || opts.now >= payload.exp) {
+    return { valid: false, reason: 'EXPIRED' };
+  }
+  if (payload.aud !== opts.audience) return { valid: false, reason: 'WRONG_AUDIENCE' };
+
+  return { valid: true, sub: payload.sub, role: payload.role };
+}
+`,
+      hints: [
+        { title: 'Split and parse safely', content: 'Wrap <code>JSON.parse(decodeURIComponent(parts[0]))</code> and <code>parts[1]</code> in a <code>try / catch</code> so garbage input returns <code>{ valid: false, reason: "MALFORMED" }</code> instead of throwing.' },
+        { title: 'Check alg and signature BEFORE claims', content: 'An attacker can write any <code>exp</code> or <code>sub</code> they want in an unsigned token. Always check <code>header.alg === "HS256"</code> and the signature before looking at <code>payload</code>.' },
+        { title: 'Expiry boundary', content: 'Following RFC 7519 §4.1.4, the current time must be strictly before <code>exp</code>: if <code>opts.now &gt;= payload.exp</code>, return <code>EXPIRED</code>.' }
+      ],
+      tests: [
+        { name: 'Valid token returns sub and role', exportSymbol: 'verifyToken', testFn: (x) => {
+          const t = makeToken({ alg: 'HS256' }, { sub: '42', role: 'CUSTOMER', aud: 'pulseorder', exp: 2000 }, 's3cret');
+          eq(x.verifyToken(t, { secret: 's3cret', now: 1500, audience: 'pulseorder' }), { valid: true, sub: '42', role: 'CUSTOMER' }, 'result');
+        }},
+        { name: 'Tampered payload (sub changed to 1) -> BAD_SIGNATURE', exportSymbol: 'verifyToken', testFn: (x) => {
+          const t = makeToken({ alg: 'HS256' }, { sub: '42', role: 'CUSTOMER', aud: 'pulseorder', exp: 2000 }, 's3cret');
+          const parts = t.split('.');
+          parts[1] = encodeURIComponent(JSON.stringify({ sub: '1', role: 'STAFF', aud: 'pulseorder', exp: 2000 }));
+          eq(x.verifyToken(parts.join('.'), { secret: 's3cret', now: 1500, audience: 'pulseorder' }), { valid: false, reason: 'BAD_SIGNATURE' }, 'tampered');
+        }},
+        { name: 'alg: "none" attack -> ALG_NOT_ALLOWED', exportSymbol: 'verifyToken', testFn: (x) => {
+          const t = makeToken({ alg: 'none' }, { sub: '1', role: 'STAFF', aud: 'pulseorder', exp: 2000 }, null);
+          eq(x.verifyToken(t, { secret: 's3cret', now: 1500, audience: 'pulseorder' }), { valid: false, reason: 'ALG_NOT_ALLOWED' }, 'alg none');
+        }},
+        { name: 'Expired token (now >= exp) -> EXPIRED', exportSymbol: 'verifyToken', testFn: (x) => {
+          const t = makeToken({ alg: 'HS256' }, { sub: '42', role: 'CUSTOMER', aud: 'pulseorder', exp: 1500 }, 's3cret');
+          eq(x.verifyToken(t, { secret: 's3cret', now: 1500, audience: 'pulseorder' }), { valid: false, reason: 'EXPIRED' }, 'expired');
+        }},
+        { name: 'Token meant for another service -> WRONG_AUDIENCE', exportSymbol: 'verifyToken', testFn: (x) => {
+          const t = makeToken({ alg: 'HS256' }, { sub: '42', role: 'CUSTOMER', aud: 'other-service', exp: 2000 }, 's3cret');
+          eq(x.verifyToken(t, { secret: 's3cret', now: 1500, audience: 'pulseorder' }), { valid: false, reason: 'WRONG_AUDIENCE' }, 'aud');
+        }},
+        { name: 'Malformed strings -> MALFORMED without throwing', exportSymbol: 'verifyToken', testFn: (x) => {
+          eq(x.verifyToken('not-a-jwt', { secret: 's3cret', now: 1500, audience: 'pulseorder' }), { valid: false, reason: 'MALFORMED' }, 'no dots');
+          eq(x.verifyToken('a.b.c', { secret: 's3cret', now: 1500, audience: 'pulseorder' }), { valid: false, reason: 'MALFORMED' }, 'bad json');
+        }}
+      ]
+    });
+
+    new QuizEngine('quiz-0023-a', {
+      id: 'l0023_a',
+      question: 'Why must servers store passwords using a slow, salted hash (like Argon2id or bcrypt) instead of encrypting them?',
+      options: [
+        { text: 'Database leaks cannot reveal raw passwords', rationale: 'Correct. A one-way slow hash with a per-user salt cannot be decrypted even if an attacker steals the database and config, and its slowness makes brute-forcing expensive.' },
+        { text: 'Encryption keys never fit in memory', rationale: 'AES keys are 16–32 bytes. The problem with encryption is that it is reversible whenever the key is compromised.' },
+        { text: 'Hashing makes login requests run faster', rationale: 'Password hashes are deliberately slow (tens of milliseconds) so attackers cannot test billions of guesses per second.' },
+        { text: 'Encrypted strings break SQL column indexes', rationale: 'You never query a user row by password column; you look up by email and compare the hash in code.' }
+      ],
+      correctIndex: 0,
+      summary: 'Never encrypt passwords and never use a fast hash like SHA-256. Use Argon2id or bcrypt.'
+    });
+
+    new QuizEngine('quiz-0023-b', {
+      id: 'l0023_b',
+      question: 'A user taps Log Out, or their phone is stolen. What is the main drawback of pure stateless JWT access tokens?',
+      options: [
+        { text: 'Stateless JWTs cannot carry user roles', rationale: 'They can carry claims like role or scope in the signed payload.' },
+        { text: 'Valid tokens work until they expire', rationale: 'Correct. Because the server checks only the signature and exp without consulting a store, a stateless JWT stays valid until exp. That is why access tokens are kept short-lived (5–15 min) and paired with revocable refresh tokens.' },
+        { text: 'Every request must query the database', rationale: 'Avoiding a database/session lookup on every request is the main advantage of stateless JWTs, not a drawback.' },
+        { text: 'Mobile apps cannot store header tokens', rationale: 'Android apps easily store tokens in DataStore/Keystore and send them in the Authorization header.' }
+      ],
+      correctIndex: 1,
+      summary: 'Short access-token lifetime + rotating, revocable refresh tokens is the standard balance between stateless speed and revocation control.'
+    });
+
+    new QuizEngine('quiz-0023-c', {
+      id: 'l0023_c',
+      question: 'Which OAuth 2.0 flow should a native Android app use when signing in through an authorization server?',
+      options: [
+        { text: 'Implicit flow inside a WebView', rationale: 'RFC 8252 bans embedded WebViews (the host app can read cookies/passwords) and RFC 9700 deprecates the Implicit flow.' },
+        { text: 'Client credentials with static secret', rationale: 'A secret shipped inside an APK is public; anyone can decompile the APK and extract it.' },
+        { text: 'Password grant with raw credentials', rationale: 'The Resource Owner Password Credentials grant is deprecated in RFC 9700 because it exposes raw credentials to the client.' },
+        { text: 'Authorization Code flow with PKCE', rationale: 'Correct. Per RFC 8252 and RFC 9700, native apps are public clients and must use Authorization Code + PKCE in the system browser / Custom Tabs.' }
+      ],
+      correctIndex: 3,
+      summary: 'On Android: system browser / Custom Tabs + Authorization Code + PKCE (RFC 8252, RFC 7636, RFC 9700).'
+    });
+  </script>
+</body>
+</html>

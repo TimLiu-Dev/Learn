@@ -74,3 +74,36 @@ _Avoid_: Error code (most status codes aren't errors)
 **Stateless Service**:
 A service instance that keeps no client or data state in its own memory between requests. Any instance can serve any request, which is what makes horizontal scaling work.
 _Avoid_: Sessionless, Pure service
+
+
+**Round-Trip Time (RTT)**:
+The time for a network packet to travel from client to server and back. A cold HTTPS request pays RTTs for DNS, TCP (1 RTT), TLS (1 RTT in TLS 1.3; 2 RTT in TLS 1.2), and the HTTP exchange itself.
+_Avoid_: Ping time, Network lag
+
+**Layer 7 Load Balancer**:
+An application-aware reverse proxy that terminates TLS, inspects HTTP paths/headers/cookies, and routes traffic across healthy backend instances.
+_Avoid_: Smart router, Web switch
+
+**Schema Migration**:
+A versioned, immutable SQL script (such as Flyway `V1__init.sql`) recorded with a checksum in `flyway_schema_history` so every environment applies identical schema changes in order.
+_Avoid_: Manual DB script, Auto-DDL
+
+**Lost Update**:
+A concurrency anomaly where two transactions read the same row, compute a new value in application code, and overwrite each other's write. Prevented by atomic conditional `UPDATE`, `SELECT ... FOR UPDATE`, or `@Version` optimistic locking.
+_Avoid_: Write collision, Stale save
+
+**Refresh Token Rotation**:
+An OAuth 2.0 security practice (RFC 9700) where each token refresh issues a new refresh token and invalidates the old one; replaying an invalidated token revokes the entire token family.
+_Avoid_: Permanent session token, Static refresh key
+
+**Readiness vs Liveness Probe**:
+Two distinct container health checks: a failing liveness probe tells the orchestrator to restart a wedged process, while a failing readiness probe removes the instance from the load balancer without restarting it.
+_Avoid_: Single ping check
+
+**Server-Sent Events (SSE)**:
+A W3C/WHATWG standard (`text/event-stream`) for streaming unidirectional server-to-client events over a single long-lived HTTP connection with automatic reconnection and `Last-Event-ID` replay.
+_Avoid_: One-way WebSocket, Push polling
+
+**Error Budget & Burn Rate**:
+The allowed unreliability over an SLO window ($1 - \text{SLO}$), and the rate at which that budget is being consumed ($\text{observed error rate} / (1 - \text{SLO})$).
+_Avoid_: Downtime quota, Failure speed

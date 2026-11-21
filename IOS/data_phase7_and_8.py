@@ -1,5 +1,5 @@
 # Phase 7: App Store Readiness, Ecosystem & DevOps (Lessons 0044 - 0048)
-# Phase 9: Capstone Portfolio Project (Lesson 0061)
+# Phase 10: Capstone Portfolio Project (Lesson 0067)
 
 PHASE7_AND_8_LESSONS = [
     # 0044: Lesson 7.1
@@ -581,41 +581,42 @@ runTests()""",
         "coaching_prompt": "Congratulations! You have completed Phase 7: App Store Readiness, Ecosystem & DevOps! Next up is Phase 8: 2027 Senior iOS Frontier & Platform Expansion, covering Swift 6.2/6.3, Obj-C interop, TCA, SQLite/GRDB, XCFrameworks, Liquid Glass, FoundationModels, AppIntents, StoreKit 2, and Xcode Cloud!"
     },
 
-    # 0061: Milestone 9.1
+    # 0067: Milestone 10.1
     {
-        "id": "0061",
-        "slug": "0061-capstone-portfolio-blueprint",
-        "phase_num": 9,
-        "phase_title": "Phase 9: Capstone Portfolio Project",
-        "lesson_num": "Milestone 9.1",
+        "id": "0067",
+        "slug": "0067-capstone-portfolio-blueprint",
+        "phase_num": 10,
+        "phase_title": "Phase 10: Capstone Portfolio Project",
+        "lesson_num": "Milestone 10.1",
         "title": "Capstone Showcase: PulseFlow Enterprise Architecture",
-        "subtitle": "The definitive, interview-winning 2027 portfolio project: multi-package SPM & XCFramework, SwiftData/SQLite, Swift 6.3 concurrency, AppIntents, FoundationModels, StoreKit 2, and MetricKit telemetry.",
-        "prev_url": "0060-xcode-cloud-and-release-engineering.html",
+        "subtitle": "The definitive, interview-winning 2027 portfolio project: multi-package SPM & XCFramework, SwiftData/SQLite/CloudKit, Swift 6.3 concurrency, Swift Charts/Canvas, AppIntents, FoundationModels, DocC, StoreKit 2, and MetricKit telemetry.",
+        "prev_url": "0066-docc-previews-and-swiftui-inspector.html",
         "next_url": "../index.html",
         "cheatsheet_url": "../reference/architecture-and-modularization-cheatsheet.html",
         "cheatsheet_title": "Architecture Cheatsheet",
         "android_anchor_html": """
         <p>In Android, senior portfolio showcases demonstrate modular architecture (Compose + Hilt + Room + Coroutines + WorkManager + Gradle convention plugins).</p>
-        <p>In iOS, <strong>PulseFlow Enterprise</strong> is architected specifically to secure Senior iOS engineering offers in 2027. It demonstrates low-level compiler mechanics, multi-package SPM modularization with static linkage and an <code>XCFramework</code> SDK boundary, Swift 6.3 data-race immunity, offline-first sync, WidgetKit + <code>AppIntents</code>, on-device <code>FoundationModels</code> triage, <code>StoreKit 2</code> entitlements, and MetricKit telemetry.</p>
+        <p>In iOS, <strong>PulseFlow Enterprise</strong> is architected specifically to secure Senior iOS engineering offers in 2027. It demonstrates low-level compiler mechanics, multi-package SPM modularization with static linkage and an <code>XCFramework</code> SDK boundary, Swift 6.3 data-race immunity, offline-first + <code>CKSyncEngine</code> cloud sync, <code>Swift Charts</code> + <code>Canvas</code> telemetry UI, WidgetKit + <code>AppIntents</code>, on-device <code>FoundationModels</code> triage, <code>StoreKit 2</code> entitlements, <code>DocC</code> package documentation, and MetricKit telemetry.</p>
         """,
         "core_sections_html": """
         <h3>1. The Modular SPM + Binary SDK Architecture</h3>
         <pre><code>PulseFlowEnterprise (Xcode Project / App Runner Target + .xctestplan)
     ├── FeatureAuth (SwiftUI Liquid Glass, Passkeys, ViewModels, UDF/TCA)
-    ├── FeatureDashboard (Swift Charts, PhaseAnimator, FoundationModels Triage)
+    ├── FeatureDashboard (Swift Charts, Canvas/TimelineView, PhaseAnimator, FoundationModels Triage)
     ├── CoreNetwork (URLSession, Actor OAuth Token Refresh, Lossy Codable)
-    ├── CoreDatabase (SwiftData VersionedSchema + SQLite/GRDB Sync Queue)
-    ├── DesignSystem (Liquid Glass tokens, ViewModifiers, .xcstrings)
-    ├── PulseAnalyticsSDK (Distributable XCFramework with .swiftinterface)
+    ├── CoreDatabase (SwiftData VersionedSchema + SQLite/GRDB + CKSyncEngine Sync)
+    ├── DesignSystem (@ViewBuilder DSL, Liquid Glass tokens, .xcstrings, #Preview)
+    ├── PulseAnalyticsSDK (Distributable XCFramework with .swiftinterface &amp; DocC)
     └── Telemetry (MetricKit subscriber, os.Logger subsystems, StoreKit 2)</code></pre>
 
         <h3>2. 2027 Senior Technical Deliverables Checklist</h3>
         <ul>
           <li><strong>Swift 6.3 Strict &amp; Approachable Concurrency:</strong> Zero warnings, <code>Mutex</code> for short critical sections, <code>~Copyable</code> resource guards.</li>
           <li><strong>Sub-400ms Pre-Main Launch Time:</strong> Static linkage (<code>type: .static</code>) eliminating dyld dylib rebasing overhead.</li>
-          <li><strong>Resilient Offline-First Sync:</strong> Protected sandbox storage + SQLite/SwiftData local caching with Last-Write-Wins conflict resolution.</li>
+          <li><strong>Resilient Offline-First &amp; CloudKit Sync:</strong> Protected sandbox storage + SQLite/SwiftData local caching with <code>CKSyncEngine</code> multi-device sync and conflict resolution.</li>
+          <li><strong>120fps SwiftUI DSL &amp; Telemetry Charts:</strong> Custom <code>@ViewBuilder</code> components, <code>List</code> virtualization, vectorized <code>Swift Charts</code>, and adaptive <code>NavigationSplitView</code>.</li>
           <li><strong>System Intelligence &amp; On-Device AI:</strong> <code>AppIntents</code> for Siri/Shortcuts/Widgets and <code>@Generable</code> on-device triage.</li>
-          <li><strong>Production Observability &amp; CI:</strong> MetricKit telemetry, <code>swift-format</code> + SwiftLint, <code>.xctestplan</code> matrices, and Xcode Cloud / Fastlane release trains.</li>
+          <li><strong>Production Observability, Docs &amp; CI:</strong> MetricKit telemetry, <code>DocC</code> catalogs, <code>swift-format</code> + SwiftLint, <code>.xctestplan</code> matrices, and Xcode Cloud / Fastlane release trains.</li>
         </ul>
         """,
         "failure_mode_html": """
@@ -657,7 +658,7 @@ struct PulseFlowEngine {
 }
 
 func runTests() {
-    print("🧪 Running Milestone 9.1 Verification Tests...")
+    print("🧪 Running Milestone 10.1 Verification Tests...")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: true, isTelemetryActive: true) == true, "Test 1 Failed")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: false, isDatabaseReady: true, isTelemetryActive: true) == false, "Test 2 Failed")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: false, isTelemetryActive: true) == false, "Test 3 Failed")
@@ -676,7 +677,7 @@ struct PulseFlowEngine {
 }
 
 func runTests() {
-    print("🧪 Running Milestone 9.1 Verification Tests...")
+    print("🧪 Running Milestone 10.1 Verification Tests...")
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: true, isTelemetryActive: true) == true)
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: false, isDatabaseReady: true, isTelemetryActive: true) == false)
     assert(PulseFlowEngine.evaluateSystemReadiness(isNetworkReady: true, isDatabaseReady: false, isTelemetryActive: true) == false)
@@ -689,8 +690,8 @@ runTests()""",
             {"title": "PulseFlow Enterprise Architecture Specification", "url": "../index.html#capstone-card", "desc": "Complete senior portfolio project technical specification and milestone legend."},
             {"title": "The Swift Programming Language", "url": "https://docs.swift.org/swift-book/", "desc": "Canonical language reference for modern Swift 6 platform engineering."}
         ],
-        "coaching_prompt": "Congratulations! You have completed the entire 61-lesson Senior iOS Engineering syllabus! You are now equipped with deep systems mastery of the Swift compiler, Swift 6.3 concurrency, zero-copy Swift, SwiftUI Liquid Glass, offline architectures, FoundationModels, AppIntents, StoreKit 2, Instruments profiling, and commercial release engineering!"
+        "coaching_prompt": "Congratulations! You have completed the entire 67-lesson Senior iOS Engineering syllabus! You are now equipped with deep systems mastery of the Swift compiler, Swift 6.3 concurrency, zero-copy Swift, advanced SwiftUI DSL & Liquid Glass, Swift Charts, CloudKit, FoundationModels, AppIntents, StoreKit 2, DocC, Instruments profiling, and commercial release engineering!"
     }
 ]
 
-print("Phase 7 and 9 data loaded (Lessons 7.1 - 7.5 and Milestone 9.1).")
+print("Phase 7 and 10 data loaded (Lessons 7.1 - 7.5 and Milestone 10.1).")

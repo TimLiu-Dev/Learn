@@ -5,10 +5,10 @@ One lesson per session; **R** = mixed review that ends each section.
 Items marked ➕ were added to expand the language scope.
 
 **Every lesson follows the same shape:**
-1. Warm-up: 2–3 recall questions from earlier lessons (spaced practice)
-2. The concept: what problem it solves, why the syntax looks the way it does, and its implications across Android, backend, and algorithmic efficiency
-3. Quick check: a short quiz with instant feedback
-4. Practice: Native in-browser code editor with instant typing. One **write-from-blank** task plus one or two **refactors** of AI/Java-flavoured code. Every exercise includes a **Model Answer** tab with self-check rationale. Run code in your separate local IDE or playground.
+1. Warm-up: 2–5 recall questions from earlier lessons (spaced practice)
+2. The concept: what problem it solves, why the syntax looks the way it does, an **Interactive Concept Lab** (`<code class="kt-run">`), and a **Blank-Page Syntax Blueprint** showing how to type the syntax from memory
+3. Quick check: 3–8 balanced multiple-choice quizzes with per-option instant feedback
+4. Practice: Native in-browser code editor with instant execution and self-checking verification. One **write-from-blank** task plus one **refactor** of AI/Java-flavoured code. Every exercise includes a **Model Answer** tab with self-check rationale.
 
 ---
 
@@ -104,12 +104,14 @@ Items marked ➕ were added to expand the language scope.
 - **12.3** ➕ Testing Flows & hot state: `StateFlow` conflation, `Channel` effects, `backgroundScope`, and `Turbine`
 - **R12** ➕ Mixed review & Senior Production Bug Hunt: race conditions, unmockable singletons, and dispatcher leaks
 
-## 13 · Modern Kotlin 2.2–2.4, Production Flow & Android Tooling (2027 Track — Built & Live)
+## 13 · Modern Kotlin 2.2–2.4, Compose Runtime & Staff Architecture (2027 Track — Built & Live)
 - **13.1** ➕ Modern Kotlin 2.2–2.4 syntax, DSLs & deep recursion (`when` guards, non-local `break`/`continue`, context parameters, `@DslMarker`, `fun interface` SAM, `tailrec`, `DeepRecursiveFunction`)
 - **13.2** ➕ Production Android Flow & Concurrency (`callbackFlow` + `awaitClose`, `stateIn(WhileSubscribed(5_000))`, `flatMapLatest`, `Mutex.withLock`)
 - **13.3** ➕ Gradle Kotlin DSL (`build.gradle.kts` & `libs.versions.toml`), resilient `kotlinx.serialization`, and JVM interop (`@JvmOverloads`, `@JvmName`, `@JvmStatic`, `@Throws`)
 - **13.4** ➕ Staff Internals: Kotlin Contracts (`callsInPlace`, `returns(true) implies`), `@PublishedApi internal`, binary compatibility, and Android R8 shrinking
-- **R13** ➕ 2027 Android Mastery Review: Capstone offline-sync engine & 4-bug production PR audit
+- **13.5** ➕ Compose Compiler & Kotlin Runtime Mental Model (`@Immutable` vs `@Stable`, Strong Skipping Mode `===` vs `==`, lambda closure capture, `rememberUpdatedState`, and `snapshotFlow`)
+- **13.6** ➕ Multi-Module Architecture, `explicitApi()` & Pure-Kotlin DI (`internal` module boundaries, `kotlin { explicitApi() }`, `api` vs `implementation`, and scoped `AppGraph` + assisted `fun interface` factories)
+- **R13** ➕ 2027 Senior Kotlin & Android Mastery Review: Capstone offline-sync engine & 4-bug production PR audit
 
 ---
 

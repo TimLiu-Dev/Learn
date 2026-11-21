@@ -42,7 +42,19 @@
 - [Tool: Spring Initializr](https://start.spring.io/)
   Official project generator. Use for: bootstrapping Kotlin/Java Spring Boot projects.
 - [Spec: RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) and [MDN: HTTP response status codes](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status)
-  Authoritative HTTP method and status semantics. Use for: choosing 200/201/204/400/404/409, Location header.
+  Authoritative HTTP method and status semantics. Use for: choosing 200/201/202/301/302/400/401/403/404/409, Location header.
+- [Book: _High Performance Browser Networking_ — Ilya Grigorik](https://hpbn.co/)
+  Free online reference on TCP handshakes, TLS 1.2/1.3 round trips, and HTTP latency physics. Use for: lesson 0020 request lifecycle and RTT math.
+- [Docs: Flyway Migrations](https://documentation.red-gate.com/fd/migrations-271585107.html) & [PostgreSQL Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
+  Primary sources for immutable schema evolution and Read Committed vs Repeatable Read / Serializable concurrency. Use for: lessons 0021 and 0022.
+- [Cheat Sheet: OWASP Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) & [RFC 9700 — OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700)
+  Authoritative standards for Argon2id/bcrypt password hashing, PKCE on native apps (RFC 8252), and refresh token rotation. Use for: lesson 0023.
+- [Docs: Spring Boot Externalized Configuration](https://docs.spring.io/spring-boot/reference/features/external-config.html) & [The Twelve-Factor App: Config](https://12factor.net/config)
+  Canonical reference for environment variable relaxed binding, precedence, and container health probes. Use for: lesson 0024.
+- [Spec: WHATWG Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html) & [Firebase Cloud Messaging Architectural Overview](https://firebase.google.com/docs/cloud-messaging/concept-options)
+  Primary specs for `text/event-stream`, `Last-Event-ID` replay, and mobile push delivery semantics. Use for: lesson 0025.
+- [Book: _Google Site Reliability Engineering (SRE) Book & Workbook_](https://sre.google/sre-book/service-level-objectives/)
+  Primary source for SLIs, SLOs, error budgets, and multi-window burn-rate alerting. Use for: lesson 0027.
 
 ## Wisdom (Communities)
 

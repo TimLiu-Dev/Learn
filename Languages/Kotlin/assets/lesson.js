@@ -281,15 +281,27 @@
           detailsHtml.push(`<p class="console-exc bad"><strong>${escapeHtml(fullName)}${lineNote}:</strong> ${escapeHtml(msg)}</p>`);
         }
       } else if (isCheckMode) {
-        if (expectedOutput && streams.out.trim() !== expectedOutput) {
+        const isUnmodified = opts && opts.isUserTab && opts.rawStarter && code.trim() === opts.rawStarter.trim();
+        if (isUnmodified) {
+          statusClass = "warn";
+          statusLabel = "🚧 Starter code unmodified — write or refactor your solution first";
+          detailsHtml.push(
+            `<p class="console-exc warn">You haven't edited the starter code yet. Write your solution or refactor the smells in the editor, then click <strong>▶ Run &amp; Check</strong>.</p>`
+          );
+        } else if (expectedOutput && streams.out.trim() !== expectedOutput) {
           statusClass = "bad";
           statusLabel = "❌ Output mismatch";
           detailsHtml.push(
             `<p class="console-exc bad"><strong>Expected output:</strong>\n<code>${escapeHtml(expectedOutput)}</code>\n<strong>Actual output:</strong>\n<code>${escapeHtml(streams.out.trim() || "(empty)")}</code></p>`
           );
         } else if (!expectedOutput && !/\bcheck\s*\(|\brequire\s*\(/.test(code)) {
-          statusClass = "good";
-          statusLabel = "✅ Program ran (compare output with checklist)";
+          if (!streams.out.trim()) {
+            statusClass = "warn";
+            statusLabel = "🚧 Program ran with no output";
+          } else {
+            statusClass = "good";
+            statusLabel = "✅ Program ran (compare output with checklist)";
+          }
         }
       }
 
@@ -416,7 +428,7 @@
       const btnAnswer = document.createElement("button");
       btnAnswer.type = "button";
       btnAnswer.className = "tab-btn";
-      btnAnswer.textContent = "Final Answer";
+      btnAnswer.textContent = "Model Answer";
 
       const actions = document.createElement("div");
       actions.className = "tab-actions";
@@ -459,8 +471,14 @@
       consoleEl.className = "kt-console";
 
       const triggerRun = () => {
-        const activeCode = contentCode.classList.contains("active") ? textarea.value : (answerCode || textarea.value);
-        executeInPanel(activeCode, consoleEl, btnRun, { mode: "check", expectedOutput: answerExpected });
+        const isUserTab = contentCode.classList.contains("active");
+        const activeCode = isUserTab ? textarea.value : (answerCode || textarea.value);
+        executeInPanel(activeCode, consoleEl, btnRun, {
+          mode: "check",
+          expectedOutput: answerExpected,
+          isUserTab,
+          rawStarter
+        });
       };
 
       bindCodeShortcuts(textarea, triggerRun);
@@ -481,7 +499,7 @@
         if (answerWhy) {
           const whyP = document.createElement("p");
           whyP.className = "why-idiomatic";
-          whyP.innerHTML = `<strong>Why this final answer works:</strong> ${formatInlineCode(answerWhy)}`;
+          whyP.innerHTML = `<strong>Why this model answer works:</strong> ${formatInlineCode(answerWhy)}`;
           answerBody.appendChild(whyP);
         }
       } else {

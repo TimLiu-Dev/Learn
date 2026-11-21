@@ -30,7 +30,7 @@ class Parser(private val tokens: List<String>) {
 
     private fun term(): Expr = TODO("an atom, then a loop that handles * and /")
 
-private fun atom(): Expr {
+    private fun atom(): Expr {
         val t = next() ?: throw CalcError("expected a number or '(' but found end of input")
         return when {
             t == "(" -> expr().also { if (next() != ")") throw CalcError("expected ')'") }

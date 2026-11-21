@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0022: Transactions &amp; Isolation — Don't Sell the Last Croissant Twice</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    details.java-side { margin: 1rem 0 1.5rem 0; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-surface); }
+    details.java-side summary { cursor: pointer; padding: 0.7rem 1rem; font-weight: 600; font-size: 0.92rem; color: var(--text-secondary); }
+    details.java-side pre { margin: 0; border-radius: 0 0 var(--radius-md) var(--radius-md); }
+    ol.steps li { margin-bottom: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="page-container">
+    <nav class="top-nav">
+      <a href="../master-plan.html" class="nav-brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+        <span>Back to Master Plan</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../master-plan.html">Master Plan</a></li>
+        <li><a href="../reference/0003-backend-foundations-cheatsheet.html">Foundations Cheat Sheet</a></li>
+        <li><a href="../reference/0004-capstone-part1-pulseorder-spec.html">Part 1 Capstone</a></li>
+      </ul>
+    </nav>
+
+    <header>
+      <div class="badge-group">
+        <span class="badge badge-benchmark">Module 0022</span>
+        <span class="badge badge-mid">Part 1 · Phase 0: Build It</span>
+        <span class="badge badge-senior">Junior → Mid</span>
+        <span class="badge badge-big">~25 min</span>
+      </div>
+      <h1>Transactions &amp; Isolation: Don't Sell the Last Croissant Twice</h1>
+      <p style="font-size: 1.15rem;">
+        Two customers tap "Order" on the last croissant at the same moment. Both requests read <code>stock = 1</code>, both see "in stock", and both write <code>stock = 0</code>. You've sold two croissants and own one. The skill in this lesson: <strong>spot the read-modify-write race and fix it three ways.</strong> roadmap.sh doesn't cover this at all, yet it comes up in almost every order, booking, or payment design question.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. ACID in four lines</h2>
+      <div class="table-wrapper"><table>
+        <thead><tr><th>Letter</th><th>Promise</th><th>Croissant meaning</th></tr></thead>
+        <tbody>
+          <tr><td><strong>A</strong>tomicity</td><td>All of the transaction's writes happen, or none do</td><td>Order row and stock decrement commit together</td></tr>
+          <tr><td><strong>C</strong>onsistency</td><td>Your invariants hold (enforced partly by constraints)</td><td><code>CHECK (stock_qty &gt;= 0)</code></td></tr>
+          <tr><td><strong>I</strong>solation</td><td>Concurrent transactions don't see each other's half-finished work…</td><td>…<em>to a degree that depends on the isolation level</em></td></tr>
+          <tr><td><strong>D</strong>urability</td><td>Once committed, it survives a crash</td><td>The order isn't lost on restart</td></tr>
+        </tbody>
+      </table></div>
+      <p>The "I" is where bugs hide. PostgreSQL's default isolation level is <strong>Read Committed</strong>: each statement sees data committed before <em>that statement</em> began (<a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL: Transaction Isolation</a>). That prevents dirty reads, but it does <strong>not</strong> protect a read-then-write sequence done in your application code.</p>
+    </section>
+
+    <section>
+      <h2>2. The bug: a lost update</h2>
+<pre><code>// ❌ Broken under concurrency, even inside @Transactional at Read Committed
+val item = repo.findById(id)                 // both requests read qty = 1
+if (item.qty &gt; 0) {
+    repo.save(item.copy(qty = item.qty - 1)) // both write qty = 0 → two orders, one croissant
+}</code></pre>
+      <p>Kleppmann calls this the <strong>lost update</strong> problem: two read-modify-write cycles interleave and one overwrites the other (<a href="https://dataintensive.net/">DDIA ch. 7</a>). There are three standard fixes:</p>
+      <div class="table-wrapper"><table>
+        <thead><tr><th>Fix</th><th>How</th><th>Best when</th></tr></thead>
+        <tbody>
+          <tr><td><strong>1. Atomic conditional update</strong></td><td><code>UPDATE items SET qty = qty - 1 WHERE id = :id AND qty &gt; 0</code>, then check rows affected (1 = sold, 0 = sold out)</td><td>The change fits in one statement. Simplest and fastest. <strong>Default choice.</strong></td></tr>
+          <tr><td><strong>2. Pessimistic lock</strong></td><td><code>SELECT … FOR UPDATE</code> locks the row, so other transactions wait until you commit</td><td>Complex logic between read and write, with conflicts expected to be common</td></tr>
+          <tr><td><strong>3. Optimistic lock</strong></td><td>A <code>version</code> column: <code>UPDATE … SET qty = ?, version = version + 1 WHERE id = ? AND version = ?</code>. Zero rows means someone else got there first, so retry</td><td>Conflicts are rare and you don't want to hold locks (e.g. editing a menu item)</td></tr>
+        </tbody>
+      </table></div>
+      <p>Postgres makes fix 1 safe: a concurrent <code>UPDATE</code> on the same row waits for the first transaction, then re-checks the <code>WHERE</code> clause against the newly committed row (<a href="https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED">Read Committed details</a>). Spring Data JDBC implements fix 3 for you. Add a <code>@Version</code> property and a conflicting <code>save()</code> throws <code>OptimisticLockingFailureException</code> (<a href="https://docs.spring.io/spring-data/relational/reference/jdbc/entity-persistence.html#jdbc.entity-persistence.optimistic-locking">Spring Data JDBC: optimistic locking</a>).</p>
+    </section>
+
+    <section>
+      <h2>3. <code>@Transactional</code> in one paragraph</h2>
+      <p>Put <code>@Transactional</code> on a service method and Spring wraps the call in a proxy: begin, run your method, then commit. If a <strong><code>RuntimeException</code> or <code>Error</code></strong> escapes, it rolls back instead. <strong>Checked exceptions do not trigger a rollback by default</strong>, so use <code>rollbackFor</code> if you throw one (<a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/rolling-back.html">Spring: rolling back</a>). Kotlin doesn't distinguish checked exceptions, but Spring still does: an <code>IOException</code> thrown from Kotlin won't roll back. Because it works through a proxy, calling a <code>@Transactional</code> method from <em>inside the same class</em> skips the proxy, and no transaction starts.</p>
+<pre><code>@Service
+class OrderService(private val items: ItemRepository, private val orders: OrderRepository) {
+
+    @Transactional
+    fun placeOrder(userId: Long, itemId: Long, qty: Int): Order {
+        val updated = items.decrementIfAvailable(itemId, qty)   // fix 1: atomic + conditional
+        if (updated == 0) throw OutOfStockException(itemId)     // RuntimeException → rollback → 409
+        return orders.save(Order(userId = userId, itemId = itemId, qty = qty))
+    }
+}
+
+interface ItemRepository : CrudRepository&lt;Item, Long&gt; {
+    @Modifying
+    @Query("UPDATE items SET stock_qty = stock_qty - :qty WHERE id = :id AND stock_qty &gt;= :qty")
+    fun decrementIfAvailable(id: Long, qty: Int): Int
+}</code></pre>
+      <details class="java-side">
+        <summary>☕ Java on the side: the same service</summary>
+<pre><code>@Service
+public class OrderService {
+    private final ItemRepository items; private final OrderRepository orders;
+    public OrderService(ItemRepository items, OrderRepository orders) { this.items = items; this.orders = orders; }
+
+    @Transactional
+    public Order placeOrder(long userId, long itemId, int qty) {
+        if (items.decrementIfAvailable(itemId, qty) == 0) throw new OutOfStockException(itemId);
+        return orders.save(new Order(null, userId, itemId, qty));
+    }
+}</code></pre>
+      </details>
+    </section>
+
+    <section>
+      <h2>4. Practice: optimistic locking with retry</h2>
+      <p>The simulated database lets another buyer sneak in between your read and your write. Implement:</p>
+      <ul>
+        <li><code>buyOptimistic(db, id, maxRetries)</code>: read <code>{qty, version}</code>. If <code>qty === 0</code>, return <code>'SOLD_OUT'</code>. Otherwise call <code>db.compareAndSet(id, version, qty - 1)</code>. If that returns <code>false</code>, someone else won, so re-read and retry. Make at most <code>maxRetries</code> retries after the first attempt, then return <code>'CONFLICT'</code>. Return <code>'OK'</code> on success.</li>
+        <li><code>buyAtomic(db, id)</code>: one call to <code>db.decrementIfPositive(id)</code>, which returns the number of rows affected (1 or 0).</li>
+      </ul>
+      <div id="sandbox-0022"></div>
+    </section>
+
+    <section>
+      <h2>5. Check yourself</h2>
+      <div id="quiz-0022-a"></div>
+      <div id="quiz-0022-b"></div>
+      <div id="quiz-0022-c"></div>
+    </section>
+
+    <section>
+      <h2>6. Do it for real (on your machine)</h2>
+      <ol class="steps">
+        <li><strong>Reproduce the race in two psql sessions.</strong> Add migration <code>V3__items.sql</code>: <code>CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT NOT NULL, stock_qty INT NOT NULL CHECK (stock_qty &gt;= 0)); INSERT INTO items VALUES (1, 'croissant', 1);</code> Then open two terminals with <code>docker exec -it notes-db psql -U postgres -d notes</code>:
+<pre><code>-- A: BEGIN; SELECT stock_qty FROM items WHERE id = 1;    -- 1
+-- B: BEGIN; SELECT stock_qty FROM items WHERE id = 1;    -- 1
+-- A: UPDATE items SET stock_qty = 0 WHERE id = 1; COMMIT;   -- "app" computed 1 - 1
+-- B: UPDATE items SET stock_qty = 0 WHERE id = 1; COMMIT;   -- succeeds too → two sales</code></pre></li>
+        <li><strong>Now the fix.</strong> Reset the stock to 1 and have both sessions run <code>UPDATE items SET stock_qty = stock_qty - 1 WHERE id = 1 AND stock_qty &gt; 0;</code>. B blocks until A commits, then reports <code>UPDATE 0</code>. That 0 is your 409 Out of Stock.</li>
+        <li><strong>In Spring:</strong> add <code>ItemRepository.decrementIfAvailable</code> and a <code>@Transactional</code> <code>OrderService.placeOrder</code> like §3. Map <code>OutOfStockException</code> to <strong>409 Conflict</strong> (e.g. with <code>@ResponseStatus(HttpStatus.CONFLICT)</code> on the exception class).</li>
+        <li><strong>Hammer it:</strong> set the stock to 5 and fire 20 concurrent orders:
+<pre><code>seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/orders \
+  -H 'Content-Type: application/json' -d '{"itemId":1,"qty":1}' | sort | uniq -c
+#   5 201
+#  15 409</code></pre>
+        Then swap in the broken "read, check, save" version and run it again. You'll often see more than 5 × 201, which means overselling.</li>
+        <li><strong>Java on the side:</strong> write the same service in Java and repeat step 4.</li>
+      </ol>
+      <div class="callout callout-tip">
+        <div class="callout-title">✓ Win condition</div>
+        <p>Exactly 5 × 201 and 15 × 409 on every run, and stock never goes negative (the CHECK constraint is your safety net).</p>
+      </div>
+      <div class="callout callout-tip">
+        <div class="callout-title">🏗 Capstone milestone (PulseOrder M2, part 1)</div>
+        <p><code>POST /orders</code> decrements inventory atomically inside one transaction with the order insert. A concurrency test proves there's no oversell, and failed orders roll back fully. Idempotency keys complete M2 in <a href="0008-idempotency-keys-and-safe-retries.html">0008</a>. See the <a href="../reference/0004-capstone-part1-pulseorder-spec.html">capstone spec</a>.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>7. Primary source &amp; where this sits</h2>
+      <ul>
+        <li><strong>Read next (primary):</strong> Martin Kleppmann, <a href="https://dataintensive.net/"><em>Designing Data-Intensive Applications</em></a>, ch. 7 "Transactions", especially "Preventing Lost Updates".</li>
+        <li><strong>Reference:</strong> <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL: Transaction Isolation</a> · <a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/rolling-back.html">Spring: @Transactional rollback rules</a></li>
+        <li><strong>roadmap.sh:</strong> <em>not covered</em> (a gap in that roadmap). Related nodes: Strong Consistency, Databases.</li>
+        <li><strong>Previous:</strong> <a href="0021-postgres-spring-data-stateless-service.html">0021 Postgres + Spring Data</a> · <strong>Next:</strong> <a href="0023-server-side-auth-sessions-jwt-oauth.html">0023 Server-Side Auth</a></li>
+      </ul>
+    </section>
+
+    <footer class="page-footer">
+      <div class="agent-help-box">
+        <p style="margin-bottom: 0.5rem;"><strong>Ask your teacher:</strong> paste your xargs output if the counts look wrong.</p>
+        <p style="margin-bottom: 0;">Good follow-ups: <em>"What is write skew, and why doesn't fix 1 solve it?"</em> · <em>"When should I use SERIALIZABLE?"</em> · <em>"How would I lock several items in one order without deadlocks?"</em></p>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
+        <span>Backend System Design // Part 1 · Phase 0</span>
+        <span>Local Workspace: <code>Backend/</code></span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/code-runner.js"></script>
+  <script>
+    const eq = (actual, expected, label) => {
+      if (actual !== expected) throw new Error(label + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual));
+    };
+    // Simulated DB. `interfere` = how many times a competing buyer sneaks in right after you read.
+    function makeDb(qty, interfere) {
+      const row = { qty: qty, version: 0 };
+      const stats = { casCalls: 0 };
+      let pending = interfere || 0;
+      return {
+        row: row, stats: stats,
+        read: function () {
+          const snapshot = { qty: row.qty, version: row.version };
+          if (pending > 0) { pending--; if (row.qty > 0) { row.qty--; } row.version++; } // competitor commits
+          return snapshot;
+        },
+        compareAndSet: function (id, expectedVersion, newQty) {
+          stats.casCalls++;
+          if (newQty < 0) throw new Error('CHECK constraint violated: stock_qty >= 0');
+          if (row.version !== expectedVersion) return false;
+          row.qty = newQty; row.version++; return true;
+        },
+        decrementIfPositive: function () {
+          if (row.qty > 0) { row.qty--; row.version++; return 1; }
+          return 0;
+        }
+      };
+    }
+
+    new CodeRunner('sandbox-0022', {
+      id: 'lesson0022_optimistic_lock',
+      successMessage: 'No oversells, even with a competitor slipping in between every read and write. Now prove it against real Postgres with 20 concurrent curls (section 6).',
+      starterCode: `
+// db.read(id)                          -> { qty, version }   (a competitor may commit right after!)
+// db.compareAndSet(id, version, newQty) -> true if version still matched (and bumps version), else false
+// db.decrementIfPositive(id)           -> rows affected: 1 or 0
+
+function buyOptimistic(db, id, maxRetries) {
+  // TODO: read -> sold out? -> compareAndSet -> on false, retry (at most maxRetries retries)
+  // return 'OK' | 'SOLD_OUT' | 'CONFLICT'
+  return 'OK';
+}
+
+function buyAtomic(db, id) {
+  // TODO: one conditional update; 1 row -> 'OK', 0 rows -> 'SOLD_OUT'
+  return 'OK';
+}
+`,
+      solutionCode: `
+function buyOptimistic(db, id, maxRetries) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const { qty, version } = db.read(id);
+    if (qty <= 0) return 'SOLD_OUT';
+    if (db.compareAndSet(id, version, qty - 1)) return 'OK';
+    // someone else changed the row since our read: loop and re-read
+  }
+  return 'CONFLICT';
+}
+
+function buyAtomic(db, id) {
+  return db.decrementIfPositive(id) === 1 ? 'OK' : 'SOLD_OUT';
+}
+`,
+      hints: [
+        { title: 'Loop shape', content: '<code>for (let attempt = 0; attempt &lt;= maxRetries; attempt++)</code> gives one first attempt plus <code>maxRetries</code> retries.' },
+        { title: 'Re-read inside the loop', content: 'After a failed <code>compareAndSet</code>, your snapshot is stale. The next iteration must call <code>db.read(id)</code> again, and may discover the item is now sold out.' },
+        { title: 'Atomic version', content: 'Exactly like checking <code>UPDATE … WHERE qty &gt; 0</code> in SQL: <code>db.decrementIfPositive(id) === 1 ? "OK" : "SOLD_OUT"</code>.' }
+      ],
+      tests: [
+        { name: 'No contention: OK, stock 3 → 2', exportSymbol: 'buyOptimistic', testFn: (x) => {
+          const db = makeDb(3, 0);
+          eq(x.buyOptimistic(db, 1, 3), 'OK', 'result'); eq(db.row.qty, 2, 'stock');
+        }},
+        { name: 'Stock 0: SOLD_OUT without attempting a write', exportSymbol: 'buyOptimistic', testFn: (x) => {
+          const db = makeDb(0, 0);
+          eq(x.buyOptimistic(db, 1, 3), 'SOLD_OUT', 'result'); eq(db.stats.casCalls, 0, 'compareAndSet calls');
+        }},
+        { name: 'Competitor buys first, stock 2: retry succeeds, stock ends at 0', exportSymbol: 'buyOptimistic', testFn: (x) => {
+          const db = makeDb(2, 1);
+          eq(x.buyOptimistic(db, 1, 3), 'OK', 'result'); eq(db.row.qty, 0, 'stock (2 sold, 2 owned)');
+        }},
+        { name: 'Last croissant stolen: SOLD_OUT, never negative', exportSymbol: 'buyOptimistic', testFn: (x) => {
+          const db = makeDb(1, 1);
+          eq(x.buyOptimistic(db, 1, 3), 'SOLD_OUT', 'result'); eq(db.row.qty, 0, 'stock');
+        }},
+        { name: 'Endless contention: CONFLICT after 1 + maxRetries attempts', exportSymbol: 'buyOptimistic', testFn: (x) => {
+          const db = makeDb(100, 50);
+          eq(x.buyOptimistic(db, 1, 3), 'CONFLICT', 'result'); eq(db.stats.casCalls, 4, 'compareAndSet calls');
+        }},
+        { name: 'Atomic: stock 1 → first OK, second SOLD_OUT', exportSymbol: 'buyAtomic', testFn: (x) => {
+          const db = makeDb(1, 0);
+          eq(x.buyAtomic(db, 1), 'OK', 'first'); eq(x.buyAtomic(db, 1), 'SOLD_OUT', 'second'); eq(db.row.qty, 0, 'stock');
+        }}
+      ]
+    });
+
+    new QuizEngine('quiz-0022-a', {
+      id: 'l0022_a',
+      question: 'A @Transactional method reads stock, checks it is above zero, then saves stock minus one. Under Postgres Read Committed, what can happen with two concurrent buyers of the last item?',
+      options: [
+        { text: 'Postgres serializes them, so one waits', rationale: 'Plain SELECTs take no row locks under Read Committed, so neither waits during the read phase.' },
+        { text: 'Both read one and both succeed', rationale: 'Correct. This is a lost update: each read is a fresh snapshot, so both pass the check and both write 0. Two orders, one item.' },
+        { text: 'The transaction annotation prevents all races', rationale: '@Transactional gives atomicity (all or nothing). It does not make concurrent read-modify-write cycles safe at Read Committed.' },
+        { text: 'One gets a deadlock error immediately', rationale: 'A deadlock needs two transactions each waiting on a lock the other holds. Plain reads take no such locks here.' }
+      ],
+      correctIndex: 1,
+      summary: 'Transactions give you all-or-nothing writes. They don\'t, by themselves, stop two read-modify-write cycles from overwriting each other.'
+    });
+
+    new QuizEngine('quiz-0022-b', {
+      id: 'l0022_b',
+      question: 'A flash sale: 10,000 users order the same item in one second. Which fix should you reach for first?',
+      options: [
+        { text: 'Optimistic locking with many retries', rationale: 'Under heavy contention almost every attempt conflicts, so the retries multiply load and most users get CONFLICT anyway.' },
+        { text: 'SERIALIZABLE isolation on every request', rationale: 'It works, but it causes many serialization failures under this contention, each needing a retry. That\'s heavier than one atomic statement.' },
+        { text: 'Lock entire tables during checkout', rationale: 'A table lock stops all orders, including orders for other items, which is a throughput disaster.' },
+        { text: 'One atomic conditional UPDATE statement', rationale: 'Correct. UPDATE … WHERE qty >= n does the check and the decrement in one step on a single row, and zero rows affected tells you it\'s sold out. No application-level retries.' }
+      ],
+      correctIndex: 3,
+      summary: 'If the change fits in one statement, let the database do the check and the write atomically. Optimistic locking suits low-contention edits.'
+    });
+
+    new QuizEngine('quiz-0022-c', {
+      id: 'l0022_c',
+      question: 'Inside a @Transactional placeOrder(), the stock decrement succeeds and then the order insert throws a RuntimeException. What is in the database afterwards?',
+      options: [
+        { text: 'Neither the decrement nor the order', rationale: 'Correct. A RuntimeException escaping a @Transactional method triggers a rollback, so the decrement is undone too. That\'s atomicity.' },
+        { text: 'The decrement, but not the order', rationale: 'That would happen without a transaction, because each statement would auto-commit on its own.' },
+        { text: 'The order, but not the decrement', rationale: 'The insert never succeeded, so there\'s no order row to keep.' },
+        { text: 'Both, because Kotlin exceptions are unchecked', rationale: 'Kotlin lacking checked exceptions doesn\'t matter here. Spring rolls back on RuntimeException by default.' }
+      ],
+      correctIndex: 0,
+      summary: 'Default rollback rule: RuntimeException or Error rolls back, checked exceptions commit unless you set rollbackFor.'
+    });
+  </script>
+</body>
+</html>

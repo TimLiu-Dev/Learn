@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0025: Real-Time Delivery — Polling, SSE, WebSockets &amp; FCM</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    details.java-side { margin: 1rem 0 1.5rem 0; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-surface); }
+    details.java-side summary { cursor: pointer; padding: 0.7rem 1rem; font-weight: 600; font-size: 0.92rem; color: var(--text-secondary); }
+    details.java-side pre { margin: 0; border-radius: 0 0 var(--radius-md) var(--radius-md); }
+    ol.steps li { margin-bottom: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="page-container">
+    <nav class="top-nav">
+      <a href="../master-plan.html" class="nav-brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+        <span>Back to Master Plan</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../master-plan.html">Master Plan</a></li>
+        <li><a href="../reference/0003-backend-foundations-cheatsheet.html">Foundations Cheat Sheet</a></li>
+        <li><a href="../reference/0004-capstone-part1-pulseorder-spec.html">Part 1 Capstone</a></li>
+      </ul>
+    </nav>
+
+    <header>
+      <div class="badge-group">
+        <span class="badge badge-benchmark">Module 0025</span>
+        <span class="badge badge-mid">Part 1 · Phase 1: Junior Core</span>
+        <span class="badge badge-senior">Junior → Mid (L3/L4)</span>
+        <span class="badge badge-big">~25 min</span>
+      </div>
+      <h1>Real-Time Delivery: Polling, SSE, WebSockets &amp; FCM</h1>
+      <p style="font-size: 1.15rem;">
+        A customer places a coffee order and watches the status change from <em>received &rarr; preparing &rarr; ready</em>. How does that update reach their phone? This topic is missing from roadmap.sh, yet it decides the architecture of every chat, live-feed, ride-status, and notification question — and your Android background gives you an unfair advantage.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. Five ways to push data to a phone</h2>
+      <div class="table-wrapper"><table>
+        <thead><tr><th>Transport</th><th>Direction</th><th>How it works</th><th>Pick it when…</th></tr></thead>
+        <tbody>
+          <tr><td><strong>1. Short polling</strong></td><td>Client pulls</td><td><code>GET /orders/42</code> every <em>N</em> seconds</td><td>Updates are slow (&gt;30 s) and traffic is tiny. Wastes battery and QPS at scale.</td></tr>
+          <tr><td><strong>2. Long polling</strong></td><td>Client pulls, server holds</td><td>Server holds the GET open until an event arrives or a timeout expires</td><td>Fallback when proxies block streaming (historical chat systems).</td></tr>
+          <tr><td><strong>3. Server-Sent Events (SSE)</strong></td><td><strong>Server &rarr; client</strong> stream</td><td>One long-lived HTTP response (<code>text/event-stream</code>) with <code>id:</code> and <code>data:</code> frames + automatic reconnect via <code>Last-Event-ID</code> (<a href="https://html.spec.whatwg.org/multipage/server-sent-events.html">WHATWG SSE Spec</a>)</td><td><strong>One-way live updates while the app is open:</strong> order status, live scores, LLM token streaming.</td></tr>
+          <tr><td><strong>4. WebSockets</strong></td><td><strong>Full-duplex</strong> (both ways)</td><td>HTTP <code>Upgrade: websocket</code> handshake (<a href="https://www.rfc-editor.org/rfc/rfc6455">RFC 6455</a>), then persistent two-way frames</td><td>Both sides send at high rate: 1:1 chat, collaborative docs, multiplayer games.</td></tr>
+          <tr><td><strong>5. Mobile Push (FCM / APNs)</strong></td><td><strong>OS-level wakeup</strong></td><td>Your server calls Firebase Cloud Messaging; Google Play Services wakes the device (<a href="https://firebase.google.com/docs/cloud-messaging/concept-options">FCM Architectural Overview</a>)</td><td><strong>The app is backgrounded or killed.</strong> Best-effort delivery; not guaranteed or strictly ordered.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="callout callout-note">
+        <div class="callout-title">Your Android edge in interviews</div>
+        <p>Many backend candidates say "we'll hold a WebSocket to the phone in the background." You know Android's Doze mode and background execution limits kill open sockets when the user locks the screen. The real production answer is <strong>SSE (or WebSockets) while foregrounded + FCM push when backgrounded + a fresh GET on app resume as the source of truth.</strong></p>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Why two server instances break naive SSE/WebSockets</h2>
+      <div class="diagram-box">
+        <div class="diagram-title">Multi-instance fan-out via Redis Pub/Sub</div>
+<pre class="ascii-diagram">
+ Customer phone ─── SSE (open socket) ───&gt; [ app #1 ] &lt;── SUBSCRIBE order-events ──┐
+                                                                                   ├── [ Redis Pub/Sub ]
+ Barista tablet ─── PATCH /orders/42 ────&gt; [ app #2 ] ─── PUBLISH order-events ────┘
+</pre>
+      </div>
+      <p>An open SSE or WebSocket connection is an in-memory socket held by <em>one</em> specific app instance (say, app #1). When the barista taps "Ready", the load balancer can send their <code>PATCH</code> to app #2. App #2 has no reference to app #1's socket! To bridge instances, app #2 writes the new status to Postgres and <strong>publishes</strong> the event to a shared bus (like Redis Pub/Sub); every app instance subscribes and forwards matching events to its local sockets.</p>
+    </section>
+
+    <section>
+      <h2>3. Spring <code>SseEmitter</code> + <code>Last-Event-ID</code> replay</h2>
+      <p>When a phone rides through a subway tunnel, its SSE connection drops. On reconnect, SSE clients automatically send the <code>Last-Event-ID</code> header so the server can replay missed events (<a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html#mvc-ann-async-sse">Spring MVC: Server-Sent Events</a>):</p>
+<pre><code>@RestController
+class OrderEventsController(private val hub: OrderEventHub) {
+
+    @GetMapping("/orders/{id}/events", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])
+    fun stream(
+        @PathVariable id: Long,
+        @RequestHeader("Last-Event-ID", required = false) lastId: Long?
+    ): SseEmitter {
+        val emitter = SseEmitter(0L)
+        hub.subscribe(orderId = id, lastEventId = lastId) { evt -&gt;
+            emitter.send(SseEmitter.event().id(evt.id.toString()).name("status").data(evt.data))
+        }
+        return emitter
+    }
+}</code></pre>
+      <details class="java-side">
+        <summary>☕ Java on the side: the same SSE endpoint</summary>
+<pre><code>@GetMapping(value = "/orders/{id}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public SseEmitter stream(@PathVariable long id,
+                         @RequestHeader(value = "Last-Event-ID", required = false) Long lastId) {
+    SseEmitter emitter = new SseEmitter(0L);
+    hub.subscribe(id, lastId, evt -&gt;
+        emitter.send(SseEmitter.event().id(String.valueOf(evt.id())).name("status").data(evt.data()))
+    );
+    return emitter;
+}</code></pre>
+      </details>
+    </section>
+
+    <section>
+      <h2>4. Practice: bounded replay hub + multi-instance fan-out</h2>
+      <p>Implement <code>createEventHub(bufferSize)</code>:</p>
+      <ul>
+        <li><code>publish(data)</code> assigns an incrementing numeric <code>id</code> (starting at 1), keeps only the last <code>bufferSize</code> events in a ring/sliding buffer, notifies all active subscribers, and returns the created <code>{ id, data }</code>.</li>
+        <li><code>subscribe(lastEventId, onEvent)</code>:
+          <ul>
+            <li>If <code>lastEventId</code> is provided and is <em>older</em> than the oldest buffered event (meaning some events were evicted, i.e. <code>buffer.length &gt; 0 &amp;&amp; lastEventId &lt; buffer[0].id - 1</code>), immediately deliver <code>{ id: null, data: 'RESYNC' }</code> so the client knows to do a full HTTP GET.</li>
+            <li>Otherwise, if <code>lastEventId</code> is provided, immediately replay every buffered event with <code>event.id &gt; lastEventId</code> in order.</li>
+            <li>Register <code>onEvent</code> so future <code>publish()</code> calls deliver to it, and return an <code>unsubscribe()</code> function.</li>
+          </ul>
+        </li>
+      </ul>
+      <div id="sandbox-0025"></div>
+    </section>
+
+    <section>
+      <h2>5. Check yourself</h2>
+      <div id="quiz-0025-a"></div>
+      <div id="quiz-0025-b"></div>
+      <div id="quiz-0025-c"></div>
+    </section>
+
+    <section>
+      <h2>6. Do it for real (on your machine)</h2>
+      <ol class="steps">
+        <li>Add the <code>/orders/{id}/events</code> endpoint above to your service and watch it in one terminal with <code>curl -N http://localhost:8080/orders/1/events</code> (<code>-N</code> disables output buffering).</li>
+        <li>In a second terminal, call <code>curl -X PATCH http://localhost:8080/staff/orders/1/status -H 'Content-Type: application/json' -d '{"status":"PREPARING"}'</code> and watch the SSE frame (<code>id: 1</code>, <code>event: status</code>, <code>data: ...</code>) appear immediately in terminal 1.</li>
+        <li>Stop <code>curl -N</code>, publish two more status updates, then reconnect with <code>curl -N -H 'Last-Event-ID: 1' http://localhost:8080/orders/1/events</code> and watch events 2 and 3 replay on connect.</li>
+        <li><strong>Android bonus:</strong> add <code>com.squareup.okhttp3:okhttp-sse</code> to your Android app and connect an <code>EventSource</code> while the Order Status screen is visible (`Lifecycle.State.STARTED`). When the status becomes <code>READY</code> and the user isn't connected, trigger an FCM notification message via the Firebase Admin SDK.</li>
+        <li><strong>Java on the side:</strong> run the Java controller snippet in your Java project and test with the same two <code>curl -N</code> commands.</li>
+      </ol>
+      <div class="callout callout-tip">
+        <div class="callout-title">✓ Win condition</div>
+        <p>Live status frames stream to <code>curl -N</code>, reconnecting with <code>Last-Event-ID</code> replays missed frames, and publishing through Redis Pub/Sub reaches a client connected to a different instance.</p>
+      </div>
+      <div class="callout callout-tip">
+        <div class="callout-title">🏗 Capstone milestone (PulseOrder M6, part 1)</div>
+        <p>PulseOrder streams order status via SSE while the app is open, fans events out across instances via Redis Pub/Sub, and sends an FCM push when the order becomes <code>READY</code>. You'll pair this with the Transactional Outbox (<a href="0011-transactional-outbox-and-eventual-consistency.html">0011</a>) and job retries (<a href="0017-distributed-job-schedulers-and-delayed-queues.html">0017</a>). See the <a href="../reference/0004-capstone-part1-pulseorder-spec.html">capstone spec</a>.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>7. Primary source &amp; where this sits</h2>
+      <ul>
+        <li><strong>Read next (primary):</strong> <a href="https://html.spec.whatwg.org/multipage/server-sent-events.html">WHATWG HTML Living Standard: §9.2 Server-sent events</a> and <a href="https://firebase.google.com/docs/cloud-messaging/concept-options">Firebase Cloud Messaging: Architectural Overview</a>.</li>
+        <li><strong>Reference:</strong> <a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html#mvc-ann-async-sse">Spring MVC SseEmitter</a> · <a href="https://www.rfc-editor.org/rfc/rfc6455">RFC 6455 (WebSockets)</a> · Part 2 deep dive: <a href="0013-websockets-10m-connections-and-vector-caching.html">0013 WebSockets at 10M Connections</a></li>
+        <li><strong>roadmap.sh:</strong> <em>missing as a dedicated topic</em> (a gap in that roadmap). Connects to: Communication, Asynchronism, Publisher/Subscriber.</li>
+        <li><strong>Previous:</strong> <a href="0008-idempotency-keys-and-safe-retries.html">0008 Idempotent API Design</a> · <strong>Next:</strong> <a href="0026-worked-designs-url-shortener-notification-system.html">0026 Worked Designs: URL Shortener &amp; Notification System</a></li>
+      </ul>
+    </section>
+
+    <footer class="page-footer">
+      <div class="agent-help-box">
+        <p style="margin-bottom: 0.5rem;"><strong>Ask your teacher:</strong> not sure when an interviewer wants SSE vs WebSockets? Ask for a 3-question drill.</p>
+        <p style="margin-bottom: 0;">Good follow-ups: <em>"Why does SSE work better than WebSockets over HTTP/2 and corporate proxies?"</em> · <em>"How do I authenticate an SSE stream?"</em> · <em>"What happens when FCM throttles or drops a push?"</em></p>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
+        <span>Backend System Design // Part 1 · Phase 1</span>
+        <span>Local Workspace: <code>Backend/</code></span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/code-runner.js"></script>
+  <script>
+    const eq = (actual, expected, label) => {
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(label + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual));
+    };
+
+    new CodeRunner('sandbox-0025', {
+      id: 'lesson0025_sse_event_hub',
+      successMessage: 'Your event hub handles live fan-out, Last-Event-ID replay, buffer eviction RESYNC, and multi-instance pub/sub.',
+      starterCode: `
+function createEventHub(bufferSize) {
+  let nextId = 1;
+  const buffer = [];        // keep at most bufferSize items: { id, data }
+  const subscribers = new Set();
+
+  function publish(data) {
+    // TODO:
+    // 1. Create evt = { id: nextId++, data }
+    // 2. Push to buffer; if buffer.length > bufferSize, shift() the oldest
+    // 3. Call every fn in subscribers with evt
+    // 4. Return evt
+    return { id: 0, data: null };
+  }
+
+  function subscribe(lastEventId, onEvent) {
+    // TODO:
+    // 1. If lastEventId != null:
+    //    - If buffer.length > 0 && lastEventId < buffer[0].id - 1 -> call onEvent({ id: null, data: 'RESYNC' })
+    //    - Else replay every buffered evt with evt.id > lastEventId in order
+    // 2. Add onEvent to subscribers and return () => subscribers.delete(onEvent)
+    return () => {};
+  }
+
+  return { publish, subscribe };
+}
+`,
+      solutionCode: `
+function createEventHub(bufferSize) {
+  let nextId = 1;
+  const buffer = [];
+  const subscribers = new Set();
+
+  function publish(data) {
+    const evt = { id: nextId++, data };
+    buffer.push(evt);
+    if (buffer.length > bufferSize) buffer.shift();
+    subscribers.forEach(fn => fn(evt));
+    return evt;
+  }
+
+  function subscribe(lastEventId, onEvent) {
+    if (lastEventId !== null && lastEventId !== undefined) {
+      if (buffer.length > 0 && lastEventId < buffer[0].id - 1) {
+        onEvent({ id: null, data: 'RESYNC' });
+      } else {
+        buffer.forEach(evt => {
+          if (evt.id > lastEventId) onEvent(evt);
+        });
+      }
+    }
+    subscribers.add(onEvent);
+    return () => subscribers.delete(onEvent);
+  }
+
+  return { publish, subscribe };
+}
+`,
+      hints: [
+        { title: 'Ring buffer trimming', content: 'After <code>buffer.push(evt)</code>, if <code>buffer.length &gt; bufferSize</code>, call <code>buffer.shift()</code> to drop the oldest event.' },
+        { title: 'Detecting a gap (RESYNC)', content: 'If the oldest event in the buffer has <code>id = 4</code>, then a client with <code>lastEventId = 3</code> missed nothing before id 4 (<code>3 === 4 - 1</code>). A client with <code>lastEventId = 2</code> missed event 3, which is gone — so whenever <code>lastEventId &lt; buffer[0].id - 1</code>, send <code>{ id: null, data: "RESYNC" }</code>.' },
+        { title: 'Unsubscribe clean-up', content: 'Return <code>() =&gt; subscribers.delete(onEvent)</code> so closed sockets stop receiving events.' }
+      ],
+      tests: [
+        { name: 'Live subscriber receives published events with incrementing ids', exportSymbol: 'createEventHub', testFn: (x) => {
+          const hub = x.createEventHub(3);
+          const seen = [];
+          hub.subscribe(null, e => seen.push(e));
+          hub.publish('RECEIVED');
+          hub.publish('PREPARING');
+          eq(seen, [{ id: 1, data: 'RECEIVED' }, { id: 2, data: 'PREPARING' }], 'live events');
+        }},
+        { name: 'Reconnect with Last-Event-ID replays only missed events', exportSymbol: 'createEventHub', testFn: (x) => {
+          const hub = x.createEventHub(5);
+          hub.publish('RECEIVED');
+          hub.publish('PREPARING');
+          hub.publish('READY');
+          const replayed = [];
+          hub.subscribe(1, e => replayed.push(e));
+          eq(replayed, [{ id: 2, data: 'PREPARING' }, { id: 3, data: 'READY' }], 'replayed 2 and 3');
+        }},
+        { name: 'Reconnect caught up to latest event replays nothing, still gets future events', exportSymbol: 'createEventHub', testFn: (x) => {
+          const hub = x.createEventHub(3);
+          hub.publish('RECEIVED');
+          const seen = [];
+          hub.subscribe(1, e => seen.push(e));
+          eq(seen.length, 0, 'nothing replayed');
+          hub.publish('PREPARING');
+          eq(seen, [{ id: 2, data: 'PREPARING' }], 'future delivered');
+        }},
+        { name: 'Stale Last-Event-ID (evicted from buffer) emits RESYNC', exportSymbol: 'createEventHub', testFn: (x) => {
+          const hub = x.createEventHub(2);
+          hub.publish('E1'); hub.publish('E2'); hub.publish('E3'); hub.publish('E4'); // buffer has [E3, E4]
+          const seen = [];
+          hub.subscribe(1, e => seen.push(e)); // missed E2!
+          eq(seen, [{ id: null, data: 'RESYNC' }], 'resync signal');
+        }},
+        { name: 'Boundary Last-Event-ID right before oldest buffered event replays without RESYNC', exportSymbol: 'createEventHub', testFn: (x) => {
+          const hub = x.createEventHub(2);
+          hub.publish('E1'); hub.publish('E2'); hub.publish('E3'); // buffer has [E2, E3]
+          const seen = [];
+          hub.subscribe(1, e => seen.push(e)); // saw E1, needs E2 and E3
+          eq(seen, [{ id: 2, data: 'E2' }, { id: 3, data: 'E3' }], 'replayed E2, E3');
+        }},
+        { name: 'Two app instances sharing one hub fan out across instances and respect unsubscribe', exportSymbol: 'createEventHub', testFn: (x) => {
+          const sharedRedisBus = x.createEventHub(5);
+          const clientOnInstance1 = [];
+          const unsub = sharedRedisBus.subscribe(null, e => clientOnInstance1.push(e.data));
+          sharedRedisBus.publish('READY_FROM_INSTANCE_2');
+          unsub();
+          sharedRedisBus.publish('AFTER_DISCONNECT');
+          eq(clientOnInstance1, ['READY_FROM_INSTANCE_2'], 'cross-instance fan-out + unsub');
+        }}
+      ]
+    });
+
+    new QuizEngine('quiz-0025-a', {
+      id: 'l0025_a',
+      question: 'Your PulseOrder Android app is open on the Order Status screen. Which pair of transports best handles live status while foregrounded and alerts when backgrounded?',
+      options: [
+        { text: 'SSE while open, FCM when backgrounded', rationale: 'Correct. Order status is one-way (server -> client), so SSE with Last-Event-ID is simple and reliable while the app is open, and FCM wakes the user when the app is backgrounded.' },
+        { text: 'WebSockets while closed, polling when open', rationale: 'Android suspends background sockets under Doze/background limits, and polling while open wastes requests.' },
+        { text: 'Short polling every fifty milliseconds forever', rationale: '20 QPS per open client drains the battery and melts your database.' },
+        { text: 'FCM only, because FCM guarantees ordering', rationale: 'FCM is best-effort and does not guarantee instant or strictly ordered delivery for a live foreground UI.' }
+      ],
+      correctIndex: 0,
+      summary: 'Match the transport to the direction and app lifecycle: SSE (or WebSockets if two-way) while foregrounded, FCM when backgrounded.'
+    });
+
+    new QuizEngine('quiz-0025-b', {
+      id: 'l0025_b',
+      question: 'Customer A holds an SSE connection to app instance #1. A barista updates the order on a request routed to app instance #2. Why is Redis Pub/Sub needed?',
+      options: [
+        { text: 'Postgres cannot store order status strings', rationale: 'Postgres stores the durable status just fine; it just doesn\'t push over app #1\'s open HTTP socket.' },
+        { text: 'Load balancers block all SSE responses', rationale: 'L7 load balancers stream SSE responses normally.' },
+        { text: 'Instance two lacks instance one sockets', rationale: 'Correct. An open SSE connection lives in instance #1\'s memory. Instance #2 publishes the event to Redis Pub/Sub so instance #1 receives it and writes it to the customer\'s socket.' },
+        { text: 'Redis encrypts every SSE frame automatically', rationale: 'TLS handles encryption; Redis Pub/Sub is used here purely as a low-latency cross-instance broadcast bus.' }
+      ],
+      correctIndex: 2,
+      summary: 'Any stateful socket tier (SSE or WebSockets) behind a load balancer needs a pub/sub backplane so any instance can trigger a push.'
+    });
+
+    new QuizEngine('quiz-0025-c', {
+      id: 'l0025_c',
+      question: 'What does the SSE Last-Event-ID header allow a server to do when a mobile client drops through a tunnel and reconnects?',
+      options: [
+        { text: 'Skip TLS handshakes on future connections', rationale: 'TLS session resumption is a TLS-layer mechanism, unrelated to SSE headers.' },
+        { text: 'Replay events missed during the disconnect', rationale: 'Correct. Per the WHATWG SSE spec, the reconnecting client sends Last-Event-ID with the last id it processed, so the server can send any newer events (or tell the client to resync).' },
+        { text: 'Compress older events into one image', rationale: 'Last-Event-ID is a cursor string, not a compression mechanism.' },
+        { text: 'Force the load balancer to restart', rationale: 'It is an application-level HTTP header handled by your controller.' }
+      ],
+      correctIndex: 1,
+      summary: 'Always attach an id to SSE events so short mobile disconnects can resume cleanly.'
+    });
+  </script>
+</body>
+</html>

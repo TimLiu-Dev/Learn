@@ -45,3 +45,14 @@
 - L33: GDPR Art. 4(1), 5(1)(e) and Recital 26 are quoted from memory (EUR-Lex blocks fetches). Verify via gdpr-info.eu or an official mirror. The final part id moved p4→p5 (check anchors and links). toc 185 vs meta 160–175.
 - L37 (.build/l37/lesson.src.html): line ~460 auto box still lists take among "error-free" functions; ~341 p2-2 option "The code, to pass test" awkward. Chapter titles/IntelliJ shortcuts from memory.
 - L38 (tpl): ~332 p1-3 explanation calls List.of().add "an LSP violation built into the JDK" (debatable: add is documented optional). ~507 the Dummy table row says MemberStore is a dummy, but in the final it is the shared FakeMemberStore (a fake).
+- L39: Events.kt:11 removes listeners by equality (fine for the demo; p1 names it as a mistake). The State pattern is not taught, so no practice for it. Only 3 quotes were checked.
+- L56 (tpl): ~548 p4-1 question ends "gives…" while every option starts "Gives" (style). ~207 one column covers OS crash and power loss, "may be lost" really applies only to power cuts. The Java p3 practice uses List.reversed() (JDK 21+; fine for IntelliJ with a modern JDK).
+- L43 (.build/l43/lesson.src.html): ~182 "/fast answered after 1.8 s" vs runs 1856/1845 ms (~1.85 s). ~183 "answers in 4 ms" vs Kotlin 5 ms. p2-2 option "Jitter makes every backoff sleep shorter" partly true (explanation adjusted).
+- L42: the meta total is below the toc (154). The recaptured final run crashed on "thumbnail 2" instead of 1 (a race; the prose does not depend on which).
+- L41 (tpl): ~343/345/752 "1 database queries" is real program output (ungrammatical; could fix in the source program + recapture). ~91 the rule of thumb says SSD read ≈100 µs while the table says 150 µs.
+- SHARED (fixed): Open Course.command now detects a running copy of the course (it fetches the launcher from each port 8000–8005 and compares bytes) and reopens it, and it says so clearly when all ports are busy. L1 note updated to match.
+- L44: tpl_src ~364 links OpenJDK Code.java on master, not a fixed revision. The Java p1 Long-overflow mistake would hang in IntelliJ (hint 2 warns about it). Meta below the toc sum.
+- R1 OPEN: L4 VIZ highlight-convention inconsistency (specs in build.py), minor. Gatekeeper Open Anyway untested.
+- L40: the new part id "rel" (Part 3); CI keeps id p3 and is labelled Part 4. tpl_src ~295 p1-4 says "most times" vs 7 of 8 in every run. Meta ~170–180 vs the parts sum of 187.
+- SHARED (fixed): check messages in the page now keep runs of spaces (white-space: pre-wrap on test lines).
+- R2 OPEN: L8 JEP 513 note (~99) "statements before super(…) do not use the object under construction" is slightly loose (they may assign fields). L5 "<local6>" NPE output kept (optional note).

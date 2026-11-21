@@ -1,10 +1,5 @@
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
-
-// A plain message: the page's test view hides text written inside <…>, which assertEquals uses.
-fun assertText(expected: String, actual: String?, what: String = "") =
-    assertTrue("$what expected \"$expected\" but was \"$actual\"".trim(), expected == actual)
 
 class BadgeTest {
     val roster = listOf(
@@ -14,15 +9,15 @@ class BadgeTest {
     )
 
     @Test fun `two words give two initials`() {
-        assertText("AL", initials("Ada Lovelace"))
+        assertEquals("AL", initials("Ada Lovelace"))
     }
 
     @Test fun `lower-case words are capitalised`() {
-        assertText("GH", initials("grace hopper"))
+        assertEquals("GH", initials("grace hopper"))
     }
 
     @Test fun `one word gives one initial`() {
-        assertText("C", initials("Cher"))
+        assertEquals("C", initials("Cher"))
     }
 
     @Test fun `every name on the roster gets a badge`() {
@@ -31,7 +26,7 @@ class BadgeTest {
     }
 
     @Test fun `a blank name gives an empty badge`() {
-        assertText("", initials(""))
-        assertText("", initials("   "))
+        assertEquals("", initials(""))
+        assertEquals("", initials("   "))
     }
 }

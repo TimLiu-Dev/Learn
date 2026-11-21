@@ -4,10 +4,73 @@
  */
 
 document.addEventListener('DOMContentLoaded', () => {
+  initLessonProgress();
   initRunnableExamples();
   initCodeEditors();
   initQuizzes();
 });
+
+/* ==========================================================================
+   0. Lesson Completion Progress Tracker (localStorage)
+   ========================================================================== */
+const PROGRESS_STORAGE_KEY = 'mad_2027_completed_lessons';
+const TOTAL_CURRICULUM_LESSONS = 72;
+
+function getCompletedLessons() {
+  try {
+    const raw = localStorage.getItem(PROGRESS_STORAGE_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveCompletedLessons(list) {
+  try {
+    localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(Array.from(new Set(list)).sort()));
+  } catch (e) {}
+}
+
+function initLessonProgress() {
+  const pathMatch = window.location.pathname.match(/(\d{4})-[^/]+\.html$/);
+  if (!pathMatch) return;
+  const lessonId = pathMatch[1];
+
+  const toggleBtns = document.querySelectorAll('.btn-complete-lesson');
+  const progressPills = document.querySelectorAll('.course-progress-pill');
+
+  function updateUi() {
+    const completed = getCompletedLessons();
+    const isDone = completed.includes(lessonId);
+    const pct = Math.round((completed.length / TOTAL_CURRICULUM_LESSONS) * 100);
+
+    toggleBtns.forEach(btn => {
+      btn.classList.toggle('completed', isDone);
+      btn.innerHTML = isDone ? '✓ Completed' : '○ Mark Lesson Complete';
+    });
+
+    progressPills.forEach(pill => {
+      pill.textContent = `${completed.length} / ${TOTAL_CURRICULUM_LESSONS} Completed (${pct}%)`;
+    });
+  }
+
+  toggleBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const completed = getCompletedLessons();
+      const idx = completed.indexOf(lessonId);
+      if (idx >= 0) {
+        completed.splice(idx, 1);
+      } else {
+        completed.push(lessonId);
+      }
+      saveCompletedLessons(completed);
+      updateUi();
+    });
+  });
+
+  updateUi();
+}
 
 /* ==========================================================================
    1. Runnable Code Examples Runner

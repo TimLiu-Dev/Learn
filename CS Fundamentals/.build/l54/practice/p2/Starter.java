@@ -47,7 +47,7 @@ public class Practice {
             throw new UnsupportedOperationException("TODO: an atom, then a loop that handles * and /");
         }
 
-private Expr atom() {
+        private Expr atom() {
             String t = next();
             if (t == null) throw new CalcError("expected a number or '(' but found end of input");
             if (t.equals("(")) {

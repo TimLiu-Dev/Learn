@@ -92,8 +92,16 @@
   
   <nav class="nav-bar">
     <a href="../MASTER_PLAN.html" class="back-legend">&larr; Back to Master Plan &amp; Legend</a>
-    <span class="badge primary">Phase VII: Capstone Project: Aether</span>
+    <span class="badge primary">Phase VIII: Capstone Project: Aether</span>
   </nav>
+
+  <div class="lesson-utility-bar">
+    <a href="../reference/03-modern-android-architecture.html" class="ref-sheet-link">📑 Cheat Sheet 03: Modern Android Architecture &rarr;</a>
+    <div class="lesson-progress-controls">
+      <span class="course-progress-pill">0 / 72 Completed (0%)</span>
+      <button class="btn-complete-lesson">○ Mark Lesson Complete</button>
+    </div>
+  </div>
 
   <header>
     <div class="lesson-meta">
@@ -115,42 +123,132 @@
   </div>
 
   <!-- Lesson Concepts -->
-  <article>
-    
-          <p>The core engine of <strong>Aether</strong> is its offline-first data synchronization engine in <code>:core:data</code>. It merges high-throughput WebSocket price telemetry, REST historical queries, and the local Room SQLite cache into a unified reactive stream.</p>
+    <article>
+<p>In Lesson 0052, we build the beating heart of Aether's data layer across <strong>&lt;code&gt;:core:network&lt;/code&gt;</strong>, <strong>&lt;code&gt;:core:database&lt;/code&gt;</strong>, and <strong>&lt;code&gt;:core:data&lt;/code&gt;</strong>: a real-time <strong>Ktor WebSocket telemetry stream</strong> with full-jitter exponential backoff, a <strong>Room SQLite database (&lt;code&gt;AssetEntity&lt;/code&gt;, &lt;code&gt;PortfolioDao&lt;/code&gt;)</strong> acting as the Single Source of Truth, and an <strong>&lt;code&gt;OfflineFirstPortfolioRepository&lt;/code&gt;</strong> paired with a &lt;code&gt;WorkManager&lt;/code&gt; delta-sync worker.</p>
 
-          <div class="junior-note">
-            <div class="junior-note-title">🌱 Junior Android Dev Mental Model: Conflated Database Writes</div>
-            <p>If a WebSocket emits 100 prices per second, executing 100 database transactions per second will lock the SQLite database. In Aether, we <strong>buffer and conflate</strong> price updates using <code>chunked()</code> or <code>sample()</code>, writing batched updates to Room at controlled 500ms intervals!</p>
-          </div>
-        
+      <h2>1. &lt;code&gt;:core:network&lt;/code&gt;: Resilient Ktor WebSocket Stream with Conflation &amp; Backoff</h2>
+      <p>Financial markets broadcast dozens of tick frames per second over &lt;code&gt;wss://telemetry.aether.io/v1/stream&lt;/code&gt;. If we write every individual 10ms WebSocket frame directly to SQLite on disk, we will thrash the flash storage controller and trigger Room &lt;code&gt;InvalidationTracker&lt;/code&gt; storms! Instead, &lt;code&gt;KtorRealtimeMarketDataSource&lt;/code&gt; parses incoming &lt;code&gt;Frame.Text&lt;/code&gt; JSON ticks via &lt;code&gt;kotlinx.serialization&lt;/code&gt;, buffers them inside a &lt;code&gt;callbackFlow&lt;/code&gt; / &lt;code&gt;flow&lt;/code&gt; using <strong>windowed batching or &lt;code&gt;sample(250.milliseconds)&lt;/code&gt;</strong>, and automatically reconnects using exponential backoff + random jitter on socket drops.</p>
+
+      <h2>2. &lt;code&gt;:core:database&lt;/code&gt; &amp; &lt;code&gt;:core:data&lt;/code&gt;: Atomic Room &lt;code&gt;@Upsert&lt;/code&gt; SSOT</h2>
+      <p>&lt;code&gt;AssetDao&lt;/code&gt; exposes &lt;code&gt;observePortfolioHoldings(): Flow&lt;List&lt;PopulatedHoldingEntity&gt;&gt;&lt;/code&gt; using &lt;code&gt;@Transaction&lt;/code&gt; and &lt;code&gt;@Upsert&lt;/code&gt; to batch-write incoming WebSocket price ticks into SQLite inside a single WAL transaction, while &lt;code&gt;AetherSyncWorker&lt;/code&gt; (&lt;code&gt;@HiltWorker&lt;/code&gt;) reconciles full historical candlesticks in the background when &lt;code&gt;NetworkType.CONNECTED&lt;/code&gt; is satisfied.</p>
+
+      <div class="junior-note">
+        <div class="junior-note-title">🌱 Junior Android Dev Mental Model: Why Batch WebSocket Writes to Room?</div>
+        <p>Every individual Room &lt;code&gt;@Upsert&lt;/code&gt; commits a SQLite WAL transaction and notifies &lt;code&gt;InvalidationTracker&lt;/code&gt; to re-run active &lt;code&gt;SELECT&lt;/code&gt; queries. Grouping high-frequency WebSocket ticks into 250ms micro-batches (&lt;code&gt;chunked&lt;/code&gt; / &lt;code&gt;sample&lt;/code&gt;) cuts disk I/O and UI recompositions by <strong>95%</strong> while still updating prices 4 times per second—faster than human visual perception!</p>
+      </div>
+
+      <div class="comparison-grid">
+        <div class="comparison-card bad">
+          <h4>❌ Junior Anti-Pattern: Unthrottled Per-Tick SQLite Write &amp; Tight Retry Loop</h4>
+          <pre><code>// 1. Writes 100 SQLite transactions/sec -> Disk &amp; UI thrashing!
+// 2. Retry without delay DDoSes backend when server restarts!
+while (true) {
+    try {
+        client.webSocket("wss://api.aether.io/ticks") {
+            for (frame in incoming) {
+                val tick = decode(frame)
+                dao.upsertSingleTick(tick.toEntity())
+            }
+        }
+    } catch (e: Exception) { /* instant retry storm! */ }
+}</code></pre>
+        </div>
+        <div class="comparison-card good">
+          <h4>✅ 2027 Senior Production Standard: Micro-Batched Ktor WebSocket + Room SSOT</h4>
+          <pre><code>// :core:data/OfflineFirstPortfolioRepository.kt
+class OfflineFirstPortfolioRepository @Inject constructor(
+    private val dao: AssetDao,
+    private val wsDataSource: KtorRealtimeMarketDataSource
+) : PortfolioRepository {
+
+    override val holdings: Flow&lt;List&lt;PortfolioHolding&gt;&gt; =
+        dao.observeHoldings().map { list -&gt; list.map(HoldingEntity::asExternalModel) }
+
+    override suspend fun streamLiveTelemetry() =
+        wsDataSource.observeTickBatches(windowMs = 250L)
+            .retryWhen { cause, attempt -&gt;
+                cause is IOException &amp;&amp; run {
+                    delay( computeJitterBackoffMs(attempt) )
+                    true
+                }
+            }
+            .collect { batch -&gt;
+                dao.upsertAssetPrices(batch.map(NetworkTickDto::asEntity))
+            }
+}</code></pre>
+        </div>
+      </div>
+
+      <h2>⚠️ Senior Interview Trap: Cold vs. Hot Sharing of WebSocket Connections (&lt;code&gt;WhileSubscribed(5_000)&lt;/code&gt;)</h2>
+      <p>If two Composables or ViewModels collect a cold WebSocket &lt;code&gt;Flow&lt;/code&gt; independently, Ktor opens &lt;strong&gt;two duplicate TCP/TLS WebSocket connections&lt;/strong&gt;! Always share the upstream telemetry pipeline in the repository or ViewModel using &lt;code&gt;shareIn(scope, SharingStarted.WhileSubscribed(stopTimeoutMillis = 5_000), replay = 1)&lt;/code&gt; so rotating the screen keeps the WebSocket open during the 5-second configuration change window, and backgrounding the app cleanly closes the socket after 5 seconds to save battery.</p>
 
     <!-- Runnable Code Example -->
     <h2>2027 Production Standard (Runnable Example)</h2>
     <p>Click <strong>▶ Run Example</strong> to execute this snippet and inspect the simulated runtime output and state transformations:</p>
 
-    <div class="runnable-example-box" data-output="[AETHER-ENGINE] Starting Real-Time Telemetry Pipeline...
-[WS-SOCKET] Connected to wss://stream.aether.app/v1/market
-[BUFFER] Ingesting 50 market ticks per second -&gt; Batching in memory
-[ROOM-DAO] Flushing batch upsert: 50 asset quotes written to SQLite in 4.2ms
-[UI-OBSERVER] MarketViewModel receives updated StateFlow: BTC = $94,500.00
-[WORKMANAGER] Registered PeriodicSyncWorker constraint: WiFi + BatteryNotLow
-[SUCCESS] High-frequency data ingested cleanly without dropping UI frames!">
+    <div class="runnable-example-box" data-output="[WEBSOCKET-BATCH] Coalesced 4 ticks into 1 SQLite WAL transaction!
+[SSOT-SNAPSHOT]   [AssetPriceEntity(symbol=BTC, priceUsd=93890.0, updatedAtMs=1240), AssetPriceEntity(symbol=ETH, priceUsd=3115.0, updatedAtMs=1180)]
+[BACKOFF-JITTER]  Reconnection schedule: [attempt#0=250ms, attempt#1=637ms, attempt#2=1274ms, attempt#3=2411ms]">
       <div class="runnable-header">
         <div class="runnable-tab">
           <span class="runnable-badge">KOTLIN 2.X</span>
-          <span>AetherTelemetrySync.kt</span>
+          <span>AetherRealtimeSyncEngine.kt</span>
         </div>
         <button class="btn-run-example">▶ Run Example</button>
       </div>
-      <pre class="runnable-code"><code>fun main() {
-    println(&quot;[AETHER-ENGINE] Starting Real-Time Telemetry Pipeline...&quot;)
-    println(&quot;[WS-SOCKET] Connected to wss://stream.aether.app/v1/market&quot;)
-    println(&quot;[BUFFER] Ingesting 50 market ticks per second -&gt; Batching in memory&quot;)
-    println(&quot;[ROOM-DAO] Flushing batch upsert: 50 asset quotes written to SQLite in 4.2ms&quot;)
-    println(&quot;[UI-OBSERVER] MarketViewModel receives updated StateFlow: BTC = $94,500.00&quot;)
-    println(&quot;[WORKMANAGER] Registered PeriodicSyncWorker constraint: WiFi + BatteryNotLow&quot;)
-    println(&quot;[SUCCESS] High-frequency data ingested cleanly without dropping UI frames!&quot;)
+      <pre class="runnable-code"><code>data class NetworkTickDto(val symbol: String, val priceUsd: Double, val timestampMs: Long)
+data class AssetPriceEntity(val symbol: String, val priceUsd: Double, val updatedAtMs: Long)
+
+class AetherRoomDaoSim {
+    private val rows = linkedMapOf(
+        &quot;BTC&quot; to AssetPriceEntity(&quot;BTC&quot;, 93000.0, 1000L),
+        &quot;ETH&quot; to AssetPriceEntity(&quot;ETH&quot;, 3100.0, 1000L)
+    )
+    var transactionCount: Int = 0
+        private set
+
+    fun upsertBatchTransaction(entities: List&lt;AssetPriceEntity&gt;) {
+        transactionCount++
+        for (e in entities) {
+            rows[e.symbol] = e
+        }
+    }
+
+    fun snapshot(): List&lt;AssetPriceEntity&gt; = rows.values.toList()
+}
+
+class AetherTelemetryCoordinator(private val dao: AetherRoomDaoSim) {
+    fun computeBackoffWithJitterMs(attempt: Int, baseMs: Long = 500L, maxMs: Long = 16_000L): Long {
+        val exp = (baseMs * (1L shl attempt.coerceAtMost(5))).coerceAtMost(maxMs)
+        val deterministicJitter = (attempt * 137L) % (exp / 2)
+        return (exp / 2) + deterministicJitter
+    }
+
+    fun ingestMicroBatch(rawTicks: List&lt;NetworkTickDto&gt;) {
+        // Deduplicate by symbol within the 250ms window keeping only the newest tick per symbol!
+        val latestPerSymbol = rawTicks
+            .groupBy { it.symbol }
+            .mapValues { (_, ticks) -&gt; ticks.maxBy { it.timestampMs } }
+            .values
+            .map { AssetPriceEntity(it.symbol, it.priceUsd, it.timestampMs) }
+        dao.upsertBatchTransaction(latestPerSymbol)
+    }
+}
+
+fun main() {
+    val dao = AetherRoomDaoSim()
+    val coordinator = AetherTelemetryCoordinator(dao)
+
+    val burst250ms = listOf(
+        NetworkTickDto(&quot;BTC&quot;, 93150.0, 1050L),
+        NetworkTickDto(&quot;BTC&quot;, 93420.0, 1120L),
+        NetworkTickDto(&quot;ETH&quot;, 3115.0, 1180L),
+        NetworkTickDto(&quot;BTC&quot;, 93890.0, 1240L)
+    )
+    coordinator.ingestMicroBatch(burst250ms)
+    println(&quot;[WEBSOCKET-BATCH] Coalesced ${burst250ms.size} ticks into ${dao.transactionCount} SQLite WAL transaction!&quot;)
+    println(&quot;[SSOT-SNAPSHOT]   ${dao.snapshot()}&quot;)
+    println(&quot;[BACKOFF-JITTER]  Reconnection schedule: ${(0..3).map { &quot;attempt#$it=${coordinator.computeBackoffWithJitterMs(it)}ms&quot; }}&quot;)
 }</code></pre>
       <div class="runnable-terminal">
         <span class="terminal-badge">Terminal Console Output</span>
@@ -160,30 +258,37 @@
 
     <!-- Interactive In-Browser Code Practice & Runner -->
     <h2>Interactive Code Practice</h2>
-    <p>Write a repository method suspend fun syncQuotes(remote: List&lt;String&gt;, dao: MockDao) that calls dao.upsertQuotes(remote).</p>
-    
-    <div class="interactive-ide" data-tests="[{&quot;name&quot;: &quot;Calls dao.upsertQuotes&quot;, &quot;pattern&quot;: &quot;dao\\.upsertQuotes\\s*\\(\\s*remote\\s*\\)&quot;, &quot;message&quot;: &quot;Call &#x27;dao.upsertQuotes(remote)&#x27;.&quot;}]" data-hints="[&quot;Inside syncQuotes, call dao.upsertQuotes(remote).&quot;]">
+    <p>Implement <code>TelemetryBatchCoalescer</code> with <code>fun coalesceLatestBySymbol(ticks: List&lt;PriceTick&gt;): List&lt;PriceTick&gt;</code> that groups a 250ms burst of WebSocket <code>PriceTick</code> objects by <code>symbol</code> and returns only the single tick with the maximum <code>timestampMs</code> for each symbol.</p>
+
+    <div class="interactive-ide" data-tests="[{&quot;name&quot;: &quot;Groups incoming ticks by symbol&quot;, &quot;pattern&quot;: &quot;groupBy\\s*\\{\\s*it\\.symbol\\s*\\}&quot;, &quot;message&quot;: &quot;Group the ticks list using .groupBy { it.symbol }.&quot;}, {&quot;name&quot;: &quot;Selects the newest tick per symbol using maxBy or maxByOrNull on timestampMs&quot;, &quot;pattern&quot;: &quot;maxBy(?:OrNull)?\\s*\\{\\s*it\\.timestampMs\\s*\\}&quot;, &quot;message&quot;: &quot;Select the tick with the highest timestampMs in each group using maxBy { it.timestampMs }.&quot;}]" data-hints="[&quot;Start with ticks.groupBy { it.symbol } to partition ticks into a Map&lt;String, List&lt;PriceTick&gt;&gt;.&quot;, &quot;Chain .map { (_, symbolTicks) -&gt; ... } (or .values.map { ... }) on the grouped map.&quot;, &quot;Inside the map lambda, return symbolTicks.maxBy { it.timestampMs }.&quot;]">
       <div class="ide-header">
-        <div class="ide-tab">TelemetryRepository.kt</div>
+        <div class="ide-tab">TelemetryBatchCoalescer.kt</div>
         <div class="ide-actions">
           <button class="btn-secondary-dark btn-reset">Reset Code</button>
         </div>
       </div>
-      
-      <div class="code-editor-area">
-        <textarea class="code-textarea" spellcheck="false">interface MockDao {
-    suspend fun upsertQuotes(items: List<String>)
-}
 
-suspend fun syncQuotes(remote: List<String>, dao: MockDao) {
-    // TODO: dao.upsertQuotes(remote)
+      <div class="code-editor-area">
+        <textarea class="code-textarea" spellcheck="false">data class PriceTick(
+    val symbol: String,
+    val priceUsd: Double,
+    val timestampMs: Long
+)
+
+class TelemetryBatchCoalescer {
+    fun coalesceLatestBySymbol(ticks: List&lt;PriceTick&gt;): List&lt;PriceTick&gt; {
+        // TODO 1: Group ticks by { it.symbol }
+        // TODO 2: For each symbol group, select the tick with maxBy { it.timestampMs }
+        // TODO 3: Return the resulting list of latest PriceTicks
+        return emptyList()
+    }
 }</textarea>
       </div>
 
       <div class="ide-controls">
         <div class="ide-controls-left">
           <button class="btn-run">▶ Run &amp; Check Code</button>
-          <button class="btn-hint">💡 Hint (0/1)</button>
+          <button class="btn-hint">💡 Hint (0/3)</button>
         </div>
         <button class="btn-solution">👁️ Reveal Answer</button>
       </div>
@@ -206,34 +311,45 @@ suspend fun syncQuotes(remote: List<String>, dao: MockDao) {
           <span>🎯 Reference Production Solution</span>
           <button class="btn-load-solution">Load Solution into Editor</button>
         </div>
-        <pre class="solution-code"><code>interface MockDao {
-    suspend fun upsertQuotes(items: List&lt;String&gt;)
-}
+        <pre class="solution-code"><code>data class PriceTick(
+    val symbol: String,
+    val priceUsd: Double,
+    val timestampMs: Long
+)
 
-suspend fun syncQuotes(remote: List&lt;String&gt;, dao: MockDao) {
-    dao.upsertQuotes(remote)
+class TelemetryBatchCoalescer {
+    fun coalesceLatestBySymbol(ticks: List&lt;PriceTick&gt;): List&lt;PriceTick&gt; {
+        return ticks
+            .groupBy { it.symbol }
+            .map { (_, symbolTicks) -&gt;
+                symbolTicks.maxBy { it.timestampMs }
+            }
+    }
 }</code></pre>
         <p style="font-size:0.88rem; color:var(--text-muted); margin-top:0.5rem;">
-          <strong>Why this works:</strong> Writing network quotes directly into the local database cache ensures that the UI&#x27;s reactive Room query emits the new state without coupling the UI directly to network listeners.
+          <strong>Why this works:</strong> When 20 ticks for BTC arrive within a 250ms micro-batch window, intermediate ticks are already obsolete; coalescing by symbol with maxBy { it.timestampMs } minimizes SQLite row updates per batch.
         </p>
       </div>
     </div>
 
     <!-- Enhanced Dual Quiz Section -->
     <h2>Concept Retrieval &amp; Code Quizzes</h2>
-    
-    <!-- Quiz 1: Code-Reading / Bug-Hunting Quiz -->
-    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;What is the key benefit of piping WebSocket price updates through the Room database before updating the UI?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;It guarantees that the latest prices are immediately cached locally, so the user sees fresh data even if they restart the app offline&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! The database acts as the single source of truth, persisting the latest prices automatically across app restarts.&quot;}, {&quot;text&quot;: &quot;It converts SQLite into a hardware graphic accelerator&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Room is a database library, not a graphics driver.&quot;}, {&quot;text&quot;: &quot;It bypasses Android&#x27;s battery saver restrictions&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Database operations adhere to standard OS process limits.&quot;}, {&quot;text&quot;: &quot;It makes the network connection 100% free of charge&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Data usage is governed by the carrier, not the database.&quot;}]}">
+
+    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;Examine this Room DAO method in :core:database. When observePortfolioWithTransactions() runs, Room logs a build warning: The query returns some columns [id, symbol] which are not used... and executes a relation query without @Transaction. What runtime bug can happen without @Transaction?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;Without the @Transaction annotation, Room always executes relational SELECT queries synchronously on the main UI thread.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. Queries returning a reactive &lt;code&gt;Flow&amp;lt;T&amp;gt;&lt;/code&gt; always execute asynchronously on Room&#x27;s query executor regardless of &lt;code&gt;@Transaction&lt;/code&gt;.&quot;}, {&quot;text&quot;: &quot;Room automatically truncates and deletes all child rows from the trades table when @Transaction is omitted.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. Omitting &lt;code&gt;@Transaction&lt;/code&gt; risks inconsistent reads across multiple tables, not data deletion.&quot;}, {&quot;text&quot;: &quot;The bundled Android SQLite engine rejects wildcard SELECT queries unless the DAO method includes @Transaction metadata.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. Standard single-table &lt;code&gt;SELECT *&lt;/code&gt; queries do not require &lt;code&gt;@Transaction&lt;/code&gt;.&quot;}, {&quot;text&quot;: &quot;Room runs two separate SELECT queries for @Relation, so concurrent writes between them emit torn snapshots.&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! Room fetches the parent entities in query #1 and then queries matching child &lt;code&gt;@Relation&lt;/code&gt; rows in query #2. Adding &lt;code&gt;@Transaction&lt;/code&gt; wraps both &lt;code&gt;SELECT&lt;/code&gt; queries inside a single SQLite read transaction, guaranteeing snapshot isolation.&quot;}], &quot;code&quot;: &quot;@Dao\ninterface PortfolioDao {\n    // Missing @Transaction on a @Relation query!\n    @Query(\&quot;SELECT * FROM holdings\&quot;)\n    fun observeHoldingsWithHistory(): Flow&lt;List&lt;HoldingWithTrades&gt;&gt;\n}&quot;}">
       <div class="quiz-card">
         <span class="quiz-tag">Quiz 1: Code Analysis &amp; Bug Hunt</span>
-        <p class="quiz-question">What is the key benefit of piping WebSocket price updates through the Room database before updating the UI?</p>
-        
+        <p class="quiz-question">Examine this Room DAO method in &lt;code&gt;:core:database&lt;/code&gt;. When &lt;code&gt;observePortfolioWithTransactions()&lt;/code&gt; runs, Room logs a build warning: &lt;code&gt;The query returns some columns [id, symbol] which are not used... and executes a relation query without @Transaction&lt;/code&gt;. What runtime bug can happen without &lt;code&gt;@Transaction&lt;/code&gt;?</p>
+        <pre class="quiz-code-block"><code>@Dao
+interface PortfolioDao {
+    // Missing @Transaction on a @Relation query!
+    @Query(&quot;SELECT * FROM holdings&quot;)
+    fun observeHoldingsWithHistory(): Flow&lt;List&lt;HoldingWithTrades&gt;&gt;
+}</code></pre>
         <div class="quiz-options">
-          <div class="quiz-option" data-idx="0">It guarantees that the latest prices are immediately cached locally, so the user sees fresh data even if they restart the app offline</div>
-<div class="quiz-option" data-idx="1">It converts SQLite into a hardware graphic accelerator</div>
-<div class="quiz-option" data-idx="2">It bypasses Android&#x27;s battery saver restrictions</div>
-<div class="quiz-option" data-idx="3">It makes the network connection 100% free of charge</div>
-
+          <div class="quiz-option" data-idx="0">Without the @Transaction annotation, Room always executes relational SELECT queries synchronously on the main UI thread.</div>
+          <div class="quiz-option" data-idx="1">Room automatically truncates and deletes all child rows from the trades table when @Transaction is omitted.</div>
+          <div class="quiz-option" data-idx="2">The bundled Android SQLite engine rejects wildcard SELECT queries unless the DAO method includes @Transaction metadata.</div>
+          <div class="quiz-option" data-idx="3">Room runs two separate SELECT queries for @Relation, so concurrent writes between them emit torn snapshots.</div>
         </div>
         <div class="quiz-breakdown-card">
           <div class="breakdown-header">
@@ -245,17 +361,15 @@ suspend fun syncQuotes(remote: List&lt;String&gt;, dao: MockDao) {
       </div>
     </div>
 
-    <!-- Quiz 2: Conceptual & Architectural Quiz -->
-    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;Why should high-frequency WebSocket price updates (e.g. 50 ticks/sec) be batched before writing to Room?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;To prevent excessive disk I/O and SQLite lock contention from saturating CPU threads and causing frame drops&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! Individual disk writes are expensive. Batching updates into 500ms chunks drastically reduces disk transactions and CPU overhead.&quot;}, {&quot;text&quot;: &quot;Because SQLite has a hard limit of only 5 queries per day&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: SQLite handles millions of queries, but disk I/O latency adds up.&quot;}, {&quot;text&quot;: &quot;Because Kotlin Coroutines can only run once every minute&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: Coroutines can dispatch thousands of operations per second.&quot;}, {&quot;text&quot;: &quot;To prevent the phone&#x27;s camera from opening automatically&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect: The camera hardware is completely unrelated.&quot;}]}">
+    <div class="interactive-quiz" data-quiz="{&quot;question&quot;: &quot;When 10,000 WebSocket reconnection attempts occur concurrently across 10,000 mobile clients after a brief server deploy, why must your Ktor retry logic include **random jitter** on top of exponential backoff (2^attempt)?&quot;, &quot;options&quot;: [{&quot;text&quot;: &quot;Deterministic backoff synchronizes client retries into thundering herds; random jitter spreads reconnection traffic across time.&quot;, &quot;isCorrect&quot;: true, &quot;explanation&quot;: &quot;Correct! Without jitter, every client disconnected by the same load-balancer restart computes the exact same sleep duration and stampedes the backend simultaneously on every retry wave.&quot;}, {&quot;text&quot;: &quot;Android&#x27;s Dispatchers.IO thread pool throws an IllegalStateException whenever multiple coroutines call delay with identical durations.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. &lt;code&gt;delay()&lt;/code&gt; supports any number of coroutines waiting on identical durations.&quot;}, {&quot;text&quot;: &quot;The TLS 1.3 handshake specification requires mobile client connection timestamps to include randomized millisecond offsets.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. TLS 1.3 has no such reconnection timer requirement; jitter is for distributed load smoothing.&quot;}, {&quot;text&quot;: &quot;Adding randomized coroutine delay jitter prevents Room from exclusively locking the local SQLite write-ahead log.&quot;, &quot;isCorrect&quot;: false, &quot;explanation&quot;: &quot;Incorrect. Reconnection backoff jitter protects the remote backend from synchronized retry spikes.&quot;}]}">
       <div class="quiz-card">
         <span class="quiz-tag">Quiz 2: Production Architectural Reasoning</span>
-        <p class="quiz-question">Why should high-frequency WebSocket price updates (e.g. 50 ticks/sec) be batched before writing to Room?</p>
+        <p class="quiz-question">When 10,000 WebSocket reconnection attempts occur concurrently across 10,000 mobile clients after a brief server deploy, why must your Ktor retry logic include &lt;strong&gt;random jitter&lt;/strong&gt; on top of exponential backoff (&lt;code&gt;2^attempt&lt;/code&gt;)?</p>
         <div class="quiz-options">
-          <div class="quiz-option" data-idx="0">To prevent excessive disk I/O and SQLite lock contention from saturating CPU threads and causing frame drops</div>
-<div class="quiz-option" data-idx="1">Because SQLite has a hard limit of only 5 queries per day</div>
-<div class="quiz-option" data-idx="2">Because Kotlin Coroutines can only run once every minute</div>
-<div class="quiz-option" data-idx="3">To prevent the phone&#x27;s camera from opening automatically</div>
-
+          <div class="quiz-option" data-idx="0">Deterministic backoff synchronizes client retries into thundering herds; random jitter spreads reconnection traffic across time.</div>
+          <div class="quiz-option" data-idx="1">Android's Dispatchers.IO thread pool throws an IllegalStateException whenever multiple coroutines call delay with identical durations.</div>
+          <div class="quiz-option" data-idx="2">The TLS 1.3 handshake specification requires mobile client connection timestamps to include randomized millisecond offsets.</div>
+          <div class="quiz-option" data-idx="3">Adding randomized coroutine delay jitter prevents Room from exclusively locking the local SQLite write-ahead log.</div>
         </div>
         <div class="quiz-breakdown-card">
           <div class="breakdown-header">
@@ -272,10 +386,18 @@ suspend fun syncQuotes(remote: List&lt;String&gt;, dao: MockDao) {
       <div class="agent-prompt-title">
         <span>💬 Learn with your Antigravity Pair Programmer</span>
       </div>
-      <p>Have questions about this lesson? Want me to review your custom code variation or explain a compiler diagnostic? Switch back to our conversation and ask — I'm here as your personal pair programmer!</p>
+      <p>Have questions about this lesson? Want me to review your custom code variation, walk through an architectural tradeoff, or run a mock interview drill? Switch back to our conversation and ask — I'm here as your personal pair programmer!</p>
     </div>
 
   </article>
+
+  <div class="footer-complete-banner">
+    <div>
+      <strong>Finished this lesson?</strong>
+      <span style="color:var(--text-muted); font-size:0.88rem; margin-left:0.5rem;">Mark it complete to track your progress to 2027 Senior Android Engineer.</span>
+    </div>
+    <button class="btn-complete-lesson">○ Mark Lesson Complete</button>
+  </div>
 
   <footer>
     <div><a href="0051-aether-core-designsystem-modules.html" class="lesson-link">&larr; Previous: Aether: Core Infrastructure &amp; Design System Modules</a></div>

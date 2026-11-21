@@ -113,3 +113,39 @@ _Avoid_: Software isolation, process sandbox
 **VirtIO**:
 A standardized virtualization standard enabling guest operating systems (such as Android) to access shared host hardware devices via zero-copy ring buffers.
 _Avoid_: Virtual driver, VM bridge
+
+---
+
+### Non-AOSP Linux, Embedded Cloud & Embedded DevOps
+
+**epoll**:
+A scalable Linux kernel I/O event notification mechanism enabling a single-threaded daemon to monitor thousands of file descriptors (sockets, pipes, `/dev` nodes) in O(1) per ready event.
+_Avoid_: Busy-wait polling, select loop
+
+**Yocto Project**:
+An open-source build framework (powered by BitBake) for compiling reproducible, minimal custom Embedded Linux distributions, kernels, and root filesystems from source layers.
+_Avoid_: Ubuntu desktop distro, manual tarballs
+
+**eBPF (Extended Berkeley Packet Filter)**:
+A sandboxed in-kernel virtual machine allowing safe, zero-overhead tracing of syscalls, scheduler latency, and network packets in production Linux systems without modifying kernel source.
+_Avoid_: Kernel printk debugging, custom kernel fork
+
+**mTLS (Mutual TLS)**:
+A cryptographic handshake protocol where both the cloud broker and the embedded edge device authenticate each other using X.509 certificates before exchanging MQTT telemetry.
+_Avoid_: API key string, plaintext password
+
+**Protobuf (Protocol Buffers)**:
+A strongly-typed, schema-driven binary serialization format (implemented via `nanopb` on MCUs and `prost`/Go structs on gateways/cloud) that minimizes bandwidth and parsing overhead.
+_Avoid_: Verbose JSON, custom ad-hoc strings
+
+**A/B OTA (Over-The-Air) Update**:
+A fail-safe firmware or rootfs update architecture maintaining two redundant flash/disk slots (Active and Inactive) so a failed boot automatically rolls back via hardware watchdog.
+_Avoid_: In-place overwrite, live patching
+
+**Hardware-in-the-Loop (HIL)**:
+An automated CI testing architecture where compiled firmware or Linux images execute against real target boards or QEMU emulators driven by scripted bus stimuli.
+_Avoid_: Manual bench click-testing, unit-only mocks
+
+**JNI (Java Native Interface)**:
+The binary boundary bridging Kotlin/Java code in Android's ART runtime with native C, C++, or Rust shared libraries (`.so`) compiled via the Android NDK.
+_Avoid_: AIDL HAL, Binder RPC

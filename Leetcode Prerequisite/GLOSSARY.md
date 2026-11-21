@@ -24,6 +24,10 @@ _Avoid_: Free pool, dynamic area
 The fixed-size chunk of physical memory (typically 64 bytes) transferred between main RAM and the CPU L1/L2/L3 caches in a single bus transaction.
 _Avoid_: Memory packet, cache block
 
+**Two's Complement**:
+The standard binary encoding for signed integers where the leftmost bit carries negative weight (`-2^31` for 32-bit `Int`), computed by inverting bits and adding 1.
+_Avoid_: Minus flag bit, reverse binary
+
 ## Asymptotic Complexity
 
 **Asymptotic Analysis**:
@@ -95,6 +99,30 @@ _Avoid_: Loop rule, consistency check
 **Complement**:
 In pair-matching problems, the exact mathematical difference between the target value and the current element (`complement = target - current`).
 _Avoid_: Target difference, matching partner
+
+**Subarray / Substring**:
+A strictly contiguous slice of adjacent elements or characters `[left..right]` with zero skipped positions.
+_Avoid_: Partial list, sequence slice
+
+**Subsequence**:
+A sequence derived by deleting zero or more elements while strictly preserving the original left-to-right relative order.
+_Avoid_: Subset, contiguous slice
+
+**Prefix Sum**:
+An auxiliary array of length `n + 1` storing cumulative totals from index `0` so any contiguous range sum `[l..r]` computes via `prefix[r + 1] - prefix[l]` in `O(1)`.
+_Avoid_: Running tally list, partial sum
+
+**Binary Heap (Priority Queue)**:
+A complete binary tree packed inside a contiguous array (`2i+1`, `2i+2`) guaranteeing `O(1)` access to the min or max root and `O(log n)` insertion and extraction.
+_Avoid_: Sorted queue, auto-sorting list
+
+**Adjacency List**:
+A graph representation storing only actual neighbor lists per vertex in `O(V + E)` space rather than an `O(V^2)` matrix.
+_Avoid_: Edge table, vertex grid
+
+**Stable Sort**:
+A sorting algorithm that guarantees elements with equal sort keys remain in their exact original relative input order.
+_Avoid_: Crash-free sort, deterministic sort
 
 ## Interview Dynamics
 

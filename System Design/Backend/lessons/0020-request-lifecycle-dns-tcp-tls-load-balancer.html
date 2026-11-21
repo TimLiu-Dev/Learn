@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0020: From Tap to Controller — DNS, TCP, TLS &amp; the Load Balancer</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    details.java-side { margin: 1rem 0 1.5rem 0; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-surface); }
+    details.java-side summary { cursor: pointer; padding: 0.7rem 1rem; font-weight: 600; font-size: 0.92rem; color: var(--text-secondary); }
+    details.java-side pre { margin: 0; border-radius: 0 0 var(--radius-md) var(--radius-md); }
+    ol.steps li { margin-bottom: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="page-container">
+    <nav class="top-nav">
+      <a href="../master-plan.html" class="nav-brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+        <span>Back to Master Plan</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../master-plan.html">Master Plan</a></li>
+        <li><a href="../reference/0003-backend-foundations-cheatsheet.html">Foundations Cheat Sheet</a></li>
+        <li><a href="../reference/0004-capstone-part1-pulseorder-spec.html">Part 1 Capstone</a></li>
+      </ul>
+    </nav>
+
+    <header>
+      <div class="badge-group">
+        <span class="badge badge-benchmark">Module 0020</span>
+        <span class="badge badge-mid">Part 1 · Phase 0: Build It</span>
+        <span class="badge badge-senior">Junior (L3)</span>
+        <span class="badge badge-big">~20 min</span>
+      </div>
+      <h1>From Tap to Controller: DNS, TCP, TLS &amp; the Load Balancer</h1>
+      <p style="font-size: 1.15rem;">
+        Between <code>api.getNote(1)</code> in your app and <code>@GetMapping("/{id}")</code> on the server, the request makes several network round trips before your code runs. The skill in this lesson: <strong>count the round trips</strong>, so you can estimate latency and explain why the first request is slow and later ones are fast.
+      </p>
+    </header>
+
+    <section>
+      <h2>1. The journey of one request</h2>
+      <div class="diagram-box">
+        <div class="diagram-title">Cold request: nothing cached, no open connection</div>
+<pre class="ascii-diagram">
+ Android app          DNS resolver       Load balancer            app #1 / app #2
+     |  where is api.x.com? |                   |                          |
+     |---------------------&gt;|  (1 RTT, unless cached until its TTL expires) |
+     |&lt;---- 203.0.113.7 ----|                   |                          |
+     |  SYN / SYN-ACK / ACK  (TCP: 1 RTT)       |                          |
+     |-----------------------------------------&gt;|                          |
+     |  TLS handshake  (TLS 1.3: 1 RTT · TLS 1.2: 2 RTT)                  |
+     |-----------------------------------------&gt;|                          |
+     |  GET /notes/1 ... response (1 RTT + server time)                    |
+     |-----------------------------------------&gt;|--- picks an instance ---&gt;|
+     |&lt;-----------------------------------------|&lt;---- 200 {note} --------|
+</pre>
+      </div>
+      <ul>
+        <li><strong>DNS</strong> turns a hostname into an IP address. Answers are cached for their <em>TTL</em> (time to live), so later lookups are usually free.</li>
+        <li><strong>TCP</strong> needs a three-way handshake (SYN, SYN-ACK, ACK) before any data flows, which costs about one round trip (<a href="https://hpbn.co/building-blocks-of-tcp/">HPBN: Building Blocks of TCP</a>).</li>
+        <li><strong>TLS</strong> sets up encryption. A full TLS 1.3 handshake takes <strong>1 RTT</strong>, half of TLS 1.2's <strong>2 RTT</strong> (<a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446</a>, <a href="https://hpbn.co/transport-layer-security-tls/">HPBN: TLS</a>).</li>
+        <li><strong>The HTTP request</strong> itself costs one more round trip, plus the time your server spends working.</li>
+      </ul>
+      <div class="callout callout-note">
+        <div class="callout-title">Keep-alive is the big win</div>
+        <p>Once a connection is open, later requests reuse it and skip DNS, TCP, and TLS entirely. This is why OkHttp's docs say <code>OkHttpClient</code> instances should be <strong>shared</strong>: each client has its own connection pool and thread pools, and creating new clients throws that reuse away (<a href="https://square.github.io/okhttp/5.x/okhttp/okhttp3/-ok-http-client/index.html">OkHttpClient docs</a>).</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Round-trip math</h2>
+      <p>The model used in the sandbox below, with one RTT meaning one trip there and back between phone and server:</p>
+      <div class="table-wrapper"><table>
+        <thead><tr><th>Phase</th><th>Cost</th><th>Skipped when…</th></tr></thead>
+        <tbody>
+          <tr><td>DNS lookup</td><td>1 RTT <em>(a simplification: the resolver may be closer than the server)</em></td><td>Answer is cached, or the connection is reused</td></tr>
+          <tr><td>TCP handshake</td><td>1 RTT</td><td>Connection reused</td></tr>
+          <tr><td>TLS handshake</td><td>1.3 → 1 RTT · 1.2 → 2 RTT · plain HTTP → 0</td><td>Connection reused</td></tr>
+          <tr><td>Request + response</td><td>1 RTT + server time</td><td>Never</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>Example:</strong> on mobile with RTT = 100 ms, server time = 20 ms, TLS 1.2, and cold DNS: (1 + 1 + 2 + 1) × 100 + 20 = <strong>520 ms</strong>. The same request on a reused connection: 1 × 100 + 20 = <strong>120 ms</strong>. Most of a cold request is spent on the network, not in your code.</p>
+    </section>
+
+    <section>
+      <h2>3. Load balancers: L4 vs L7</h2>
+      <p>In 0019's quiz you put two app instances behind a load balancer. There are two kinds (<a href="https://github.com/donnemartin/system-design-primer#load-balancer">System Design Primer: load balancer</a>):</p>
+      <div class="table-wrapper"><table>
+        <thead><tr><th></th><th>Layer 4 (transport)</th><th>Layer 7 (application)</th></tr></thead>
+        <tbody>
+          <tr><td>Sees</td><td>IP addresses and ports</td><td>The full HTTP request: path, headers, cookies</td></tr>
+          <tr><td>Can route <code>/api/*</code> and <code>/static/*</code> differently?</td><td>No</td><td>Yes</td></tr>
+          <tr><td>Terminates TLS?</td><td>Usually passes it through</td><td>Usually yes: it decrypts, then routes</td></tr>
+          <tr><td>Cost</td><td>Cheaper, faster</td><td>More CPU, much more flexible</td></tr>
+        </tbody>
+      </table></div>
+      <p>A <strong>reverse proxy</strong> (such as nginx) sits in front of servers and forwards requests to them. A load balancer is a reverse proxy that spreads traffic across several servers. Both run <strong>health checks</strong> and stop sending traffic to instances that fail them, which you'll wire up in <a href="0024-docker-and-deploy-first-service.html">0024</a>.</p>
+    </section>
+
+    <section>
+      <h2>4. Practice: estimate and route</h2>
+      <p>Implement two functions:</p>
+      <ul>
+        <li><code>estimateRequestMs(opts)</code> uses the table in §2.</li>
+        <li><code>routeL7(path, rules, defaultBackend)</code> picks a backend the way an L7 load balancer does. The <strong>longest matching path prefix wins</strong>, and anything unmatched goes to the default.</li>
+      </ul>
+      <div id="sandbox-0020"></div>
+    </section>
+
+    <section>
+      <h2>5. Check yourself</h2>
+      <div id="quiz-0020-a"></div>
+      <div id="quiz-0020-b"></div>
+      <div id="quiz-0020-c"></div>
+    </section>
+
+    <section>
+      <h2>6. Do it for real (on your machine)</h2>
+      <ol class="steps">
+        <li>Start your 0019 service (<code>./gradlew bootRun</code>) and time one request. The <code>-w</code> timings are <em>cumulative</em> from the start of the request (<a href="https://everything.curl.dev/usingcurl/verbose/writeout.html">everything.curl.dev: --write-out</a>):
+<pre><code>curl -s -o /dev/null -w 'dns %{time_namelookup}  tcp %{time_connect}  tls %{time_appconnect}  ttfb %{time_starttransfer}  total %{time_total}\n' http://localhost:8080/notes/1</code></pre>
+        On localhost, DNS, TCP, and TLS are close to zero. That's why your laptop hides the real cost.</li>
+        <li>Run the same command against a public HTTPS site, e.g. <code>https://www.google.com/</code>. Work out TCP time as <code>time_connect − time_namelookup</code> and TLS time as <code>time_appconnect − time_connect</code>. Compare the TLS time with the TCP time (roughly one RTT). Is TLS about one RTT (TLS 1.3) or two?</li>
+        <li>Look up a DNS answer and its TTL: <code>dig www.google.com</code>. The number before <code>IN A</code> is the TTL in seconds. Run it twice and watch it count down while your resolver serves it from cache.</li>
+        <li><strong>Android bonus:</strong> check your app creates exactly <em>one</em> <code>OkHttpClient</code> (e.g. a Hilt <code>@Singleton</code>) and that Retrofit reuses it. If you need a different timeout somewhere, use <code>client.newBuilder()</code>, which shares the same pools.</li>
+      </ol>
+      <details class="java-side">
+        <summary>☕ Java on the side: a shared client in plain Java</summary>
+<pre><code>public final class Http {
+    public static final OkHttpClient CLIENT = new OkHttpClient();   // one per app
+    private Http() {}
+}
+// Per-call tweak that shares the same connection pool:
+OkHttpClient slow = Http.CLIENT.newBuilder().readTimeout(Duration.ofSeconds(30)).build();</code></pre>
+      </details>
+      <div class="callout callout-tip">
+        <div class="callout-title">✓ Win condition</div>
+        <p>You can point at a curl timing line and say which part was DNS, TCP, TLS, and server time, and why a reused connection skips the first three.</p>
+      </div>
+      <div class="callout callout-tip">
+        <div class="callout-title">🏗 Capstone milestone (PulseOrder)</div>
+        <p>Start <code>docs/design-doc.md</code> with a "request path" diagram: app → DNS → load balancer → 2 app instances → Postgres. Record the <code>curl -w</code> timings for one endpoint. See the <a href="../reference/0004-capstone-part1-pulseorder-spec.html">capstone spec</a>.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>7. Primary source &amp; where this sits</h2>
+      <ul>
+        <li><strong>Read next (primary):</strong> Ilya Grigorik, <em>High Performance Browser Networking</em>, free online: <a href="https://hpbn.co/building-blocks-of-tcp/">Building Blocks of TCP</a> and <a href="https://hpbn.co/transport-layer-security-tls/">TLS</a>.</li>
+        <li><strong>Reference:</strong> <a href="https://www.rfc-editor.org/rfc/rfc8446">RFC 8446 (TLS 1.3)</a> · <a href="https://github.com/donnemartin/system-design-primer#load-balancer">System Design Primer: load balancer and reverse proxy</a></li>
+        <li><strong>roadmap.sh nodes covered:</strong> DNS, TCP, HTTP, Load Balancers, Layer 4 / Layer 7 Load Balancing, LB vs Reverse Proxy, Latency vs Throughput.</li>
+        <li><strong>Previous:</strong> <a href="0019-first-endpoint-server-side-of-retrofit.html">0019 First Endpoint</a> · <strong>Next:</strong> <a href="0021-postgres-spring-data-stateless-service.html">0021 Postgres + Spring Data</a></li>
+      </ul>
+    </section>
+
+    <footer class="page-footer">
+      <div class="agent-help-box">
+        <p style="margin-bottom: 0.5rem;"><strong>Ask your teacher:</strong> paste your curl timing line and ask for a breakdown.</p>
+        <p style="margin-bottom: 0;">Good follow-ups: <em>"What does HTTP/2 or HTTP/3 change about these round trips?"</em> · <em>"How does TLS 0-RTT resumption work, and why is it risky?"</em> · <em>"When would I pick an L4 load balancer?"</em></p>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
+        <span>Backend System Design // Part 1 · Phase 0</span>
+        <span>Local Workspace: <code>Backend/</code></span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="../assets/quiz.js"></script>
+  <script src="../assets/code-runner.js"></script>
+  <script>
+    const eq = (actual, expected, label) => {
+      if (actual !== expected) throw new Error(label + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual));
+    };
+    const RULES = [
+      { prefix: '/api/', backend: 'api-pool' },
+      { prefix: '/api/orders/', backend: 'orders-pool' },
+      { prefix: '/static/', backend: 'cdn-origin' }
+    ];
+
+    new CodeRunner('sandbox-0020', {
+      id: 'lesson0020_rtt_and_l7',
+      successMessage: 'You can now count round trips and route like an L7 load balancer. Next, measure the real numbers with curl -w (section 6).',
+      starterCode: `
+// opts = { rttMs, dnsCached, tls: '1.3' | '1.2' | 'none', reuseConnection, serverMs }
+function estimateRequestMs(opts) {
+  // TODO: count round trips using the table in section 2.
+  //   DNS: 1 RTT unless cached OR connection reused
+  //   TCP: 1 RTT unless connection reused
+  //   TLS: '1.3' -> 1, '1.2' -> 2, 'none' -> 0 (skipped if reused)
+  //   Request/response: always 1 RTT
+  // return rtts * opts.rttMs + opts.serverMs
+  return 0;
+}
+
+// rules = [{ prefix: '/api/', backend: 'api-pool' }, ...]
+function routeL7(path, rules, defaultBackend) {
+  // TODO: longest matching prefix wins; no match -> defaultBackend
+  return defaultBackend;
+}
+`,
+      solutionCode: `
+function estimateRequestMs(opts) {
+  let rtts = 1;                                          // request + response
+  if (!opts.reuseConnection) {
+    if (!opts.dnsCached) rtts += 1;                      // DNS
+    rtts += 1;                                           // TCP handshake
+    rtts += ({ '1.3': 1, '1.2': 2, 'none': 0 })[opts.tls]; // TLS handshake
+  }
+  return rtts * opts.rttMs + opts.serverMs;
+}
+
+function routeL7(path, rules, defaultBackend) {
+  let best = null;
+  for (const rule of rules) {
+    if (path.startsWith(rule.prefix) && (!best || rule.prefix.length > best.prefix.length)) {
+      best = rule;
+    }
+  }
+  return best ? best.backend : defaultBackend;
+}
+`,
+      hints: [
+        { title: 'Start from the request itself', content: 'Begin with <code>rtts = 1</code>, the request/response that always happens. Then add the handshakes only when <code>!opts.reuseConnection</code>.' },
+        { title: 'TLS as a lookup', content: 'A small object maps the version to RTTs: <code>({ "1.3": 1, "1.2": 2, "none": 0 })[opts.tls]</code>.' },
+        { title: 'Longest prefix', content: 'Loop over every rule and keep the matching one with the longest <code>prefix</code>. Order in the array shouldn\'t matter: <code>/api/orders/</code> must beat <code>/api/</code> even if it comes later.' }
+      ],
+      tests: [
+        { name: 'Cold, TLS 1.2: 5 RTT + server = 520 ms', exportSymbol: 'estimateRequestMs', testFn: (x) => {
+          eq(x.estimateRequestMs({ rttMs: 100, dnsCached: false, tls: '1.2', reuseConnection: false, serverMs: 20 }), 520, 'ms');
+        }},
+        { name: 'Cold, TLS 1.3: one RTT less = 420 ms', exportSymbol: 'estimateRequestMs', testFn: (x) => {
+          eq(x.estimateRequestMs({ rttMs: 100, dnsCached: false, tls: '1.3', reuseConnection: false, serverMs: 20 }), 420, 'ms');
+        }},
+        { name: 'DNS cached, TLS 1.3 = 320 ms', exportSymbol: 'estimateRequestMs', testFn: (x) => {
+          eq(x.estimateRequestMs({ rttMs: 100, dnsCached: true, tls: '1.3', reuseConnection: false, serverMs: 20 }), 320, 'ms');
+        }},
+        { name: 'Reused connection skips DNS, TCP and TLS = 120 ms', exportSymbol: 'estimateRequestMs', testFn: (x) => {
+          eq(x.estimateRequestMs({ rttMs: 100, dnsCached: false, tls: '1.2', reuseConnection: true, serverMs: 20 }), 120, 'ms');
+        }},
+        { name: 'Plain HTTP (no TLS), cached DNS = 2 RTT + server', exportSymbol: 'estimateRequestMs', testFn: (x) => {
+          eq(x.estimateRequestMs({ rttMs: 50, dnsCached: true, tls: 'none', reuseConnection: false, serverMs: 5 }), 105, 'ms');
+        }},
+        { name: 'L7: longest prefix wins, regardless of rule order', exportSymbol: 'routeL7', testFn: (x) => {
+          eq(x.routeL7('/api/orders/42', RULES, 'web'), 'orders-pool', '/api/orders/42');
+          eq(x.routeL7('/api/menu', RULES, 'web'), 'api-pool', '/api/menu');
+        }},
+        { name: 'L7: unmatched path goes to the default backend', exportSymbol: 'routeL7', testFn: (x) => {
+          eq(x.routeL7('/static/logo.png', RULES, 'web'), 'cdn-origin', '/static/logo.png');
+          eq(x.routeL7('/health', RULES, 'web'), 'web', '/health');
+        }}
+      ]
+    });
+
+    new QuizEngine('quiz-0020-a', {
+      id: 'l0020_a',
+      question: 'Users say the first request after opening your app is slow, and later ones are fast. What is the most likely cause?',
+      options: [
+        { text: 'The JVM recompiles your controller code', rationale: 'JIT warm-up affects the server, but the server has been running and serving everyone. It doesn\'t restart because one phone opened the app.' },
+        { text: 'Postgres reloads the table into memory', rationale: 'Other users keep the database warm. One client opening an app doesn\'t make Postgres reload anything.' },
+        { text: 'DNS, TCP, TLS run before data', rationale: 'Correct. A cold connection pays DNS + TCP + TLS (two to four extra RTTs) before the request. Later requests reuse the pooled connection and skip all of it.' },
+        { text: 'Retrofit parses the interface each time', rationale: 'Retrofit creates its proxy once, and parsing annotations costs microseconds, not the hundreds of milliseconds users notice.' }
+      ],
+      correctIndex: 2,
+      summary: 'On mobile networks, connection setup usually costs more than your server code. Reuse connections, which means sharing one OkHttpClient.'
+    });
+
+    new QuizEngine('quiz-0020-b', {
+      id: 'l0020_b',
+      question: 'You want /api/orders/* to go to an orders service and /static/* to go to a file server. Which component can do this?',
+      options: [
+        { text: 'A layer 4 load balancer', rationale: 'An L4 balancer sees only IPs and ports. It never reads the HTTP path, so it can\'t route on it.' },
+        { text: 'A layer 7 load balancer', rationale: 'Correct. L7 balancers understand HTTP, usually terminate TLS, and can route on path, host, or headers.' },
+        { text: 'The DNS resolver by itself', rationale: 'DNS maps hostnames to IPs. It never sees the path, which travels inside the encrypted HTTP request.' },
+        { text: 'The TCP handshake process alone', rationale: 'The handshake only opens a connection. No HTTP data, including the path, has been sent yet.' }
+      ],
+      correctIndex: 1,
+      summary: 'Routing on anything inside the HTTP request needs a component that understands HTTP: layer 7.'
+    });
+
+    new QuizEngine('quiz-0020-c', {
+      id: 'l0020_c',
+      question: 'A teammate creates a new OkHttpClient for every API call. On a 100 ms RTT network with TLS 1.3, what does each call lose compared with a shared client?',
+      options: [
+        { text: 'Nothing, because the server caches responses', rationale: 'Server caching doesn\'t help with connection setup. Each new client opens a new connection, handshakes included.' },
+        { text: 'About ten milliseconds of object allocation', rationale: 'Allocation is cheap. The real cost is the network handshakes a fresh connection pool forces.' },
+        { text: 'One RTT for the DNS lookup', rationale: 'DNS is often cached by the OS, so the loss is usually TCP plus TLS, not DNS.' },
+        { text: 'Two RTTs for TCP and TLS', rationale: 'Correct. Without a shared pool, every call opens a new connection: 1 RTT for TCP and 1 RTT for TLS 1.3, about 200 ms. Even more if DNS isn\'t cached.' }
+      ],
+      correctIndex: 3,
+      summary: 'Share one OkHttpClient. Its connection pool turns 3 RTTs into 1 for every request after the first.'
+    });
+  </script>
+</body>
+</html>

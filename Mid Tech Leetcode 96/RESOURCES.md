@@ -19,8 +19,8 @@
 
 - [r/leetcode (Reddit)](https://www.reddit.com/r/leetcode/)
   High-signal community sharing real-world interview loop debriefs, question patterns, and technical screen formats across mid-tech companies. Use for: discovering recent question trends and interview variations.
-- [LeetCode Discuss (Interview Questions & Experiences)](https://leetcode.com/discuss/interview-question)
-  Direct candidate reports tagging specific mid-tech companies (Target, Capital One, Walmart, Stripe, Uber, Salesforce). Use for: verbatim interview prompts, exact follow-up questions asked by interviewers, and technical/OOP splits.
+- [NeetCode Practice & Interview Experiences](https://neetcode.io/practice)
+  Direct problem workspaces, pattern roadmaps, and company-tagged practice sets for Mid-Tech interviews (Target, Capital One, Walmart, Stripe, Uber, Salesforce). Use for: practicing problems cold on NeetCode, reviewing exact follow-up questions asked by interviewers, and technical/OOP splits.
 - [Team Blind (LeetCode & Tech Careers)](https://www.teamblind.com/channels/leetcode)
   Anonymous verified tech worker forum. Use for: company hiring bar calibrations, level-specific expectations (Mid vs Senior), and realistic loop format insights.
 - [r/cscareerquestions (Reddit)](https://www.reddit.com/r/cscareerquestions/)

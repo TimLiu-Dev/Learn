@@ -111,3 +111,25 @@ _Avoid_: Deep link URL handler, SiriKit legacy intent
 **StoreKit 2 `VerificationResult` (JWS)**:
 Cryptographically signed JSON Web Signature payload verified locally by StoreKit 2 without requiring a custom receipt-validation server.
 _Avoid_: Legacy receipt ASN.1 blob
+
+## Advanced SwiftUI DSL, Graphics & CloudKit
+
+**`@resultBuilder` / `@ViewBuilder`**:
+Compile-time Swift syntax transformation lowering multi-statement DSL closures into static generic expressions (`TupleView`, `_ConditionalContent`) without runtime reflection.
+_Avoid_: View compiler plugin, dynamic closure array
+
+**`PreferenceKey`**:
+SwiftUI protocol propagating child view metrics upward through the view hierarchy using an associative `reduce(value:nextValue:)` combiner.
+_Avoid_: Child-to-parent Environment, upward Binding
+
+**`Swift Charts` & `Canvas`**:
+Declarative accessible charting (`BarMark`, vectorized `LinePlot`) and immediate-mode CoreGraphics `Canvas` rendering 10,000+ primitives without `AttributeGraph` node bloat.
+_Avoid_: UIKit CoreGraphics layer hack, ZStack shape loop
+
+**`CKSyncEngine`**:
+First-party CloudKit sync coordinator managing `CKServerChangeToken` persistence, reachability scheduling, batch splitting, and `serverRecordChanged` conflict handling.
+_Avoid_: Manual CKQuery polling
+
+**`DocC` (`swift-docc-plugin`)**:
+Apple's documentation compiler transforming `///` symbol comments, double-backtick symbol links, and `.docc` tutorials into Xcode and static HTML documentation.
+_Avoid_: Javadoc comments, README dump

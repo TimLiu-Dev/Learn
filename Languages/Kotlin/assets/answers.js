@@ -1,3 +1,4 @@
+// Pre-populated idiomatic model answers and explanations for all lesson exercises.
 window.EXERCISE_ANSWERS = {
   "0000-ex1": {
     "title": "Diagnostic Task 1 · Profile & Heart-Rate Classifier (Write from blank)",
@@ -14,7 +15,8 @@ window.EXERCISE_ANSWERS = {
   "0001-ex1": {
     "title": "Exercise 1 · Interval session (Write from blank)",
     "code": "fun main() {\n    val athlete = \"Sam\"\n    val maxHeartRate = 185\n    val distanceKm = 4.8\n    var calories = 0\n    calories += 120\n    calories += 95\n    calories += 140\n    println(\"$athlete ran $distanceKm km, burned $calories kcal (max HR: $maxHeartRate)\")\n}",
-    "why": "Immutable values (athlete, maxHeartRate, distanceKm) use `val`. `calories` is the only value that changes, so it is the single `var`. The compiler infers `Double` for 4.8 and `Int` for 0 without verbose type annotations."
+    "why": "Immutable values (athlete, maxHeartRate, distanceKm) use `val`. `calories` is the only value that changes, so it is the single `var`. The compiler infers `Double` for 4.8 and `Int` for 0 without verbose type annotations.",
+    "expectedOutput": "Sam ran 4.8 km, burned 355 kcal (max HR: 185)"
   },
   "0001-ex2": {
     "title": "Exercise 2 · Clean up an AI-generated snippet (Refactor)",
@@ -25,7 +27,8 @@ window.EXERCISE_ANSWERS = {
   "0002-ex1": {
     "title": "Exercise 1 · Post-workout summary (Write from blank)",
     "code": "fun main() {\n    val athlete = \"Priya\"\n    val minutes = 42\n    val distanceKm = 7.3\n    val avgHeartRate = 151\n\n    println(\"$athlete ran $distanceKm km in $minutes min (avg $avgHeartRate bpm)\")\n\n    val summary = \"\"\"\n        Workout summary\n        Athlete: $athlete\n        Distance: $distanceKm km\n        Calories: ${minutes * 10}\n    \"\"\".trimIndent()\n    println(summary)\n}",
-    "why": "String templates ($variable) eliminate all `+` concatenation. Curly braces are used exclusively for expressions (`${minutes * 10}`). Raw strings with `trimIndent()` remove shared leading indentation while avoiding ugly `\\n` escape sequences."
+    "why": "String templates ($variable) eliminate all `+` concatenation. Curly braces are used exclusively for expressions (`${minutes * 10}`). Raw strings with `trimIndent()` remove shared leading indentation while avoiding ugly `\\n` escape sequences.",
+    "expectedOutput": "Priya ran 7.3 km in 42 min (avg 151 bpm)\nWorkout summary\nAthlete: Priya\nDistance: 7.3 km\nCalories: 420"
   },
   "0002-ex2": {
     "title": "Exercise 2 · Clean up the string building (Refactor)",
@@ -36,7 +39,8 @@ window.EXERCISE_ANSWERS = {
   "0003-ex1": {
     "title": "Exercise 1 · Session timer (Write from blank)",
     "code": "fun main() {\n    // 1. Reps countdown\n    for (rep in 10 downTo 1) {\n        print(\"$rep \")\n    }\n    println()\n\n    // 2. Minute markers (excluding 30)\n    for (m in 0..<30 step 5) {\n        print(\"$m \")\n    }\n    println()\n\n    // 3. Heart rate in range\n    val heartRate = 142\n    val zone = if (heartRate in 133..152) \"Cardio\" else \"Other\"\n    println(zone)\n\n    // 4. Incline bounded to 0..15\n    val requestedIncline = 18\n    val incline = requestedIncline.coerceIn(0, 15)\n    println(incline)\n}",
-    "why": "Progressions use `downTo` for descending counts, `..<` for open-ended upper bounds, and `step` for custom strides. `in` checks range membership, and `coerceIn(min, max)` safely clamps numeric limits without awkward nested `if` comparisons."
+    "why": "Progressions use `downTo` for descending counts, `..<` for open-ended upper bounds, and `step` for custom strides. `in` checks range membership, and `coerceIn(min, max)` safely clamps numeric limits without awkward nested `if` comparisons.",
+    "expectedOutput": "10 9 8 7 6 5 4 3 2 1 \n0 5 10 15 20 25 \nCardio\n15"
   },
   "0003-ex2": {
     "title": "Exercise 2 · Off-by-one country (Refactor)",
@@ -47,7 +51,8 @@ window.EXERCISE_ANSWERS = {
   "0004-ex1": {
     "title": "Exercise 1 · Two small functions (Write from blank)",
     "code": "fun paceLabel(minPerKm: Double): String =\n    if (minPerKm < 5.0) \"Fast\" else \"Steady\"\n\nfun parseReps(input: String): Int =\n    try {\n        input.toInt()\n    } catch (e: NumberFormatException) {\n        0\n    }\n\nfun main() {\n    println(paceLabel(4.6))\n    println(paceLabel(5.8))\n    println(parseReps(\"12\"))\n    println(parseReps(\"twelve\"))\n}",
-    "why": "`if` and `try` are expressions that evaluate to a value. Both functions use single-expression bodies (`=`) directly returning the expression result without temporary variables or return statements in each branch."
+    "why": "`if` and `try` are expressions that evaluate to a value. Both functions use single-expression bodies (`=`) directly returning the expression result without temporary variables or return statements in each branch.",
+    "expectedOutput": "Fast\nSteady\n12\n0"
   },
   "0004-ex2": {
     "title": "Exercise 2 · Assign-in-every-branch cleanup (Refactor)",
@@ -58,7 +63,8 @@ window.EXERCISE_ANSWERS = {
   "0005-ex1": {
     "title": "Exercise 1 · Heart-rate zones (Write from blank)",
     "code": "fun zoneFor(percent: Int): String = when (percent) {\n    in 0..49 -> \"Rest\"\n    in 50..59 -> \"Warm-up\"\n    in 60..69 -> \"Fat burn\"\n    in 70..79 -> \"Cardio\"\n    in 80..89 -> \"Hard\"\n    in 90..100 -> \"Peak\"\n    else -> \"Invalid\"\n}\n\nfun main() {\n    val bpm = 152\n    val maxHr = 190\n    val percent = (bpm * 100) / maxHr\n    println(\"$bpm bpm → ${zoneFor(percent)} ($percent%)\")\n}",
-    "why": "`when` with a subject (`percent`) supports range checks using `in a..b`. Single-expression body (`= when`) cleanly returns the resulting branch value. The `else` branch guarantees exhaustiveness for integer inputs."
+    "why": "`when` with a subject (`percent`) supports range checks using `in a..b`. Single-expression body (`= when`) cleanly returns the resulting branch value. The `else` branch guarantees exhaustiveness for integer inputs.",
+    "expectedOutput": "152 bpm → Hard (80%)"
   },
   "0005-ex2": {
     "title": "Exercise 2 · Untangle the ladders (Refactor)",
@@ -69,7 +75,8 @@ window.EXERCISE_ANSWERS = {
   "0006-ex1": {
     "title": "Exercise 1 · Pace, week and plan (Write from blank)",
     "code": "fun splitPace(totalSeconds: Int): Pair<Int, Int> =\n    (totalSeconds / 60) to (totalSeconds % 60)\n\nfun main() {\n    val weeklyMinutes = mapOf(\"Mon\" to 30, \"Wed\" to 45, \"Sat\" to 60)\n    val planned = listOf(\"Run\", \"Row\")\n    val completed = listOf(\"Run\", \"Row\")\n\n    for ((day, mins) in weeklyMinutes) {\n        println(\"$day: $mins min\")\n    }\n\n    val (mins, secs) = splitPace(335)\n    println(\"Pace: $mins:$secs /km\")\n\n    if (completed == planned) {\n        println(\"Plan complete\")\n    }\n}",
-    "why": "`to` creates a `Pair` succinctly, destructuring unpacks map entries and Pairs without `.key`/`.first`, and `==` checks structural list contents."
+    "why": "`to` creates a `Pair` succinctly, destructuring unpacks map entries and Pairs without `.key`/`.first`, and `==` checks structural list contents.",
+    "expectedOutput": "Mon: 30 min\nWed: 45 min\nSat: 60 min\nPace: 5:35 /km\nPlan complete"
   },
   "0006-ex2": {
     "title": "Exercise 2 · Fix the bug, then clean up (Refactor)",
@@ -80,7 +87,8 @@ window.EXERCISE_ANSWERS = {
   "0007-ex1": {
     "title": "Exercise 1 · Weekly report (Write from blank)",
     "code": "fun main() {\n    val week = mapOf(\n        \"Mon\" to 25, \"Tue\" to 0, \"Wed\" to 50, \"Thu\" to 35,\n        \"Fri\" to 0, \"Sat\" to 75, \"Sun\" to 40,\n    )\n\n    var total = 0\n    var activeDays = 0\n\n    for ((day, mins) in week) {\n        val label = when (mins) {\n            0 -> \"rest\"\n            in 1..29 -> \"short\"\n            in 30..59 -> \"medium\"\n            else -> \"long\"\n        }\n        if (mins > 0) activeDays++\n        total += mins\n        println(\"$day: $mins min ($label)\")\n    }\n\n    val goalMet = if (total >= 150) \"yes\" else \"no\"\n    println(\"\"\"\n        Total: $total min\n        Active days: $activeDays of ${week.size}\n        Goal met: $goalMet\n    \"\"\".trimIndent())\n}",
-    "why": "Integrates map destructuring, `when` with range branches, single `if` expression for goal evaluation, and a raw multiline summary string using `trimIndent()`."
+    "why": "Integrates map destructuring, `when` with range branches, single `if` expression for goal evaluation, and a raw multiline summary string using `trimIndent()`.",
+    "expectedOutput": "Mon: 25 min (short)\nTue: 0 min (rest)\nWed: 50 min (medium)\nThu: 35 min (medium)\nFri: 0 min (rest)\nSat: 75 min (long)\nSun: 40 min (medium)\nTotal: 225 min\nActive days: 5 of 7\nGoal met: yes"
   },
   "0007-ex2": {
     "title": "Exercise 2 · The full AI-flavoured special (Refactor)",
@@ -91,7 +99,8 @@ window.EXERCISE_ANSWERS = {
   "0008-ex1": {
     "title": "Exercise 1 · Workout banner safely (Write from blank)",
     "code": "class Coach(val name: String)\nclass Workout(val title: String, val coach: Coach?)\nclass Profile(val nickname: String?, val currentWorkout: Workout?)\n\nfun coachName(profile: Profile?): String? =\n    profile?.currentWorkout?.coach?.name\n\nfun nicknameLength(profile: Profile?): Int? =\n    profile?.nickname?.length\n\nfun main() {\n    val full = Profile(\"Kai\", Workout(\"Intervals\", Coach(\"Maya\")))\n    val noWorkout = Profile(null, null)\n    println(coachName(full))\n    println(coachName(noWorkout))\n    println(coachName(null))\n    println(nicknameLength(full))\n    println(nicknameLength(noWorkout))\n}",
-    "why": "Chains safe calls (`?.`) cleanly across nullable objects without any `if (x != null)` checks or unsafe `!!` assertions. Both functions return nullable types (`String?` / `Int?`)."
+    "why": "Chains safe calls (`?.`) cleanly across nullable objects without any `if (x != null)` checks or unsafe `!!` assertions. Both functions return nullable types (`String?` / `Int?`).",
+    "expectedOutput": "Maya\nnull\nnull\n3\nnull"
   },
   "0008-ex2": {
     "title": "Exercise 2 · Flatten the null-check pyramid (Refactor)",
@@ -102,7 +111,8 @@ window.EXERCISE_ANSWERS = {
   "0009-ex1": {
     "title": "Exercise 1 · Display name and workout banner (Write from blank)",
     "code": "class Coach(val name: String)\nclass Workout(val title: String, val coach: Coach?)\nclass Profile(val nickname: String?, val email: String?, val currentWorkout: Workout?)\n\nfun displayName(profile: Profile?): String =\n    profile?.nickname ?: profile?.email ?: \"Athlete\"\n\nfun describeWorkout(profile: Profile?): String {\n    val workout = profile?.currentWorkout ?: return \"Rest day\"\n    val coach = workout.coach ?: throw IllegalStateException(\"${workout.title} has no coach\")\n    return \"${workout.title} with ${coach.name}\"\n}\n\nfun main() {\n    println(displayName(Profile(\"Kai\", \"kai@example.com\", null)))\n    println(displayName(Profile(null, \"maya@example.com\", null)))\n    println(displayName(null))\n\n    val profiles = listOf(\n        null,\n        Profile(\"Kai\", null, Workout(\"Intervals\", Coach(\"Maya\"))),\n        Profile(\"Kai\", null, Workout(\"Tempo run\", null)),\n    )\n    for (p in profiles) {\n        val message = try { describeWorkout(p) } catch (e: IllegalStateException) { \"Error: ${e.message}\" }\n        println(message)\n    }\n}",
-    "why": "Chains Elvis fallbacks (`nickname ?: email ?: \"Athlete\"`) in `displayName`, and uses `?: return` (normal missing workout) plus `?: throw` (data bug: missing coach) as flat guard clauses in `describeWorkout`."
+    "why": "Chains Elvis fallbacks (`nickname ?: email ?: \"Athlete\"`) in `displayName`, and uses `?: return` (normal missing workout) plus `?: throw` (data bug: missing coach) as flat guard clauses in `describeWorkout`.",
+    "expectedOutput": "Kai\nmaya@example.com\nAthlete\nRest day\nIntervals with Maya\nError: Tempo run has no coach"
   },
   "0009-ex2": {
     "title": "Exercise 2 · Flatten the defaults (Refactor)",
@@ -113,7 +123,8 @@ window.EXERCISE_ANSWERS = {
   "0010-ex1": {
     "title": "Exercise 1 · Describe a synced value (Write from blank)",
     "code": "fun describe(value: Any): String = when (value) {\n    is Int -> \"$value bpm\"\n    is String -> \"Note (${value.length} chars): $value\"\n    is Double -> \"$value km\"\n    else -> \"Unknown\"\n}\n\nfun main() {\n    val synced: List<Any> = listOf(150, \"Morning run\", 5.2, true)\n    for (value in synced) {\n        println(describe(value))\n    }\n}",
-    "why": "In a `when` branch with `is String`, Kotlin automatically smart-casts `value` from `Any` to `String`, allowing direct access to `.length` without manual casting like `(value as String).length`."
+    "why": "In a `when` branch with `is String`, Kotlin automatically smart-casts `value` from `Any` to `String`, allowing direct access to `.length` without manual casting like `(value as String).length`.",
+    "expectedOutput": "150 bpm\nNote (11 chars): Morning run\n5.2 km\nUnknown"
   },
   "0010-ex2": {
     "title": "Exercise 2 · Remove the casts and assertions (Refactor)",
@@ -124,7 +135,8 @@ window.EXERCISE_ANSWERS = {
   "0011-ex1": {
     "title": "Exercise 1 · Heart-rate monitor (Write from blank)",
     "code": "class HeartRateMonitor {\n    lateinit var deviceName: String\n\n    fun pair(name: String) {\n        deviceName = name\n    }\n\n    fun reading(raw: String?): String {\n        val safeRaw = requireNotNull(raw) { \"No reading from $deviceName\" }\n        val bpm = safeRaw.toIntOrNull() ?: error(\"Bad reading: $safeRaw\")\n        return \"$deviceName: $bpm bpm\"\n    }\n}\n\nfun main() {\n    val monitor = HeartRateMonitor()\n    monitor.pair(\"Chest strap\")\n    println(monitor.reading(\"142\"))\n    try { monitor.reading(null) } catch (e: IllegalArgumentException) { println(e.message) }\n    try { monitor.reading(\"abc\") } catch (e: IllegalStateException) { println(e.message) }\n}",
-    "why": "`lateinit var` avoids making `deviceName` nullable, `requireNotNull` signals bad arguments (`IllegalArgumentException`), and `toIntOrNull() ?: error(...)` turns malformed input into `IllegalStateException` with a clear message."
+    "why": "`lateinit var` avoids making `deviceName` nullable, `requireNotNull` signals bad arguments (`IllegalArgumentException`), and `toIntOrNull() ?: error(...)` turns malformed input into `IllegalStateException` with a clear message.",
+    "expectedOutput": "Chest strap: 142 bpm\nNo reading from Chest strap\nBad reading: abc"
   },
   "0011-ex2": {
     "title": "Exercise 2 · The session that crashes on launch (Refactor)",
@@ -135,7 +147,8 @@ window.EXERCISE_ANSWERS = {
   "0012-ex1": {
     "title": "Exercise 1 · Coach message (Write from blank)",
     "code": "fun coachMessage(name: String?, bpm: Int?, maxHr: Int): String {\n    val athlete = name ?: \"Athlete\"\n    val rate = bpm ?: return \"$athlete: no heart-rate signal\"\n    val pct = rate * 100 / maxHr\n    val message = when (pct) {\n        in 90..Int.MAX_VALUE -> \"ease off\"\n        in 70..89 -> \"great pace\"\n        else -> \"pick it up\"\n    }\n    return \"$athlete, $pct% of max: $message\"\n}\n\nfun main() {\n    println(coachMessage(\"Ana\", 171, 190))\n    println(coachMessage(null, 140, 190))\n    println(coachMessage(\"Ben\", null, 185))\n    println(coachMessage(\"Cy\", 100, 200))\n}",
-    "why": "Combines Elvis fallback for strings (`name ?: \"Athlete\"`), early exit guard for missing signal (`val rate = bpm ?: return`), and when expression for zone classification without mutable vars."
+    "why": "Combines Elvis fallback for strings (`name ?: \"Athlete\"`), early exit guard for missing signal (`val rate = bpm ?: return`), and when expression for zone classification without mutable vars.",
+    "expectedOutput": "Ana, 90% of max: ease off\nAthlete, 73% of max: great pace\nBen: no heart-rate signal\nCy, 50% of max: pick it up"
   },
   "0012-ex2": {
     "title": "Exercise 2 · Untangle the profile summary (Refactor)",
@@ -151,7 +164,8 @@ window.EXERCISE_ANSWERS = {
   "0013-ex1": {
     "title": "Exercise 1 · Session Configurator (Write from blank)",
     "code": "fun createSession(\n    activity: String,\n    targetDistanceKm: Double = 5.0,\n    allowGps: Boolean = true,\n    coachNote: String? = null\n): String {\n    val note = coachNote ?: \"None\"\n    return \"Activity: $activity, Goal: $targetDistanceKm km, GPS: $allowGps, Note: $note\"\n}\n\nfun main() {\n    println(createSession(\"Cycling\"))\n    println(createSession(\"Running\", targetDistanceKm = 10.0))\n    println(createSession(\"Yoga\", allowGps = false, coachNote = \"Focus on breath\"))\n}",
-    "why": "Declares default parameters directly in the signature, eliminating constructor overloads. Callers use named arguments to specify only the optional parameters they care about."
+    "why": "Declares default parameters directly in the signature, eliminating constructor overloads. Callers use named arguments to specify only the optional parameters they care about.",
+    "expectedOutput": "Activity: Cycling, Goal: 5.0 km, GPS: true, Note: None\nActivity: Running, Goal: 10.0 km, GPS: true, Note: None\nActivity: Yoga, Goal: 5.0 km, GPS: false, Note: Focus on breath"
   },
   "0013-ex2": {
     "title": "Exercise 2 · Kill the Telescoping Overloads (Refactor)",
@@ -162,7 +176,8 @@ window.EXERCISE_ANSWERS = {
   "0014-ex1": {
     "title": "Exercise 1 · Metrics & Conversions (Write from blank)",
     "code": "fun milesToKm(miles: Double): Double = miles * 1.60934\n\nfun paceDescription(minPerKm: Double): String = when {\n    minPerKm < 3.5 -> \"Elite\"\n    minPerKm in 3.5..5.0 -> \"Fast\"\n    else -> \"Steady\"\n}\n\nfun calorieEstimate(weightKg: Double, km: Double): Double = weightKg * km * 1.036\n\nfun main() {\n    println(milesToKm(10.0))\n    println(paceDescription(4.2))\n    println(calorieEstimate(70.0, 10.0))\n}",
-    "why": "Single-expression bodies (`=`) eliminate `{ return ... }` boilerplate. Explicit return types document public API contracts."
+    "why": "Single-expression bodies (`=`) eliminate `{ return ... }` boilerplate. Explicit return types document public API contracts.",
+    "expectedOutput": "16.0934\nFast\n725.2"
   },
   "0014-ex2": {
     "title": "Exercise 2 · Simplify Java-Flavoured Calculators (Refactor)",
@@ -197,7 +212,8 @@ window.EXERCISE_ANSWERS = {
   "0017-ex1": {
     "title": "Exercise 1 · Session Logger & Rate Calculator (Write from blank)",
     "code": "val Int.secondsToTime: String\n    get() {\n        val m = this / 60\n        val s = this % 60\n        val sPadded = if (s < 10) \"0$s\" else \"$s\"\n        return \"$m:$sPadded\"\n    }\n\ninfix fun String.assignedTo(coach: String?): String =\n    \"$this -> ${coach ?: \"Unassigned\"}\"\n\nfun calcSpeed(distanceMeters: Double, seconds: Int = 3600): Double =\n    distanceMeters / seconds\n\nfun main() {\n    println(125.secondsToTime)\n    println(300.secondsToTime)\n    println(\"Hill Repeats\" assignedTo \"Elena\")\n    println(\"Solo Run\" assignedTo null)\n    println(\"Speed: ${calcSpeed(5000.0, 1000)} m/s\")\n    println(\"Speed default: ${calcSpeed(5000.0)} m/s\")\n}",
-    "why": "Combines an extension property with formatting, an infix function handling nullable coaches, and a single-expression function with a default parameter."
+    "why": "Combines an extension property with formatting, an infix function handling nullable coaches, and a single-expression function with a default parameter.",
+    "expectedOutput": "2:05\n5:00\nHill Repeats -> Elena\nSolo Run -> Unassigned\nSpeed: 5.0 m/s\nSpeed default: 1.3888888888888888 m/s"
   },
   "0017-ex2": {
     "title": "Exercise 2 · The Java/AI Functions Special (Refactor)",
@@ -208,7 +224,8 @@ window.EXERCISE_ANSWERS = {
   "0018-ex1": {
     "title": "Exercise 1 · Workout Tracker Model (Write from blank)",
     "code": "class WorkoutSession(\n    val title: String,\n    val distanceKm: Double,\n    val durationMinutes: Int = 30\n) {\n    init {\n        require(distanceKm > 0.0) { \"Distance must be positive: $distanceKm\" }\n        require(durationMinutes > 0) { \"Duration must be positive: $durationMinutes\" }\n    }\n\n    val paceMinPerKm: Double\n        get() = durationMinutes / distanceKm\n\n    val isLongRun: Boolean\n        get() = distanceKm >= 15.0 || durationMinutes >= 90\n}\n\nfun main() {\n    val session1 = WorkoutSession(\"Morning 10k\", 10.0, 50)\n    println(\"${session1.title}: pace ${session1.paceMinPerKm} min/km, long run: ${session1.isLongRun}\")\n\n    val session2 = WorkoutSession(\"Half Marathon\", 21.1, 105)\n    println(\"${session2.title}: pace ${session2.paceMinPerKm} min/km, long run: ${session2.isLongRun}\")\n}",
-    "why": "Properties declared with `val` directly in constructor header. Validation runs inside `init` using `require()`. Computed properties use custom getters `get()` without backing storage."
+    "why": "Properties declared with `val` directly in constructor header. Validation runs inside `init` using `require()`. Computed properties use custom getters `get()` without backing storage.",
+    "expectedOutput": "Morning 10k: pace 5.0 min/km, long run: false\nHalf Marathon: pace 4.976303317535545 min/km, long run: true"
   },
   "0018-ex2": {
     "title": "Exercise 2 · Kill the Java Getter/Setter Boilerplate (Refactor)",
@@ -219,7 +236,8 @@ window.EXERCISE_ANSWERS = {
   "0019-ex1": {
     "title": "Exercise 1 · Modular Repository & Secondary Constructor (Write from blank)",
     "code": "open class BaseLogger(val tag: String) {\n    open fun log(msg: String): String = \"[$tag] $msg\"\n}\n\ninternal class SessionLogger(tag: String, val verbose: Boolean) : BaseLogger(tag) {\n    constructor(tag: String) : this(tag, false)\n\n    override fun log(msg: String): String =\n        if (verbose) \"VERBOSE: \" + super.log(msg) else super.log(msg)\n}\n\nfun main() {\n    val logger1 = SessionLogger(\"GPS\", verbose = true)\n    println(logger1.log(\"Satellite acquired\"))\n\n    val logger2 = SessionLogger(\"HeartRate\")\n    println(logger2.log(\"Connected\"))\n}",
-    "why": "Base class marked `open` along with method `log`. `SessionLogger` is scoped with `internal`. Secondary constructor delegates to primary with `this(tag, false)`."
+    "why": "Base class marked `open` along with method `log`. `SessionLogger` is scoped with `internal`. Secondary constructor delegates to primary with `this(tag, false)`.",
+    "expectedOutput": "VERBOSE: [GPS] Satellite acquired\n[HeartRate] Connected"
   },
   "0019-ex2": {
     "title": "Exercise 2 · Eliminate Redundant Constructors (Refactor)",
@@ -230,7 +248,8 @@ window.EXERCISE_ANSWERS = {
   "0020-ex1": {
     "title": "Exercise 1 · Immutable Workout Milestone (Write from blank)",
     "code": "data class Milestone(val name: String, val targetKm: Double, val achieved: Boolean = false)\n\nfun main() {\n    val m1 = Milestone(\"5K Qualifier\", 5.0)\n    val m2 = m1.copy(achieved = true)\n    val (name, km, done) = m2\n    println(\"Milestone: $name ($km km) - Done: $done\")\n    println(\"Are equal: ${m1 == m2}\")\n}",
-    "why": "Data class auto-generates `copy()` and destructuring `componentN()` functions. Structural equality `m1 == m2` compares all constructor values."
+    "why": "Data class auto-generates `copy()` and destructuring `componentN()` functions. Structural equality `m1 == m2` compares all constructor values.",
+    "expectedOutput": "Milestone: 5K Qualifier (5.0 km) - Done: true\nAre equal: false"
   },
   "0020-ex2": {
     "title": "Exercise 2 · Fix the Identity Bug (Refactor)",
@@ -241,7 +260,8 @@ window.EXERCISE_ANSWERS = {
   "0021-ex1": {
     "title": "Exercise 1 · Heart Rate Zone Enum (Write from blank)",
     "code": "enum class CardioZone(val minBpm: Int, val maxBpm: Int) {\n    REST(0, 99),\n    FAT_BURN(100, 139),\n    CARDIO(140, 169),\n    PEAK(170, 220);\n\n    fun contains(bpm: Int): Boolean = bpm in minBpm..maxBpm\n}\n\nfun classify(bpm: Int): CardioZone =\n    CardioZone.entries.firstOrNull { it.contains(bpm) } ?: CardioZone.REST\n\nfun main() {\n    println(classify(72))\n    println(classify(145))\n    println(classify(180))\n}",
-    "why": "Uses `CardioZone.entries` for zero-allocation iteration. Semicolon separates enum constants from member functions."
+    "why": "Uses `CardioZone.entries` for zero-allocation iteration. Semicolon separates enum constants from member functions.",
+    "expectedOutput": "REST\nCARDIO\nPEAK"
   },
   "0021-ex2": {
     "title": "Exercise 2 · Replace Java Integer Constants with an Enum (Refactor)",
@@ -252,7 +272,8 @@ window.EXERCISE_ANSWERS = {
   "0022-ex1": {
     "title": "Exercise 1 · Android UI State Model (Write from blank)",
     "code": "sealed interface WorkoutUiState {\n    data object Loading : WorkoutUiState\n    data class Ready(val workoutTitle: String, val distanceKm: Double) : WorkoutUiState\n    data class Failure(val reason: String, val recoverable: Boolean = true) : WorkoutUiState\n}\n\nfun statusMessage(state: WorkoutUiState): String = when (state) {\n    WorkoutUiState.Loading -> \"Please wait: syncing with device...\"\n    is WorkoutUiState.Ready -> \"Workout ready: ${state.workoutTitle} (${state.distanceKm} km)\"\n    is WorkoutUiState.Failure -> \"Failed: ${state.reason} [Retry: ${state.recoverable}]\"\n}\n\nfun main() {\n    val s1: WorkoutUiState = WorkoutUiState.Loading\n    val s2: WorkoutUiState = WorkoutUiState.Ready(\"Hill Sprints\", 6.5)\n    val s3: WorkoutUiState = WorkoutUiState.Failure(\"GPS Signal Lost\", recoverable = false)\n\n    println(statusMessage(s1))\n    println(statusMessage(s2))\n    println(statusMessage(s3))\n}",
-    "why": "`sealed interface` enforces compile-time exhaustiveness. In each branch, Kotlin automatically smart-casts `state` to access subtype-specific fields."
+    "why": "`sealed interface` enforces compile-time exhaustiveness. In each branch, Kotlin automatically smart-casts `state` to access subtype-specific fields.",
+    "expectedOutput": "Please wait: syncing with device...\nWorkout ready: Hill Sprints (6.5 km)\nFailed: GPS Signal Lost [Retry: false]"
   },
   "0022-ex2": {
     "title": "Exercise 2 · Eliminate the Anemic Nullable State Antipattern (Refactor)",
@@ -263,7 +284,8 @@ window.EXERCISE_ANSWERS = {
   "0023-ex1": {
     "title": "Exercise 1 · Factory Companion & Data Object State (Write from blank)",
     "code": "sealed interface DownloadState {\n    data object Idle : DownloadState\n    data class InProgress(val percent: Int) : DownloadState\n}\n\nclass SessionToken private constructor(val raw: String) {\n    companion object {\n        const val PREFIX = \"RUN_\"\n        fun create(userId: String): SessionToken = SessionToken(\"$PREFIX$userId\")\n    }\n}\n\nfun main() {\n    val state: DownloadState = DownloadState.Idle\n    println(\"State: $state\")\n\n    val token = SessionToken.create(\"u123\")\n    println(\"Token: ${token.raw}\")\n}",
-    "why": "`data object` outputs clean string representation. Private constructor forces callers to instantiate through the companion object factory."
+    "why": "`data object` outputs clean string representation. Private constructor forces callers to instantiate through the companion object factory.",
+    "expectedOutput": "State: Idle\nToken: RUN_u123"
   },
   "0023-ex2": {
     "title": "Exercise 2 · Kill the Java Static Pattern (Refactor)",
@@ -285,7 +307,8 @@ window.EXERCISE_ANSWERS = {
   "0025-ex1": {
     "title": "Exercise 1 · Complete Feature Architecture (Write from blank)",
     "code": "@JvmInline\nvalue class SessionId(val raw: String)\n\nenum class ActivityType(val icon: String) {\n    RUN(\"🏃\"),\n    CYCLE(\"🚴\")\n}\n\ndata class SessionRecord(val id: SessionId, val type: ActivityType, val distanceKm: Double)\n\nsealed interface SyncState {\n    data object Pending : SyncState\n    data class Completed(val record: SessionRecord) : SyncState\n}\n\nfun describeSync(state: SyncState): String = when (state) {\n    SyncState.Pending -> \"Syncing...\"\n    is SyncState.Completed -> \"${state.record.type.icon} ${state.record.id.raw}: ${state.record.distanceKm} km\"\n}\n\nfun main() {\n    val id = SessionId(\"sess_01\")\n    val record = SessionRecord(id, ActivityType.RUN, 10.5)\n    val state: SyncState = SyncState.Completed(record)\n    println(describeSync(state))\n}",
-    "why": "Synthesizes value classes, enums, data classes, and sealed interfaces into a bulletproof, type-safe architecture."
+    "why": "Synthesizes value classes, enums, data classes, and sealed interfaces into a bulletproof, type-safe architecture.",
+    "expectedOutput": "🏃 sess_01: 10.5 km"
   },
   "0025-ex2": {
     "title": "Exercise 2 · The Java Architecture Special (Refactor)",
@@ -296,7 +319,8 @@ window.EXERCISE_ANSWERS = {
   "0026-ex1": {
     "title": "Exercise 1 · Custom Workout Filter & Timer (Write from blank)",
     "code": "fun filterPaces(paces: List<Double>, predicate: (Double) -> Boolean): List<Double> {\n    val result = mutableListOf<Double>()\n    for (p in paces) {\n        if (predicate(p)) result.add(p)\n    }\n    return result\n}\n\nfun runBenchmark(tag: String, block: () -> Unit) {\n    println(\"Starting $tag...\")\n    block()\n    println(\"Finished $tag\")\n}\n\nfun main() {\n    val paces = listOf(3.8, 5.2, 4.1, 6.0, 3.4)\n    val fastPaces = filterPaces(paces) { it < 4.5 }\n    println(\"Fast paces: $fastPaces\")\n\n    runBenchmark(\"100m Dash\") {\n        println(\"Athlete sprinting across track...\")\n    }\n}",
-    "why": "Higher-order functions declare function types `(Double) -> Boolean` and `() -> Unit`, called with trailing lambda syntax."
+    "why": "Higher-order functions declare function types `(Double) -> Boolean` and `() -> Unit`, called with trailing lambda syntax.",
+    "expectedOutput": "Fast paces: [3.8, 4.1, 3.4]\nStarting 100m Dash...\nAthlete sprinting across track...\nFinished 100m Dash"
   },
   "0026-ex2": {
     "title": "Exercise 2 · Eliminate Java Callback Interfaces (Refactor)",
@@ -307,7 +331,8 @@ window.EXERCISE_ANSWERS = {
   "0027-ex1": {
     "title": "Exercise 1 · Performance Inlining & Qualified Returns (Write from blank)",
     "code": "inline fun processUntilNegative(numbers: List<Int>, action: (Int) -> Unit) {\n    numbers.forEach {\n        if (it == 0) return@forEach\n        if (it < 0) return\n        action(it)\n    }\n}\n\nfun main() {\n    val list = listOf(10, 0, 25, 0, 40, -1, 50, 60)\n    processUntilNegative(list) {\n        println(\"Processed: $it\")\n    }\n    println(\"Complete\")\n}",
-    "why": "`inline` avoids function object allocation. `return@forEach` skips the current iteration, while non-local `return` exits the outer calling context immediately."
+    "why": "`inline` avoids function object allocation. `return@forEach` skips the current iteration, while non-local `return` exits the outer calling context immediately.",
+    "expectedOutput": "Processed: 10\nProcessed: 25\nProcessed: 40\nComplete"
   },
   "0027-ex2": {
     "title": "Exercise 2 · Replace Lambdas with Member References (Refactor)",
@@ -318,7 +343,8 @@ window.EXERCISE_ANSWERS = {
   "0028-ex1": {
     "title": "Exercise 1 · Custom Workout Plan Builder DSL (Write from blank)",
     "code": "class PlanBuilder {\n    var title: String = \"\"\n    private val exercises = mutableListOf<String>()\n\n    fun exercise(name: String) {\n        exercises.add(name)\n    }\n\n    fun build(): String = \"$title:\\n\" + exercises.joinToString(\"\\n\") { \" - $it\" }\n}\n\nfun buildPlan(setup: PlanBuilder.() -> Unit): String {\n    val builder = PlanBuilder()\n    builder.setup()\n    return builder.build()\n}\n\nfun main() {\n    val plan = buildPlan {\n        title = \"Leg Day\"\n        exercise(\"Back Squats\")\n        exercise(\"Romanian Deadlifts\")\n        exercise(\"Calf Raises\")\n    }\n    println(plan)\n}",
-    "why": "`PlanBuilder.() -> Unit` makes `builder` the implicit `this` inside the lambda, allowing direct method calls."
+    "why": "`PlanBuilder.() -> Unit` makes `builder` the implicit `this` inside the lambda, allowing direct method calls.",
+    "expectedOutput": "Leg Day:\n - Back Squats\n - Romanian Deadlifts\n - Calf Raises"
   },
   "0028-ex2": {
     "title": "Exercise 2 · Replace Java StringBuilder Boilerplate (Refactor)",
@@ -329,7 +355,8 @@ window.EXERCISE_ANSWERS = {
   "0029-ex1": {
     "title": "Exercise 1 · Type-Safe Report Builder (Write from blank)",
     "code": "class ReportScope {\n    val lines = mutableListOf<String>()\n    fun header(title: String) { lines.add(\"=== $title ===\") }\n    fun item(text: String) { lines.add(\"* $text\") }\n}\n\ninline fun buildReport(block: ReportScope.() -> Unit): String {\n    val scope = ReportScope()\n    scope.block()\n    return scope.lines.joinToString(\"\\n\")\n}\n\nfun main() {\n    val report = buildReport {\n        header(\"Weekly Running Log\")\n        item(\"Mon: 10k Tempo\")\n        item(\"Wed: 8k Recovery\")\n        item(\"Sat: 21k Long Run\")\n    }\n    println(report)\n}",
-    "why": "Combines `inline` for zero allocation overhead with `ReportScope.() -> Unit` for clean DSL syntax."
+    "why": "Combines `inline` for zero allocation overhead with `ReportScope.() -> Unit` for clean DSL syntax.",
+    "expectedOutput": "=== Weekly Running Log ===\n* Mon: 10k Tempo\n* Wed: 8k Recovery\n* Sat: 21k Long Run"
   },
   "0029-ex2": {
     "title": "Exercise 2 · The Functional Anti-Pattern Special (Refactor)",
@@ -352,7 +379,8 @@ window.EXERCISE_ANSWERS = {
   "0031-ex1": {
     "title": "Exercise 1 · HTTP Request Builder & Execution",
     "code": "class HttpRequest {\n    var url: String = \"\"\n    var method: String = \"GET\"\n    var timeoutMs: Int = 1000\n    val headers = mutableMapOf<String, String>()\n}\n\nfun buildJsonPost(url: String): HttpRequest = HttpRequest().apply {\n    this.url = url\n    method = \"POST\"\n    timeoutMs = 5000\n    headers[\"Content-Type\"] = \"application/json\"\n}\n\nfun HttpRequest.toCurlCommand(): String = run {\n    val headerStr = headers.entries.joinToString(\" \") { \"-H '${it.key}: ${it.value}'\" }\n    \"curl -X $method '$url' $headerStr\".trim()\n}\n\nfun main() {\n    val req = buildJsonPost(\"https://api.example.com/orders\")\n    println(\"Configured URL: ${req.url}\")\n    println(\"Configured Method: ${req.method}\")\n    println(req.toCurlCommand())\n}",
-    "why": "`apply` is idiomatic for object initialization returning the configured receiver; `run` transforms receiver into a computed string."
+    "why": "`apply` is idiomatic for object initialization returning the configured receiver; `run` transforms receiver into a computed string.",
+    "expectedOutput": "Configured URL: https://api.example.com/orders\nConfigured Method: POST\ncurl -X POST 'https://api.example.com/orders' -H 'Content-Type: application/json'"
   },
   "0031-ex2": {
     "title": "Exercise 2 · Java-Style Android View Configuration (Refactor)",
@@ -363,7 +391,8 @@ window.EXERCISE_ANSWERS = {
   "0032-ex1": {
     "title": "Exercise 1 · Sanitized Port Validator Pipeline",
     "code": "fun resolvePort(configuredPort: Int?, defaultPort: Int = 8080): Int =\n    (configuredPort?.takeIf { it in 1..65535 } ?: defaultPort).also { port ->\n        println(\"Resolved active port: $port\")\n    }\n\nfun main() {\n    println(resolvePort(443))\n    println(resolvePort(-1))\n    println(resolvePort(null))\n    println(resolvePort(70000))\n}",
-    "why": "`takeIf` filters the nullable port within valid numeric range; Elvis (`?:`) supplies the fallback, and `also` logs the final resolution."
+    "why": "`takeIf` filters the nullable port within valid numeric range; Elvis (`?:`) supplies the fallback, and `also` logs the final resolution.",
+    "expectedOutput": "Resolved active port: 443\n443\nResolved active port: 8080\n8080\nResolved active port: 8080\n8080\nResolved active port: 8080\n8080"
   },
   "0032-ex2": {
     "title": "Exercise 2 · Flatten the 'Arrow of Scope' Anti-Pattern (Refactor)",
@@ -374,7 +403,8 @@ window.EXERCISE_ANSWERS = {
   "0033-ex1": {
     "title": "Exercise 1 · Transactional Order Processor",
     "code": "data class Order(val id: String, val amountCents: Int, var status: String = \"PENDING\")\n\nfun processOrder(order: Order?): Order? =\n    order?.takeIf { it.amountCents > 0 }\n        ?.apply { status = \"PROCESSED\" }\n        ?.also { println(\"AUDIT: Order ${it.id} processed for ${it.amountCents}c\") }\n\nfun main() {\n    val o1 = processOrder(Order(\"ord-1\", 4500))\n    val o2 = processOrder(Order(\"ord-2\", -500))\n    val o3 = processOrder(null)\n    println(\"O1: $o1\")\n    println(\"O2: $o2\")\n    println(\"O3: $o3\")\n}",
-    "why": "Clean composition of `takeIf` (validation), `apply` (state mutation), and `also` (audit logging side-effect)."
+    "why": "Clean composition of `takeIf` (validation), `apply` (state mutation), and `also` (audit logging side-effect).",
+    "expectedOutput": "AUDIT: Order ord-1 processed for 4500c\nO1: Order(id=ord-1, amountCents=4500, status=PROCESSED)\nO2: null\nO3: null"
   },
   "0033-ex2": {
     "title": "Exercise 2 · The Scope Overuse Special (Refactor)",
@@ -385,7 +415,8 @@ window.EXERCISE_ANSWERS = {
   "0034-ex1": {
     "title": "Exercise 1 · Two Sum with Primitive Array",
     "code": "fun twoSum(nums: IntArray, target: Int): IntArray {\n    val seen = HashMap<Int, Int>() // value -> index\n    for (i in nums.indices) {\n        val complement = target - nums[i]\n        val matchIndex = seen[complement]\n        if (matchIndex != null) {\n            return intArrayOf(matchIndex, i)\n        }\n        seen[nums[i]] = i\n    }\n    return intArrayOf()\n}\n\nfun main() {\n    val nums = intArrayOf(2, 7, 11, 15)\n    val result = twoSum(nums, 9)\n    println(\"Indices: ${result.joinToString()}\")\n}",
-    "why": "Operates directly on unboxed `IntArray` for O(N) time and optimal cache locality without boxing overhead."
+    "why": "Operates directly on unboxed `IntArray` for O(N) time and optimal cache locality without boxing overhead.",
+    "expectedOutput": "Indices: 0, 1"
   },
   "0034-ex2": {
     "title": "Exercise 2 · Java-Style Collection Construction (Refactor)",
@@ -396,7 +427,8 @@ window.EXERCISE_ANSWERS = {
   "0035-ex1": {
     "title": "Exercise 1 · Product Catalog Lookup Indexer",
     "code": "data class Product(val sku: String, val price: Double, val active: Boolean)\n\nfun createCatalogIndex(products: List<Product>): Map<String, Double> =\n    products\n        .filter { it.active && it.price > 0.0 }\n        .associate { it.sku.uppercase() to it.price }\n\nfun main() {\n    val items = listOf(\n        Product(\"p-100\", 19.99, true),\n        Product(\"p-200\", 0.0, true),\n        Product(\"p-300\", 49.50, false),\n        Product(\"p-400\", 12.00, true)\n    )\n    val index = createCatalogIndex(items)\n    println(index)\n}",
-    "why": "Combines `filter` with `associate` (or `associateBy`) for concise, declarative index generation."
+    "why": "Combines `filter` with `associate` (or `associateBy`) for concise, declarative index generation.",
+    "expectedOutput": "{P-100=19.99, P-400=12.0}"
   },
   "0035-ex2": {
     "title": "Exercise 2 · Eliminating Imperative Extraction Loops (Refactor)",
@@ -407,7 +439,8 @@ window.EXERCISE_ANSWERS = {
   "0036-ex1": {
     "title": "Exercise 1 · Order Ledger Category Revenue Report",
     "code": "data class Order(val category: String, val amountCents: Long, val isCompleted: Boolean)\n\nfun calculateCategoryRevenue(orders: List<Order>): Map<String, Long> =\n    orders.filter { it.isCompleted }\n        .groupBy({ it.category }, { it.amountCents })\n        .mapValues { (_, centsList) -> centsList.sum() }\n\nfun main() {\n    val orders = listOf(\n        Order(\"Electronics\", 29900, true),\n        Order(\"Groceries\", 4500, true),\n        Order(\"Electronics\", 15000, false),\n        Order(\"Groceries\", 2500, true),\n        Order(\"Books\", 1200, true)\n    )\n    println(calculateCategoryRevenue(orders))\n}",
-    "why": "Uses `groupBy` with value transform followed by `mapValues` to compute grouped aggregate revenue cleanly."
+    "why": "Uses `groupBy` with value transform followed by `mapValues` to compute grouped aggregate revenue cleanly.",
+    "expectedOutput": "{Electronics=29900, Groceries=7000, Books=1200}"
   },
   "0036-ex2": {
     "title": "Exercise 2 · Two-Pass Filter Split Anti-Pattern (Refactor)",
@@ -418,7 +451,8 @@ window.EXERCISE_ANSWERS = {
   "0037-ex1": {
     "title": "Exercise 1 · Max Average Subarray of Size K",
     "code": "fun findMaxAverage(nums: IntArray, k: Int): Double {\n    var currentSum = 0L\n    for (i in 0 until k) {\n        currentSum += nums[i]\n    }\n    var maxSum = currentSum\n    for (i in k until nums.size) {\n        currentSum += nums[i] - nums[i - k]\n        if (currentSum > maxSum) maxSum = currentSum\n    }\n    return maxSum.toDouble() / k\n}\n\nfun main() {\n    val arr = intArrayOf(1, 12, -5, -6, 50, 3)\n    val maxAvg = findMaxAverage(arr, 4)\n    println(\"Max Average: $maxAvg\")\n}",
-    "why": "Optimal O(N) sliding window with O(1) space, avoiding re-summing sub-windows on every shift."
+    "why": "Optimal O(N) sliding window with O(1) space, avoiding re-summing sub-windows on every shift.",
+    "expectedOutput": "Max Average: 12.75"
   },
   "0037-ex2": {
     "title": "Exercise 2 · Messy Custom Sorting Comparator (Refactor)",
@@ -429,7 +463,8 @@ window.EXERCISE_ANSWERS = {
   "0038-ex1": {
     "title": "Exercise 1 · Valid Parentheses with ArrayDeque",
     "code": "fun isValidParentheses(s: String): Boolean {\n    val stack = ArrayDeque<Char>()\n    for (ch in s) {\n        when (ch) {\n            '(', '{', '[' -> stack.addLast(ch)\n            ')' -> if (stack.removeLastOrNull() != '(') return false\n            '}' -> if (stack.removeLastOrNull() != '{') return false\n            ']' -> if (stack.removeLastOrNull() != '[') return false\n        }\n    }\n    return stack.isEmpty()\n}\n\nfun main() {\n    println(isValidParentheses(\"()[]{}\"))\n    println(isValidParentheses(\"(]\"))\n    println(isValidParentheses(\"([{}])\"))\n    println(isValidParentheses(\"]\"))\n}",
-    "why": "`ArrayDeque.addLast` and `removeLastOrNull` form Kotlin's idiomatic unsynchronized, high-performance LIFO stack."
+    "why": "`ArrayDeque.addLast` and `removeLastOrNull` form Kotlin's idiomatic unsynchronized, high-performance LIFO stack.",
+    "expectedOutput": "true\nfalse\ntrue\nfalse"
   },
   "0038-ex2": {
     "title": "Exercise 2 · Top-K Elements Optimization (Refactor)",
@@ -440,7 +475,8 @@ window.EXERCISE_ANSWERS = {
   "0039-ex1": {
     "title": "Exercise 1 · Infinite Paginated API Stream",
     "code": "fun fetchItemsSequence(): Sequence<String> =\n    generateSequence(seed = 1) { it + 1 }\n        .flatMap { page -> listOf(\"Item-${page}A\", \"Item-${page}B\").asSequence() }\n\nfun main() {\n    val items = fetchItemsSequence().take(5).toList()\n    println(items)\n}",
-    "why": "`generateSequence` creates an infinite on-demand pagination generator that lazily computes items only as demanded by `take(5)`."
+    "why": "`generateSequence` creates an infinite on-demand pagination generator that lazily computes items only as demanded by `take(5)`.",
+    "expectedOutput": "[Item-1A, Item-1B, Item-2A, Item-2B, Item-3A]"
   },
   "0039-ex2": {
     "title": "Exercise 2 · Heavy Eager Pipeline Optimization (Refactor)",
@@ -451,7 +487,8 @@ window.EXERCISE_ANSWERS = {
   "0040-ex1": {
     "title": "Exercise 1 · Top-K Frequent Elements",
     "code": "import java.util.PriorityQueue\n\nfun topKFrequent(nums: IntArray, k: Int): IntArray {\n    val counts = HashMap<Int, Int>()\n    for (n in nums) {\n        counts[n] = (counts[n] ?: 0) + 1\n    }\n\n    // Min-Heap ordered by frequency count\n    val minHeap = PriorityQueue<Int>(compareBy { counts[it] })\n    for (num in counts.keys) {\n        minHeap.add(num)\n        if (minHeap.size > k) {\n            minHeap.poll()\n        }\n    }\n\n    val result = IntArray(k)\n    var idx = 0\n    while (minHeap.isNotEmpty()) {\n        result[idx++] = minHeap.poll()\n    }\n    return result\n}\n\nfun main() {\n    val arr = intArrayOf(1, 1, 1, 2, 2, 3, 3, 3, 3, 4)\n    val top2 = topKFrequent(arr, 2)\n    println(\"Top 2: ${top2.joinToString()}\")\n}",
-    "why": "Combines frequency counting with a Min-Heap of size K, returning unboxed `IntArray` in O(N log K) time."
+    "why": "Combines frequency counting with a Min-Heap of size K, returning unboxed `IntArray` in O(N log K) time.",
+    "expectedOutput": "Top 2: 1, 3"
   },
   "0040-ex2": {
     "title": "Exercise 2 · The Algorithmic Anti-Pattern Special (Refactor)",
@@ -462,7 +499,8 @@ window.EXERCISE_ANSWERS = {
   "0041-ex1": {
     "title": "Exercise 1 · Thread-Safe Heavy Report Engine",
     "code": "class ReportGenerator {\n    val heavyTemplate: String by lazy {\n        println(\"Compiling complex template...\")\n        \"=== ANNUAL REPORT TEMPLATE ===\"\n    }\n    \n    lateinit var author: String\n\n    fun generate(data: String): String {\n        if (!::author.isInitialized) {\n            throw IllegalStateException(\"Author required\")\n        }\n        return \"$heavyTemplate\\nAuthor: $author\\nData: $data\"\n    }\n}\n\nfun main() {\n    val gen = ReportGenerator()\n    gen.author = \"Dr. Jane Hopper\"\n    println(\"ReportGenerator created.\")\n    println(gen.generate(\"Q4 Revenue: $1.2M\"))\n    println(gen.generate(\"Q1 Projection: $1.4M\"))\n}",
-    "why": "Combines thread-safe deferred initialization (`by lazy`) with dependency injection readiness (`lateinit var`) and safe reflection check (`::author.isInitialized`)."
+    "why": "Combines thread-safe deferred initialization (`by lazy`) with dependency injection readiness (`lateinit var`) and safe reflection check (`::author.isInitialized`).",
+    "expectedOutput": "ReportGenerator created.\nCompiling complex template...\n=== ANNUAL REPORT TEMPLATE ===\nAuthor: Dr. Jane Hopper\nData: Q4 Revenue: $1.2M\n=== ANNUAL REPORT TEMPLATE ===\nAuthor: Dr. Jane Hopper\nData: Q1 Projection: $1.4M"
   },
   "0041-ex2": {
     "title": "Exercise 2 · Java-Style Lazy Double-Checked Locking (Refactor)",
@@ -497,7 +535,8 @@ window.EXERCISE_ANSWERS = {
   "0044-ex1": {
     "title": "Exercise 1 · Thread-Safe Metric Cache with Class Delegation",
     "code": "interface MetricStore {\n    fun record(key: String, value: Double)\n    fun read(key: String): Double?\n}\n\nclass InMemoryMetricStore : MetricStore {\n    private val data = HashMap<String, Double>()\n    override fun record(key: String, value: Double) { data[key] = value }\n    override fun read(key: String): Double? = data[key]\n}\n\nclass CachedMetricStore(private val store: MetricStore) : MetricStore by store {\n    val statusSummary: String by lazy { \"MetricStore active with cache\" }\n\n    override fun record(key: String, value: Double) {\n        println(\"LOG: Recorded $key = $value\")\n        store.record(key, value)\n    }\n}\n\nfun main() {\n    val store = CachedMetricStore(InMemoryMetricStore())\n    println(store.statusSummary)\n    store.record(\"cpu_usage\", 42.5)\n    println(\"CPU: ${store.read(\"cpu_usage\")}\")\n}",
-    "why": "Seamless combination of interface delegation (`by store`), lazy computed property (`by lazy`), and method interception."
+    "why": "Seamless combination of interface delegation (`by store`), lazy computed property (`by lazy`), and method interception.",
+    "expectedOutput": "MetricStore active with cache\nLOG: Recorded cpu_usage = 42.5\nCPU: 42.5"
   },
   "0044-ex2": {
     "title": "Exercise 2 · Over-Inherited Base Class Anti-Pattern (Refactor)",
@@ -508,7 +547,8 @@ window.EXERCISE_ANSWERS = {
   "0045-ex1": {
     "title": "Exercise 1 · Generic Clamped Range Search",
     "code": "fun <T : Comparable<T>> clamp(value: T, min: T, max: T): T = when {\n    value < min -> min\n    value > max -> max\n    else -> value\n}\n\nfun main() {\n    println(clamp(15, 0, 10))\n    println(clamp(-5, 0, 100))\n    println(clamp(\"kotlin\", \"a\", \"m\"))\n}",
-    "why": "Upper bound `T : Comparable<T>` enables comparison operators (`<`, `>`) across numbers, strings, and any custom comparable types."
+    "why": "Upper bound `T : Comparable<T>` enables comparison operators (`<`, `>`) across numbers, strings, and any custom comparable types.",
+    "expectedOutput": "10\n0\nkotlin"
   },
   "0045-ex2": {
     "title": "Exercise 2 · Unsafe Casting in Generic Pipeline (Refactor)",
@@ -518,8 +558,9 @@ window.EXERCISE_ANSWERS = {
   },
   "0046-ex1": {
     "title": "Exercise 1 · Event Producer and Consumer Architecture",
-    "code": "open class UIEvent(val timestamp: Long)\nclass ClickEvent(timestamp: Long, val buttonId: String) : UIEvent(timestamp)\n\ninterface EventSource<out T : UIEvent> {\n    fun poll(): T?\n}\n\ninterface EventDispatcher<in T : UIEvent> {\n    fun dispatch(event: T)\n}\n\nfun main() {\n    val clickSource: EventSource<ClickEvent> = object : EventSource<ClickEvent> {\n        override fun poll(): ClickEvent = ClickEvent(System.currentTimeMillis(), \"btn_submit\")\n    }\n    val uiSource: EventSource<UIEvent> = clickSource\n    println(\"Polled event timestamp: ${uiSource.poll()?.timestamp}\")\n}",
-    "why": "`out T` enables covariance (subtyping preserved), allowing `EventSource<ClickEvent>` to be safely used as `EventSource<UIEvent>`."
+    "code": "open class UIEvent(val timestamp: Long)\nclass ClickEvent(timestamp: Long, val buttonId: String) : UIEvent(timestamp)\n\ninterface EventSource<out T : UIEvent> {\n    fun poll(): T?\n}\n\ninterface EventDispatcher<in T : UIEvent> {\n    fun dispatch(event: T)\n}\n\nfun main() {\n    val clickSource: EventSource<ClickEvent> = object : EventSource<ClickEvent> {\n        override fun poll(): ClickEvent = ClickEvent(1700000000L, \"btn_submit\")\n    }\n    val uiSource: EventSource<UIEvent> = clickSource\n    println(\"Polled event timestamp: ${uiSource.poll()?.timestamp}\")\n}",
+    "why": "`out T` enables covariance (subtyping preserved), allowing `EventSource<ClickEvent>` to be safely used as `EventSource<UIEvent>`.",
+    "expectedOutput": "Polled event timestamp: 1700000000"
   },
   "0046-ex2": {
     "title": "Exercise 2 · Call-Site Variance Array Copy (Refactor)",
@@ -530,7 +571,8 @@ window.EXERCISE_ANSWERS = {
   "0047-ex1": {
     "title": "Exercise 1 · Type-Safe Service Locator with Reified Generics",
     "code": "import kotlin.reflect.KClass\n\nclass ServiceRegistry {\n    val services = mutableMapOf<KClass<*>, Any>()\n\n    inline fun <reified T : Any> register(instance: T) {\n        services[T::class] = instance\n    }\n\n    inline fun <reified T : Any> resolve(): T {\n        val instance = services[T::class] ?: throw IllegalStateException(\"Service not found: ${T::class.simpleName}\")\n        return instance as T\n    }\n}\n\nclass UserRepository\nclass PaymentService\n\nfun main() {\n    val registry = ServiceRegistry()\n    registry.register(UserRepository())\n    registry.register(PaymentService())\n\n    val repo = registry.resolve<UserRepository>()\n    println(\"Resolved service: ${repo::class.simpleName}\")\n}",
-    "why": "`reified T` allows accessing `T::class` at runtime without passing explicit `Class<T>` objects, preserving type safety."
+    "why": "`reified T` allows accessing `T::class` at runtime without passing explicit `Class<T>` objects, preserving type safety.",
+    "expectedOutput": "Resolved service: UserRepository"
   },
   "0047-ex2": {
     "title": "Exercise 2 · Java-Style Class Token Passing (Refactor)",
@@ -541,7 +583,8 @@ window.EXERCISE_ANSWERS = {
   "0048-ex1": {
     "title": "Exercise 1 · Type-Safe In-Memory Message Bus",
     "code": "open class Message\nclass TextMessage(val text: String) : Message()\nclass AlertMessage(val level: Int) : Message()\n\nclass MessageBus {\n    val messages = mutableListOf<Message>()\n\n    fun publish(msg: Message) {\n        messages.add(msg)\n    }\n\n    inline fun <reified T : Message> filterMessages(): List<T> =\n        messages.filterIsInstance<T>()\n}\n\nfun main() {\n    val bus = MessageBus()\n    bus.publish(TextMessage(\"Hello\"))\n    bus.publish(AlertMessage(5))\n    bus.publish(TextMessage(\"World\"))\n\n    val texts = bus.filterMessages<TextMessage>()\n    println(\"Texts: ${texts.map { it.text }}\")\n}",
-    "why": "Combines generic upper bound `T : Message` with `inline reified` and stdlib `filterIsInstance<T>()`."
+    "why": "Combines generic upper bound `T : Message` with `inline reified` and stdlib `filterIsInstance<T>()`.",
+    "expectedOutput": "Texts: [Hello, World]"
   },
   "0048-ex2": {
     "title": "Exercise 2 · Eliminating Java Wildcard Casts (Refactor)",
@@ -552,7 +595,8 @@ window.EXERCISE_ANSWERS = {
   "0049-ex1": {
     "title": "Exercise 1 · Parallel User Profile Aggregator",
     "code": "import kotlinx.coroutines.*\n\ndata class UserSummary(val details: String, val preferences: String)\n\nsuspend fun fetchDetails(userId: String): String {\n    delay(50)\n    return \"Details for $userId\"\n}\n\nsuspend fun fetchPreferences(userId: String): String {\n    delay(50)\n    return \"Theme=Dark\"\n}\n\nsuspend fun loadUserProfile(userId: String): UserSummary = coroutineScope {\n    val defDetails = async { fetchDetails(userId) }\n    val defPrefs = async { fetchPreferences(userId) }\n    UserSummary(defDetails.await(), defPrefs.await())\n}\n\nfun main() = runBlocking {\n    val summary = loadUserProfile(\"user_42\")\n    println(summary)\n}",
-    "why": "`coroutineScope` with concurrent `async` calls runs both suspending network requests in parallel, halving total latency."
+    "why": "`coroutineScope` with concurrent `async` calls runs both suspending network requests in parallel, halving total latency.",
+    "expectedOutput": "UserSummary(details=Details for user_42, preferences=Theme=Dark)"
   },
   "0049-ex2": {
     "title": "Exercise 2 · Blocking Thread Spawning Anti-Pattern (Refactor)",
@@ -575,7 +619,8 @@ window.EXERCISE_ANSWERS = {
   "0051-ex1": {
     "title": "Exercise 1 · Resilient Batch Worker with supervisorScope",
     "code": "import kotlinx.coroutines.*\n\nsuspend fun executeBatchTasks(taskIds: List<String>): List<String> = supervisorScope {\n    val deferredList = taskIds.map { id ->\n        async {\n            if (id == \"fail\") throw RuntimeException(\"Task failed\")\n            \"SUCCESS-$id\"\n        }\n    }\n    deferredList.map { def ->\n        runCatching { def.await() }.getOrDefault(\"FAILED\")\n    }\n}\n\nfun main() = runBlocking {\n    val results = executeBatchTasks(listOf(\"A\", \"fail\", \"B\"))\n    println(results)\n}",
-    "why": "`supervisorScope` isolates child failures so one failing task does not cancel its sibling coroutines."
+    "why": "`supervisorScope` isolates child failures so one failing task does not cancel its sibling coroutines.",
+    "expectedOutput": "[SUCCESS-A, FAILED, SUCCESS-B]"
   },
   "0051-ex2": {
     "title": "Exercise 2 · Uncancellable Tight Loop Anti-Pattern (Refactor)",
@@ -586,7 +631,8 @@ window.EXERCISE_ANSWERS = {
   "0052-ex1": {
     "title": "Exercise 1 · Stock Ticker Flow Pipeline",
     "code": "import kotlinx.coroutines.*\nimport kotlinx.coroutines.flow.*\n\nfun trackStockPrices(symbol: String, initialPrice: Double): Flow<Double> = flow {\n    emit(initialPrice)\n    var price = initialPrice\n    repeat(3) {\n        delay(20)\n        price += 1.5\n        emit(price)\n    }\n}.flowOn(Dispatchers.Default)\n\nfun main() = runBlocking {\n    trackStockPrices(\"KT\", 98.0)\n        .filter { it > 100.0 }\n        .map { \"TICKER: $it\" }\n        .collect { println(it) }\n}",
-    "why": "`flow { emit() }` creates a cold stream, and `.flowOn(Dispatchers.Default)` safely offloads emissions without violating flow invariants."
+    "why": "`flow { emit() }` creates a cold stream, and `.flowOn(Dispatchers.Default)` safely offloads emissions without violating flow invariants.",
+    "expectedOutput": "TICKER: 101.0\nTICKER: 102.5"
   },
   "0052-ex2": {
     "title": "Exercise 2 · Imperative Callback Stream to Flow (Refactor)",
@@ -608,7 +654,8 @@ window.EXERCISE_ANSWERS = {
   "0054-ex1": {
     "title": "Exercise 1 · Real-Time Live Search Debouncer",
     "code": "import kotlinx.coroutines.*\nimport kotlinx.coroutines.flow.*\n\nfun searchPipeline(queryFlow: Flow<String>): Flow<List<String>> =\n    queryFlow\n        .filter { it.isNotBlank() }\n        .map { query -> listOf(\"Result 1 for $query\", \"Result 2 for $query\") }\n        .flowOn(Dispatchers.IO)\n\nfun main() = runBlocking {\n    val queries = flowOf(\"kot\", \"\", \"kotlin\", \"coroutines\")\n    searchPipeline(queries).collect { results ->\n        println(\"Search results: $results\")\n    }\n}",
-    "why": "Combines Flow operators (`filter`, `map`) with `flowOn(Dispatchers.IO)` for non-blocking stream processing."
+    "why": "Combines Flow operators (`filter`, `map`) with `flowOn(Dispatchers.IO)` for non-blocking stream processing.",
+    "expectedOutput": "Search results: [Result 1 for kot, Result 2 for kot]\nSearch results: [Result 1 for kotlin, Result 2 for kotlin]\nSearch results: [Result 1 for coroutines, Result 2 for coroutines]"
   },
   "0054-ex2": {
     "title": "Exercise 2 · The Coroutine Anti-Pattern Special (Refactor)",
@@ -795,5 +842,29 @@ window.EXERCISE_ANSWERS = {
     "code": "import kotlinx.coroutines.*\nimport kotlinx.coroutines.channels.awaitClose\nimport kotlinx.coroutines.flow.*\nimport kotlinx.coroutines.sync.Mutex\nimport kotlinx.coroutines.sync.withLock\nimport java.lang.reflect.Modifier\n\nclass FakeTicker {\n    var attached = false\n    fun attach(onTick: (String) -> Unit) {\n        attached = true\n        onTick(\"tick-1\")\n        onTick(\"tick-2\")\n        onTick(\"tick-3\")\n    }\n    fun detach() { attached = false }\n}\n\nsealed interface SyncResult {\n    data class Synced(val items: Int) : SyncResult\n    data class Error(val code: Int) : SyncResult\n}\n\nfun tickerStream(ticker: FakeTicker): Flow<String> = callbackFlow {\n    ticker.attach { trySend(it) }\n    awaitClose { ticker.detach() }\n}\n\nclass ProfileCache(private val fetch: suspend () -> String) {\n    private val mutex = Mutex()\n    private var cached: String? = null\n\n    suspend fun getProfile(): String = mutex.withLock {\n        cached ?: fetch().also { cached = it }\n    }\n}\n\nclass EndpointHelper {\n    companion object {\n        @JvmStatic\n        @JvmOverloads\n        fun buildUrl(host: String, version: Int = 2): String = \"$host/v$version\"\n    }\n}\n\nfun formatSyncState(result: SyncResult): String = when (result) {\n    is SyncResult.Synced if result.items == 0 -> \"No Changes\"\n    is SyncResult.Synced -> \"Synced ${result.items}\"\n    is SyncResult.Error if result.code >= 500 -> \"Retryable\"\n    is SyncResult.Error -> \"Fatal\"\n}\n\nfun main() = runBlocking {\n    val ticker = FakeTicker()\n    val ticks = runCatching { tickerStream(ticker).take(2).toList() }.getOrElse { emptyList() }\n    check(ticks == listOf(\"tick-1\", \"tick-2\")) { \"Bug 1: ticks=$ticks\" }\n    check(!ticker.attached) { \"Bug 1: ticker was never detached via awaitClose!\" }\n\n    var networkHits = 0\n    val cache = ProfileCache {\n        delay(15)\n        networkHits++\n        \"profile_1\"\n    }\n    val profiles = coroutineScope { List(4) { async { cache.getProfile() } }.awaitAll() }\n    check(networkHits == 1 && profiles.all { it == \"profile_1\" }) {\n        \"Bug 2: cache stampede caused networkHits=$networkHits\"\n    }\n\n    val javaMethod = runCatching {\n        EndpointHelper::class.java.getMethod(\"buildUrl\", String::class.java)\n    }.getOrNull()\n    check(javaMethod != null && Modifier.isStatic(javaMethod.modifiers)) {\n        \"Bug 3: missing @JvmStatic @JvmOverloads on EndpointHelper.buildUrl\"\n    }\n    check(javaMethod.invoke(null, \"https://host\") == \"https://host/v2\")\n\n    check(formatSyncState(SyncResult.Synced(0)) == \"No Changes\") { \"Bug 4: 0 items should be 'No Changes'\" }\n    check(formatSyncState(SyncResult.Synced(5)) == \"Synced 5\")\n    check(formatSyncState(SyncResult.Error(503)) == \"Retryable\")\n    check(formatSyncState(SyncResult.Error(404)) == \"Fatal\")\n    println(\"All 4 PR bugs fixed cleanly!\")\n}",
     "why": "Eliminates callback leaks with `awaitClose`, prevents coroutine cache stampedes with `Mutex.withLock`, exposes Java static/default bridges via `@JvmStatic @JvmOverloads`, and enforces guarded exhaustive `when` handling.",
     "expectedOutput": "All 4 PR bugs fixed cleanly!"
+  },
+  "0071-ex1": {
+    "title": "Exercise 1 · Compose Stability Judge & Closure-Safe Effect Runner (Write from blank)",
+    "code": "import kotlinx.coroutines.*\nimport kotlinx.coroutines.flow.*\n\nclass UpdatedStateHolder<T>(var current: T) {\n    fun update(newValue: T) {\n        current = newValue\n    }\n}\n\nenum class SkipResult { SKIP_STRUCTURAL, SKIP_REFERENTIAL, RECOMPOSE }\n\nfun evaluateRecomposition(\n    prev: Any,\n    next: Any,\n    isStable: Boolean,\n    strongSkipping: Boolean\n): SkipResult = when {\n    isStable && prev == next -> SkipResult.SKIP_STRUCTURAL\n    isStable -> SkipResult.RECOMPOSE\n    strongSkipping && prev === next -> SkipResult.SKIP_REFERENTIAL\n    else -> SkipResult.RECOMPOSE\n}\n\nfun <T> simulatedSnapshotFlow(snapshots: List<T>): Flow<T> =\n    snapshots.asFlow().distinctUntilChanged()\n\nfun main() = runBlocking {\n    val holder = UpdatedStateHolder { \"Initial\" }\n    val deferred = async {\n        delay(20)\n        holder.current()\n    }\n    delay(5)\n    holder.update { \"Updated after recomposition\" }\n    check(deferred.await() == \"Updated after recomposition\")\n\n    val listA = listOf(\"A\", \"B\")\n    val listB = listOf(\"A\", \"B\")\n    check(evaluateRecomposition(\"ok\", \"ok\", isStable = true, strongSkipping = true) == SkipResult.SKIP_STRUCTURAL)\n    check(evaluateRecomposition(listA, listA, isStable = false, strongSkipping = true) == SkipResult.SKIP_REFERENTIAL)\n    check(evaluateRecomposition(listA, listB, isStable = false, strongSkipping = true) == SkipResult.RECOMPOSE)\n\n    val scrollIndices = simulatedSnapshotFlow(listOf(0, 0, 1, 1, 1, 2, 2)).toList()\n    check(scrollIndices == listOf(0, 1, 2))\n    println(\"All Compose runtime mental model checks passed: $scrollIndices\")\n}",
+    "why": "`UpdatedStateHolder` models `rememberUpdatedState` so long-lived coroutines read the latest lambda reference without restarting. `evaluateRecomposition` mirrors Compose Strong Skipping (`==` for stable types, `===` for unstable types), and `distinctUntilChanged()` models `snapshotFlow` deduplication.",
+    "expectedOutput": "All Compose runtime mental model checks passed: [0, 1, 2]"
+  },
+  "0071-ex2": {
+    "title": "Exercise 2 · Fix the In-Place State Mutation & Stale Effect Closure (Refactor)",
+    "code": "import kotlinx.coroutines.*\nimport kotlinx.coroutines.flow.*\n\nclass StateBox<T>(var value: T)\n\ndata class CartUiState(\n    val items: List<String> = emptyList(),\n    val checkedOut: Boolean = false\n)\n\nclass CartController {\n    private val _state = MutableStateFlow(CartUiState())\n    val state: StateFlow<CartUiState> = _state.asStateFlow()\n\n    fun addItem(item: String) {\n        _state.update { it.copy(items = it.items + item) }\n    }\n\n    fun markCheckedOut() {\n        _state.update { it.copy(checkedOut = true) }\n    }\n}\n\nclass AutoSaveWorker(initialOnSave: () -> String) {\n    private val callbackHolder = StateBox(initialOnSave)\n\n    fun updateOnSave(newOnSave: () -> String) {\n        callbackHolder.value = newOnSave\n    }\n\n    suspend fun runOnce(): String {\n        delay(20)\n        return callbackHolder.value()\n    }\n}\n\nfun main() = runBlocking {\n    val controller = CartController()\n    val firstRef = controller.state.value\n    controller.addItem(\"Pixel Watch\")\n    controller.markCheckedOut()\n    val secondRef = controller.state.value\n\n    check(firstRef !== secondRef) { \"Bug 1: State must produce a new immutable instance via copy()!\" }\n    check(firstRef.items.isEmpty() && secondRef.items == listOf(\"Pixel Watch\") && secondRef.checkedOut)\n\n    val worker = AutoSaveWorker { \"Saved v1\" }\n    val resultDeferred = async { worker.runOnce() }\n    delay(5)\n    worker.updateOnSave { \"Saved v2\" }\n    check(resultDeferred.await() == \"Saved v2\") { \"Bug 2: Worker invoked stale captured callback!\" }\n    println(\"Fixed immutable Compose state and fresh callback capture!\")\n}",
+    "why": "Replacing in-place `MutableList` and `var` mutations with `val` + `_state.update { it.copy(...) }` guarantees distinct references and reliable `StateFlow`/Compose diffing. Reading `callbackHolder.value()` after `delay(20)` avoids capturing a stale lambda reference before suspension.",
+    "expectedOutput": "Fixed immutable Compose state and fresh callback capture!"
+  },
+  "0072-ex1": {
+    "title": "Exercise 1 · Explicit-API Module Contract & Scoped Pure-Kotlin DI Graph (Write from blank)",
+    "code": "public interface TokenStore {\n    public fun loadToken(): String?\n}\n\ninternal class InMemoryTokenStore(private val seed: String?) : TokenStore {\n    override fun loadToken(): String? = seed\n}\n\npublic class SessionValidator(\n    private val store: TokenStore,\n    private val region: String\n) {\n    public fun validate(): String {\n        val token = store.loadToken()?.takeIf { it.isNotBlank() }\n        return if (token != null) \"Valid($region:$token)\" else \"Invalid($region)\"\n    }\n}\n\npublic fun interface SessionValidatorFactory {\n    public fun create(region: String): SessionValidator\n}\n\npublic class AuthGraph(seedToken: String?) {\n    public var storeCreations: Int = 0\n    public val tokenStore: TokenStore by lazy {\n        storeCreations++\n        InMemoryTokenStore(seedToken)\n    }\n    public val validatorFactory: SessionValidatorFactory = SessionValidatorFactory { region ->\n        SessionValidator(tokenStore, region)\n    }\n}\n\nfun main() {\n    val graph = AuthGraph(seedToken = \"jwt_2027\")\n    check(graph.storeCreations == 0) { \"tokenStore should initialize lazily!\" }\n\n    val euValidator = graph.validatorFactory.create(\"EU\")\n    val usValidator = graph.validatorFactory.create(\"US\")\n    check(euValidator.validate() == \"Valid(EU:jwt_2027)\")\n    check(usValidator.validate() == \"Valid(US:jwt_2027)\")\n    check(graph.storeCreations == 1) { \"tokenStore singleton should be created exactly once!\" }\n\n    val emptyGraph = AuthGraph(seedToken = \"   \")\n    check(emptyGraph.validatorFactory.create(\"APAC\").validate() == \"Invalid(APAC)\")\n    println(\"Explicit API & Pure-Kotlin DI graph checks passed! storeCreations=${graph.storeCreations}\")\n}",
+    "why": "Explicit `public` modifiers and return types satisfy `kotlin { explicitApi() }`, while `internal class InMemoryTokenStore` hides implementation details inside the module. `AuthGraph` combines a thread-safe `by lazy` singleton (`tokenStore`) with an assisted `fun interface` factory (`SessionValidatorFactory`).",
+    "expectedOutput": "Explicit API & Pure-Kotlin DI graph checks passed! storeCreations=1"
+  },
+  "0072-ex2": {
+    "title": "Exercise 2 · Eliminate the Global Service-Locator Singleton & Concrete Coupling (Refactor)",
+    "code": "public interface PaymentGateway {\n    public fun charge(cents: Int): String\n}\n\ninternal class StripeGatewayImpl : PaymentGateway {\n    override fun charge(cents: Int): String = \"LIVE_STRIPE:$cents\"\n}\n\npublic class BillingService(private val gateway: PaymentGateway = StripeGatewayImpl()) {\n    public fun chargeOrder(orderId: String, cents: Int): String =\n        \"$orderId -> ${gateway.charge(cents)}\"\n}\n\nfun main() {\n    val fakeGateway = object : PaymentGateway {\n        override fun charge(cents: Int): String = \"FAKE_OK:$cents\"\n    }\n    val testService = BillingService(fakeGateway)\n    val prodService = BillingService(StripeGatewayImpl())\n\n    check(testService.chargeOrder(\"ORD-1\", 2500) == \"ORD-1 -> FAKE_OK:2500\") {\n        \"BillingService is still calling StripeGatewaySingleton instead of injected gateway!\"\n    }\n    check(prodService.chargeOrder(\"ORD-2\", 9900) == \"ORD-2 -> LIVE_STRIPE:9900\")\n    println(\"Clean constructor-injected multi-module boundary verified!\")\n}",
+    "why": "Delegating to the constructor-injected `PaymentGateway` interface instead of a global `object` service locator enables deterministic fake testing, while marking `StripeGatewayImpl` as `internal` and declaring explicit `public` visibility and `: String` return types enforces clean multi-module contracts.",
+    "expectedOutput": "Clean constructor-injected multi-module boundary verified!"
   }
 };

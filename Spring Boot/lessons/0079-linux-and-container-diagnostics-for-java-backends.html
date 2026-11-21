@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0079: Linux &amp; Container Diagnostics for Java Spring Boot Engineers</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 3 • Phase 14: Production SQL, Linux, Correctness &amp; Networking Foundations</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 21/25</span>
+        <span class="badge badge-kotlin">Kotlin 2.x</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0079 • Stage 3 • Phase 14</span>
+    <h1 style="margin-top: 8px;">Linux &amp; Container Shell Essentials for Java Spring Boot Engineers</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Every production Spring Boot service runs inside a Linux environment (containers, CI runners, EC2/EKS nodes). You do not need to be a Linux kernel sysadmin, but you <em>must</em> be fluent in the Linux diagnostics that solve real Java incidents: <strong>POSIX signals (<code>SIGTERM</code> exit <code>143</code> vs <code>SIGKILL</code> <code>137</code>)</strong>, <strong>file descriptors (<code>ulimit -n</code> / "Too many open files")</strong>, <strong>socket &amp; port debugging (<code>ss -tulpn</code>, <code>lsof -i</code>)</strong>, <strong>non-root UID/permissions (<code>chmod</code>, <code>chown</code>)</strong>, and <strong>triaging ECS JSON logs with <code>jq</code> &amp; <code>rg</code></strong>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://brendangregg.com/LinuxPerformance/linux_perf_tools_full.png" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Brendan Gregg: Linux Performance Observability Tools</a> and <a href="https://jqlang.github.io/jq/manual/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">jq Official Manual (JSON Log Triage)</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Android Mental Model Bridge</div>
+    <p style="margin-bottom: 0;">
+      You already use <code>adb shell</code> and <code>logcat</code> to inspect Android processes and permissions. Production backend debugging is the same concept on a Linux host/container: instead of <code>logcat</code>, you slice structured JSON stdout with <code>jq</code> and <code>rg</code>; instead of Android app sandbox UIDs, you verify non-root container UIDs, open TCP sockets (<code>ss</code>), and POSIX shutdown signals (<code>SIGTERM</code>).
+    </p>
+  </div>
+
+  <h2>1. The 5 Linux Survival Skills Every Java Backend Engineer Needs</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>PID 1 &amp; Exit Codes (<code>143</code> vs <code>137</code>):</strong> Always use Docker <strong>exec-form</strong> (<code>ENTRYPOINT ["java", "-jar", "app.jar"]</code>), never shell-form (<code>java -jar ...</code> wrapped in <code>/bin/sh -c</code>), so Java runs as <strong>PID 1</strong> and receives <code>SIGTERM</code> directly! Clean shutdown exits with <code>128 + 15 = 143</code> (or <code>0</code>); Linux OOM Killer or timeout <code>SIGKILL</code> exits with <code>128 + 9 = 137</code>.</li>
+    <li><strong>File Descriptors (<code>ulimit -n</code>):</strong> On Linux, <em>every TCP socket, open JAR, log file, and DB connection is a file descriptor</em>. If a container defaults to <code>1024</code> FDs, 900 concurrent clients crash Tomcat with <code>java.io.IOException: Too many open files</code>. Check limits via <code>ulimit -n</code> and inspect active process FDs via <code>ls /proc/&lt;pid&gt;/fd | wc -l</code>.</li>
+    <li><strong>Port, Socket &amp; Process Triage:</strong> Quickly answer "who owns port 8080?" or "how many connections are stuck in <code>CLOSE_WAIT</code>/<code>TIME_WAIT</code>?" with <code>ss -tulnp</code>, <code>lsof -i :8080</code>, and <code>ps -ef | grep java</code>.</li>
+    <li><strong>Filesystem Permissions &amp; Non-Root Containers:</strong> When mounting volumes (logs, TLS certs, `/tmp` heap dumps) into a non-root container (`USER 1001`), mismatched ownership causes silent startup crashes (`AccessDeniedException`). Fix in Dockerfiles with <code>chown -R 1001:1001 /app</code> and restrict private keys with <code>chmod 600</code>.</li>
+    <li><strong>Piping &amp; JSON Log Triage (<code>jq</code> + <code>rg</code>):</strong> Pipe container logs through <code>jq</code> to isolate slow or failing requests in seconds: <code>kubectl logs pod-1 | jq 'select(.log_level == "ERROR" and .trace_id != null)'</code>.</li>
+  </ul>
+
+  <h2>2. Production Implementation: Safe Exec-Form Container + Linux Diagnostics</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Exec-Form PID 1 Signal Safety &amp; Everyday Linux Triage Commands</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Dockerfile &amp; Shell (Java Pod)</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Dockerfile &amp; Shell (Kotlin Pod)</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code># 1. Dockerfile PID 1 Signal Hygiene (Java 21/25)
+FROM eclipse-temurin:21-jre-alpine
+RUN addgroup -S appgroup &amp;&amp; adduser -S appuser -G appgroup
+WORKDIR /app
+COPY --chown=appuser:appgroup target/order-service.jar app.jar
+USER appuser
+# MUST use JSON exec-form so Java is PID 1 and receives SIGTERM (graceful shutdown)!
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]
+
+# 2. Essential Linux Triage One-Liners:
+# ss -tulnp | grep 8080                # Check which PID is bound to port 8080
+# ss -tan state time-wait | wc -l      # Count sockets stuck in TIME_WAIT
+# ulimit -n                            # Inspect max open file descriptors (sockets + files)
+# docker logs api | jq -c 'select(.level=="ERROR") | {ts:.["@timestamp"], msg:.message, trace:.traceId}'</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code># 1. Dockerfile PID 1 Signal Hygiene (Kotlin 2.x Spring Boot)
+FROM eclipse-temurin:21-jre-alpine
+RUN addgroup -S appgroup &amp;&amp; adduser -S appuser -G appgroup
+WORKDIR /app
+COPY --chown=appuser:appgroup build/libs/order-service.jar app.jar
+USER appuser
+# Exec-form ensures PID 1 forwards SIGTERM directly to the JVM
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]
+
+# 2. Essential Linux Triage One-Liners:
+# lsof -i :8080                        # Identify process holding port 8080
+# cat /sys/fs/cgroup/memory.current    # Check live container cgroup v2 memory usage
+# docker logs worker | jq -c 'select(.level=="ERROR") | {msg:.message, trace:.traceId}'</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to verify your Linux and container runtime intuition.</p>
+
+  <div class="quiz-card" id="q0079_1" data-explanation="Shell-form ENTRYPOINT spawns /bin/sh as PID 1 and Java as a child PID. Linux /bin/sh does not forward SIGTERM to child processes, so Kubernetes waits 30s and kills the pod violently with SIGKILL (exit code 137) instead of triggering graceful shutdown.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Your Dockerfile uses shell-form <code>ENTRYPOINT java -jar app.jar</code> instead of JSON exec-form <code>["java", "-jar", "app.jar"]</code>. What fails during Kubernetes rolling restarts?</div>
+    <div class="quiz-code-snippet"><pre><code># ❌ Shell form spawns /bin/sh -c "java -jar app.jar" as PID 1!
+# Result on kubectl delete pod: waits 30s, then Exit Code 137!</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! /bin/sh as PID 1 swallows SIGTERM, preventing Tomcat graceful shutdown and forcing SIGKILL (137).">
+        The wrapper shell as PID 1 swallows SIGTERM, bypassing Spring graceful shutdown until SIGKILL kills the pod.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Shell-form starts the JVM normally, though it breaks POSIX signal forwarding on shutdown.">
+        The JVM refuses to parse environment variables whenever Docker launches it through a Bourne shell.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. DNS resolution and port 8080 binding operate identically regardless of ENTRYPOINT syntax.">
+        Embedded Tomcat cannot bind port 8080 unless the container entrypoint uses shell-form redirection.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. ZGC memory flags work inside both entrypoint forms; the bug is PID 1 signal swallowing.">
+        Generational ZGC disables garbage collection whenever Java starts as a child process of /bin/sh.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0079_2" data-explanation="Every open network socket counts as a file descriptor in Linux. Under high concurrency (Virtual Threads + Tomcat + outbound RestClient + HikariCP), a low default ulimit -n (e.g., 1024) causes 'Too many open files' errors even when plenty of RAM and CPU remain.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">Your Spring Boot service handles 1,500 concurrent requests with 50% free RAM and 30% CPU, yet crashes with <code>java.io.IOException: Too many open files</code>. What Linux resource hit its ceiling?</div>
+    <div class="quiz-code-snippet"><pre><code>java.io.IOException: Too many open files
+    at sun.nio.ch.Net.socket0(Native Method)</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Disk inode exhaustion prevents creating files on disk, whereas Net.socket0 fails on per-process FD limits.">
+        The container root filesystem ran out of ext4 disk storage space for temporary Tomcat upload buffers.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Linux counts every TCP socket as a file descriptor, so hitting ulimit -n blocks new sockets.">
+        The process exceeded its Linux open file descriptor limit (ulimit -n) across active TCP sockets and files.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Metaspace stores loaded class metadata and throws OutOfMemoryError: Metaspace, not IOException.">
+        The JVM Metaspace region filled up while loading Hibernate entity proxy classes at runtime.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Ephemeral port exhaustion throws 'Cannot assign requested address', whereas FD caps throw 'Too many open files'.">
+        Kubernetes CoreDNS stopped resolving internal service hostnames after one thousand DNS lookups.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0079_3" data-explanation="In Linux, exit code 128 + N means the process died from signal N. Signal 9 is SIGKILL (128 + 9 = 137, typically OOMKilled or grace-period timeout), whereas Signal 15 is SIGTERM (128 + 15 = 143, graceful termination).">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">In Linux containers, what is the operational difference between a Spring Boot container terminating with exit code <code>143</code> versus exit code <code>137</code>?</div>
+    <div class="quiz-code-snippet"><pre><code>Pod A: Terminated (Exit Code 143)
+Pod B: OOMKilled  (Exit Code 137)</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Exit codes above 128 correspond to POSIX signals (128 + signal number), not HTTP 4xx/5xx codes.">
+        Exit code 143 indicates a PostgreSQL deadlock whereas 137 indicates an invalid Spring Boot YAML key.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Exit code 137 is forced SIGKILL (128 + 9), which prevents graceful shutdown hooks from completing.">
+        Exit code 137 means graceful shutdown succeeded whereas 143 means the Linux OOM Killer intervened.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! 143 = 128 + 15 (SIGTERM graceful termination), while 137 = 128 + 9 (forced SIGKILL / OOMKilled).">
+        143 means the JVM received SIGTERM (128+15), whereas 137 means forced SIGKILL (128+9) such as OOMKilled.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Both codes are standard POSIX signal exit codes generated on any Linux container runtime.">
+        143 only occurs on AWS Lambda whereas 137 only occurs when running local macOS Docker Desktop.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Harden the production container runtime stage and diagnostic command: set non-root file ownership (<code>--chown=nonroot:nonroot</code>), switch to <code>USER nonroot</code>, use <strong>JSON exec-form <code>ENTRYPOINT</code></strong> so Java runs as PID 1, and inspect port <code>8080</code> with <code>ss</code> or filter JSON errors with <code>jq</code>.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0079-lab"
+       data-starter-java="# 1. Complete Dockerfile runtime stage with non-root ownership and PID 1 exec-form ENTRYPOINT:
+FROM gcr.io/distroless/java21-debian12:nonroot
+WORKDIR /app
+# TODO 1: COPY --chown=nonroot:nonroot target/app.jar app.jar
+# TODO 2: Set USER nonroot
+# TODO 3: Set exec-form ENTRYPOINT [&quot;java&quot;, &quot;-XX:MaxRAMPercentage=75.0&quot;, &quot;-jar&quot;, &quot;app.jar&quot;]
+# TODO 4: Write a Linux ss command to inspect listening TCP port 8080 (e.g. ss -tuln)"
+       data-starter-kotlin="# 1. Complete Dockerfile runtime stage with non-root ownership and PID 1 exec-form ENTRYPOINT:
+FROM gcr.io/distroless/java21-debian12:nonroot
+WORKDIR /app
+# TODO 1: COPY --chown=nonroot:nonroot build/libs/app.jar app.jar
+# TODO 2: Set USER nonroot
+# TODO 3: Set exec-form ENTRYPOINT [&quot;java&quot;, &quot;-XX:MaxRAMPercentage=75.0&quot;, &quot;-jar&quot;, &quot;app.jar&quot;]
+# TODO 4: Write a Linux ss command to inspect listening TCP port 8080 (e.g. ss -tuln)">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0079</span>
+        <span class="practice-title">Linux PID 1 Signal Hygiene &amp; Socket Triage Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java Pod (Maven)</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin Pod (Gradle)</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0079-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Complete the Dockerfile with <code>COPY --chown=nonroot:nonroot ... app.jar</code>, <code>USER nonroot</code>, exec-form <code>ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]</code>, and include a Linux socket triage command (<code>ss -tuln</code> or <code>lsof -i :8080</code>).</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false"># 1. Complete Dockerfile runtime stage with non-root ownership and PID 1 exec-form ENTRYPOINT:
+FROM gcr.io/distroless/java21-debian12:nonroot
+WORKDIR /app
+# TODO 1: COPY --chown=nonroot:nonroot target/app.jar app.jar
+# TODO 2: Set USER nonroot
+# TODO 3: Set exec-form ENTRYPOINT [&quot;java&quot;, &quot;-XX:MaxRAMPercentage=75.0&quot;, &quot;-jar&quot;, &quot;app.jar&quot;]
+# TODO 4: Write a Linux ss command to inspect listening TCP port 8080 (e.g. ss -tuln)</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Non-Root Ownership &amp; User</div>
+        <div>Add <code>COPY --chown=nonroot:nonroot target/app.jar app.jar</code> and <code>USER nonroot</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Exec-Form ENTRYPOINT</div>
+        <div>Use JSON bracket syntax: <code>ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Socket Diagnostic Command</div>
+        <div>Include <code>ss -tuln | grep 8080</code> (or <code>lsof -i :8080</code>).</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java Pod (Maven) Implementation:</div>
+      <pre class="solution-code"><code>FROM gcr.io/distroless/java21-debian12:nonroot
+WORKDIR /app
+COPY --chown=nonroot:nonroot target/app.jar app.jar
+USER nonroot
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
+
+ss -tuln | grep 8080</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin Pod (Gradle) Implementation:</div>
+      <pre class="solution-code"><code>FROM gcr.io/distroless/java21-debian12:nonroot
+WORKDIR /app
+COPY --chown=nonroot:nonroot build/libs/app.jar app.jar
+USER nonroot
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
+
+ss -tuln | grep 8080</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Exec-form <code>ENTRYPOINT</code> ensures the JVM receives <code>SIGTERM</code> directly as PID 1 for clean shutdown (exit 143 instead of 137), while <code>--chown=nonroot:nonroot</code> and <code>ss -tuln</code> cover container permissions and live socket triage.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"Why do thousands of sockets stuck in CLOSE_WAIT (unlike TIME_WAIT) usually point to a bug in your Java code rather than normal TCP teardown?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0078-production-sql-ctes-window-functions-and-jdbcclient.html" class="btn btn-secondary">← Previous: Lesson 0078</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0075-backend-networking-essentials-dns-tcp-tls-and-timeouts.html" class="btn btn-primary">Next: Lesson 0075 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0079 (Stage 3 Production)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0079-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Non-Root Ownership & USER Instruction",
+    passed: /COPY\s+--chown=nonroot:nonroot/.test(code) && /USER\s+nonroot/.test(code),
+    error: "Must set COPY --chown=nonroot:nonroot and USER nonroot."
+  });
+  tests.push({
+    name: "Exec-Form PID 1 ENTRYPOINT",
+    passed: /ENTRYPOINT\s*\[\s*["']java["'][\s\S]*["']app\.jar["']\s*\]/.test(code),
+    error: "Must use JSON exec-form ENTRYPOINT [\"java\", ..., \"app.jar\"]."
+  });
+  tests.push({
+    name: "Linux Socket Inspection Command (ss or lsof)",
+    passed: /\bss\s+-[a-zA-Z]*[tu]/.test(code) || /\blsof\s+-i/.test(code),
+    error: "Must include a Linux socket triage command such as 'ss -tuln | grep 8080' or 'lsof -i :8080'."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

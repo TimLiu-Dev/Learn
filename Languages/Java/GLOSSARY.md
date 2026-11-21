@@ -144,6 +144,30 @@ _Avoid_: Premature microservices or unverified package-by-layer spaghetti.
 The enterprise Spring abstraction for orchestrating LLMs, mapping responses into strongly-typed Java `record`s via JSON Schema, executing Retrieval-Augmented Generation (RAG) over `PgVectorStore`, and exposing deterministic Java `@Tool` methods.
 _Avoid_: Raw prompt string concatenation or trusting LLM-supplied security/tenant parameters.
 
+**gRPC (HTTP/2 & Protobuf) & GraphQL `@BatchMapping`**:
+gRPC uses schema-first binary Protocol Buffers over multiplexed HTTP/2 streams where fields are identified on the wire strictly by integer tag numbers (`= 1`, `= 2`); `Spring for GraphQL` `@BatchMapping` binds a `DataLoader` to batch all parent entities of a graph level into one bulk query (`Map<Parent, Child>`), eliminating GraphQL N+1 queries.
+_Avoid_: Reusing deleted Protobuf field numbers or querying a database inside per-item `@SchemaMapping` resolvers.
+
+**Server-Sent Events (`SseEmitter`) & Replay-Safe Signed Webhooks**:
+SSE streams unidirectional server-to-client events over standard HTTP (`text/event-stream`) with explicit `onCompletion`/`onTimeout`/`onError` listener cleanup; Signed Webhooks authenticate asynchronous server-to-server HTTP callbacks by computing `HmacSHA256` over `<timestamp>.<raw_utf8_body>`, enforcing a strict replay window (e.g., $\le 300\text{s}$), and comparing digests via constant-time `MessageDigest.isEqual`.
+_Avoid_: Computing webhook HMACs over re-serialized DTOs or scaling WebSockets across pods with in-memory `enableSimpleBroker`.
+
+**`EXPLAIN (ANALYZE, BUFFERS)`, Composite B-Tree Left-Prefix & Read-Replica Pinning**:
+Inspecting actual database execution plans and buffer hits (`shared hit` vs. `read`), ordering composite B-Tree index columns from equality predicates to range/sort predicates, and routing `@Transactional(readOnly = true)` traffic via `LazyConnectionDataSourceProxy` + `AbstractRoutingDataSource` while pinning post-write reads to the primary to prevent replication-lag anomalies.
+_Avoid_: Wrapping indexed columns in SQL functions (`LOWER(col)`) without a functional index or routing read-only transactions before connection acquisition is deferred.
+
+**BOLA/IDOR, Conditional `ETag` Caching & API `Sunset` (RFC 8594)**:
+Enforcing object-level ownership (`WHERE id = :id AND tenant_id = :authTenant`) against Broken Object Level Authorization (OWASP API1), short-circuiting unchanged GET responses with `304 Not Modified` via `If-None-Match` / `ETag` and `Cache-Control`, and signaling version retirement via `Deprecation` and `Sunset` HTTP headers.
+_Avoid_: Checking only role names (`ROLE_USER`) without verifying resource ownership or allowing wildcard `*` CORS origins with `allowCredentials(true)`.
+
+**Edge API Gateway, Trusted `X-Forwarded-*` & Consumer-Driven Contract Testing**:
+Terminating TLS, rate limiting, and routing at an edge proxy (`Nginx` / `Spring Cloud Gateway`) with `server.forward-headers-strategy=framework` restricted to trusted internal proxy CIDRs, and verifying producer/consumer schema compatibility in CI before deployment alongside `k6` p95/p99 load tests.
+_Avoid_: Trusting `X-Forwarded-For` from untrusted public clients or shipping schema changes without contract verification.
+
+**Distributed Saga & Virtual-Thread Bulkhead (`@ConcurrencyLimit`)**:
+Coordinating multi-service workflows as a sequence of local ACID transactions paired with idempotent backward compensating actions, while bounding concurrent virtual-thread access to scarce downstream resources (such as a 20-connection HikariCP pool) using `@ConcurrencyLimit` or `Semaphore` bulkheads and narrow `TransactionTemplate` scopes.
+_Avoid_: Holding `@Transactional` database connections open across slow external HTTP/LLM calls on Virtual Threads.
+
 ---
 
 ## Distributed Systems & Event Streaming

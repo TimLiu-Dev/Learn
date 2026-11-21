@@ -168,7 +168,15 @@
         const harness = `
 import sys
 import json
-from collections import deque
+import math
+import collections
+from collections import deque, defaultdict
+
+class __GenericShim:
+    def __getitem__(self, item):
+        return object
+
+Optional = List = Dict = Tuple = Set = __GenericShim()
 
 class ListNode:
     def __init__(self, val=0, next=None):
@@ -238,6 +246,12 @@ def tree_to_array(root):
     return res
 
 ${userCode}
+
+if "Solution" in globals() and isinstance(Solution, type):
+    __sol = Solution()
+    for __attr in dir(__sol):
+        if not __attr.startswith("_"):
+            globals()[__attr] = getattr(__sol, __attr)
 
 __tests = json.loads('''${testsJson.replace(/\\/g, "\\\\").replace(/'''/g, "\\'\\'\\'")}''')
 __results = []

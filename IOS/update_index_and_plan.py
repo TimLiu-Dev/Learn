@@ -11,6 +11,7 @@ from data_phase5 import PHASE5_LESSONS
 from data_phase6 import PHASE6_LESSONS
 from data_phase7_and_8 import PHASE7_AND_8_LESSONS
 from data_phase8_frontier import PHASE8_FRONTIER_LESSONS
+from data_phase9_swiftui_mastery import PHASE9_SWIFTUI_LESSONS
 
 all_lessons = (
     PHASE1_LESSONS +
@@ -21,6 +22,7 @@ all_lessons = (
     PHASE5_LESSONS +
     PHASE6_LESSONS +
     PHASE8_FRONTIER_LESSONS +
+    PHASE9_SWIFTUI_LESSONS +
     PHASE7_AND_8_LESSONS
 )
 
@@ -75,7 +77,13 @@ phases_meta = [
     },
     {
         "num": 9,
-        "title": "Phase 9: Capstone Portfolio Project ('PulseFlow Enterprise')",
+        "title": "Phase 9: Advanced SwiftUI DSL, Graphics, CloudKit & Tooling",
+        "subtitle": "Result Builders (@ViewBuilder), ScrollView & PreferenceKey, Swift Charts & Canvas, Adaptive Navigation/Transferable, CKSyncEngine & DocC/#Preview",
+        "badge": "6 Lessons Available"
+    },
+    {
+        "num": 10,
+        "title": "Phase 10: Capstone Portfolio Project ('PulseFlow Enterprise')",
         "subtitle": "Resume-Worthy End-to-End 2027 Multi-Module Production App Blueprint & Practice",
         "badge": "Capstone Available"
     }
