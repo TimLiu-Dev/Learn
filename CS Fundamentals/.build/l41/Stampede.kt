@@ -53,6 +53,6 @@ suspend fun burst(name: String, request: suspend () -> String) = coroutineScope 
     val t = System.nanoTime()
     gate.complete(Unit)                                 // release all 50 at once
     jobs.awaitAll()
-    println("%-10s 50 requests -> %2d database queries, %d ms"
+    println("%-10s 50 requests -> database queries: %2d, %d ms"
         .format(name, dbQueries.get(), (System.nanoTime() - t) / 1_000_000))
 }

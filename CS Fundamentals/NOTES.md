@@ -187,3 +187,44 @@
   - **Batches** (one builder per lesson): A = L1–L7; then L9–L15; L48, L16–L21; L49–L52, L22, L53, L23; L54, L24–L29; L30–L33, L55, L34–L36; L56, L37–L43; L57, L44–L47.
   - **Then:** an independent second review of every lesson (check #2), and automated QA, manifest, chrome and nav (check #3).
   - **Progress tracking:** `.build/v6/queue.md` (done, running, queued) and `.build/v6/findings.md` (builder findings left for check #2). These live in the course because macOS cleared the scratchpad during the weekly-limit pause (2026-11-07 → 11-14). By 2026-11-14, L1–L8 were done; the L9–L21 and L48 builders were resumed after the pause.
+- 2026-11-21: **v6 COMPLETE.** All 57 lessons were upgraded by one builder each, then independently reviewed (check #2: 14 review groups), then passed check #3.
+  - **Final counts:**
+    - 1,495 quizzes, every one with per-option `whyopts`;
+    - 195 in-page practices (Kotlin via the Playground, SQL via sql.js), each with Java versions, hints, an answer and at least one `Mistake` file the checks catch;
+    - 227 verified code quizzes;
+    - 632 of 830 Kotlin listings with a `main` are runnable in the page.
+  - **Check #3 (2026-11-21), all green:**
+    - `pg_check` 57/57 folders `0 problem(s)`;
+    - `qa.py --strict` 57/57 OK;
+    - `cq_answers.py` 227/227 (every code quiz marks the option its `.out` prints);
+    - `chrome_qa` 74/74 pages `errs=[]`, sw 485;
+    - `sheet_fit` 51/51;
+    - nav walk from L1 reaches all 57 in study order with reciprocal back-links;
+    - live end-to-end through http: example ▶ Run prints output; a code quiz unlocks Run after answering and prints the marked answer; practice ✗ then ✓; the `file://` page explains how to open the course.
+  - **Content added from the CS2023 gap check:**
+    - L2: Unicode part 2.
+    - L25: licences, SemVer, BOMs and multi-module builds. Split into Part 3 (id `p3`) and Part 4 "Licences, versions and modules" (id `p3b`), plus a task-graph practice `p3a`.
+    - L28: Amdahl's and Little's laws.
+    - L33: five security principles, plus Part 4 "Personal data" (the final moved to id `p5`).
+    - L40: Part 3 "Branching and releases" (id `rel`; CI keeps `p3`).
+    - L44: accessibility.
+    - L45: Part 4 "Coverage and property-based tests" (id `p5`).
+    - L47: professional responsibility (`#ethics`).
+    - L48: Bayes and variance.
+    - Reference sheets updated with all of the above.
+  - **Shared fixes made during v6:**
+    - `playground.js` intercepts the Playground's test XHR: it escapes failure messages, names exception types, appends "printed:" output, and keeps responseType text.
+    - Test lines keep runs of spaces (pre-wrap).
+    - Empty SQL results now say "returned no rows".
+    - `pg_check` runs SQL in autocommit, like sql.js.
+    - Practice selector tightened to `div.practice[data-id]`.
+    - `Open Course.command` reopens a running copy of the course (it compares the served launcher byte for byte) and says so when ports 8000–8005 are busy.
+  - **Lesson lengths now:** median ~150–165 min, range 120–205 min, ~150 h total. The roadmap says "~2.5 h per lesson" and "~8–13 mo".
+  - **Known minor leftovers:** listed in `.build/v6/findings.md`, entries marked OPEN.
+    - Gatekeeper's "Open Anyway" was never tested on a quarantined `.command`.
+    - L4 VIZ highlight conventions differ.
+    - Some pasted timings (L51 Kotlin Tsp, L26 final) were not re-run.
+    - L53's final title says "Five questions".
+  - **Maintenance:**
+    - After editing a lesson, re-run `pg_check.py .build/lNN`, `pg_manifest.py` (cached), `cq_answers.py` and `qa.py --strict`.
+    - Scratch files go in the session scratchpad, which macOS clears during long pauses. Tracking lives in `.build/v6/`.

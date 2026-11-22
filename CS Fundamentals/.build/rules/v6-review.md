@@ -33,6 +33,8 @@ Course root: `/Users/tl/Documents/Learns/CS Fundamentals` (always use absolute p
 3. **Fix definite problems** in the true source (template, `tpl_src.html`, a generator, or practice/cq files), then rebuild with the lesson's recipe. Diff the new build against a backup you took first: only your changes may appear. Keep the voice, and change only what's wrong.
 4. **Browser:** one practice end to end per lesson, using `node .build/bin/cdp.mjs` against `http://127.0.0.1:8790/…`. Use a different practice from the one the builder tested (its report is in findings or NOTES), with no page errors.
 
+Don't spawn subagents or forks: the session has a 20-agent cap. Review your lessons one after another yourself.
+
 Don't restructure lessons (no splitting parts, no renumbering) unless your brief says to. Don't edit shared files (`assets/*`, `.build/bin/*`, the roadmap, other lessons); report what they need.
 
 ## Report (under 250 words per lesson)

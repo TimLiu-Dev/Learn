@@ -112,6 +112,12 @@
   Free MIT lectures (2026 edition) on the shell, editors, Git, debugging and profiling, build and packaging, and AI-assisted coding. Use for: becoming fluent on the command line you'll drive Gradle and Git from.
 - [Docs: _Gradle User Manual_ by Gradle Inc.](https://docs.gradle.org/current/userguide/userguide.html)
   The official build tool docs (9.x), including a beginner tutorial that initialises a basic Java app. Use for: understanding the build system both Android and Spring Boot projects use.
+- [Spec: _Semantic Versioning 2.0.0_ by Tom Preston-Werner](https://semver.org/)
+  The one-page spec behind MAJOR.MINOR.PATCH: what each number promises, numeric comparison, pre-release tags, and "anything may change" before 1.0.0. Use for: deciding the next version of something you publish, and reading what a library's upgrade promises (L25).
+- [Guide: _choosealicense.com_ by GitHub](https://choosealicense.com/licenses/)
+  Plain-language summaries of the common open-source licences (MIT, Apache-2.0, GPL, LGPL, AGPL and more), listing each one's permissions, conditions and limitations. Not legal advice. Use for: a first read of what a dependency's licence asks of you before you ship it (L25).
+- [Docs: _Gradle: Platforms_ by Gradle Inc.](https://docs.gradle.org/current/userguide/platforms.html)
+  The Gradle chapter on platforms and importing Maven BOMs with `platform()`, including `enforcedPlatform()`. Use for: keeping a family of libraries (Jackson, Spring, Compose) on one tested set of versions (L25).
 
 ### Operating Systems
 - [Book: _Operating Systems: Three Easy Pieces_ by Remzi H. Arpaci-Dusseau & Andrea C. Arpaci-Dusseau](https://pages.cs.wisc.edu/~remzi/OSTEP/)

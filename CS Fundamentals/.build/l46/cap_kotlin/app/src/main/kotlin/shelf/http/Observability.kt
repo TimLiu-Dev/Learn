@@ -13,7 +13,19 @@ import java.util.concurrent.atomic.LongAdder
 
 /** One JSON object per line (L43): easy to grep, easy for a log pipeline to parse. */
 fun jsonLine(vararg fields: Pair<String, Any?>): String = fields.joinToString(",", "{", "}") { (k, v) ->
-    "\"$k\":" + when (v) { null -> "null"; is Number, is Boolean -> v.toString(); else -> "\"" + v.toString().replace("\"", "\\\"") + "\"" }
+    "\"$k\":" + when (v) { null -> "null"; is Number, is Boolean -> v.toString(); else -> jsonString(v.toString()) }
+}
+
+// Clients choose the path, so escape everything JSON requires (RFC 8259 §7): a raw quote,
+// backslash or newline would break the line, or forge a second one.
+private fun jsonString(s: String) = buildString {
+    append('"')
+    for (c in s) when {
+        c == '"' || c == '\\' -> append('\\').append(c)
+        c < ' ' -> append("\\u%04x".format(c.code))
+        else -> append(c)
+    }
+    append('"')
 }
 
 /** The four golden signals (L43): traffic and errors (by status), latency (histogram), saturation (in flight). */

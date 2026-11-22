@@ -7,7 +7,6 @@ val notes = mapOf(
 )
 
 // Returns (status, body).
-// Returns (status, body).
 fun readNote(token: String?, id: Int): Pair<Int, String> {
     val caller = tokens[token] ?: return 401 to "who are you?"      // who is asking, before anything else
     val note = notes[id]

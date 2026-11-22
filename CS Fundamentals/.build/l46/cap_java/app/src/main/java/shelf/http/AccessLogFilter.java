@@ -87,8 +87,20 @@ public final class AccessLogFilter extends Filter {
             sb.append('"').append(k).append("\":");
             if (v == null) sb.append("null");
             else if (v instanceof Number || v instanceof Boolean) sb.append(v);
-            else sb.append('"').append(v.toString().replace("\"", "\\\"")).append('"');
+            else sb.append(jsonString(v.toString()));
         });
         return sb.append('}').toString();
+    }
+
+    // Clients choose the path, so escape everything JSON requires (RFC 8259 §7): a raw quote,
+    // backslash or newline would break the line, or forge a second one.
+    private static String jsonString(String s) {
+        StringBuilder sb = new StringBuilder("\"");
+        for (char c : s.toCharArray()) {
+            if (c == '"' || c == '\\') sb.append('\\').append(c);
+            else if (c < ' ') sb.append(String.format("\\u%04x", (int) c));
+            else sb.append(c);
+        }
+        return sb.append('"').toString();
     }
 }

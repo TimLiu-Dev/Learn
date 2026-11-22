@@ -56,3 +56,19 @@
 - L40: the new part id "rel" (Part 3); CI keeps id p3 and is labelled Part 4. tpl_src ~295 p1-4 says "most times" vs 7 of 8 in every run. Meta ~170–180 vs the parts sum of 187.
 - SHARED (fixed): check messages in the page now keep runs of spaces (white-space: pre-wrap on test lines).
 - R2 OPEN: L8 JEP 513 note (~99) "statements before super(…) do not use the object under construction" is slightly loose (they may assign fields). L5 "<local6>" NPE output kept (optional note).
+- R5 OPEN: L19 p4 twoSum is close to L16 p1 (it adds indices and pair counts; kept).
+- L57: meta below the toc sum (177). Lamport IR1 and Kleppmann nanoTime quotes matched after cleaning PDF extraction.
+- SHARED (check #3): table.vs has no narrow-screen fallback; L57 was fixed with <wbr>. Run chrome_qa across all pages and fix overflow centrally if any appears.
+- R4 OPEN: reference/maths-and-theory.html lacks Bayes/variance (SHEETS task). L48 p2 Java checks use String.format("%.4f"), which is locale-sensitive (decimal comma). Fix with Locale.ROOT.
+- R7 OPEN: L51 Kotlin Tsp timings (~548) not re-run. L53 final title "Five questions" vs six items (works if the request count is not a question). L53 parts have no <h3>Check</h3> headings (pre-v6 layout).
+- CHECK #3 TOOL: .build/bin/cq_answers.py checks every code quiz's marked option against its .out (219 OK on 2026-11-21; L45/L47 pending).
+- L46: Kotlin Config.fromEnv throws NumberFormatException on an empty value (SHELF_PORT=); minor. Personal data is covered in L33 (not L46), by design.
+- R10 OPEN: L31 practice p1: PUT /notes/99 gives 405 rather than 404 (the solution checks the method first; no test covers it).
+- R8 OPEN: L23 Part 4 says Kotlin null checks "are still there" on Android (R8 may strip some; labelled unchecked). L54 warm-up heading cites L18 but no item does. L25 Part 3 had no practice after the split; coordinator adding p3a (task-graph order).
+- R11 OPEN: L55 Part 1 login stepper mentions an idle timer the demo lacks (conceptual). L35 p3 checker compares the whole plan row (needs the named index; the task says so). L36 SqliteBusy.kt:19 comment "at most 0.2 s" vs 259 ms run.
+- COORDINATOR: added L25 practice p3a (task-graph order, Part 3) after the R8 split; verified (6 tests, 2 mistakes), times 41 min / ~185–200.
+- R9 OPEN: L26 p3 starter fails the 8-thread stress test only sometimes (the mid-load test fails it every time, so red is guaranteed). L26 final figures not re-run.
+- L47: p2 answer.html claim that Spring Boot lists every failed @Validated field is from memory (verify against Spring docs). ACM quotes checked via an official PDF mirror (acm.org 403s scripts). The look-back table has no per-phase text, so the v6 topics are not listed there (the "Still yours" table mentions L33/L25 additions).
+- L45: new Part 4 (id p5) coverage + property tests; tpl_src ~95 "JDK 26 warns otherwise" vs JDK 21 toolchain (R14b). QuickCheck quote from the abstract only.
+- ROADMAP (check #3, coordinator): add the new parts to the roadmap part lists: L25 Part 4 licences/versions/modules, L33 principles + Part 4 personal data, L40 Part 3 branching & releases, L45 Part 4 coverage & property tests, L47 professional responsibility; L2 Unicode part 2; L48 Bayes/variance; L28 Amdahl/Little. Update the time stat.
+- R13 OPEN: L42 p3-2 explanation quotes "skips #2" (Java run); the Kotlin run printed #3. Minor.

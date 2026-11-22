@@ -59,7 +59,7 @@ public class Stampede {
             gate.countDown();                           // release all 50 at once
             for (var f : results) f.get();
         }
-        System.out.printf("%-10s 50 requests -> %2d database queries, %d ms%n",
+        System.out.printf("%-10s 50 requests -> database queries: %2d, %d ms%n",
                 name, dbQueries.get(), (System.nanoTime() - t) / 1_000_000);
     }
 }
