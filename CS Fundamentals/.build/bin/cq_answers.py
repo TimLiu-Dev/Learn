@@ -11,7 +11,7 @@ W = Path(__file__).resolve().parents[2]
 norm = lambda s: re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", s))).strip()   # HTML: drop tags, then unescape
 plain = lambda s: re.sub(r"\s+", " ", s).strip()                                        # source files are raw text
 snippets = {}
-for f in W.glob(".build/l*/cq/*.*"):
+for f in [*W.glob(".build/l*/cq/*.*"), *W.glob(".build/e*/cq/*.*")]:
     if f.suffix in (".kt", ".java", ".sql") and f.with_suffix(".out").exists():
         snippets[plain(f.read_text())] = (f, f.with_suffix(".out").read_text())
 
@@ -25,7 +25,7 @@ def score(opt, out):
     return len(a & b) / max(1, len(a | b))
 
 problems, checked = [], 0
-for page in sorted((W / "lessons").glob("0*.html")):
+for page in sorted([*(W / "lessons").glob("0*.html"), *(W / "lessons").glob("e*.html")]):
     s = page.read_text()
     for m in re.finditer(r'<div class="quiz" data-id="([^"]+)"[^>]*data-answer="(\d+)"[^>]*>(.*?)<div class="opts">(.*?)</div>', s, re.S):
         qid, ans, q, opts = m.group(1), int(m.group(2)), m.group(3), m.group(4)

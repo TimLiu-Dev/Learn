@@ -14,7 +14,7 @@
 <p class="subtitle">The JVM frees memory for you, so how can a Java or Kotlin program still run out of it? This lesson covers what the garbage collector actually does, how leaks happen anyway, and how to find where the time and memory really go, using only tools that ship with the JDK.</p>
 
 <div class="lesson-meta">
-  <span><b>~150–165 min</b> · warm-up + 3 parts + final</span>
+  <span><b>~160–175 min</b> · warm-up + 3 parts + final</span>
   <span>stop cleanly after any part</span>
   <span id="resume"></span>
 </div>
@@ -26,7 +26,7 @@
 
 <ol class="toc">
   <li><a href="#warm">Warm-up</a><span class="t">10 min</span></li>
-  <li data-part="p1"><a href="#p1">1 · Reachability, GC roots, generations</a><span class="t">38 min</span></li>
+  <li data-part="p1"><a href="#p1">1 · Reachability, GC roots, generations</a><span class="t">48 min</span></li>
   <li data-part="p2"><a href="#p2">2 · Memory leaks in a garbage-collected language</a><span class="t">38 min</span></li>
   <li data-part="p3"><a href="#p3">3 · Profiling: where do the time and memory go?</a><span class="t">38 min</span></li>
   <li data-part="p4"><a href="#p4">Final exercise: find the leak and the hotspot</a><span class="t">20 min</span></li>
@@ -73,7 +73,7 @@
 
 <!-- ═════════════════════════ PART 1 ═════════════════════════ -->
 <div class="part-label">Part 1</div>
-<div class="part-head" id="p1" data-title="Part 1"><h2>Reachability, GC roots, generations</h2><span class="t">~38 min</span></div>
+<div class="part-head" id="p1" data-title="Part 1"><h2>Reachability, GC roots, generations</h2><span class="t">~48 min</span></div>
 
 <p>You never call <code>free</code> on the JVM. So how does the garbage collector decide which objects to throw away? It never asks "is this object still <em>needed</em>?", because it can't know that. It asks a question it <em>can</em> answer: <b>can the program still reach it?</b> The Java API puts it like this: "A reachable object is any object that can be accessed in any potential continuing computation from any live thread" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ref/package-summary.html#reachability"><code>java.lang.ref</code>: Reachability</a>, quoting <a href="https://docs.oracle.com/javase/specs/jls/se25/html/jls-12.html#jls-12.6.1">JLS §12.6.1</a>). Everything else is garbage, and "its memory can be reused by the VM when it can no longer be reached from any reference of any other live object in the running program" (<a href="https://docs.oracle.com/en/java/javase/25/gctuning/garbage-collector-implementation.html">HotSpot GC Tuning Guide, ch. 3</a>).</p>
 
@@ -217,6 +217,106 @@ pauses=65 total=257.4ms max=23.52ms</pre>
 <h3><code>System.gc()</code> is a request</h3>
 <p>The API docs: calling it "suggests that the Java Virtual Machine expend effort toward recycling unused objects", and "there is no guarantee that this effort will recycle any particular number of unused objects, reclaim any particular amount of space, or complete at any particular time, if at all" (<a href="https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/System.html#gc()"><code>System.gc</code></a>). Operators can switch it off entirely with <code>-XX:+DisableExplicitGC</code>. I ran <code>Churn</code> with that flag, and the final <code>Pause Full (System.gc())</code> line simply wasn't there. Don't sprinkle it into code to "help". G1 already decides when to collect better than you can.</p>
 <p><b>And not <code>finalize()</code> either.</b> Finalizers, which run "some time" before an object is reclaimed, were deprecated for removal in JDK 18 (<a href="https://openjdk.org/jeps/421">JEP 421</a>). The replacement for releasing files and sockets is try-with-resources / <code>use</code> (L10). For long-lived resources, use the <code>java.lang.ref.Cleaner</code> API, which "allows a program to register a cleaning action for an object that is run some time after the object becomes unreachable". Garbage collection manages <em>memory</em>. It isn't a resource-closing mechanism.</p>
+
+<h3>Fitting a JVM into a container</h3>
+<p><a href="0022-the-os-and-the-memory-hierarchy.html#p1b">L22</a> showed that a container is just a process with a memory limit. The JVM reads that limit: "the maximum amount of available memory to the JVM process is the minimum of the machine's physical memory and any constraints set by the environment (e.g. container)", and the default maximum heap is 25 percent of it (<a href="https://docs.oracle.com/en/java/javase/26/docs/specs/man/java.html">the <code>java</code> command</a>: <code>-XX:MaxRAM</code>, <code>-XX:MaxRAMPercentage</code>). There are no containers on my Mac, but <code>-XX:MaxRAM</code> sets the same number by hand, so here's the arithmetic for a 1 GB limit:</p>
+<pre class="term"><span class="p">$ </span>java -XX:MaxRAM=1g -XX:+PrintFlagsFinal -version | grep -E ' MaxHeapSize | MaxRAMPercentage '
+   size_t MaxHeapSize                              = 268435456                                 {product} {ergonomic}
+   double MaxRAMPercentage                         = 25.000000                                 {product} {default}
+<span class="p">$ </span>java -XX:MaxRAM=1g -XX:MaxRAMPercentage=75 -XX:+PrintFlagsFinal -version | grep -E ' MaxHeapSize | MaxRAMPercentage '
+   size_t MaxHeapSize                              = 805306368                                 {product} {ergonomic}
+   double MaxRAMPercentage                         = 75.000000                                 {product} {command line}</pre>
+<p>A 256 MB heap in a 1 GB container looks wasteful, but remember the warm-up question: the heap isn't the whole process, and the kernel counts <em>everything</em> the process uses against the limit. This program fills three areas outside the heap, then waits so we can look at it with Native Memory Tracking (L23):</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Footprint.kt</figcaption>
+<pre><code class="language-kotlin">import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
+import kotlin.concurrent.thread
+
+// Fills three memory areas outside the heap, then waits so jcmd can look.
+data class Point(val x: Int, val y: Int)
+
+fun main(args: Array&lt;String&gt;) {
+    val points = Array(1_000_000) { Point(it, -it) }          // heap: 1M small objects
+
+    val direct = ByteBuffer.allocateDirect(64 shl 20)         // 64 MB off-heap
+    for (i in 0 until direct.capacity() step 4096) direct.put(i, 1)
+
+    val never = CountDownLatch(1)
+    repeat(50) {                                              // 50 idle threads
+        thread(isDaemon = true) { never.await() }
+    }
+    println("pid ${ProcessHandle.current().pid()}, ${points.size} points, " +
+            "${direct.capacity() shr 20} MB direct")
+    Thread.sleep(args.firstOrNull()?.toLong() ?: 5000)
+}</code></pre></figure>
+  <figure class="java"><figcaption>JAVA · Footprint.java</figcaption>
+<pre><code class="language-java">import java.nio.ByteBuffer;
+import java.util.concurrent.CountDownLatch;
+
+// Fills three memory areas outside the heap, then waits so jcmd can look.
+public class Footprint {
+    record Point(int x, int y) {}
+
+    public static void main(String[] args) throws Exception {
+        Point[] points = new Point[1_000_000];               // heap: 1M small objects
+        for (int i = 0; i &lt; points.length; i++) points[i] = new Point(i, -i);
+
+        ByteBuffer direct = ByteBuffer.allocateDirect(64 &lt;&lt; 20); // 64 MB off-heap
+        for (int i = 0; i &lt; direct.capacity(); i += 4096) direct.put(i, (byte) 1);
+
+        CountDownLatch never = new CountDownLatch(1);
+        for (int i = 0; i &lt; 50; i++) {                        // 50 idle threads
+            Thread t = new Thread(() -&gt; {
+                try { never.await(); } catch (InterruptedException e) { }
+            });
+            t.setDaemon(true);
+            t.start();
+        }
+        System.out.println("pid " + ProcessHandle.current().pid() + ", "
+                + points.length + " points, " + direct.capacity() / (1 &lt;&lt; 20) + " MB direct");
+        Thread.sleep(Long.parseLong(args.length &gt; 0 ? args[0] : "5000"));
+    }
+}</code></pre></figure>
+</div>
+<pre class="term"><span class="p">$ </span>java -XX:NativeMemoryTracking=summary -Xmx256m Footprint 8000 &amp;
+pid 51350, 1000000 points, 64 MB direct
+<span class="p">$ </span>jcmd 51350 VM.native_memory summary scale=MB     <span class="c"># trimmed</span>
+Total: reserved=1886MB, committed=198MB
+-                 Java Heap (reserved=256MB, committed=42MB)
+-                    Thread (reserved=148MB, committed=5MB)
+-                      Code (reserved=244MB, committed=8MB)
+-                        GC (reserved=66MB, committed=61MB)
+-                     Other (reserved=64MB, committed=64MB)
+-        Shared class space (reserved=16MB, committed=14MB, readonly=0MB)
+-                 Metaspace (reserved=64MB, committed=1MB)
+<span class="p">$ </span>ps -o rss= -p 51350        <span class="c"># KB</span>
+160528</pre>
+<p><em>Reserved</em> is address space the JVM has set aside; <em>committed</em> is memory it has actually asked the OS for, which becomes resident (RSS, L22) once it's touched. So read the committed column:</p>
+<ul>
+  <li><b>Java Heap, 42 MB:</b> the million <code>Point</code>s. Only about a fifth of the total.</li>
+  <li><b>Other, 64 MB:</b> the direct <code>ByteBuffer</code>, which lives outside the heap, so <code>-Xmx</code> doesn't cap it. <code>-XX:MaxDirectMemorySize</code> does; "if not set, … the JVM chooses the size for NIO direct-buffer allocations automatically".</li>
+  <li><b>GC, 61 MB:</b> the collector's own data structures, on top of the heap it manages.</li>
+  <li><b>Thread, 5 MB committed of 148 MB reserved:</b> each thread reserves a full stack (<code>-Xss</code>, 2048 KB by default on macOS/AArch64 and 1024 KB on Linux/x64) but commits only the pages it touches. Deep recursion or thousands of platform threads change that.</li>
+  <li><b>Code, Metaspace, Shared class space:</b> the JIT's compiled code (up to 240 MB by default, <code>-XX:ReservedCodeCacheSize</code>) and the class metadata from L23.</li>
+</ul>
+<p>The Kotlin version gave the same picture: 277 MB committed with a 117 MB heap, and the same 64 MB "Other". So size a container like this: <b>limit ≥ maximum heap + non-heap measured under real load + headroom</b>. Raise <code>-XX:MaxRAMPercentage</code> (75 is the man page's own example) only after NMT has shown you how much the rest needs. If you get it wrong, the two failures look completely different:</p>
+<table class="vs">
+  <tr><th></th><th>Java <code>OutOfMemoryError</code></th><th>Kernel OOM kill</th></tr>
+  <tr><td>Cause</td><td>the heap (or metaspace) is full</td><td>the whole process reached the container limit</td></tr>
+  <tr><td>Who acts</td><td>the JVM throws an exception</td><td>"the OOM killer is invoked in the cgroup" (<a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">cgroup v2: memory.max</a>) and sends <code>SIGKILL</code> (<a href="https://github.com/torvalds/linux/blob/master/mm/oom_kill.c">oom_kill.c</a>)</td></tr>
+  <tr><td>What you see</td><td>a stack trace; a heap dump if you asked for one (Part 2)</td><td>nothing in your logs; exit status 137 = 128 + 9 (L53)</td></tr>
+  <tr><td>Where to look</td><td>histograms, heap dumps</td><td>NMT: direct buffers, threads, code; then the heap size</td></tr>
+</table>
+<p>The cruel part is that a bigger <code>-Xmx</code> turns the first failure into the second. A container killed with 137 and no <code>OutOfMemoryError</code> in its logs usually needs a <em>smaller</em> heap share or a bigger limit, not a bigger heap.</p>
+<p><b>Smaller objects, too.</b> Look at what the histogram says each <code>Point</code> costs, and then at the same run with one more flag:</p>
+<pre class="term"><span class="p">$ </span>jcmd 51350 GC.class_histogram | head -4
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:       1000000       24000000  Footprint$Point
+<span class="p">$ </span>java -XX:+UseCompactObjectHeaders -Xmx256m Footprint 4000 &amp;   <span class="c"># then the same jcmd</span>
+   1:       1000000       16000000  Footprint$Point</pre>
+<p>Two <code>int</code>s are 8 bytes of data, but each object also has a header the JVM uses for its class pointer, locking and GC age. Normally it's 96 bits, so 12 + 8 = 20 bytes, rounded up to the 8-byte alignment (<code>-XX:ObjectAlignmentInBytes</code>): 24. <dfn>Compact object headers</dfn> shrink the header to 64 bits, so 8 + 8 = 16, a third less for this class (Kotlin's data class gave the same 24 → 16). <a href="https://openjdk.org/jeps/519">JEP 519</a> made them a product feature in JDK 25, still off unless you pass <code>-XX:+UseCompactObjectHeaders</code>, and reports SPECjbb2015 using "22% less heap space" with them. <a href="https://openjdk.org/jeps/534">JEP 534</a> makes them the default from JDK 27, reducing headers "from 96 bits down to 64 bits on 64-bit architectures". Small objects gain most, and a heap full of small objects is exactly what a container's memory limit squeezes.</p>
 
 <div class="auto">
   <strong>What Kotlin does for you.</strong>
@@ -501,6 +601,19 @@ public class Practice {
   <div class="opts"><button>Prints null</button><button>Throws exception</button><button>Prints A</button><button>Prints B</button></div>
   <p class="why"><code>head = null</code> removes one reference to <code>A</code>, not <code>A</code> itself. <code>A</code> is still reachable from the local <code>tail</code>, through <code>B</code>'s <code>next</code> field, so it's live, and <code>tail.next</code> is <code>A</code>. Reachability follows any path from a root, whatever the variables are called.</p>
   <ol class="whyopts"><li><code>head = null</code> changes the variable only. <code>B</code>'s <code>next</code> field still refers to <code>A</code>.</li><li>Nothing along <code>tail</code> → <code>B</code> → <code>A</code> is null, so there's no <code>NullPointerException</code>.</li><li><code>A</code> is reachable through <code>tail</code> → <code>B</code> → <code>A</code>, so it's alive, and its name prints.</li><li><code>tail</code> is <code>B</code>, but the code prints <code>tail.next</code>, which is <code>A</code>.</li></ol>
+</div>
+
+<div class="quiz" data-id="p1-7" data-group="Part 1 · Containers" data-answer="3">
+  <p class="q">A service in a container restarts with exit status 137. Its logs show no <code>OutOfMemoryError</code>. What most likely happened?</p>
+  <div class="opts"><button>The heap filled up</button><button>The JIT compiler crashed</button><button>It received a SIGTERM</button><button>The kernel killed it</button></div>
+  <p class="why">137 is 128 + 9, death by <code>SIGKILL</code>. When the whole process reaches the cgroup's <code>memory.max</code>, the kernel's OOM killer sends exactly that, and the JVM gets no chance to log anything.</p>
+  <ol class="whyopts"><li>A full heap makes the JVM throw <code>OutOfMemoryError</code>, which would show up in the logs with a stack trace.</li><li>A JVM crash writes an <code>hs_err</code> file and aborts with a different signal, not a clean 137.</li><li>SIGTERM is signal 15, so the status would be 143, and shutdown hooks would run.</li><li>Exceeding the container's memory limit invokes the OOM killer, whose <code>SIGKILL</code> gives 128 + 9 = 137.</li></ol>
+</div>
+<div class="quiz" data-id="p1-8" data-group="Part 1 · Containers" data-answer="1">
+  <p class="q">A container has a 1 GB memory limit. Someone sets <code>-Xmx1g</code> so the heap can use all of it. Under load, what happens?</p>
+  <div class="opts"><button>Throws OutOfMemoryError before that</button><button>Kernel kills the process</button><button>JVM refuses to start</button><button>Runs fine with headroom</button></div>
+  <p class="why">The limit counts the whole process: heap plus metaspace, thread stacks, code cache, GC structures and direct buffers. With the heap allowed to fill the limit, the rest pushes the process over it first.</p>
+  <ol class="whyopts"><li>The heap never gets full: the non-heap memory pushes the whole process over 1 GB while the heap still has room.</li><li>Heap plus everything outside it exceeds 1 GB, so the OOM killer ends the process with exit 137.</li><li>The JVM starts fine. <code>-Xmx</code> is only a cap, and the heap is committed gradually.</li><li>In <code>Footprint</code>, non-heap memory was over 150 MB. There's no headroom left for it here.</li></ol>
 </div>
 
 <label class="done"><input type="checkbox" class="part-done" data-part="p1"> Part 1 done</label>

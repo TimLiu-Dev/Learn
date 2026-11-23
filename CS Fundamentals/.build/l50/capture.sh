@@ -5,7 +5,7 @@ set -u
 K="${KOTLINC:-kotlinc}"
 mkdir -p outs
 for f in TwoPointers PairTiming Windows WindowTiming WindowMax MinWindowSum Subsets NoCopy Queens FirstPerms Parens \
-         Trie CountingTrie Stress IntervalStress; do
+         Trie CountingTrie Stress IntervalStress PrefixSums RabinKarp; do
   d="$(mktemp -d)"
   "$K" "$f.kt" -include-runtime -d "$d/$f.jar" 2>&1 | grep -v '^$'
   java -jar "$d/$f.jar" > "outs/$f.kt.txt" 2>&1

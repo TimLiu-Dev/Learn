@@ -57,7 +57,7 @@ def classify(text):
 
 report = {}
 runnable = set()
-for page in sorted((W / "lessons").glob("0*.html")):
+for page in sorted([*(W / "lessons").glob("0*.html"), *(W / "lessons").glob("e*.html")]):   # core lessons + electives
     for text in listings(page):
         verdict = classify(text)
         report.setdefault(page.name, []).append((verdict, text.split("\n")[0][:60]))

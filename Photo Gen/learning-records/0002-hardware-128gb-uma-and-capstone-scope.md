@@ -1,0 +1,6 @@
+# Learning Record: Hardware (Dual 128GB UMA) & Capstone Scope
+
+- **Status:** active (supersedes app-capstone framing in LR-0001)
+- **Hardware Established:** Learner owns both an **M5 Max MacBook Pro (128GB)** and an **ASUS ROG Flow Z13 Ryzen AI Max+ 395 / Strix Halo (128GB)**. Because both provide 128GB unified memory, the learner is NOT VRAM-capacity constrained for local inference (even 32B FLUX.2 `dev` or 14B Wan 2.2 fits locally), though memory bandwidth makes cloud GPUs (RunPod L40S/H100) still valuable for fast LoRA training (`ai-toolkit` / `kohya_ss`) and batch video rendering.
+- **Capstone Scope Established:** Disregard building an Android/Web SaaS application. The end-to-end capstones are the actual generative media productions and reproducible workflows for: (1) LinkedIn headshots, (2) Tinder dating photos, (3) Cat photos & videos, and (4) optional uncensored/NSFW local photos & videos.
+- **Implications for Future Lessons:** Include explicit local setup branches (MPS/GGUF for M5 Max + ROCm 7.x `gfx1151` for Strix Halo) alongside Cloud GPU rental workflows in Modules 2–6, and focus Module 7 on portfolio-grade generative pipelines, quality evaluation, and workflow automation rather than mobile app UI development.

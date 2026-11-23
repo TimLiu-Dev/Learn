@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lesson 14 — Batch Automation, WebSocket API, Upscaling &amp; ArcFace Evals</title>
+  <link rel="stylesheet" href="../assets/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="topbar-brand" href="../master-plan.html">AI Media Engineering &middot; 2027 Track</a>
+      <nav class="topbar-nav">
+        <a href="../master-plan.html">Master Plan</a>
+        <a class="active" href="./0014-batch-automation-upscaling-and-evals.html">Lesson 14</a>
+        <a href="../reference/01-diffusion-pipeline-reference.html">Ref 01: Pipeline</a>
+        <a href="../reference/02-dataset-shooting-and-hardware-guide.html">Ref 02: Shooting &amp; 128GB</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <article class="article-body">
+      <div class="kicker">Module 6 &middot; Lesson 14 &middot; Engineering Automation</div>
+      <h1>Batch Automation, WebSocket API, Upscaling &amp; Quality Evals</h1>
+      <p class="subtitle">
+        Separating hobbyists from senior engineers: driving ComfyUI deterministically over WebSockets, avoiding brittle hardcoded node IDs, tiled 4K upscaling, and scoring likeness automatically with InsightFace ArcFace.
+      </p>
+
+      <h2>1. Headless ComfyUI WebSocket Client (Complete Runnable Pattern)</h2>
+      <p>
+        ComfyUI is an HTTP + WebSocket server. Export any workflow via <strong>Save (API Format)</strong> to get <code>workflow_api.json</code>. Instead of fire-and-forget POSTs or fragile hardcoded node IDs like <code>graph["3"]</code>, locate nodes by <code>_meta.title</code> or <code>class_type</code>, listen on <code>/ws</code> until execution completes, and fetch outputs via <code>/history</code> + <code>/view</code>:
+      </p>
+
+      <div class="code-label">Python &middot; Full WebSocket Seed Sweep + Image Retrieval</div>
+      <pre><code>import json, uuid, urllib.request, urllib.parse, websocket  # pip install websocket-client
+
+SERVER = "127.0.0.1:8188"
+CLIENT_ID = str(uuid.uuid4())
+
+def find_node(graph, title=None, class_type=None):
+    for node_id, node in graph.items():
+        if title and node.get("_meta", {}).get("title") == title:
+            return node
+        if class_type and node.get("class_type") == class_type:
+            return node
+    raise KeyError(f"Node not found: title={title}, class_type={class_type}")
+
+with open("workflow_api.json") as f:
+    base_graph = json.load(f)
+
+ws = websocket.WebSocket()
+ws.connect(f"ws://{SERVER}/ws?clientId={CLIENT_ID}")
+
+for seed in [101, 202, 303, 404]:
+    for strength in [0.75, 0.85]:
+        graph = json.loads(json.dumps(base_graph))
+        find_node(graph, class_type="KSampler")["inputs"]["seed"] = seed
+        find_node(graph, class_type="LoraLoader")["inputs"]["strength_model"] = strength
+
+        req = urllib.request.Request(
+            f"http://{SERVER}/prompt",
+            data=json.dumps({"prompt": graph, "client_id": CLIENT_ID}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        prompt_id = json.loads(urllib.request.urlopen(req).read())["prompt_id"]
+
+        while True:
+            msg = json.loads(ws.recv())
+            if msg.get("type") == "executing" and msg["data"]["node"] is None and msg["data"]["prompt_id"] == prompt_id:
+                break  # DAG finished!
+
+        history = json.loads(urllib.request.urlopen(f"http://{SERVER}/history/{prompt_id}").read())[prompt_id]
+        for node_out in history["outputs"].values():
+            for img in node_out.get("images", []):
+                params = urllib.parse.urlencode({"filename": img["filename"], "subfolder": img["subfolder"], "type": img["type"]})
+                data = urllib.request.urlopen(f"http://{SERVER}/view?{params}").read()
+                with open(f"sweep_s{seed}_w{strength}.png", "wb") as out:
+                    out.write(data)
+ws.close()</code></pre>
+
+      <h2>2. Tiled 4K Upscaling &amp; FaceDetailer Polish</h2>
+      <ul>
+        <li><strong>Why Tiled?</strong> Sampling directly at <code>4096 &times; 4096</code> explodes attention memory and introduces duplicated heads/limbs. Generate at ~<code>1024 &times; 1024</code> first, then run <strong>Ultimate SD Upscale</strong> + <code>4x-UltraSharp</code> at low tiled denoise (<code>0.20–0.30</code>).</li>
+        <li><strong>Video Upscaling:</strong> Run frame-consistent upscalers (SeedVR2 / Real-ESRGAN per frame) only on your top selected clips.</li>
+      </ul>
+
+      <h2>3. Quantitative Quality Evals (ArcFace Cosine Similarity)</h2>
+      <p>
+        Instead of eyeballing 40 candidates manually, extract 512-D facial identity embeddings with <strong>InsightFace</strong> (<code>buffalo_l</code>) and rank generated portraits objectively against your reference selfie:
+      </p>
+      <div class="code-label">Python &middot; Rank Sweep Candidates by ArcFace Cosine Similarity</div>
+      <pre><code>import cv2, glob, numpy as np
+from insightface.app import FaceAnalysis  # pip install insightface onnxruntime
+
+app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+app.prepare(ctx_id=0, det_size=(640, 640))
+
+def face_vec(path):
+    faces = app.get(cv2.imread(path))
+    if not faces:
+        return None
+    v = faces[0].normed_embedding
+    return v
+
+ref = face_vec("datasets/me_raw/me_01.png")
+scores = []
+for p in glob.glob("sweep_*.png"):
+    vec = face_vec(p)
+    if vec is not None:
+        scores.append((float(np.dot(ref, vec)), p))
+
+for sim, path in sorted(scores, reverse=True)[:5]:
+    print(f"{sim:.4f}  {path}")  # &gt; 0.55–0.70+ indicates strong identity lock</code></pre>
+
+      <h2>4. Hands-On Verification Lab</h2>
+      <div class="callout callout-lab">
+        <div class="callout-title">Run an Automated 8-Image Sweep &amp; Rank Top Winners</div>
+        <ol style="margin-bottom:0">
+          <li>Export your Lesson 11 LinkedIn or Tinder graph via <strong>Save (API Format)</strong> as <code>workflow_api.json</code>.</li>
+          <li>Run the WebSocket sweep script above for 4 seeds &times; 2 LoRA weights, then score all 8 PNGs with the <code>insightface</code> script to see which <code>(seed, strength)</code> pair maximizes likeness without waxy overfit.</li>
+        </ol>
+      </div>
+
+      <h2>5. Code &amp; Diagnostic Quizzes</h2>
+      <div id="lesson-14-quiz"></div>
+
+      <div class="callout callout-tip">
+        <div class="callout-title">Recommended Primary Source</div>
+        Inspect ComfyUI's official <a href="https://github.com/Comfy-Org/ComfyUI/tree/master/script_examples" target="_blank" rel="noopener">API Script Examples</a> and <a href="https://github.com/deepinsight/insightface" target="_blank" rel="noopener">InsightFace GitHub</a>.
+      </div>
+
+      <div class="callout callout-teacher">
+        <div class="callout-title">Ask Your Teacher Anytime</div>
+        Want help adapting <code>find_node()</code> to target multiple <code>LoraLoader</code> nodes by custom title in your own graph? Paste your <code>workflow_api.json</code> structure in chat!
+      </div>
+
+      <div class="lesson-footer">
+        <div><a href="./0013-project-multi-shot-cat-videos.html">&larr; Lesson 13: Multi-Shot Cat Videos</a></div>
+        <div><a href="./0015-serverless-deployment-and-compliance.html">Lesson 15: Serverless Ops &amp; C2PA &rarr;</a></div>
+      </div>
+    </article>
+  </main>
+
+  <script src="../assets/quiz.js"></script>
+  <script>
+    window.LessonQuiz.init("lesson-14-quiz", {
+      lessonId: "0014-batch-automation-evals",
+      questions: [
+        {
+          id: "q1-api-json-vs-ui-json",
+          category: "ComfyUI Automation · Serialization",
+          prompt: "You export the normal 'Save' workflow.json from ComfyUI and POST it to /prompt, getting an HTTP 400 error. What export format does /prompt require?",
+          code: `POST http://127.0.0.1:8188/prompt  # fails on UI layout JSON`,
+          correctIndex: 2,
+          options: [
+            {
+              text: "Export the graph as a compressed PNG screenshot.",
+              why: "PNG workflow metadata stores UI JSON for drag-and-drop, not the execution dict expected by /prompt."
+            },
+            {
+              text: "Convert all node coordinates into HTML SVG tags.",
+              why: "The /prompt execution endpoint ignores visual UI coordinates completely."
+            },
+            {
+              text: "Export using Save API Format for valid workflow_api.json.",
+              why: "Save (API Format) strips UI layout metadata and outputs the clean node-ID dictionary keyed by class_type and inputs that ComfyUI's /prompt endpoint executes."
+            },
+            {
+              text: "Rename the standard UI JSON file to safetensors.",
+              why: "Renaming a JSON text file does not reformat its internal schema."
+            }
+          ]
+        },
+        {
+          id: "q2-ws-completion-signal",
+          category: "WebSocket API · Execution Lifecycle",
+          prompt: "In a headless ComfyUI WebSocket client, how do you know a queued prompt_id finished executing so you can safely query /history/{prompt_id}?",
+          code: `msg = json.loads(ws.recv())`,
+          correctIndex: 1,
+          options: [
+            {
+              text: "Assume execution finishes instantly 0.1 seconds after POST /prompt.",
+              why: "POST /prompt only enqueues the job and returns immediately before sampling begins."
+            },
+            {
+              text: "Wait for type == 'executing' with node == None for your prompt_id.",
+              why: "ComfyUI emits {\"type\": \"executing\", \"data\": {\"node\": None, \"prompt_id\": ...}} once the entire DAG finishes, signaling outputs are ready in /history."
+            },
+            {
+              text: "Close the WebSocket before calling POST /prompt to free ports.",
+              why: "Closing the WebSocket beforehand prevents receiving execution events."
+            },
+            {
+              text: "Poll /view continuously with random filenames until one exists.",
+              why: "/history/{prompt_id} returns exact output filenames and subfolders cleanly."
+            }
+          ]
+        },
+        {
+          id: "q3-arcface-eval",
+          category: "Evaluation · Quantitative Ranking",
+          prompt: "When automating 50 Tinder or LinkedIn candidates overnight, how do you programmatically rank which outputs actually look most like your real face?",
+          code: `# Score each generated PNG against datasets/me_raw/me_01.png`,
+          correctIndex: 3,
+          options: [
+            {
+              text: "Sort images purely by largest PNG disk file size.",
+              why: "File size reflects high-frequency texture/noise entropy, not facial identity similarity."
+            },
+            {
+              text: "Pick whichever generation finished in the fewest GPU milliseconds.",
+              why: "Every seed at identical steps runs in the same time and speed says nothing about likeness."
+            },
+            {
+              text: "Compare average RGB brightness values across the entire frame.",
+              why: "Mean image brightness only measures exposure, not facial structure."
+            },
+            {
+              text: "Compute face embedding cosine similarity using InsightFace or ArcFace.",
+              why: "Extracting 512-D facial identity embeddings with ArcFace/InsightFace lets a Python script score and rank all 50 candidates automatically by true facial similarity."
+            }
+          ]
+        },
+        {
+          id: "q4-tiled-high-denoise-bug",
+          category: "Code Debugging · Tile Seams",
+          prompt: "During Ultimate SD Upscale, your LinkedIn blazer develops visible grid seams and tiny extra faces inside background tiles. What parameter is too high?",
+          code: `"UltimateSDUpscale": {"upscale_by": 2.0, "denoise": 0.85, "tile_width": 512}`,
+          correctIndex: 0,
+          options: [
+            {
+              text: "denoise=0.85 lets each tile hallucinate independently instead of refining.",
+              why: "At denoise=0.85, each 512px tile forgets the global portrait and invents new objects/seams; keeping tiled denoise around 0.20–0.32 refines detail seamlessly."
+            },
+            {
+              text: "upscale_by=2.0 is too small and needs raising to 16.0.",
+              why: "2x upscaling is standard; extreme upscaling worsens seam artifacts if denoise is too high."
+            },
+            {
+              text: "tile_width=512 must equal zero to disable spatial tile passes.",
+              why: "Zero tile width is invalid for a tiled upscaler node."
+            },
+            {
+              text: "You must set CFG 22.0 to glue tiles together.",
+              why: "High CFG amplifies edge contrast and makes tile boundaries even more obvious."
+            }
+          ]
+        }
+      ]
+    });
+  </script>
+</body>
+</html>
