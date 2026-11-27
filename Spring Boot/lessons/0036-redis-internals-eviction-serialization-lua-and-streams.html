@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0036: Redis Internals (Eviction Policies, Serialization, Atomic Lua Scripts &amp; Redis Streams)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 2 • Phase 7: High-Performance Distributed Caching, Redis Internals &amp; Rate Limiting</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 25 LTS</span>
+        <span class="badge badge-kotlin">Kotlin 2.2+</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0036 • Stage 2 • Phase 7</span>
+    <h1 style="margin-top: 8px;">Redis Internals: Eviction Policies, JSON Serialization, Atomic Lua Scripts &amp; Redis Streams</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Knowing <code>@Cacheable</code> and Redisson isn't enough when Redis hits production scale. Senior engineers prevent four subtle Redis outages: <strong>LRU eviction wiping out distributed locks and idempotency keys</strong>, <strong>Spring's default <code>JdkSerializationRedisSerializer</code> crashing deployments</strong>, <strong>non-atomic multi-key read-then-write races (solved with <code>DefaultRedisScript</code> Lua scripts)</strong>, and choosing <strong>Redis Streams (<code>XADD</code>/<code>XREADGROUP</code>)</strong> over lossy Pub/Sub when durable consumer groups are needed without Kafka overhead.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Redis Official Docs: Key Eviction Policies</a> and <a href="https://docs.spring.io/spring-data/redis/reference/redis/scripting.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring Data Redis Reference: Atomic Lua Scripting &amp; Streams</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Android Mental Model Bridge</div>
+    <p style="margin-bottom: 0;">
+      Think of Redis's single-threaded command loop like a super-fast serialized actor: a <strong>Lua script</strong> executes from start to finish atomically with zero interleaving from other pods—like running a single atomic SQL transaction directly inside Redis RAM!
+    </p>
+  </div>
+
+  <h2>1. Four Senior Redis Rules for Spring Boot Backends</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>Isolate Cache vs. Lock/Idempotency Redis Policies (<code>maxmemory-policy</code>):</strong> A cache cluster uses <code>allkeys-lru</code> (evicts least-recently-used keys when RAM is full). If you store distributed locks, rate-limit buckets, or <code>Idempotency-Key</code> records on that same instance, Redis will silently evict active locks under memory pressure! Put state/lock keys on a dedicated <code>noeviction</code> Redis instance (or use <code>volatile-lru</code> where only cache keys have TTL—though separate instances are safest).</li>
+    <li><strong>Ban Default Java Serialization (<code>JdkSerializationRedisSerializer</code>):</strong> Spring Data Redis defaults to Java binary serialization, which writes unreadable blobs, breaks cross-language consumers, and throws <code>InvalidClassException</code> whenever you add a field to a DTO! Always configure <code>StringRedisSerializer</code> keys + <code>GenericJackson2JsonRedisSerializer</code> values.</li>
+    <li><strong>Atomic Lua Scripts (<code>DefaultRedisScript</code>) &amp; Pipelining:</strong> Calling <code>redis.opsForValue().get()</code> followed by <code>decrement()</code> in Java has a race window between pods. Executing a 5-line <strong>Lua script</strong> runs atomically on the Redis server in one roundtrip! For bulk reads/writes, use <code>executePipelined(...)</code> to avoid 500 sequential TCP roundtrips.</li>
+    <li><strong>Redis Pub/Sub vs. Redis Streams:</strong> Pub/Sub is fire-and-forget (offline pods permanently miss events). <strong>Redis Streams (<code>XADD</code> + <code>XREADGROUP</code> + <code>XACK</code>)</strong> persist messages in an append-only log with consumer groups—a lightweight alternative when you don't run Apache Kafka.</li>
+  </ul>
+
+  <h3>1. Eviction Policy Matrix: Separating Cache Keys from Lock &amp; Idempotency State</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Redis Role</th>
+        <th>Recommended <code>maxmemory-policy</code></th>
+        <th>What Happens When RAM Hits 100%?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Read-Aside Cache (<code>@Cacheable</code>)</strong></td>
+        <td><code>allkeys-lru</code> or <code>allkeys-lfu</code></td>
+        <td>Safely evicts cold cached DTOs; DB fallback repopulates on miss</td>
+      </tr>
+      <tr>
+        <td><strong>Distributed Locks, Idempotency &amp; Rate Buckets</strong></td>
+        <td><strong><code>noeviction</code></strong> (dedicated instance!)</td>
+        <td>Returns explicit write error instead of silently deleting active mutexes!</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>2. Why Single-Threaded Lua Scripts Beat Multi-Roundtrip Java Checks</h3>
+  <div style="background:#090d13; border:1px solid var(--border-color); border-radius:var(--radius-sm); padding:16px; font-family:var(--font-mono); font-size:13px; color:#7ee787; margin:16px 0;">
+BROKEN 2-STEP JAVA CHECK (Oversells Stock Under Concurrency!):
+  Pod A: GET sku:99 =&gt; 1  ┐
+  Pod B: GET sku:99 =&gt; 1  ┴──► Both DECRBY 1 =&gt; stock becomes -1!
+
+ATOMIC SERVER-SIDE LUA SCRIPT (DefaultRedisScript):
+  Redis Single-Threaded Event Loop: [ EVAL: GET ==&gt; check &gt;= req ==&gt; DECRBY ] (Zero interleaving between pods!)
+  </div>
+  <p>
+    Keep Lua scripts tiny (&lt;1ms execution, operating only on keys passed explicitly in <code>KEYS[...]</code> so Redis Cluster hash-slot routing works cleanly) so you never stall Redis's single-threaded command loop.
+  </p>
+
+  <h2>2. Production Implementation (Java 25 vs Kotlin 2.2+)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Atomic Lua Stock-Decrement Script &amp; JSON RedisTemplate Configuration</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.nexus.redis;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.stereotype.Service;
+import java.util.List;
+
+@Service
+public class AtomicInventoryCache {
+    private static final DefaultRedisScript&lt;Long&gt; DECREMENT_IF_ENOUGH = new DefaultRedisScript&lt;&gt;("""
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        local req = tonumber(ARGV[1])
+        if current &lt; req then return -1 end
+        return redis.call('DECRBY', KEYS[1], req)
+        """, Long.class);
+
+    private final StringRedisTemplate redis;
+
+    public AtomicInventoryCache(StringRedisTemplate redis) { this.redis = redis; }
+
+    public boolean tryReserve(String skuKey, int quantity) {
+        Long remaining = redis.execute(DECREMENT_IF_ENOUGH, List.of(skuKey), String.valueOf(quantity));
+        return remaining != null &amp;&amp; remaining &gt;= 0;
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.nexus.redis
+
+import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.data.redis.core.script.DefaultRedisScript
+import org.springframework.stereotype.Service
+
+@Service
+class AtomicInventoryCache(private val redis: StringRedisTemplate) {
+    companion object {
+        private val DECREMENT_IF_ENOUGH = DefaultRedisScript(
+            """
+            local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+            local req = tonumber(ARGV[1])
+            if current &lt; req then return -1 end
+            return redis.call('DECRBY', KEYS[1], req)
+            """.trimIndent(),
+            Long::class.java
+        )
+    }
+
+    fun tryReserve(skuKey: String, quantity: Int): Boolean {
+        val remaining = redis.execute(DECREMENT_IF_ENOUGH, listOf(skuKey), quantity.toString())
+        return remaining != null &amp;&amp; remaining &gt;= 0
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to test your Redis production internals.</p>
+
+  <div class="quiz-card" id="q0036_1" data-explanation="On an allkeys-lru Redis instance, when memory hits maxmemory, Redis evicts keys across the entire keyspace—including active distributed locks and Idempotency-Key records! Locks and rate-limit state belong on an isolated noeviction Redis instance.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Your team stores both product catalog cache entries and Redisson distributed locks in a single Redis instance configured with <code>maxmemory-policy allkeys-lru</code>. What outage happens during traffic spikes?</div>
+    <div class="quiz-code-snippet"><pre><code># redis.conf: maxmemory 2gb | maxmemory-policy allkeys-lru</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Under memory pressure, allkeys-lru can evict active lock keys early, letting two pods acquire the same lock.">
+        Memory pressure causes Redis to evict active distributed lock keys early, triggering concurrent double-writes.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. allkeys-lru evicts old keys in RAM cleanly without crashing or converting Redis to disk storage.">
+        Redis shuts down immediately and refuses all TCP connections until an operator runs FLUSHALL.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Eviction policy affects key removal in RAM, not JSON vs JDK serialization formats.">
+        Redis automatically switches Spring Boot from JSON serialization back to JdkSerializationRedisSerializer.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Eviction runs inside Redis RAM and has no control over PostgreSQL Flyway migrations.">
+        PostgreSQL rolls back committed Flyway migrations whenever Redis reaches eighty percent memory capacity.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0036_2" data-explanation="Spring Data Redis's default JdkSerializationRedisSerializer encodes opaque Java serialized bytes tied to serialVersionUID and exact class package paths. Adding a field or moving a package crashes running pods with SerializationException / InvalidClassException.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">Why do senior teams explicitly replace Spring Data Redis's default <code>JdkSerializationRedisSerializer</code> with JSON (<code>GenericJackson2JsonRedisSerializer</code>)?</div>
+    <div class="quiz-code-snippet"><pre><code>template.setValueSerializer(new GenericJackson2JsonRedisSerializer());</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Redis stores raw bytes regardless of serializer; the problem is Java binary fragility during deployments.">
+        Redis refuses to persist values longer than 64 bytes unless serialized as UTF-8 JSON strings.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Java serialization breaks across DTO refactors and is unreadable by non-JVM tooling.">
+        JDK binary serialization breaks on class refactors across rolling deploys and is opaque to non-JVM tools.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Serialization format does not alter Redis maxmemory eviction rules.">
+        Using JSON serialization prevents Redis from ever running out of RAM under allkeys-lru policies.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Both serializers work identically on Java 21 Virtual Threads.">
+        JdkSerializationRedisSerializer pins Java 25 Virtual Threads to OS carrier threads on every GET command.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0036_3" data-explanation="Redis Pub/Sub delivers messages only to currently connected subscribers—any message published while a pod restarts is lost forever. Redis Streams (XADD / XREADGROUP / XACK) persist events in an append-only log with consumer-group tracking.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">Why is <strong>Redis Pub/Sub</strong> unsuitable for durable order-fulfillment work queues compared to <strong>Redis Streams (<code>XADD</code>/<code>XREADGROUP</code>)</strong> or Kafka?</div>
+    <div class="quiz-code-snippet"><pre><code>// Pod restarts for 5 seconds while Redis PUBLISH runs...</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Redis Pub/Sub runs in microseconds; its limitation is zero persistence or delivery acknowledgments.">
+        Redis Pub/Sub queues messages on disk for seven days, making real-time event delivery take minutes.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Pub/Sub broadcasts to multiple subscribers easily; it simply cannot persist missed messages.">
+        Redis Pub/Sub restricts every topic channel strictly to a single connected Spring Boot consumer pod.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Pub/Sub is fire-and-forget with no persistence or ACK, whereas Redis Streams track consumer-group offsets.">
+        Pub/Sub is fire-and-forget and drops messages during pod restarts, whereas Streams persist and acknowledge deliveries.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Spring Data Redis supports Pub/Sub, Streams, and Lua scripts natively.">
+        Spring Data Redis forbids calling PUBLISH from inside @Transactional or @Service Spring beans.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Wire a safe <code>RedisTemplate</code> configuration with <code>StringRedisSerializer</code> keys and <code>GenericJackson2JsonRedisSerializer</code> values, and invoke an atomic <code>DefaultRedisScript</code> via <code>redis.execute(...)</code>.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0036-lab"
+       data-starter-java="package com.nexus.redis;
+
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+import java.util.List;
+
+public class SafeRedisConfig {
+    public static RedisTemplate&lt;String, Object&gt; jsonTemplate(RedisConnectionFactory factory) {
+        var template = new RedisTemplate&lt;String, Object&gt;();
+        template.setConnectionFactory(factory);
+        // TODO 1: Set key serializer to new StringRedisSerializer()
+        // TODO 2: Set value serializer to new GenericJackson2JsonRedisSerializer()
+        return template;
+    }
+
+    public static Long runAtomicScript(RedisTemplate&lt;String, Object&gt; template, DefaultRedisScript&lt;Long&gt; script, String key) {
+        // TODO 3: Execute script atomically via template.execute(script, List.of(key))
+        return 0L;
+    }
+}"
+       data-starter-kotlin="package com.nexus.redis
+
+import org.springframework.data.redis.connection.RedisConnectionFactory
+import org.springframework.data.redis.core.RedisTemplate
+import org.springframework.data.redis.core.script.DefaultRedisScript
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer
+import org.springframework.data.redis.serializer.StringRedisSerializer
+
+object SafeRedisConfig {
+    fun jsonTemplate(factory: RedisConnectionFactory): RedisTemplate&lt;String, Any&gt; =
+        RedisTemplate&lt;String, Any&gt;().apply {
+            connectionFactory = factory
+            // TODO 1: Set keySerializer = StringRedisSerializer()
+            // TODO 2: Set valueSerializer = GenericJackson2JsonRedisSerializer()
+        }
+
+    fun runAtomicScript(template: RedisTemplate&lt;String, Any&gt;, script: DefaultRedisScript&lt;Long&gt;, key: String): Long? {
+        // TODO 3: Execute script atomically via template.execute(script, listOf(key))
+        return 0L
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0036</span>
+        <span class="practice-title">JSON RedisTemplate &amp; Atomic Lua Script Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0036-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>1) Set <code>StringRedisSerializer</code> for keys and <code>GenericJackson2JsonRedisSerializer</code> for values.<br>
+      2) Execute the Lua script atomically using <code>template.execute(script, List.of(key))</code> (or <code>listOf(key)</code>).</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.nexus.redis;
+
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+import java.util.List;
+
+public class SafeRedisConfig {
+    public static RedisTemplate&lt;String, Object&gt; jsonTemplate(RedisConnectionFactory factory) {
+        var template = new RedisTemplate&lt;String, Object&gt;();
+        template.setConnectionFactory(factory);
+        // TODO 1: Set key serializer to new StringRedisSerializer()
+        // TODO 2: Set value serializer to new GenericJackson2JsonRedisSerializer()
+        return template;
+    }
+
+    public static Long runAtomicScript(RedisTemplate&lt;String, Object&gt; template, DefaultRedisScript&lt;Long&gt; script, String key) {
+        // TODO 3: Execute script atomically via template.execute(script, List.of(key))
+        return 0L;
+    }
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: String Key Serializer</div>
+        <div>Set <code>template.setKeySerializer(new StringRedisSerializer());</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: JSON Value Serializer</div>
+        <div>Set <code>template.setValueSerializer(new GenericJackson2JsonRedisSerializer());</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Execute Lua Script</div>
+        <div>Return <code>template.execute(script, List.of(key));</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 25 Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.redis;
+
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+import java.util.List;
+
+public class SafeRedisConfig {
+    public static RedisTemplate&lt;String, Object&gt; jsonTemplate(RedisConnectionFactory factory) {
+        var template = new RedisTemplate&lt;String, Object&gt;();
+        template.setConnectionFactory(factory);
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        return template;
+    }
+
+    public static Long runAtomicScript(RedisTemplate&lt;String, Object&gt; template, DefaultRedisScript&lt;Long&gt; script, String key) {
+        return template.execute(script, List.of(key));
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.redis
+
+import org.springframework.data.redis.connection.RedisConnectionFactory
+import org.springframework.data.redis.core.RedisTemplate
+import org.springframework.data.redis.core.script.DefaultRedisScript
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer
+import org.springframework.data.redis.serializer.StringRedisSerializer
+
+object SafeRedisConfig {
+    fun jsonTemplate(factory: RedisConnectionFactory): RedisTemplate&lt;String, Any&gt; =
+        RedisTemplate&lt;String, Any&gt;().apply {
+            connectionFactory = factory
+            keySerializer = StringRedisSerializer()
+            valueSerializer = GenericJackson2JsonRedisSerializer()
+        }
+
+    fun runAtomicScript(template: RedisTemplate&lt;String, Any&gt;, script: DefaultRedisScript&lt;Long&gt;, key: String): Long? =
+        template.execute(script, listOf(key))
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Human-readable JSON/String serialization eliminates rolling-deploy binary breakages, while atomic Lua scripts execute check-and-mutate logic on Redis without multi-pod race conditions.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"When running Redis Cluster with multiple hash slots, why do multi-key Lua scripts fail with CROSSSLOT unless you use hash tags like {order:123}?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0035-distributed-rate-limiting-redis-bucket4j.html" class="btn btn-secondary">← Previous: Lesson 0035</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0037-fault-tolerance-resilience4j-circuit-breaker.html" class="btn btn-primary">Next: Lesson 0037 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0036 (Stage 2: Senior Core)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0036-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "StringRedisSerializer Configured for Keys",
+    passed: /StringRedisSerializer\s*\(\s*\)/.test(code) && /(?:setKeySerializer|keySerializer)/.test(code),
+    error: "Must set key serializer to StringRedisSerializer()."
+  });
+  tests.push({
+    name: "GenericJackson2JsonRedisSerializer Configured for Values",
+    passed: /GenericJackson2JsonRedisSerializer\s*\(\s*\)/.test(code) && /(?:setValueSerializer|valueSerializer)/.test(code),
+    error: "Must set value serializer to GenericJackson2JsonRedisSerializer()."
+  });
+  tests.push({
+    name: "Atomic Lua Script Executed via template.execute",
+    passed: /template\.execute\s*\(\s*script\s*,\s*(?:List\.of|listOf)\s*\(\s*key\s*\)\s*\)/.test(code),
+    error: "Must invoke template.execute(script, List.of(key)) (or listOf(key))."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

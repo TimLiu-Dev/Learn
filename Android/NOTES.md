@@ -1,38 +1,13 @@
 # Workspace Notes & Pedagogical Strategy
 
-## Learner Profile & Objectives
-- **Target**: High-Impact Modern Android Engineer (2026/2027 standards).
-- **Background**: Junior Android Developer new to the industry. Calibrate lessons with clear mental models, visual diagrams, explicit explanations of Android internals and terminology, and clear anti-patterns ("Junior Pitfall" vs. "Production Standard").
-- **Learning Mode**: 100% Upfront generation & verified curriculum (Option B).
-- **Outcome**: Job-readiness at top tech companies, senior architectural foundations, resume-grade capstone project ("Aether Portfolio").
-- **Learning Principles**: High-retention pedagogy (fluency vs storage strength), self-contained interactive HTML lessons with runnable code examples, comment-stripped verification IDEs, progressive hints, reference answers with explanation, and multi-question code quizzes with full explanations of both correct and wrong answers.
+## Learner Profile & Curriculum Structure
+- **Learner Baseline**: Junior Android Developer targeting Senior Modern Android & KMP readiness (2026/2027 standards).
+- **Curriculum Structure**: **76 Sequential Lessons** (`0001`–`0076`, zero numbering jumps):
+  - **Core Pathway (`0001`–`0074`, Phases I–IX)**: Kotlin 2.x & Flow -> Compose, `TextFieldState`/i18n & UI/Screenshot Testing -> Navigation 3, MVI, Hilt & Brownfield Interop -> Networking, Room, DataStore, WorkManager & OS Boundaries -> Multi-Module, `build-logic`, Feature Flags & CI/CD -> Profiling, 16 KB, Security/Passkeys, Release & `ApplicationExitInfo` -> Media3/CameraX, Glance/Live Updates, KMP, CMP & Gemini Nano -> 9-Module "Aether" Capstone -> System Design & Career.
+  - **Optional Specializations (`0075`–`0076`, Phase X)**: Google Play Billing 7+ Subscriptions (`0075`) and Schema-First APIs with Apollo Kotlin 4 GraphQL & gRPC/Protobuf (`0076`).
+- **Desk References (`./reference/`)**: 5 printable HTML cheat sheets (`01` through `05`, where `05-glossary.html` holds the full curriculum dictionary while `GLOSSARY.md` tracks concepts personally mastered by the learner).
 
-## Modern Tech Stack Standard (2026/2027)
-- **Language**: Kotlin 2.x (K2 Compiler, Context Parameters, Sealed Hierarchies, Type-safe Builders)
-- **UI Engine**: Jetpack Compose (100% Declarative, Material 3 Expressive, Composition Optimization, Strong Skipping Mode)
-- **Edge-to-Edge & Insets**: Mandatory `enableEdgeToEdge()`, `WindowInsets.safeDrawing`, `PredictiveBackHandler`
-- **Graphics & Gestures**: Compose `Canvas` (`DrawScope`) & `Modifier.pointerInput` (`detectDragGestures`)
-- **Accessibility**: Compose `Semantics` & TalkBack optimization
-- **Navigation**: Jetpack Navigation 3 (`androidx.navigation3` user-owned back stack & adaptive multi-pane) alongside Navigation Compose 2.8+ Type-Safe Navigation
-- **Architecture**: Modern Android Architecture (Now In Android style, Unidirectional Data Flow, Clean Architecture Layering, Multi-Module)
-- **Asynchronous & Reactive**: Kotlin Coroutines & Flow (Structured concurrency, StateFlow, SharedFlow, Lifecycle-aware collection)
-- **Dependency Injection**: Dagger Hilt with KSP (Kotlin Symbol Processing)
-- **Networking & Serialization**: Retrofit / Ktor Client + `kotlinx.serialization` (JSON, streaming, HTTP/3)
-- **Pagination & Media**: Jetpack Paging 3 + Coil 3 Coroutine Image Loader
-- **Local Persistence**: Room (KSP, reactive flows, migrations) + Jetpack DataStore (Preferences & Proto)
-- **Background Tasks**: Jetpack WorkManager (CoroutineWorker, expedited sync, battery-conscious constraints)
-- **Testing**: JUnit 5, MockK, Turbine, Robolectric, Compose Test Rule, Maestro E2E
-- **Build & Optimization**: Gradle Version Catalogs (`libs.versions.toml`), Kotlin DSL (`build.gradle.kts`), Convention Plugins (`build-logic`), Baseline Profiles, R8 Full Mode
-- **2027 Platform Mandates & Trust**: 16 KB Memory Page alignment, Android 17 mandatory large-screen resizability, Predictive Back (`PredictiveBackHandler`), Credential Manager (Passkeys), Play Integrity API, Foreground Service Types & Photo Picker
-- **Visual Regression & Observability**: Roborazzi / Compose Preview Screenshot Testing, `ApplicationExitInfo` ANR/OOM forensics, Staged Rollouts
-- **Cross-Platform Native & On-Device AI**: Kotlin Multiplatform (KMP `commonMain` shared domain/data with Ktor, Room KMP, Koin), Compose Multiplatform (CMP), Gemini Nano / AICore
-- **Enterprise Brownfield, Media & System Surfaces**: `ComposeView`/`AndroidView` interop (`DisposeOnViewTreeLifecycleDestroyed`), Jetpack Media3 (`ExoPlayer` pooling & `CacheDataSource`) + `CameraX`, Jetpack Glance Widgets + Android 16/17 Promoted Live Updates, Multi-Module Feature Flags & Analytics
-
-## Current Progress & Curriculum State
-- **Master Plan**: 72 Lessons across 9 Phases fully structured in `MASTER_PLAN.md` and `MASTER_PLAN.html`.
-- **Reference Cheat Sheets**:
-  1. `reference/01-kotlin-coroutines-flow.html`
-  2. `reference/02-jetpack-compose-m3.html`
-  3. `reference/03-modern-android-architecture.html`
-  4. `reference/04-2027-senior-mandates-and-kmp.html`
-- **Interactive Engine v2**: Universal JS & CSS in `assets/lesson-interactives.js` and `assets/interactives.css` supporting runnable code examples, comment-stripped verification IDEs, progressive hints, solution injection, and dual quizzes (code reading + architectural) with explanations for every choice.
+## Recommended Study & `/teach` Workflow
+1. **Browser Lesson (`lessons/0001-*.html` .. `0076-*.html`)**: Read mental model + anti-pattern comparison, run the simulated snippet, solve the coding challenge *from memory* before revealing hints/answers, and complete both retrieval quizzes.
+2. **Real Compiler Verification (`./playground/`)**: Paste or extend solutions inside `./playground/core-practice` and run `./gradlew test` (using Android Studio's JBR 21) so K2, Coroutines `runTest`, and Turbine verify real compilation and behavior.
+3. **Stateful `/teach` Check-In**: After each lesson (or 2–3 lesson block), check in via `/teach` for spaced/interleaved recall questions, edge-case code review, promoting mastered terms into `GLOSSARY.md`, and recording decision-grade insights in `learning-records/`.

@@ -7,10 +7,22 @@ import java.time.format.DateTimeParseException
 sealed interface Command {
     data object Help : Command
     data class Validate(val statement: String) : Command
-    data class Categorise(val statement: String, val rules: String) : Command
-    data class Report(val statement: String, val rules: String, val month: YearMonth) : Command
-    data class Top(val statement: String, val rules: String, val month: YearMonth, val n: Int) : Command
-    data class Budget(val statement: String, val rules: String, val budgets: String, val month: YearMonth) : Command
+
+    /** The commands that categorise transactions, so they all need a statement and rules. */
+    sealed interface WithRules : Command {
+        val statement: String
+        val rules: String
+    }
+
+    data class Categorise(override val statement: String, override val rules: String) : WithRules
+    data class Report(override val statement: String, override val rules: String, val month: YearMonth) : WithRules
+    data class Top(override val statement: String, override val rules: String, val month: YearMonth, val n: Int) : WithRules
+    data class Budget(
+        override val statement: String,
+        override val rules: String,
+        val budgets: String,
+        val month: YearMonth,
+    ) : WithRules
 }
 
 val USAGE = """

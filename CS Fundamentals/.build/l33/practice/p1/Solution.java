@@ -1,11 +1,14 @@
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Objects;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 public class Practice {
+    static final long TOLERANCE_SECONDS = 300;
+
     // The hex HMAC-SHA256 of message under key: 64 hex digits.
     static String hmacHex(byte[] key, String message) throws Exception {
         Mac mac = Mac.getInstance("HmacSHA256");
@@ -13,33 +16,49 @@ public class Practice {
         return HexFormat.of().formatHex(mac.doFinal(message.getBytes(StandardCharsets.UTF_8)));
     }
 
-    static String sign(byte[] key, String message) throws Exception {
-        return message + "." + hmacHex(key, message);
+    // The signature header a sender attaches: t=<timestamp>,v1=<tag of "t.body">
+    static String sign(byte[] secret, long t, String body) throws Exception {
+        return "t=" + t + ",v1=" + hmacHex(secret, t + "." + body);
     }
 
-    // The message if the tag is genuine; null for anything else. Never throws.
-    static String verify(byte[] key, String token) throws Exception {
-        int dot = token.lastIndexOf('.');         // the tag never contains a dot; the message might
-        if (dot < 0) return null;
-        String message = token.substring(0, dot);
-        String tag = token.substring(dot + 1);
-        byte[] expected = hmacHex(key, message).getBytes(StandardCharsets.UTF_8);
+    // True only for a genuine, recent delivery. Never throws.
+    static boolean verify(byte[] secret, String header, String body, long now) throws Exception {
+        Long t = null;
+        String tag = null;
+        for (String entry : header.split(",")) {
+            int eq = entry.indexOf('=');
+            if (eq < 0) continue;
+            String key = entry.substring(0, eq), value = entry.substring(eq + 1);
+            if (key.equals("t")) {
+                try { t = Long.parseLong(value); } catch (NumberFormatException e) { return false; }
+            } else if (key.equals("v1")) {
+                tag = value;
+            }
+        }
+        if (t == null || tag == null) return false;
+        byte[] expected = hmacHex(secret, t + "." + body).getBytes(StandardCharsets.UTF_8);   // the timestamp is signed too
         // Constant-time comparison: the time taken doesn't reveal how much of the tag was right.
-        return MessageDigest.isEqual(expected, tag.getBytes(StandardCharsets.UTF_8)) ? message : null;
+        if (!MessageDigest.isEqual(expected, tag.getBytes(StandardCharsets.UTF_8))) return false;
+        return Math.abs(now - t) <= TOLERANCE_SECONDS;     // a genuine but old delivery is a replay
     }
 
     // CHECKS
-    static final byte[] KEY = "k3y-for-tests-only-0123456789abc".getBytes(StandardCharsets.UTF_8);
-    static final byte[] OTHER_KEY = "another-key-nobody-should-trust!".getBytes(StandardCharsets.UTF_8);
+    static final byte[] SECRET = "whsec-for-tests-only-0123456789ab".getBytes(StandardCharsets.UTF_8);
+    static final byte[] OTHER = "another-secret-nobody-should-use!".getBytes(StandardCharsets.UTF_8);
+    static final long T = 1_767_225_600L;                  // 2026-01-01T00:00:00Z
+    static final String BODY = "{\"id\":\"evt_1\",\"type\":\"payment.succeeded\",\"amount\":4200}";
 
     public static void main(String[] args) {
-        check("a signed token verifies and gives back the message", "user=ana", () -> verify(KEY, sign(KEY, "user=ana")));
-        check("the token is the message, a dot and 64 hex digits", true, () -> sign(KEY, "hi").matches("hi\\.[0-9a-f]{64}"));
-        check("an edited message is rejected", null, () -> verify(KEY, sign(KEY, "user=ana;role=user").replace("role=user", "role=admin")));
-        check("a token signed with another key is rejected", null, () -> verify(KEY, sign(OTHER_KEY, "user=ana")));
-        check("a message may contain dots", "v1.2.3", () -> verify(KEY, sign(KEY, "v1.2.3")));
-        check("a token with no dot gives null", null, () -> verify(KEY, "no-dot-here"));
-        check("a non-hex tag gives null", null, () -> verify(KEY, "user=ana.not-hex"));
+        check("a genuine, recent delivery verifies", true, () -> verify(SECRET, sign(SECRET, T, BODY), BODY, T + 10));
+        check("the header is t, then v1 with 64 hex digits", true, () -> sign(SECRET, T, BODY).matches("t=1767225600,v1=[0-9a-f]{64}"));
+        check("an edited body is rejected", false, () -> verify(SECRET, sign(SECRET, T, BODY), BODY.replace("4200", "999999"), T + 10));
+        check("a delivery signed with another secret is rejected", false, () -> verify(SECRET, sign(OTHER, T, BODY), BODY, T + 10));
+        check("a delivery 301 s old is rejected", false, () -> verify(SECRET, sign(SECRET, T, BODY), BODY, T + 301));
+        check("300 s old is still inside the tolerance", true, () -> verify(SECRET, sign(SECRET, T, BODY), BODY, T + 300));
+        check("a replay with a refreshed timestamp is rejected", false,
+              () -> verify(SECRET, sign(SECRET, T, BODY).replace("t=" + T, "t=" + (T + 3600)), BODY, T + 3600));
+        for (String h : List.of("", "v1=abc", "t=abc,v1=00", "t=1767225600", "t=1767225600,v1=not-hex"))
+            check("malformed header '" + h + "' gives false", false, () -> verify(SECRET, h, BODY, T));
     }
 
     interface Check { Object get() throws Exception; }

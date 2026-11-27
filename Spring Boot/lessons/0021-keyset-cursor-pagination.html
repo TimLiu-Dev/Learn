@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0021: Keyset (Cursor) Pagination &amp; Composite Tie-Breaker Indexes</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 1 • Phase 3: Relational Persistence, Production SQL, Indexing, Flyway &amp; Keyset Pagination</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 25 LTS</span>
+        <span class="badge badge-kotlin">Kotlin 2.2+</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0021 • Stage 1 • Phase 3</span>
+    <h1 style="margin-top: 8px;">Keyset (Cursor) Pagination &amp; Composite Tie-Breaker Indexes</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Solve the #1 pagination bottleneck in mobile feeds and order histories. Learn why <code>OFFSET 100000</code> saturates PostgreSQL CPU, implement <code>O(log N)</code> <strong>Keyset (Cursor) Pagination</strong> (the server-side engine behind Android Jetpack Paging 3), and avoid duplicate/skipped rows on timestamp-sorted feeds using <strong>composite <code>(created_at, id)</code> tie-breaker cursors</strong>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://use-the-index-luke.com/no-offset" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Use The Index, Luke: We Need Tool Support for Keyset Pagination (No Offset!)</a> and <a href="https://vladmihalcea.com/keyset-pagination-rest-api/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Vlad Mihalcea: High-Performance Keyset Pagination</a>.
+    </p>
+  </div>
+
+  <h2>1. Why <code>OFFSET 100000</code> Kills Database Performance</h2>
+  <p>
+    Junior developers reach for offset pagination: <code>SELECT * FROM orders ORDER BY id ASC LIMIT 20 OFFSET 100000;</code>.
+    To return just 20 rows, <strong>PostgreSQL must still scan, fetch, and count through all 100,020 rows from disk/index and throw the first 100,000 in the trash!</strong> Worse yet, if a new row is inserted on Page 1 while a user scrolls to Page 2, <code>OFFSET</code> shifts every row down and returns a duplicate item to the mobile RecyclerView/LazyColumn.
+  </p>
+
+  <div class="callout tip">
+    <div class="callout-title">🤖 Android Mental Model: Jetpack Paging 3 &amp; Opaque Cursors</div>
+    <p style="margin-bottom: 0;">
+      In Android Jetpack <strong>Paging 3</strong>, your <code>PagingSource&lt;String, OrderItem&gt;</code> passes <code>nextCursor</code> from the previous JSON page into the next Retrofit request (<code>GET /api/v1/orders?cursor=...&amp;limit=20</code>). On the backend, <strong>Keyset Pagination</strong> seeks directly into the B-Tree index via <code>WHERE id &gt; :afterId ORDER BY id ASC LIMIT 20</code>—executing in ~0.1ms whether the user is on Page 1 or Page 50,000!
+    </p>
+  </div>
+
+  <h2>2. Simple Primary-Key Cursor Pagination</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Keyset Pagination Repository (O(log N) B-Tree Seek)</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.2+</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.ecommerce.order;
+
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+
+@Repository
+public class OrderKeysetRepository {
+    private final JdbcClient jdbcClient;
+
+    public OrderKeysetRepository(JdbcClient jdbcClient) {
+        this.jdbcClient = jdbcClient;
+    }
+
+    public List&lt;OrderSummary&gt; fetchPage(Long afterId, int limit) {
+        int safeLimit = Math.min(Math.max(limit, 1), 100); // Always cap page size!
+        if (afterId == null) {
+            return jdbcClient.sql("SELECT id, status, total FROM orders ORDER BY id ASC LIMIT :limit")
+                .param("limit", safeLimit)
+                .query(OrderSummary.class)
+                .list();
+        }
+        return jdbcClient.sql("SELECT id, status, total FROM orders WHERE id &gt; :afterId ORDER BY id ASC LIMIT :limit")
+            .param("afterId", afterId)
+            .param("limit", safeLimit)
+            .query(OrderSummary.class)
+            .list();
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.ecommerce.order
+
+import org.springframework.jdbc.core.simple.JdbcClient
+import org.springframework.stereotype.Repository
+
+@Repository
+class OrderKeysetRepository(private val jdbcClient: JdbcClient) {
+
+    fun fetchPage(afterId: Long?, limit: Int): List&lt;OrderSummary&gt; {
+        val safeLimit = limit.coerceIn(1, 100)
+        return if (afterId == null) {
+            jdbcClient.sql("SELECT id, status, total FROM orders ORDER BY id ASC LIMIT :limit")
+                .param("limit", safeLimit)
+                .query(OrderSummary::class.java)
+                .list()
+        } else {
+            jdbcClient.sql("SELECT id, status, total FROM orders WHERE id &gt; :afterId ORDER BY id ASC LIMIT :limit")
+                .param("afterId", afterId)
+                .param("limit", safeLimit)
+                .query(OrderSummary::class.java)
+                .list()
+        }
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>3. Senior Trap: Sorting by Non-Unique Columns (<code>created_at</code> Tie-Breakers)</h2>
+  <p>
+    Real mobile feeds almost always sort newest-first by <code>created_at DESC</code>. What happens if two orders arrive in the exact same microsecond (<code>2027-03-10T12:00:00.125Z</code>), and the page boundary cuts right between them? Filtering with <code>WHERE created_at &lt; :lastCreatedAt</code> <strong>permanently skips the second order!</strong>
+  </p>
+  <p>
+    <strong>The Production Fix — Composite Tuple Comparison + Matching Index:</strong> Pair the timestamp with a unique tie-breaker column (<code>id</code>) in both the Flyway index and PostgreSQL's row-value tuple predicate:
+  </p>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Deterministic Composite Cursor: (created_at DESC, id DESC)</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">PostgreSQL + Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">PostgreSQL + Kotlin 2.2+</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>-- 1. Flyway Index MUST match exact sort direction of both columns:
+CREATE INDEX CONCURRENTLY idx_orders_created_id_desc
+    ON orders (created_at DESC, id DESC);
+
+-- 2. SQL Row-Value Comparison handles timestamp ties deterministically:
+SELECT id, created_at, total
+FROM orders
+WHERE (created_at, id) &lt; (:afterCreatedAt, :afterId)
+ORDER BY created_at DESC, id DESC
+LIMIT :limit;</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>// Encode composite cursor as Base64URL("2027-03-10T12:00:00.125Z|8921") for mobile clients
+data class OrderCursor(val createdAt: Instant, val id: Long)
+
+fun findNewestOrders(cursor: OrderCursor, limit: Int): List&lt;OrderSummary&gt; =
+    jdbcClient.sql("""
+        SELECT id, created_at, total
+        FROM orders
+        WHERE (created_at, id) &lt; (:afterCreatedAt, :afterId)
+        ORDER BY created_at DESC, id DESC
+        LIMIT :limit
+    """.trimIndent())
+        .param("afterCreatedAt", cursor.createdAt)
+        .param("afterId", cursor.id)
+        .param("limit", limit.coerceIn(1, 100))
+        .query(OrderSummary::class.java)
+        .list()</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis.
+  </p>
+
+  <div class="quiz-card" id="q0021_1" data-explanation="Offset pagination forces the database to read and discard N rows before returning limit rows. Keyset pagination uses an index seek to jump straight to the cursor in O(log N) time.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Why does Keyset (cursor) pagination maintain sub-millisecond execution at page 10,000 while <code>OFFSET</code> degrades?</div>
+    <div class="quiz-code-snippet"><pre><code>-- Query A: SELECT * FROM items ORDER BY id LIMIT 20 OFFSET 200000;
+-- Query B: SELECT * FROM items WHERE id &gt; 200000 ORDER BY id LIMIT 20;</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Both are SQL queries executing on PostgreSQL; the difference is the index seek access path.">
+        Query B executes inside Redis memory cache while Query A executes on disk
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="The client only receives 20 items in both queries; the server database does the wasteful work in Query A.">
+        Query A requires client Android phones to download all 200,000 items
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Keyset pagination respects full ACID transactions.">
+        Query B disables ACID transaction isolation on PostgreSQL tables
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="WHERE id &gt; :lastId leverages the B-Tree index in O(log N) time, eliminating the linear scan-and-discard penalty.">
+        Query B seeks directly via the B-Tree index without scanning 200,000 rows
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0021_2" data-explanation="Because created_at is not guaranteed unique across concurrent writes, filtering strictly by created_at &lt; :cursor drops rows that share the boundary timestamp. Adding a unique tie-breaker column (created_at, id) guarantees total ordering.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">Why must a newest-first keyset query use a composite cursor <code>(created_at, id) &lt; (:ts, :id)</code> instead of <code>created_at &lt; :ts</code> alone?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Two concurrent orders can share the exact same timestamp, so a unique id tie-breaker prevents skipped rows.">
+        Concurrent rows can share identical timestamps, so a unique id tie-breaker prevents skipped items
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="PostgreSQL B-Tree indexes support TIMESTAMPTZ columns natively.">
+        PostgreSQL refuses to create single-column B-Tree indexes on TIMESTAMPTZ columns
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Composite cursors do not bypass JDBC parameter binding.">
+        Spring JdbcClient throws an exception whenever SQL queries bind fewer than two parameters
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Android Paging 3 accepts any opaque String cursor from the backend.">
+        Android Paging 3 crashes unless every cursor string contains two pipe-delimited values
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0021_3" data-explanation="Never trust a client-supplied ?limit=10000000 parameter! Unbounded limits let a single malicious or buggy request load millions of rows into JVM heap and trigger an OutOfMemoryError.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">What happens if your pagination endpoint passes a client-supplied <code>?limit=5000000</code> query parameter straight into SQL without clamping it (e.g., <code>Math.min(limit, 100)</code>)?</div>
+    <div class="quiz-options">
+          <button class="quiz-opt-btn" data-is-correct="false" data-reason="PostgreSQL happily executes LIMIT 5000000 and streams all matching rows.">
+        PostgreSQL automatically caps every SQL LIMIT clause at 50 rows by default
+      </button>
+          <button class="quiz-opt-btn" data-is-correct="false" data-reason="HikariCP manages connection count, not row count per SQL SELECT.">
+        HikariCP splits large LIMIT queries across 50 parallel read-only connections automatically
+      </button>
+          <button class="quiz-opt-btn" data-is-correct="false" data-reason="Jackson serializes arbitrarily large lists until heap memory runs out.">
+        Jackson 3 truncates JSON arrays at 100 elements automatically during HTTP serialization
+      </button>
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! One malicious request can pull millions of rows into JVM RAM, causing GC thrashing and OutOfMemoryError.">
+        One abusive request pulls millions of rows into JVM memory and triggers OutOfMemoryError
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Implement <code>buildKeysetQuery</code> with safe page-size clamping (max <code>100</code>) and keyset cursor filtering.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0021-lab"
+       data-starter-java="package com.example.pagination;
+
+public class KeysetQueryBuilder {
+    public static String buildKeysetQuery(Long cursorId, int requestedLimit) {
+        // TODO 1: Clamp limit to at most 100 using Math.min(requestedLimit, 100)
+        // TODO 2: If cursorId == null, return &quot;SELECT * FROM orders ORDER BY id ASC LIMIT &quot; + safeLimit
+        // TODO 3: Otherwise return &quot;SELECT * FROM orders WHERE id &gt; &quot; + cursorId + &quot; ORDER BY id ASC LIMIT &quot; + safeLimit
+        return &quot;&quot;;
+    }
+}"
+       data-starter-kotlin="package com.example.pagination
+
+import kotlin.math.min
+
+object KeysetQueryBuilder {
+    fun buildKeysetQuery(cursorId: Long?, requestedLimit: Int): String {
+        // TODO 1: Clamp limit to at most 100 using min(requestedLimit, 100) or coerceAtMost(100)
+        // TODO 2: If cursorId == null, return &quot;SELECT * FROM orders ORDER BY id ASC LIMIT $safeLimit&quot;
+        // TODO 3: Otherwise return &quot;SELECT * FROM orders WHERE id &gt; $cursorId ORDER BY id ASC LIMIT $safeLimit&quot;
+        return &quot;&quot;
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0021</span>
+        <span class="practice-title">Safe Keyset Cursor Query Builder</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.2+</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0021-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p><strong>Goal:</strong> Implement <code>buildKeysetQuery(cursorId, requestedLimit)</code>:</p>
+      <ul style="margin-left: 20px; line-height: 1.7;">
+        <li>Clamp <code>requestedLimit</code> so it never exceeds <code>100</code> (<code>Math.min(requestedLimit, 100)</code> or <code>requestedLimit.coerceAtMost(100)</code>).</li>
+        <li>If <code>cursorId == null</code>: return <code>"SELECT * FROM orders ORDER BY id ASC LIMIT " + safeLimit</code>.</li>
+        <li>If <code>cursorId != null</code>: return <code>"SELECT * FROM orders WHERE id &gt; " + cursorId + " ORDER BY id ASC LIMIT " + safeLimit</code>.</li>
+      </ul>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.pagination;
+
+public class KeysetQueryBuilder {
+    public static String buildKeysetQuery(Long cursorId, int requestedLimit) {
+        // TODO 1: Clamp limit to at most 100 using Math.min(requestedLimit, 100)
+        // TODO 2: If cursorId == null, return &quot;SELECT * FROM orders ORDER BY id ASC LIMIT &quot; + safeLimit
+        // TODO 3: Otherwise return &quot;SELECT * FROM orders WHERE id &gt; &quot; + cursorId + &quot; ORDER BY id ASC LIMIT &quot; + safeLimit
+        return &quot;&quot;;
+    }
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Page Size Cap</div>
+        <div>Compute <code>int safeLimit = Math.min(requestedLimit, 100);</code> (or <code>val safeLimit = requestedLimit.coerceAtMost(100)</code> in Kotlin).</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: First Page vs. Subsequent Page</div>
+        <div>Check <code>if (cursorId == null)</code> for the initial page, and include <code>WHERE id &gt;</code> when <code>cursorId</code> is present.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Concrete Snippet</div>
+        <div><code>int safeLimit = Math.min(requestedLimit, 100); if (cursorId == null) return "SELECT * FROM orders ORDER BY id ASC LIMIT " + safeLimit; return "SELECT * FROM orders WHERE id &gt; " + cursorId + " ORDER BY id ASC LIMIT " + safeLimit;</code></div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 25 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.pagination;
+
+public class KeysetQueryBuilder {
+    public static String buildKeysetQuery(Long cursorId, int requestedLimit) {
+        int safeLimit = Math.min(requestedLimit, 100);
+        if (cursorId == null) {
+            return "SELECT * FROM orders ORDER BY id ASC LIMIT " + safeLimit;
+        }
+        return "SELECT * FROM orders WHERE id &gt; " + cursorId + " ORDER BY id ASC LIMIT " + safeLimit;
+    }
+}</code></pre>
+
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.2+ Implementation:</div>
+      <pre class="solution-code"><code>package com.example.pagination
+
+import kotlin.math.min
+
+object KeysetQueryBuilder {
+    fun buildKeysetQuery(cursorId: Long?, requestedLimit: Int): String {
+        val safeLimit = min(requestedLimit, 100)
+        return if (cursorId == null) {
+            "SELECT * FROM orders ORDER BY id ASC LIMIT $safeLimit"
+        } else {
+            "SELECT * FROM orders WHERE id &gt; $cursorId ORDER BY id ASC LIMIT $safeLimit"
+        }
+    }
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Keyset pagination seeks the B-Tree index in constant logarithmic time while clamping <code>LIMIT</code> protects JVM heap memory against unbounded client page requests.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"Why should a REST API Base64-encode keyset cursors instead of exposing raw database primary key integers to mobile clients?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0020-database-migrations-with-flyway.html" class="btn btn-secondary">← Previous: Lesson 0020</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0022-jpa-entities-and-preventing-n-plus-one.html" class="btn btn-primary">Next: Lesson 0022 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0021 (Stage 1: Mid-Level Core)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0021-lab'] = function(code, lang) {
+  const tests = [];
+  const upper = code.toUpperCase();
+  tests.push({
+    name: "Clamps Page Size Limit (<= 100)",
+    passed: /Math\.min\s*\(|min\s*\(|coerceAtMost\s*\(|coerceIn\s*\(|>\s*100/.test(code) && /100/.test(code),
+    error: "Must clamp requestedLimit to at most 100 (e.g., Math.min(requestedLimit, 100) or coerceAtMost(100))."
+  });
+  tests.push({
+    name: "Handles Initial Page (cursorId == null)",
+    passed: /cursorId\s*(!==?|===?)\s*null/.test(code),
+    error: "Must check whether cursorId == null for the first page."
+  });
+  tests.push({
+    name: "Seeks via WHERE id > cursorId",
+    passed: (upper.includes("WHERE ID >") || upper.includes("WHERE ID>")) && upper.includes("ORDER BY ID ASC") && upper.includes("LIMIT"),
+    error: "Must return SQL containing WHERE id > ..., ORDER BY id ASC, and LIMIT."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

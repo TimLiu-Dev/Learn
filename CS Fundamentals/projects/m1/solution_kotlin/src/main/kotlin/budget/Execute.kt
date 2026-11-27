@@ -13,49 +13,38 @@ typealias ReadLines = (path: String) -> List<String>?
  * The pure core: given a checked command and a way to read files, compute the
  * outcome. No printing, no exiting, no real files.
  */
-fun execute(command: Command, read: ReadLines): Outcome {
-    if (command is Command.Help) return Outcome.Done(USAGE.lines())
-    val statementPath = when (command) {
-        is Command.Validate -> command.statement
-        is Command.Categorise -> command.statement
-        is Command.Report -> command.statement
-        is Command.Top -> command.statement
-        is Command.Budget -> command.statement
-        Command.Help -> error("handled above")
+fun execute(command: Command, read: ReadLines): Outcome = when (command) {
+    Command.Help -> Outcome.Done(USAGE.lines())
+    is Command.Validate -> {
+        val statement = read(command.statement)?.let(::parseStatement)
+        if (statement == null) Outcome.Failed("cannot read '${command.statement}'")
+        else Outcome.Done(renderValidate(statement), exitCode = if (statement.problems.isEmpty()) 0 else 2)
     }
-    val statement = parseStatement(read(statementPath) ?: return Outcome.Failed("cannot read '$statementPath'"))
-    if (command is Command.Validate) {
-        return Outcome.Done(renderValidate(statement), exitCode = if (statement.problems.isEmpty()) 0 else 2)
-    }
+    is Command.WithRules -> executeWithRules(command, read)
+}
 
-    val rulesPath = when (command) {
-        is Command.Categorise -> command.rules
-        is Command.Report -> command.rules
-        is Command.Top -> command.rules
-        is Command.Budget -> command.rules
-        else -> error("validate and help are handled above")
-    }
-    val rules = when (val parsed = parseRules(read(rulesPath) ?: return Outcome.Failed("cannot read '$rulesPath'"))) {
+private fun executeWithRules(command: Command.WithRules, read: ReadLines): Outcome {
+    val statement = parseStatement(read(command.statement) ?: return cannotRead(command.statement))
+    val rules = when (val parsed = parseRules(read(command.rules) ?: return cannotRead(command.rules))) {
         is Parsed.Ok -> parsed.value
-        is Parsed.Bad -> return Outcome.Failed("$rulesPath ${parsed.reason}")
+        is Parsed.Bad -> return Outcome.Failed("${command.rules} ${parsed.reason}")
     }
     val items = categoriseAll(statement.transactions, rules)
-    val warnings = statement.problems.size.let { bad ->
-        if (bad == 0) emptyList() else listOf("warning: skipped $bad malformed line(s); run 'budget validate' for details")
-    }
-
     val lines = when (command) {
         is Command.Categorise -> renderCategorise(items)
         is Command.Report -> renderReport(monthReport(items, command.month))
         is Command.Top -> renderTop(topExpenses(items, command.month, command.n), command.month, command.n)
         is Command.Budget -> {
-            val budgets = when (val parsed = parseBudgets(read(command.budgets) ?: return Outcome.Failed("cannot read '${command.budgets}'"))) {
+            val budgets = when (val parsed = parseBudgets(read(command.budgets) ?: return cannotRead(command.budgets))) {
                 is Parsed.Ok -> parsed.value
                 is Parsed.Bad -> return Outcome.Failed("${command.budgets} ${parsed.reason}")
             }
             renderBudget(budgetLines(items, command.month, budgets), command.month)
         }
-        else -> error("validate and help are handled above")
     }
+    val bad = statement.problems.size
+    val warnings = if (bad == 0) emptyList() else listOf("warning: skipped $bad malformed line(s); run 'budget validate' for details")
     return Outcome.Done(lines, warnings)
 }
+
+private fun cannotRead(path: String) = Outcome.Failed("cannot read '$path'")

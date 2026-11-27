@@ -1,5 +1,5 @@
 import java.lang.management.ManagementFactory
-import java.util.concurrent.locks.LockSupport
+import java.util.concurrent.SynchronousQueue
 
 fun main() {
     // 1. More busy threads than cores. None of them ever sleeps or yields.
@@ -22,28 +22,14 @@ fun main() {
     println("$n spinning threads on $cores cores for $seconds s of wall time")
     println("CPU time per thread: min ${cpuMs.min()} ms, max ${cpuMs.max()} ms, average ${cpuMs.average().toLong()} ms")
 
-    // 2. Hand a turn back and forth between two threads: each handoff blocks one and wakes the other.
+    // 2. Pass a token back and forth: every handoff blocks one thread and wakes the other.
     val rounds = 100_000
-    var turn = 0                                                    // 0 = main's turn, 1 = partner's
-    val lock = Object()
-    val partner = Thread {
-        repeat(rounds) {
-            synchronized(lock) {
-                while (turn != 1) (lock as Object).wait()
-                turn = 0
-                (lock as Object).notify()
-            }
-        }
-    }
+    val ping = SynchronousQueue<Int>()
+    val pong = SynchronousQueue<Int>()
+    val partner = Thread { repeat(rounds) { pong.put(ping.take()) } }
     partner.start()
     val t = System.nanoTime()
-    repeat(rounds) {
-        synchronized(lock) {
-            turn = 1
-            (lock as Object).notify()
-            while (turn != 0) (lock as Object).wait()
-        }
-    }
+    repeat(rounds) { ping.put(it); pong.take() }                    // one round trip = two handoffs
     val ns = (System.nanoTime() - t).toDouble() / (2 * rounds)
     partner.join()
     println("one thread-to-thread handoff: %.1f µs".format(ns / 1000))

@@ -1,8 +1,10 @@
-// A toy 8-bit computer: 4 registers, 256 bytes for code AND data.
+// A toy 8-bit computer: 4 registers, 256 bytes for code AND data, and a stack pointer (Part 4).
 // Each instruction is 2 bytes: [op:4 | rd:2 | rs:2] [value or address]
 public class Toy {
     static final int HLT = 0x0, LDI = 0x1, LD = 0x2, ST = 0x3;
     static final int ADD = 0x4, SUB = 0x5, JMP = 0x6, JZ = 0x7;
+    static final int CALL = 0x8, RET = 0x9;                  // Part 4: push/pop the return address
+    static final int STACK_LIMIT = 0xF0;                     // the stack may use F0..FF: 16 return addresses
 
     static String hex(int x) { return String.format("%02X", x); }
 
@@ -17,6 +19,8 @@ public class Toy {
             case SUB -> "SUB R" + rd + ", R" + rs;
             case JMP -> "JMP " + hex(b1);
             case JZ -> "JZ  R" + rd + ", " + hex(b1);
+            case CALL -> "CALL " + hex(b1);
+            case RET -> "RET";
             default -> "???";
         };
     }
@@ -25,6 +29,7 @@ public class Toy {
         final int[] mem = new int[256];
         final int[] reg = new int[4];
         int pc = 0;
+        int sp = 0x00;                                       // empty stack; the first push goes to FF
         boolean halted = false;
         int steps = 0;
 
@@ -49,6 +54,17 @@ public class Toy {
                 case SUB -> reg[rd] = (reg[rd] - reg[rs]) & 0xFF;
                 case JMP -> pc = b1;
                 case JZ -> { if (reg[rd] == 0) pc = b1; }          // isZero8, then a mux picks the next pc
+                case CALL -> {
+                    if (sp == STACK_LIMIT) throw new IllegalStateException("stack overflow at " + hex((pc - 2) & 0xFF) + ": SP=" + hex(sp));
+                    sp = (sp - 1) & 0xFF;                          // the stack grows down
+                    mem[sp] = pc;                                  // pc already points past the CALL: the return address
+                    pc = b1;
+                }
+                case RET -> {
+                    if (sp == 0x00) throw new IllegalStateException("stack underflow at " + hex((pc - 2) & 0xFF));
+                    pc = mem[sp];                                  // pop the return address
+                    sp = (sp + 1) & 0xFF;
+                }
                 default -> throw new IllegalStateException("unknown opcode " + hex(op) + " at " + hex((pc - 2) & 0xFF));
             }
             steps++;

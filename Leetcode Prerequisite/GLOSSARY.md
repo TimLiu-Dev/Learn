@@ -124,6 +124,22 @@ _Avoid_: Edge table, vertex grid
 A sorting algorithm that guarantees elements with equal sort keys remain in their exact original relative input order.
 _Avoid_: Crash-free sort, deterministic sort
 
+**Dummy Node (Sentinel Head)**:
+A temporary placeholder `ListNode(0)` allocated before `head` so edge-case insertions or deletions at the first node execute with the exact same `.next` pointer logic as middle nodes.
+_Avoid_: Fake head, padding node
+
+**Backtracking (State Unwinding)**:
+A recursive depth-first search technique that mutates a single shared candidate structure (`choose`), recurses (`explore`), and explicitly reverses the mutation (`unchoose`) as each stack frame unwinds.
+_Avoid_: Trial-and-error recursion, undo looping
+
+**Monotonic Predicate (`firstTrue`)**:
+A boolean condition over an ordered range that transitions at most once from `false` to `true` (`F, F, ..., T, T`), allowing binary search to pinpoint the exact boundary in `O(log n)` time.
+_Avoid_: Boolean guessing, threshold scan
+
+**Memoization (Top-Down DP)**:
+Caching the return value of each distinct recursive subproblem state in an array or hash map so overlapping subtrees evaluate once in `O(1)` lookup time instead of re-branching exponentially.
+_Avoid_: Recursive looping, history array
+
 ## Interview Dynamics
 
 **State Trace Table**:

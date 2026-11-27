@@ -10,6 +10,7 @@ import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
@@ -29,7 +30,7 @@ public class WsHandshake {
 
         CountDownLatch serverGotText = new CountDownLatch(1);
         try (ServerSocket listener = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
-            Thread.ofVirtual().start(() -> serve(listener, serverGotText));
+            Thread server = Thread.ofVirtual().start(() -> serve(listener, serverGotText));
             CompletableFuture<String> greeting = new CompletableFuture<>();
             WebSocket ws = HttpClient.newHttpClient().newWebSocketBuilder()
                 .buildAsync(URI.create("ws://127.0.0.1:" + listener.getLocalPort() + "/chat"), new WebSocket.Listener() {
@@ -43,6 +44,7 @@ public class WsHandshake {
             ws.sendText("hi from java.net.http", true).join();
             serverGotText.await();
             ws.sendClose(WebSocket.NORMAL_CLOSURE, "bye").join();
+            server.join();                                                 // let the server print its last line
         }
     }
 
@@ -54,10 +56,11 @@ public class WsHandshake {
                 System.out.println("  > " + line);
                 if (line.toLowerCase().startsWith("sec-websocket-key:")) key = line.substring(18).trim();
             }
+            String acc = accept(Objects.requireNonNull(key, "not a WebSocket request"));
             OutputStream out = s.getOutputStream();
             out.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                + "Sec-WebSocket-Accept: " + accept(key) + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
-            System.out.println("  < HTTP/1.1 101 Switching Protocols, Sec-WebSocket-Accept: " + accept(key));
+                + "Sec-WebSocket-Accept: " + acc + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            System.out.println("  < HTTP/1.1 101 Switching Protocols, Sec-WebSocket-Accept: " + acc);
             byte[] hello = "hello from a raw socket".getBytes(StandardCharsets.UTF_8);
             out.write(new byte[] {(byte) 0x81, (byte) hello.length});      // FIN + text opcode; unmasked, short length
             out.write(hello);

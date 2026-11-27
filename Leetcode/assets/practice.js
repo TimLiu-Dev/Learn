@@ -1,26 +1,52 @@
-// Interactive In-Browser Code Practice Runner using Skulpt Python
+// Interactive In-Browser Code Practice Runner powered by Pyodide (CPython 3.12 WebAssembly)
 // Supports:
-// - Live client-side Python execution against embedded test cases
-// - Progressive hint ladder (Hint 1 -> Hint 2 -> Hint 3)
-// - Final solution drawer with Kotlin, Python, and Java tabs
-// - Tab key indentation (4 spaces) & code reset
+// - Lazy on-demand WebAssembly Python 3.12 runtime (zero page-load overhead; cached after first run)
+// - Full CPython stdlib: heapq, Counter, deque, defaultdict, bisect, functools.cache, typing, eval, json
+// - Isolated per-run namespace + optional data-setup driver code (keeps user editor clean)
+// - Progressive hint ladder, trilingual solution drawer, Tab/Shift+Tab indentation, and boilerplate reset
 
 (function () {
   "use strict";
 
-  // Ensure Skulpt standard library reader is defined
-  function builtinRead(x) {
-    if (
-      typeof Sk === "undefined" ||
-      Sk.builtinFiles === undefined ||
-      Sk.builtinFiles["files"][x] === undefined
-    ) {
-      throw "File not found: '" + x + "'";
-    }
-    return Sk.builtinFiles["files"][x];
+  const PYODIDE_VERSION = "v0.27.4";
+  const PYODIDE_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/${PYODIDE_VERSION}/full/`;
+  const PYODIDE_SCRIPT_URL = `${PYODIDE_INDEX_URL}pyodide.js`;
+
+  let pyodidePromise = null;
+
+  function loadPyodideRuntime() {
+    if (pyodidePromise) return pyodidePromise;
+    pyodidePromise = new Promise(function (resolve, reject) {
+      function init() {
+        if (typeof window.loadPyodide !== "function") {
+          reject(new Error("Pyodide loader unavailable."));
+          return;
+        }
+        window
+          .loadPyodide({ indexURL: PYODIDE_INDEX_URL })
+          .then(resolve)
+          .catch(reject);
+      }
+
+      if (typeof window.loadPyodide === "function") {
+        init();
+        return;
+      }
+
+      const script = document.createElement("script");
+      script.src = PYODIDE_SCRIPT_URL;
+      script.async = true;
+      script.onload = init;
+      script.onerror = function () {
+        pyodidePromise = null;
+        reject(new Error("Failed to fetch Pyodide from CDN (check internet connection)."));
+      };
+      document.head.appendChild(script);
+    });
+    return pyodidePromise;
   }
 
-  // Handle Tab key in textareas
+  // Handle Tab / Shift+Tab key in textareas
   function setupTabIndentation(textarea) {
     textarea.addEventListener("keydown", function (e) {
       if (e.key === "Tab") {
@@ -30,17 +56,18 @@
         const value = this.value;
 
         if (e.shiftKey) {
-          // Dedent: remove up to 4 leading spaces from current line
           const lineStart = value.lastIndexOf("\n", start - 1) + 1;
           const currentLine = value.substring(lineStart, start);
           const match = currentLine.match(/^ {1,4}/);
           if (match) {
             const removed = match[0].length;
-            this.value = value.substring(0, lineStart) + currentLine.substring(removed) + value.substring(start);
+            this.value =
+              value.substring(0, lineStart) +
+              currentLine.substring(removed) +
+              value.substring(start);
             this.selectionStart = this.selectionEnd = Math.max(lineStart, start - removed);
           }
         } else {
-          // Indent 4 spaces
           this.value = value.substring(0, start) + "    " + value.substring(end);
           this.selectionStart = this.selectionEnd = start + 4;
         }
@@ -48,9 +75,301 @@
     });
   }
 
+  const PYTHON_RUNNER_DRIVER = `
+import sys, io, json, math, bisect, heapq, random, itertools, functools, collections, traceback
+from collections import deque, defaultdict, Counter
+from typing import List, Dict, Tuple, Set, Optional, Any
+
+def __run_practice_suite(user_code_str, setup_code_str, tests_json_str):
+    buf = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = buf
+
+    ns = {
+        "__builtins__": __builtins__,
+        "sys": sys,
+        "math": math,
+        "bisect": bisect,
+        "heapq": heapq,
+        "random": random,
+        "itertools": itertools,
+        "functools": functools,
+        "collections": collections,
+        "deque": deque,
+        "defaultdict": defaultdict,
+        "Counter": Counter,
+        "List": List,
+        "Dict": Dict,
+        "Tuple": Tuple,
+        "Set": Set,
+        "Optional": Optional,
+        "Any": Any,
+    }
+
+    prelude = '''
+class ListNode:
+    def __init__(self, val=0, next=None):
+        self.val = val
+        self.next = next
+
+def build_list(arr):
+    dummy = ListNode(0)
+    curr = dummy
+    for x in arr:
+        curr.next = ListNode(x)
+        curr = curr.next
+    return dummy.next
+
+def list_to_array(node):
+    res = []
+    curr = node
+    cnt = 0
+    while curr and cnt < 2000:
+        res.append(curr.val)
+        curr = curr.next
+        cnt += 1
+    return res
+
+class TreeNode:
+    def __init__(self, val=0, left=None, right=None):
+        self.val = val
+        self.left = left
+        self.right = right
+
+def build_tree(arr):
+    if not arr or arr[0] is None:
+        return None
+    root = TreeNode(arr[0])
+    q = deque([root])
+    i = 1
+    while q and i < len(arr):
+        curr = q.popleft()
+        if i < len(arr) and arr[i] is not None:
+            curr.left = TreeNode(arr[i])
+            q.append(curr.left)
+        i += 1
+        if i < len(arr) and arr[i] is not None:
+            curr.right = TreeNode(arr[i])
+            q.append(curr.right)
+        i += 1
+    return root
+
+def tree_to_array(root):
+    if not root:
+        return []
+    res = []
+    q = deque([root])
+    while q:
+        curr = q.popleft()
+        if curr:
+            res.append(curr.val)
+            q.append(curr.left)
+            q.append(curr.right)
+        else:
+            res.append(None)
+    while res and res[-1] is None:
+        res.pop()
+    return res
+'''
+    try:
+        exec(prelude, ns, ns)
+        exec(compile(user_code_str, "<editor>", "exec"), ns, ns)
+
+        if "Solution" in ns and isinstance(ns["Solution"], type):
+            sol = ns["Solution"]()
+            for attr in dir(sol):
+                if not attr.startswith("_") and attr not in ns:
+                    ns[attr] = getattr(sol, attr)
+                elif not attr.startswith("_") and callable(getattr(sol, attr)):
+                    ns[attr] = getattr(sol, attr)
+
+        if setup_code_str and setup_code_str.strip():
+            exec(compile(setup_code_str, "<test-harness>", "exec"), ns, ns)
+
+        tests = json.loads(tests_json_str)
+        results = []
+        all_passed = True
+        ListNodeCls = ns["ListNode"]
+        TreeNodeCls = ns["TreeNode"]
+
+        for idx, t in enumerate(tests):
+            call_expr = t.get("call", "")
+            expected = t.get("expected")
+            comp = t.get("compare", "equal")
+            try:
+                actual = eval(call_expr, ns, ns)
+                if isinstance(actual, ListNodeCls):
+                    actual = ns["list_to_array"](actual)
+                elif isinstance(actual, TreeNodeCls):
+                    actual = ns["tree_to_array"](actual)
+                elif actual is None and expected == [] and ("build_list" in call_expr or "build_tree" in call_expr):
+                    actual = []
+
+                is_pass = False
+                if comp == "set_or_equal":
+                    if isinstance(actual, list) and isinstance(expected, list):
+                        try:
+                            is_pass = sorted(actual) == sorted(expected)
+                        except Exception:
+                            is_pass = actual == expected
+                    else:
+                        is_pass = actual == expected
+                elif comp == "set_of_lists":
+                    try:
+                        act_s = sorted([sorted(x) if isinstance(x, list) else x for x in actual])
+                        exp_s = sorted([sorted(x) if isinstance(x, list) else x for x in expected])
+                        is_pass = act_s == exp_s
+                    except Exception:
+                        is_pass = actual == expected
+                else:
+                    is_pass = actual == expected
+
+                if not is_pass:
+                    all_passed = False
+                results.append({
+                    "idx": idx + 1,
+                    "call": call_expr,
+                    "expected": repr(expected),
+                    "actual": repr(actual),
+                    "passed": is_pass
+                })
+            except Exception as e:
+                all_passed = False
+                results.append({
+                    "idx": idx + 1,
+                    "call": call_expr,
+                    "expected": repr(expected),
+                    "actual": f"{type(e).__name__}: {e}",
+                    "passed": False,
+                    "error": True
+                })
+
+        return json.dumps({
+            "ok": True,
+            "passed": all_passed,
+            "stdout": buf.getvalue(),
+            "results": results
+        })
+    except Exception:
+        tb_lines = traceback.format_exc().splitlines()
+        filtered = [ln for ln in tb_lines if "__run_practice_suite" not in ln]
+        return json.dumps({
+            "ok": False,
+            "error": "\\n".join(filtered[-8:]),
+            "stdout": buf.getvalue()
+        })
+    finally:
+        sys.stdout = old_stdout
+`;
+
+  // Extract clean LeetCode-style Kotlin starter stub from a full Kotlin solution without leaking implementation
+  function extractKotlinStub(ktCode) {
+    if (!ktCode) return "";
+    const lines = ktCode.split("\n");
+    const out = [];
+    let depth = 0;
+    let skipUntilDepth = -1;
+
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i];
+      const trimmed = raw.trim();
+      const noComment = raw.replace(/\/\/.*$/, "");
+
+      let opens = 0;
+      let closes = 0;
+      for (let c = 0; c < noComment.length; c++) {
+        if (noComment[c] === "{") opens++;
+        else if (noComment[c] === "}") closes++;
+      }
+
+      if (skipUntilDepth >= 0) {
+        depth += opens - closes;
+        if (depth <= skipUntilDepth) {
+          const indent = skipUntilDepth === 1 ? "    " : "";
+          out.push(indent + "}");
+          skipUntilDepth = -1;
+        }
+        continue;
+      }
+
+      if (trimmed.startsWith("import ")) {
+        out.push(raw);
+        continue;
+      }
+
+      if (depth === 0 && /^(class|object)\s+\w+/.test(trimmed)) {
+        out.push(raw);
+        depth += opens - closes;
+        continue;
+      }
+
+      if (depth === 0 && /^fun\s+\w+/.test(trimmed)) {
+        const sig = raw.replace(/\{[\s\S]*$/, "{");
+        out.push(sig);
+        out.push("    // TODO: implement in Kotlin");
+        out.push("    TODO()");
+        if (opens > closes) {
+          skipUntilDepth = 0;
+          depth += opens - closes;
+        } else {
+          out.push("}");
+        }
+        continue;
+      }
+
+      if (depth === 1) {
+        if (/^private\s+/.test(trimmed)) {
+          if (opens > closes) {
+            skipUntilDepth = -2; // silent skip
+            let inner = depth + opens - closes;
+            while (i + 1 < lines.length && inner > 1) {
+              i++;
+              const nc = lines[i].replace(/\/\/.*$/, "");
+              for (let c = 0; c < nc.length; c++) {
+                if (nc[c] === "{") inner++;
+                else if (nc[c] === "}") inner--;
+              }
+            }
+            skipUntilDepth = -1;
+          }
+          continue;
+        }
+        if (/^fun\s+\w+/.test(trimmed)) {
+          if (opens === 0) {
+            out.push(raw);
+            continue;
+          }
+          const sig = raw.replace(/\{[\s\S]*$/, "{");
+          out.push(sig);
+          out.push("        // TODO: implement in Kotlin");
+          out.push("        TODO()");
+          if (opens > closes) {
+            skipUntilDepth = 1;
+            depth += opens - closes;
+          } else {
+            out.push("    }");
+          }
+          continue;
+        }
+        if (trimmed === "}" && closes > opens) {
+          out.push("}");
+          depth += opens - closes;
+          continue;
+        }
+      }
+
+      depth += opens - closes;
+    }
+
+    return out.join("\n").trim();
+  }
+
+  let driverLoaded = false;
+
   // Initialize each practice widget
   document.querySelectorAll(".practice-widget").forEach(function (widget) {
     const editor = widget.querySelector(".practice-editor");
+    const toolbar = widget.querySelector(".practice-toolbar");
     const runBtn = widget.querySelector(".practice-run-btn");
     const hintBtn = widget.querySelector(".practice-hint-btn");
     const solutionBtn = widget.querySelector(".practice-solution-btn");
@@ -63,10 +382,53 @@
 
     setupTabIndentation(editor);
 
-    // Save initial starter code for reset
-    const starterCode = editor.value;
+    // Inject "Copy Kotlin Stub" button derived from the Kotlin solution signature (without revealing solution)
+    const ktCodeEl = solutionDrawer
+      ? solutionDrawer.querySelector('.tab-pane[data-lang="kotlin"] code')
+      : null;
+    const ktStub = ktCodeEl ? extractKotlinStub(ktCodeEl.textContent) : "";
+    if (ktStub && toolbar) {
+      const ktBtn = document.createElement("button");
+      ktBtn.type = "button";
+      ktBtn.className = "practice-btn practice-kt-btn";
+      ktBtn.textContent = "📋 Kotlin Stub";
+      ktBtn.title = "View and copy the clean Kotlin starter signature without revealing the solution";
 
-    // Parse test cases & hints
+      const ktDrawer = document.createElement("div");
+      ktDrawer.className = "kt-stub-drawer callout";
+      ktDrawer.innerHTML =
+        '<p class="meta" style="margin:0 0 .25rem;"><strong>Kotlin Primary Target Starter</strong> (copied to clipboard — paste into LeetCode, IntelliJ, or chat):</p>' +
+        "<pre><code></code></pre>";
+      ktDrawer.querySelector("code").textContent = ktStub;
+      toolbar.insertAdjacentElement("afterend", ktDrawer);
+
+      ktBtn.addEventListener("click", function () {
+        const open = ktDrawer.style.display === "block";
+        ktDrawer.style.display = open ? "none" : "block";
+        if (!open && navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(ktStub).then(function () {
+            ktBtn.textContent = "✓ Kotlin Stub Copied";
+            setTimeout(function () {
+              ktBtn.textContent = "📋 Hide Kotlin Stub";
+            }, 1400);
+          }).catch(function () {
+            ktBtn.textContent = "📋 Hide Kotlin Stub";
+          });
+        } else {
+          ktBtn.textContent = open ? "📋 Kotlin Stub" : "📋 Hide Kotlin Stub";
+        }
+      });
+
+      if (resetBtn) {
+        toolbar.insertBefore(ktBtn, resetBtn);
+      } else {
+        toolbar.appendChild(ktBtn);
+      }
+    }
+
+    const starterCode = editor.value;
+    const setupCode = widget.getAttribute("data-setup") || "";
+
     let testCases = [];
     try {
       testCases = JSON.parse(widget.getAttribute("data-tests") || "[]");
@@ -83,19 +445,18 @@
 
     let currentHintIndex = 0;
 
-    // Reset button
     if (resetBtn) {
       resetBtn.addEventListener("click", function () {
         if (confirm("Reset editor to starter boilerplate?")) {
           editor.value = starterCode;
           if (consoleBox) {
-            consoleBox.innerHTML = '<p class="console-idle">Editor reset. Click <strong>▶ Run Tests</strong> to execute your code.</p>';
+            consoleBox.innerHTML =
+              '<p class="console-idle">Editor reset. Click <strong>▶ Run Tests</strong> to execute your code.</p>';
           }
         }
       });
     }
 
-    // Hint button
     if (hintBtn && hints.length > 0) {
       hintBtn.textContent = `💡 Hint (0/${hints.length})`;
       hintBtn.addEventListener("click", function () {
@@ -119,10 +480,10 @@
       hintBtn.style.display = "none";
     }
 
-    // Solution button
     if (solutionBtn && solutionDrawer) {
       solutionBtn.addEventListener("click", function () {
-        const isHidden = solutionDrawer.style.display === "none" || !solutionDrawer.style.display;
+        const isHidden =
+          solutionDrawer.style.display === "none" || !solutionDrawer.style.display;
         if (isHidden) {
           solutionDrawer.style.display = "block";
           solutionBtn.textContent = "🙈 Hide Solution";
@@ -135,234 +496,57 @@
       });
     }
 
-    // Run tests button
     if (runBtn) {
-      runBtn.addEventListener("click", function () {
+      runBtn.addEventListener("click", async function () {
         runBtn.disabled = true;
-        runBtn.textContent = "⏳ Running...";
+        const firstLoad = !pyodidePromise;
+        runBtn.textContent = firstLoad ? "⏳ Loading Python 3.12..." : "⏳ Running...";
 
         if (consoleBox) {
-          consoleBox.innerHTML = '<p class="console-running">Executing in browser environment...</p>';
+          consoleBox.innerHTML = firstLoad
+            ? '<p class="console-running">Initializing Python 3.12 WebAssembly runtime (first run ~2s, cached afterward)...</p>'
+            : '<p class="console-running">Running test suite in Python 3.12...</p>';
         }
 
-        // Check if Skulpt is loaded
-        if (typeof Sk === "undefined") {
+        try {
+          const pyodide = await loadPyodideRuntime();
+          if (!driverLoaded) {
+            await pyodide.runPythonAsync(PYTHON_RUNNER_DRIVER);
+            driverLoaded = true;
+          }
+
+          runBtn.textContent = "⏳ Running...";
+          const runnerFn = pyodide.globals.get("__run_practice_suite");
+          const rawJson = runnerFn(
+            editor.value,
+            setupCode,
+            JSON.stringify(testCases)
+          );
+          runnerFn.destroy();
+
+          const payload = JSON.parse(rawJson);
+          if (!payload.ok) {
+            renderError(consoleBox, payload.error, payload.stdout);
+          } else {
+            renderTestResults(consoleBox, payload, payload.stdout);
+          }
+        } catch (err) {
           if (consoleBox) {
             consoleBox.innerHTML = `
               <div class="callout warn">
-                <p><strong>Python Engine Notice:</strong> In-browser runtime requires internet access to fetch Skulpt interpreter.</p>
-                <p>You can still write your implementation above and verify it against the <strong>Hints</strong> and <strong>Trilingual Final Solutions</strong> below!</p>
+                <p><strong>Offline / Runtime Notice:</strong> ${escapeHtml(err.message || String(err))}</p>
+                <p>You can still write your Kotlin/Python/Java solution with your <code>/teach</code> coach in chat and verify against the <strong>Hints</strong> and <strong>Trilingual Solutions</strong> below.</p>
               </div>`;
           }
+        } finally {
           runBtn.disabled = false;
           runBtn.textContent = "▶ Run Tests";
-          return;
         }
-
-        const userCode = editor.value;
-        let stdoutCaptured = "";
-
-        // Build test runner harness
-        // Tests format: [{"call": "twoSum([2,7,11,15], 9)", "expected": [0,1], "compare": "set_or_equal"}]
-        const testsJson = JSON.stringify(testCases);
-        const harness = `
-import sys
-import json
-import math
-import collections
-from collections import deque, defaultdict
-
-class __GenericShim:
-    def __getitem__(self, item):
-        return object
-
-Optional = List = Dict = Tuple = Set = __GenericShim()
-
-class ListNode:
-    def __init__(self, val=0, next=None):
-        self.val = val
-        self.next = next
-
-def build_list(arr):
-    dummy = ListNode(0)
-    curr = dummy
-    for x in arr:
-        curr.next = ListNode(x)
-        curr = curr.next
-    return dummy.next
-
-def list_to_array(node):
-    res = []
-    curr = node
-    cnt = 0
-    while curr and cnt < 1000:
-        res.append(curr.val)
-        curr = curr.next
-        cnt += 1
-    return res
-
-class TreeNode:
-    def __init__(self, val=0, left=None, right=None):
-        self.val = val
-        self.left = left
-        self.right = right
-
-def build_tree(arr):
-    if not arr or arr[0] is None:
-        return None
-    root = TreeNode(arr[0])
-    q = [root]
-    qi = 0
-    i = 1
-    while qi < len(q) and i < len(arr):
-        curr = q[qi]
-        qi += 1
-        if i < len(arr) and arr[i] is not None:
-            curr.left = TreeNode(arr[i])
-            q.append(curr.left)
-        i += 1
-        if i < len(arr) and arr[i] is not None:
-            curr.right = TreeNode(arr[i])
-            q.append(curr.right)
-        i += 1
-    return root
-
-def tree_to_array(root):
-    if not root: return []
-    res = []
-    q = [root]
-    qi = 0
-    while qi < len(q):
-        curr = q[qi]
-        qi += 1
-        if curr:
-            res.append(curr.val)
-            q.append(curr.left)
-            q.append(curr.right)
-        else:
-            res.append(None)
-    while res and res[-1] is None:
-        res.pop()
-    return res
-
-${userCode}
-
-if "Solution" in globals() and isinstance(Solution, type):
-    __sol = Solution()
-    for __attr in dir(__sol):
-        if not __attr.startswith("_"):
-            globals()[__attr] = getattr(__sol, __attr)
-
-__tests = json.loads('''${testsJson.replace(/\\/g, "\\\\").replace(/'''/g, "\\'\\'\\'")}''')
-__results = []
-__all_passed = True
-
-for __i, __t in enumerate(__tests):
-    __call = __t.get("call", "")
-    __expected = __t.get("expected")
-    __comp = __t.get("compare", "equal")
-    try:
-        __actual = eval(__call)
-        if isinstance(__actual, ListNode):
-            __actual = list_to_array(__actual)
-        elif isinstance(__actual, TreeNode):
-            __actual = tree_to_array(__actual)
-        elif __actual is None and __expected == [] and ("build_list" in __call or "build_tree" in __call):
-            __actual = []
-
-        __is_pass = False
-        if __comp == "set_or_equal":
-            if isinstance(__actual, list) and isinstance(__expected, list):
-                __is_pass = (sorted(__actual) == sorted(__expected))
-            else:
-                __is_pass = (__actual == __expected)
-        elif __comp == "set_of_lists":
-            # Compare list of lists ignoring order of sublists
-            try:
-                __act_sorted = sorted([sorted(x) if isinstance(x, list) else x for x in __actual])
-                __exp_sorted = sorted([sorted(x) if isinstance(x, list) else x for x in __expected])
-                __is_pass = (__act_sorted == __exp_sorted)
-            except:
-                __is_pass = (__actual == __expected)
-        else:
-            __is_pass = (__actual == __expected)
-
-        if not __is_pass:
-            __all_passed = False
-        __results.append({
-            "idx": __i + 1,
-            "call": __call,
-            "expected": repr(__expected),
-            "actual": repr(__actual),
-            "passed": __is_pass
-        })
-    except Exception as __e:
-        __all_passed = False
-        __results.append({
-            "idx": __i + 1,
-            "call": __call,
-            "expected": repr(__expected),
-            "actual": type(__e).__name__ + ": " + str(__e),
-            "passed": False,
-            "error": True
-        })
-
-print("__PRACTICE_PAYLOAD__" + json.dumps({"passed": __all_passed, "results": __results}))
-`;
-
-        Sk.configure({
-          output: function (text) {
-            stdoutCaptured += text;
-          },
-          read: builtinRead,
-          __future__: Sk.python3,
-          execLimit: 6000 // 6 seconds timeout limit
-        });
-
-        Sk.misceval
-          .asyncToPromise(function () {
-            return Sk.importMainWithBody("<stdin>", false, harness, true);
-          })
-          .then(function () {
-            runBtn.disabled = false;
-            runBtn.textContent = "▶ Run Tests";
-
-            // Parse result payload from stdout
-            const marker = "__PRACTICE_PAYLOAD__";
-            const splitIdx = stdoutCaptured.lastIndexOf(marker);
-            let userOutput = stdoutCaptured;
-            let resultData = null;
-
-            if (splitIdx !== -1) {
-              userOutput = stdoutCaptured.substring(0, splitIdx);
-              const jsonStr = stdoutCaptured.substring(splitIdx + marker.length).trim();
-              try {
-                resultData = JSON.parse(jsonStr);
-              } catch (e) {
-                console.error("JSON parse error on payload:", e);
-              }
-            }
-
-            renderTestResults(consoleBox, resultData, userOutput, testCases.length);
-          })
-          .catch(function (err) {
-            runBtn.disabled = false;
-            runBtn.textContent = "▶ Run Tests";
-
-            let errStr = err.toString();
-            if (err.traceback && err.traceback.length) {
-              // Extract readable error line
-              errStr = err.toString();
-            }
-
-            let cleanUserOut = stdoutCaptured.replace(/__PRACTICE_PAYLOAD__[\s\S]*$/, "");
-            renderError(consoleBox, errStr, cleanUserOut);
-          });
       });
     }
   });
 
-  function renderTestResults(container, data, userStdout, totalTests) {
+  function renderTestResults(container, data, userStdout) {
     if (!container) return;
     if (!data || !data.results) {
       container.innerHTML = `
@@ -382,7 +566,7 @@ print("__PRACTICE_PAYLOAD__" + json.dumps({"passed": __all_passed, "results": __
     if (isAllPass) {
       html += `<div class="test-header pass">
         <span class="test-badge pass">✓ ALL ${passedCount}/${data.results.length} TESTS PASSED</span>
-        <span class="test-meta">Optimal correctness verified!</span>
+        <span class="test-meta">Python 3.12 verification passed — ready to translate/verify in Kotlin!</span>
       </div>`;
     } else {
       html += `<div class="test-header fail">

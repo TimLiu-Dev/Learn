@@ -1,11 +1,9 @@
-// Antigravity Senior Java Interactive Workbench Component
-// Supports both self-rendering into <div id="ex-1" class="workbench-container"></div>
-// and progressive enhancement of pre-existing workbench markup.
+// Antigravity Senior Java Interactive Workbench & Progress Engine
 // Features:
-// - Scaffolded / Bug-Fix initialCode editor with Tab indentation & Cmd/Ctrl+Enter shortcut
-// - Multi-check automated verification suite + realistic simulated JVM/test console output
-// - Progressive step-by-step Hints button
-// - Toggleable "Final Answer" drawer with syntax block, senior trade-off notes, Copy & "Load into Editor" buttons
+// - Scaffolded / Bug-Fix initialCode editor with Tab indentation, Cmd/Ctrl+Enter shortcut & localStorage draft autosave
+// - Multi-check automated verification suite + accurate JDK 25 / Gradle 9 simulated console output
+// - Progressive step-by-step Hints & toggleable "Final Answer" drawer (idempotent against duplicate init)
+// - Automatic & manual Lesson Completion tracking synced with Master Plan Hub (Lesson 0001)
 
 function escapeWbHtml(str) {
   return String(str)
@@ -14,6 +12,57 @@ function escapeWbHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
+
+function getWbLessonId() {
+  const m = (window.location.pathname || '').match(/\/(\d{4})-[^/]+\.html$/);
+  return m ? m[1] : null;
+}
+
+function getProgressStore() {
+  try {
+    const raw = window.localStorage.getItem('agy_java_progress_v1');
+    return raw ? JSON.parse(raw) : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveProgressStore(store) {
+  try {
+    window.localStorage.setItem('agy_java_progress_v1', JSON.stringify(store));
+  } catch (_) {
+    // Ignore sandbox storage errors
+  }
+}
+
+function getDraftKey(lessonId, exId) {
+  return `agy_java_draft_v1_${lessonId}_${exId}`;
+}
+
+function readDraft(lessonId, exId) {
+  if (!lessonId) return null;
+  try {
+    return window.localStorage.getItem(getDraftKey(lessonId, exId));
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeDraft(lessonId, exId, value, initialCode) {
+  if (!lessonId) return;
+  try {
+    const key = getDraftKey(lessonId, exId);
+    if (!value || value === initialCode) {
+      window.localStorage.removeItem(key);
+    } else {
+      window.localStorage.setItem(key, value);
+    }
+  } catch (_) {
+    // Ignore storage errors
+  }
+}
+
+const EXTERNAL_FRAMEWORK_RE = /^\s*import\s+(?:static\s+)?(?:org\.springframework|jakarta\.|javax\.servlet|org\.hibernate|org\.junit|org\.assertj|org\.mockito|io\.resilience4j|com\.github\.benmanes|org\.apache\.|io\.micrometer|io\.opentelemetry|org\.slf4j|tools\.jackson|com\.fasterxml\.jackson|org\.jspecify|io\.grpc|graphql\.|net\.javacrumbs|com\.tngtech|io\.restassured|org\.testcontainers)/m;
 
 class JavaExercise {
   constructor(config) {
@@ -27,6 +76,7 @@ class JavaExercise {
     this.tests = config.tests || [];
     this.hints = Array.isArray(config.hints) ? config.hints : (config.hints ? [config.hints] : []);
     this.revealedHints = 0;
+    this.lessonId = getWbLessonId();
     this.simulatedOutput = config.simulatedOutput || function () {
       return 'Program compiled and executed with exit code 0.';
     };
@@ -36,8 +86,9 @@ class JavaExercise {
   init() {
     this.container = document.getElementById(this.id);
     if (!this.container) return;
+    if (this.container.dataset.wbHydrated === 'true') return;
+    this.container.dataset.wbHydrated = 'true';
 
-    // Self-render if container has no .workbench-editor yet
     if (!this.container.querySelector('.workbench-editor')) {
       this.renderScaffold();
     } else {
@@ -53,12 +104,24 @@ class JavaExercise {
     this.hintBox = this.container.querySelector('.workbench-hints');
     this.solutionBtn = this.container.querySelector('.btn-show-solution');
     this.solutionBox = this.container.querySelector('.workbench-solution');
+    this.statusEl = this.container.querySelector('.workbench-save-status');
 
     if (this.textarea) {
-      if (this.initialCode) {
+      const savedDraft = readDraft(this.lessonId, this.id);
+      if (savedDraft !== null && savedDraft !== this.initialCode) {
+        this.textarea.value = savedDraft;
+        this.setSaveStatus('Draft restored');
+      } else if (this.initialCode) {
         this.textarea.value = this.initialCode;
       }
+      if (this.isExercisePassed()) {
+        this.setSaveStatus('✓ Passed');
+      }
       this.enableEditorShortcuts(this.textarea);
+      this.textarea.addEventListener('input', () => {
+        writeDraft(this.lessonId, this.id, this.textarea.value, this.initialCode);
+        this.setSaveStatus(this.textarea.value === this.initialCode ? '' : 'Draft saved');
+      });
     }
 
     if (this.checkBtn) {
@@ -68,9 +131,11 @@ class JavaExercise {
     if (this.resetBtn) {
       this.resetBtn.addEventListener('click', () => {
         if (this.textarea) this.textarea.value = this.initialCode;
+        writeDraft(this.lessonId, this.id, '', this.initialCode);
         this.revealedHints = 0;
         this.updateHintButtonLabel();
         this.clearFeedback();
+        this.setSaveStatus(this.isExercisePassed() ? '✓ Passed' : '');
       });
     }
 
@@ -87,6 +152,7 @@ class JavaExercise {
         loadBtn.addEventListener('click', () => {
           if (this.textarea && this.solution) {
             this.textarea.value = this.solution;
+            writeDraft(this.lessonId, this.id, this.solution, this.initialCode);
             this.runCheck();
           }
         });
@@ -100,6 +166,36 @@ class JavaExercise {
           }
         });
       }
+    }
+  }
+
+  setSaveStatus(msg) {
+    if (!this.statusEl) return;
+    this.statusEl.textContent = msg || '';
+    this.statusEl.style.display = msg ? 'inline-block' : 'none';
+  }
+
+  isExercisePassed() {
+    if (!this.lessonId) return false;
+    const store = getProgressStore();
+    const entry = store[this.lessonId];
+    return Boolean(entry && Array.isArray(entry.exPassed) && entry.exPassed.includes(this.id));
+  }
+
+  recordExercisePassed() {
+    if (!this.lessonId || this.lessonId === '0001') return;
+    const store = getProgressStore();
+    const entry = store[this.lessonId] || { exPassed: [], quizPassed: [], completed: false };
+    if (!Array.isArray(entry.exPassed)) entry.exPassed = [];
+    if (!entry.exPassed.includes(this.id)) {
+      entry.exPassed.push(this.id);
+    }
+    entry.updatedAt = Date.now();
+    store[this.lessonId] = entry;
+    saveProgressStore(store);
+    this.setSaveStatus('✓ Passed');
+    if (typeof window.syncLessonCompletionState === 'function') {
+      window.syncLessonCompletionState(true);
     }
   }
 
@@ -117,13 +213,16 @@ class JavaExercise {
     this.container.innerHTML = `
       <div class="workbench-header">
         <div class="workbench-filename"><span>&#128196;</span> ${escapeWbHtml(this.filename)}</div>
-        <div><span class="badge badge-current">${escapeWbHtml(this.badge)}</span></div>
+        <div style="display:flex; align-items:center; gap:0.5rem;">
+          <span class="workbench-save-status" style="display:none;"></span>
+          <span class="badge badge-current">${escapeWbHtml(this.badge)}</span>
+        </div>
       </div>
       <div class="workbench-body">
         ${instructionsBlock}
         <textarea class="workbench-editor" spellcheck="false" aria-label="${escapeWbHtml(this.filename)} code editor"></textarea>
         <div class="workbench-actions">
-          <button type="button" class="btn-primary btn-check-solution">&#9654; Run &amp; Check Code</button>
+          <button type="button" class="btn-primary btn-check-solution" title="Shortcut: Cmd/Ctrl + Enter">&#9654; Run &amp; Check Code</button>
           ${hintBtnHtml}
           ${solBtnHtml}
           <button type="button" class="btn-secondary btn-reset-code">&#8635; Reset</button>
@@ -186,6 +285,7 @@ class JavaExercise {
         const end = textarea.selectionEnd;
         textarea.value = textarea.value.substring(0, start) + '    ' + textarea.value.substring(end);
         textarea.selectionStart = textarea.selectionEnd = start + 4;
+        writeDraft(this.lessonId, this.id, textarea.value, this.initialCode);
       } else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
         this.runCheck();
@@ -255,6 +355,18 @@ class JavaExercise {
     }
   }
 
+  buildRunCommandLabel(code) {
+    const clsName = this.filename.replace(/\.java$/, '');
+    const combined = (code || '') + '\n' + (this.solution || '');
+    if (/\bStructuredTaskScope\b/.test(combined)) {
+      return `javac --enable-preview --release 25 ${this.filename} && java --enable-preview ${clsName}`;
+    }
+    if (EXTERNAL_FRAMEWORK_RE.test(combined)) {
+      return `./gradlew compileJava && ./gradlew test --tests *${clsName}*`;
+    }
+    return `javac --release 25 ${this.filename} && java ${clsName}`;
+  }
+
   runCheck() {
     const code = this.textarea ? this.textarea.value : '';
     let passedCount = 0;
@@ -280,6 +392,9 @@ class JavaExercise {
     }
 
     const allPassed = testResults.length > 0 && passedCount === testResults.length;
+    if (allPassed) {
+      this.recordExercisePassed();
+    }
 
     if (this.resultsEl) {
       this.resultsEl.style.display = 'block';
@@ -303,7 +418,8 @@ class JavaExercise {
       this.consoleEl.style.display = 'block';
       if (allPassed) {
         const out = typeof this.simulatedOutput === 'function' ? this.simulatedOutput(code) : this.simulatedOutput;
-        this.consoleEl.innerHTML = `<span class="console-prefix">&gt; javac ${escapeWbHtml(this.filename)} &amp;&amp; java ${escapeWbHtml(this.filename.replace(/\.java$/, ''))}</span>\n${escapeWbHtml(out)}`;
+        const cmdLabel = this.buildRunCommandLabel(code);
+        this.consoleEl.innerHTML = `<span class="console-prefix">&gt; ${escapeWbHtml(cmdLabel)}</span>\n${escapeWbHtml(out)}`;
         this.consoleEl.className = 'workbench-console success';
       } else {
         const firstFailures = testResults.filter((r) => !r.pass).slice(0, 3)
@@ -346,19 +462,222 @@ function runTerminalCommand(termId, command) {
   if (input) input.value = '';
 }
 
-// Auto-hydrate interactive exercises and quizzes from <script type="application/json" id="lesson-data">
+// Lesson completion toggle pill & automatic completion sync
+window.syncLessonCompletionState = function syncLessonCompletionState(allowAutoPromote) {
+  const lessonId = getWbLessonId();
+  if (!lessonId || lessonId === '0001') return;
+
+  const dataEl = document.getElementById('lesson-data');
+  let expectedEx = 0;
+  let expectedQuiz = 0;
+  if (dataEl) {
+    try {
+      const parsed = JSON.parse(dataEl.textContent);
+      expectedEx = Array.isArray(parsed.exercises) ? parsed.exercises.length : 0;
+      expectedQuiz = (parsed.quiz && Array.isArray(parsed.quiz.questions)) ? parsed.quiz.questions.length : 0;
+    } catch (_) {}
+  }
+
+  const store = getProgressStore();
+  const entry = store[lessonId] || { exPassed: [], quizPassed: [], completed: false };
+  const exDone = Array.isArray(entry.exPassed) ? entry.exPassed.length : 0;
+  const qDone = Array.isArray(entry.quizPassed) ? entry.quizPassed.length : 0;
+
+  if (allowAutoPromote && !entry.completed && expectedEx > 0 && exDone >= expectedEx && qDone >= expectedQuiz) {
+    entry.completed = true;
+    entry.updatedAt = Date.now();
+    store[lessonId] = entry;
+    saveProgressStore(store);
+  }
+
+  const btns = document.querySelectorAll('.btn-lesson-complete-toggle');
+  btns.forEach((btn) => {
+    if (entry.completed) {
+      btn.className = 'btn-lesson-complete-toggle is-completed';
+      btn.innerHTML = '&check; Lesson Completed';
+      btn.title = 'Click to mark lesson incomplete';
+    } else {
+      const sub = (exDone > 0 || qDone > 0) ? ` (${exDone}/${expectedEx} drills, ${qDone}/${expectedQuiz} quiz)` : '';
+      btn.className = 'btn-lesson-complete-toggle';
+      btn.innerHTML = `&#9744; Mark Complete${escapeWbHtml(sub)}`;
+      btn.title = 'Completing all drills & quiz questions marks this automatically, or click to toggle';
+    }
+  });
+};
+
+function mountLessonCompletionToggle() {
+  const lessonId = getWbLessonId();
+  if (!lessonId || lessonId === '0001') return;
+  if (!document.getElementById('lesson-data')) return;
+
+  const navCenter = document.querySelector('.lesson-nav .lesson-nav-center');
+  if (navCenter && !navCenter.querySelector('.btn-lesson-complete-toggle')) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-lesson-complete-toggle';
+    btn.addEventListener('click', () => {
+      const store = getProgressStore();
+      const entry = store[lessonId] || { exPassed: [], quizPassed: [], completed: false };
+      entry.completed = !entry.completed;
+      entry.updatedAt = Date.now();
+      store[lessonId] = entry;
+      saveProgressStore(store);
+      window.syncLessonCompletionState(false);
+    });
+    navCenter.appendChild(btn);
+  }
+  window.syncLessonCompletionState(false);
+}
+
+// Master Plan Hub (Lesson 0001) Live Progress Dashboard & Filters
+function hydrateMasterPlanHub() {
+  const lessonId = getWbLessonId();
+  if (lessonId !== '0001') return;
+  const items = Array.from(document.querySelectorAll('.curriculum-item'));
+  if (items.length === 0) return;
+
+  const renderHubState = (activeFilter) => {
+    const store = getProgressStore();
+    let completedLessons = 0;
+    let totalDrillsDone = 0;
+    let totalQuizDone = 0;
+    let mainCompleted = 0;
+    let mainTotal = 0;
+    let nextRecommended = null;
+
+    items.forEach((item) => {
+      const idEl = item.querySelector('.curriculum-id');
+      const linkEl = item.querySelector('.curriculum-name a');
+      const statusEl = item.querySelector('.curriculum-status');
+      const stageEl = item.closest('.stage-section');
+      if (!idEl || !linkEl || !statusEl) return;
+
+      const id = idEl.textContent.trim();
+      const isOptional = Boolean(stageEl && /Optional Track/i.test(stageEl.textContent.slice(0, 160)));
+      if (!isOptional) mainTotal += 1;
+
+      if (!statusEl.dataset.originalHtml) {
+        statusEl.dataset.originalHtml = statusEl.innerHTML;
+      }
+
+      const entry = store[id] || { exPassed: [], quizPassed: [], completed: false };
+      const exCount = Array.isArray(entry.exPassed) ? entry.exPassed.length : 0;
+      const qCount = Array.isArray(entry.quizPassed) ? entry.quizPassed.length : 0;
+      totalDrillsDone += Math.min(2, exCount);
+      totalQuizDone += Math.min(3, qCount);
+
+      if (entry.completed) {
+        completedLessons += 1;
+        if (!isOptional) mainCompleted += 1;
+        item.classList.add('is-lesson-done');
+        statusEl.innerHTML = '<span class="badge badge-next">&check; Completed</span>';
+      } else {
+        item.classList.remove('is-lesson-done');
+        if (!nextRecommended && !isOptional) {
+          nextRecommended = { id, title: linkEl.textContent.trim(), href: linkEl.getAttribute('href') };
+        }
+        if (exCount > 0 || qCount > 0) {
+          statusEl.innerHTML = `<span class="badge badge-current">In Progress (${exCount}/2 &bull; ${qCount}/3)</span>`;
+        } else {
+          statusEl.innerHTML = statusEl.dataset.originalHtml;
+        }
+      }
+
+      let visible = true;
+      if (activeFilter === 'main') visible = !isOptional;
+      else if (activeFilter === 'todo') visible = !entry.completed;
+      else if (activeFilter === 'done') visible = Boolean(entry.completed);
+      item.style.display = visible ? '' : 'none';
+    });
+
+    if (!nextRecommended) {
+      const firstTodo = items.find((it) => {
+        const id = it.querySelector('.curriculum-id')?.textContent.trim();
+        return id && !(store[id] && store[id].completed);
+      });
+      if (firstTodo) {
+        const id = firstTodo.querySelector('.curriculum-id').textContent.trim();
+        const a = firstTodo.querySelector('.curriculum-name a');
+        nextRecommended = { id, title: a.textContent.trim(), href: a.getAttribute('href') };
+      }
+    }
+
+    let banner = document.getElementById('hub-progress-dashboard');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'hub-progress-dashboard';
+      banner.className = 'hub-progress-card';
+      const anchor = document.querySelector('.metric-grid');
+      if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(banner, anchor.nextSibling);
+      }
+    }
+
+    const pct = Math.round((mainCompleted / Math.max(1, mainTotal)) * 100);
+    const resumeHtml = nextRecommended
+      ? `<a class="btn-primary hub-resume-btn" href="${escapeWbHtml(nextRecommended.href)}">&#9654; ${completedLessons === 0 ? 'Start' : 'Resume'} Lesson ${escapeWbHtml(nextRecommended.id)}: ${escapeWbHtml(nextRecommended.title)}</a>`
+      : `<span class="badge badge-next" style="font-size:0.88rem; padding:0.45rem 0.85rem;">&#127881; All 90 Coding Lessons Completed!</span>`;
+
+    banner.innerHTML = `
+      <div class="hub-progress-top">
+        <div>
+          <div class="hub-progress-title">Your Local Study Progress</div>
+          <div class="hub-progress-stats">
+            <strong>${mainCompleted} / ${mainTotal}</strong> Main Track Lessons (${pct}%) &bull;
+            <strong>${completedLessons} / ${items.length}</strong> Total &bull;
+            <strong>${totalDrillsDone}</strong> Drills &bull;
+            <strong>${totalQuizDone}</strong> Quiz Checks
+          </div>
+        </div>
+        <div>${resumeHtml}</div>
+      </div>
+      <div class="hub-progress-bar-track" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
+        <div class="hub-progress-bar-fill" style="width:${pct}%"></div>
+      </div>
+      <div class="hub-filter-bar">
+        <div class="hub-filter-group">
+          <button type="button" class="btn-inline ${activeFilter === 'all' ? 'is-active-filter' : ''}" data-hub-filter="all">All (${items.length})</button>
+          <button type="button" class="btn-inline ${activeFilter === 'main' ? 'is-active-filter' : ''}" data-hub-filter="main">Main Track (${mainTotal})</button>
+          <button type="button" class="btn-inline ${activeFilter === 'todo' ? 'is-active-filter' : ''}" data-hub-filter="todo">Remaining (${items.length - completedLessons})</button>
+          <button type="button" class="btn-inline ${activeFilter === 'done' ? 'is-active-filter' : ''}" data-hub-filter="done">Completed (${completedLessons})</button>
+        </div>
+        <button type="button" class="btn-inline hub-reset-progress">Reset Progress</button>
+      </div>
+    `;
+
+    banner.querySelectorAll('[data-hub-filter]').forEach((btn) => {
+      btn.addEventListener('click', () => renderHubState(btn.dataset.hubFilter));
+    });
+    const resetBtn = banner.querySelector('.hub-reset-progress');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        if (window.confirm('Reset all saved lesson checkmarks and quiz progress in this browser?')) {
+          saveProgressStore({});
+          renderHubState('all');
+        }
+      });
+    }
+  };
+
+  renderHubState('all');
+}
+
+// Auto-hydrate interactive exercises, quizzes, completion toggle, and Hub 0001 dashboard
 (function hydrateLessonData() {
   const dataEl = document.getElementById('lesson-data');
-  if (!dataEl) return;
-  try {
-    const payload = JSON.parse(dataEl.textContent);
-    if (Array.isArray(payload.exercises)) {
-      payload.exercises.forEach((exCfg) => new JavaExercise(exCfg));
+  if (dataEl) {
+    try {
+      const payload = JSON.parse(dataEl.textContent);
+      if (Array.isArray(payload.exercises)) {
+        payload.exercises.forEach((exCfg) => new JavaExercise(exCfg));
+      }
+      if (payload.quiz && typeof JavaQuiz !== 'undefined') {
+        new JavaQuiz(payload.quiz);
+      }
+    } catch (err) {
+      console.error('Failed to parse #lesson-data JSON:', err);
     }
-    if (payload.quiz && typeof JavaQuiz !== 'undefined') {
-      new JavaQuiz(payload.quiz);
-    }
-  } catch (err) {
-    console.error('Failed to parse #lesson-data JSON:', err);
+    mountLessonCompletionToggle();
   }
+  hydrateMasterPlanHub();
 })();

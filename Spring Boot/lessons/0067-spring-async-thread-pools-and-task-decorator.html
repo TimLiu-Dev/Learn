@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0067: Spring @Async, Bounded Thread Pools &amp; TaskDecorator Context Propagation</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 3 • Phase 15: Grafana/OTel Telemetry, SLIs/SLOs, Async Pools &amp; Load Verification</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 25 LTS</span>
+        <span class="badge badge-kotlin">Kotlin 2.2+</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0067 • Stage 3 • Phase 15</span>
+    <h1 style="margin-top: 8px;">Spring <code>@Async</code>, Bounded <code>ThreadPoolTaskExecutor</code> &amp; <code>TaskDecorator</code> Context Propagation</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Putting <code>@Async</code> on a Spring service method without configuring a custom executor triggers two silent production disasters: Spring's default <code>SimpleAsyncTaskExecutor</code> either creates unbounded threads or ignores your bounded pool limits, and <strong><code>ThreadLocal</code> context (SLF4J <code>MDC</code> trace IDs and Spring Security <code>SecurityContext</code>) vanishes</strong> on the worker thread! Master bounded <code>ThreadPoolTaskExecutor</code> sizing, <code>CallerRunsPolicy</code> backpressure, and <strong><code>TaskDecorator</code></strong> context propagation.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html#scheduling-task-execution" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring Framework Reference: Task Execution &amp; Scheduling</a> and <a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/core/task/TaskDecorator.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring Javadoc: TaskDecorator</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Android Mental Model Bridge</div>
+    <p style="margin-bottom: 0;">
+      Just as Android's <code>CoroutineContext</code> carries job cancellation and dispatchers down to child tasks, Spring's <strong><code>TaskDecorator</code></strong> intercepts a <code>Runnable</code> right before leaving the HTTP request thread, snapshots the caller's <code>MDC</code> map (<code>traceId</code>) and <code>SecurityContext</code>, restores them inside the worker thread's <code>try</code> block, and clears them in <code>finally</code> so pooled threads never leak user context!
+    </p>
+  </div>
+
+  <h2>1. Three Silent <code>@Async</code> Traps in Production Spring Boot</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>Trap 1 — Unbounded Queue OOMs (<code>queueCapacity = Integer.MAX_VALUE</code>):</strong> Never leave <code>queueCapacity</code> unbounded! If an email or webhook provider stalls, millions of queued lambdas eat container RAM until OOMKilled (137). Set explicit bounds (e.g. <code>core=8, max=16, queue=200</code>) and <code>RejectedExecutionHandler</code> (<code>CallerRunsPolicy</code> for natural backpressure, or throw + alert).</li>
+    <li><strong>Trap 2 — Lost <code>traceId</code> &amp; <code>SecurityContext</code>:</strong> Because SLF4J <code>MDC</code> and <code>SecurityContextHolder</code> store state in <code>ThreadLocal</code>, background <code>@Async</code> logs print empty <code>traceId=""</code> unless you wire a <code>TaskDecorator</code> (or Micrometer's <code>ContextPropagatingTaskDecorator</code>).</li>
+    <li><strong>Trap 3 — Self-Invocation &amp; Swallowed <code>void</code> Exceptions:</strong> Like <code>@Transactional</code>, <code>@Async</code> runs through a Spring AOP proxy—calling <code>this.sendAsync()</code> runs synchronously! Also, uncaught exceptions in <code>@Async void</code> methods never reach callers unless you register an <code>AsyncUncaughtExceptionHandler</code>.</li>
+  </ul>
+
+  <h3>1. Bounded ThreadPoolTaskExecutor Sizing &amp; Backpressure Flow</h3>
+  <div style="background:#090d13; border:1px solid var(--border-color); border-radius:var(--radius-sm); padding:16px; font-family:var(--font-mono); font-size:13px; color:#7ee787; margin:16px 0;">
+Task Submitted ──► [&lt; corePoolSize (8)?] ──Yes──► Spawn/Use Core Worker
+                          │ No
+                   [Queue &lt; queueCapacity (200)?] ──Yes──► Enqueue Bounded Task
+                          │ No (Queue Full!)
+                   [&lt; maxPoolSize (16)?] ──Yes──► Spawn Burst Worker
+                          │ No (Saturated!)
+                   [RejectedExecutionHandler: CallerRunsPolicy (Backpressure) or AbortPolicy]
+  </div>
+
+  <h3>2. Context Propagation Lifecycle Inside TaskDecorator</h3>
+  <p>
+    Note the counter-intuitive standard Java <code>ThreadPoolExecutor</code> rule: burst threads between <code>corePoolSize</code> and <code>maxPoolSize</code> only spawn <em>after</em> the bounded queue fills! Leaving <code>queueCapacity</code> at its default <code>Integer.MAX_VALUE</code> means <code>maxPoolSize</code> is never reached and heap grows until <code>OOMKilled</code>. Meanwhile, always pair <code>MDC.setContextMap(contextMap)</code> inside a <code>try</code> block with <code>finally { MDC.clear(); }</code> inside your <code>TaskDecorator</code> (or use Micrometer's <code>ContextPropagatingTaskDecorator</code>) so recycled threads never stamp Customer A's <code>traceId</code> onto Customer B's logs.
+  </p>
+
+  <h2>2. Production Implementation (Java 25 vs Kotlin 2.2+)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Bounded @Async Executor with MDC TaskDecorator &amp; Graceful Shutdown</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.nexus.async;
+
+import org.slf4j.MDC;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.TaskDecorator;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
+
+@Configuration
+@EnableAsync
+public class AsyncExecutorConfig {
+
+    @Bean(name = "notificationExecutor")
+    public Executor notificationExecutor() {
+        var executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(8);
+        executor.setMaxPoolSize(16);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix("notify-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(20);
+        executor.setTaskDecorator(mdcTaskDecorator());
+        executor.initialize();
+        return executor;
+    }
+
+    private TaskDecorator mdcTaskDecorator() {
+        return runnable -&gt; {
+            Map&lt;String, String&gt; contextMap = MDC.getCopyOfContextMap();
+            return () -&gt; {
+                try {
+                    if (contextMap != null) MDC.setContextMap(contextMap);
+                    runnable.run();
+                } finally {
+                    MDC.clear(); // Prevent ThreadLocal leak across pooled threads!
+                }
+            };
+        };
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.nexus.async
+
+import org.slf4j.MDC
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.core.task.TaskDecorator
+import org.springframework.scheduling.annotation.EnableAsync
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor
+import java.util.concurrent.Executor
+import java.util.concurrent.ThreadPoolExecutor
+
+@Configuration
+@EnableAsync
+class AsyncExecutorConfig {
+
+    @Bean("notificationExecutor")
+    fun notificationExecutor(): Executor =
+        ThreadPoolTaskExecutor().apply {
+            corePoolSize = 8
+            maxPoolSize = 16
+            queueCapacity = 200
+            setThreadNamePrefix("notify-")
+            setRejectedExecutionHandler(ThreadPoolExecutor.CallerRunsPolicy())
+            setWaitForTasksToCompleteOnShutdown(true)
+            setAwaitTerminationSeconds(20)
+            setTaskDecorator(mdcTaskDecorator())
+            initialize()
+        }
+
+    private fun mdcTaskDecorator() = TaskDecorator { runnable -&gt;
+        val contextMap = MDC.getCopyOfContextMap()
+        Runnable {
+            try {
+                if (contextMap != null) MDC.setContextMap(contextMap)
+                runnable.run()
+            } finally {
+                MDC.clear()
+            }
+        }
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to test your mastery of Spring async thread pools and context propagation.</p>
+
+  <div class="quiz-card" id="q0067_1" data-explanation="In a pooled worker thread, MDC lives in a ThreadLocal. If TaskDecorator sets MDC.setContextMap(contextMap) without calling MDC.clear() in a finally block, the next unrelated background task that reuses that same thread inherits the previous user's traceId!">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Inside a custom <code>TaskDecorator</code>, why is calling <code>MDC.clear()</code> inside a <code>finally</code> block mandatory after <code>runnable.run()</code> finishes?</div>
+    <div class="quiz-code-snippet"><pre><code>try {
+    if (contextMap != null) MDC.setContextMap(contextMap);
+    runnable.run();
+} finally {
+    MDC.clear(); // Why is this line critical?
+}</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Worker threads are pooled and reused, so stale ThreadLocal MDC entries would contaminate subsequent tasks.">
+        Pooled worker threads are reused across requests, so uncleared ThreadLocal MDC values pollute future tasks.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. MDC.clear() clears the ThreadLocal map on the worker thread; it does not flush stdout or Loki.">
+        MDC.clear() flushes buffered JSON log lines directly over HTTP to Grafana Loki before closing sockets.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. ThreadPoolTaskExecutor operates normally without throwing if MDC isn't cleared, causing silent log corruption.">
+        ThreadPoolTaskExecutor throws a RejectedExecutionException at shutdown unless every ThreadLocal map is cleared.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. MDC maps are per-thread Java HashMaps and do not lock PostgreSQL or HikariCP connections.">
+        Leaving MDC entries attached to worker threads prevents HikariCP from returning idle connections to PostgreSQL.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0067_2" data-explanation="Wait-free unbounded queues buffer lambdas indefinitely during downstream slowdowns until the pod hits OOMKilled (137). With a bounded queueCapacity and CallerRunsPolicy, when both pool threads and queue are saturated, the submitting HTTP thread executes the task itself, naturally throttling incoming load.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">What does configuring a bounded <code>queueCapacity</code> paired with <code>ThreadPoolExecutor.CallerRunsPolicy</code> accomplish when downstream I/O slows down?</div>
+    <div class="quiz-code-snippet"><pre><code>executor.setQueueCapacity(200);
+executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. CallerRunsPolicy never drops tasks silently; it runs the rejected task on the calling thread.">
+        It silently discards excess background tasks so the server returns HTTP 200 without executing them.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! When the bounded queue fills, CallerRunsPolicy executes tasks on the caller thread, creating natural backpressure.">
+        It caps memory growth and applies backpressure by executing overflow tasks directly on the calling thread.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. CallerRunsPolicy runs inside the local JVM and never pushes jobs to Kafka or SQS.">
+        It forwards overflow @Async method invocations automatically into an Apache Kafka dead-letter queue topic.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. MaxPoolSize remains fixed; CallerRunsPolicy never scales beyond maxPoolSize.">
+        It dynamically increases maxPoolSize to infinite OS threads whenever more than two hundred tasks queue.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0067_3" data-explanation="Even with @EnableAsync enabled, @Async works via Spring AOP proxies. Invoking this.sendEmail() inside the same bean bypasses the proxy and runs synchronously on the HTTP request thread, and @Async void exceptions never propagate back to the caller unless handled by AsyncUncaughtExceptionHandler.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">You annotated <code>sendEmail()</code> with <code>@Async</code>, yet calling <code>this.sendEmail()</code> from <code>placeOrder()</code> inside the same <code>OrderService</code> class still blocks the HTTP request thread. Why?</div>
+    <div class="quiz-code-snippet"><pre><code>@Service
+public class OrderService {
+    public void placeOrder() { this.sendEmail(); } // Blocks for 3 seconds!
+    @Async("notificationExecutor") public void sendEmail() { ... }
+}</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. @Async supports void methods as well as CompletableFuture&lt;T&gt; return types.">
+        Spring @Async annotations only run asynchronously when the method returns a CompletableFuture instead of void.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Naming a custom executor bean works cleanly whenever invoked through an external Spring bean proxy.">
+        Specifying a custom bean name inside @Async disables background thread pool dispatch in Spring Boot.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Calling this.sendEmail() inside the same class bypasses the Spring AOP proxy that dispatches to the executor.">
+        Self-invocation via this bypasses the outer Spring AOP proxy, executing sendEmail synchronously on the caller thread.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. @Async works inside any @Service, @Component, or @Repository Spring bean.">
+        Spring Boot restricts @Async execution exclusively to @RestController classes and disables it on @Service beans.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Implement an MDC-preserving <code>TaskDecorator</code> and configure a bounded <code>ThreadPoolTaskExecutor</code> with <code>setQueueCapacity(200)</code>, <code>CallerRunsPolicy</code>, and graceful shutdown wait.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0067-lab"
+       data-starter-java="package com.nexus.async;
+
+import org.slf4j.MDC;
+import org.springframework.core.task.TaskDecorator;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import java.util.Map;
+import java.util.concurrent.ThreadPoolExecutor;
+
+public class SafeExecutorFactory {
+    public static ThreadPoolTaskExecutor buildExecutor() {
+        var executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(8);
+        executor.setMaxPoolSize(16);
+        // TODO 1: Set queueCapacity to 200 and RejectedExecutionHandler to CallerRunsPolicy
+        // TODO 2: Enable setWaitForTasksToCompleteOnShutdown(true)
+        // TODO 3: Attach a TaskDecorator copying MDC.getCopyOfContextMap() and calling MDC.clear() in finally
+        executor.initialize();
+        return executor;
+    }
+}"
+       data-starter-kotlin="package com.nexus.async
+
+import org.slf4j.MDC
+import org.springframework.core.task.TaskDecorator
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor
+import java.util.concurrent.ThreadPoolExecutor
+
+object SafeExecutorFactory {
+    fun buildExecutor(): ThreadPoolTaskExecutor =
+        ThreadPoolTaskExecutor().apply {
+            corePoolSize = 8
+            maxPoolSize = 16
+            // TODO 1: Set queueCapacity = 200 and setRejectedExecutionHandler(ThreadPoolExecutor.CallerRunsPolicy())
+            // TODO 2: Enable setWaitForTasksToCompleteOnShutdown(true)
+            // TODO 3: Attach setTaskDecorator copying MDC.getCopyOfContextMap() and calling MDC.clear() in finally
+            initialize()
+        }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0067</span>
+        <span class="practice-title">Bounded Executor &amp; MDC TaskDecorator Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0067-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Configure <code>queueCapacity</code> (<code>200</code>), <code>CallerRunsPolicy</code>, <code>setWaitForTasksToCompleteOnShutdown(true)</code>, and a <code>TaskDecorator</code> that captures <code>MDC.getCopyOfContextMap()</code>, restores it with <code>MDC.setContextMap(...)</code>, and cleans up via <code>MDC.clear()</code> in a <code>finally</code> block.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.nexus.async;
+
+import org.slf4j.MDC;
+import org.springframework.core.task.TaskDecorator;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import java.util.Map;
+import java.util.concurrent.ThreadPoolExecutor;
+
+public class SafeExecutorFactory {
+    public static ThreadPoolTaskExecutor buildExecutor() {
+        var executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(8);
+        executor.setMaxPoolSize(16);
+        // TODO 1: Set queueCapacity to 200 and RejectedExecutionHandler to CallerRunsPolicy
+        // TODO 2: Enable setWaitForTasksToCompleteOnShutdown(true)
+        // TODO 3: Attach a TaskDecorator copying MDC.getCopyOfContextMap() and calling MDC.clear() in finally
+        executor.initialize();
+        return executor;
+    }
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Bounded Queue &amp; Backpressure</div>
+        <div>Call <code>executor.setQueueCapacity(200);</code> and <code>executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Graceful Executor Shutdown</div>
+        <div>Call <code>executor.setWaitForTasksToCompleteOnShutdown(true);</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Leak-Free MDC TaskDecorator</div>
+        <div>Capture <code>MDC.getCopyOfContextMap()</code> outside the inner lambda, call <code>MDC.setContextMap(map)</code> inside <code>try</code>, and call <code>MDC.clear()</code> in <code>finally</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 25 Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.async;
+
+import org.slf4j.MDC;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import java.util.Map;
+import java.util.concurrent.ThreadPoolExecutor;
+
+public class SafeExecutorFactory {
+    public static ThreadPoolTaskExecutor buildExecutor() {
+        var executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(8);
+        executor.setMaxPoolSize(16);
+        executor.setQueueCapacity(200);
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setTaskDecorator(runnable -&gt; {
+            Map&lt;String, String&gt; map = MDC.getCopyOfContextMap();
+            return () -&gt; {
+                try {
+                    if (map != null) MDC.setContextMap(map);
+                    runnable.run();
+                } finally {
+                    MDC.clear();
+                }
+            };
+        });
+        executor.initialize();
+        return executor;
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.async
+
+import org.slf4j.MDC
+import org.springframework.core.task.TaskDecorator
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor
+import java.util.concurrent.ThreadPoolExecutor
+
+object SafeExecutorFactory {
+    fun buildExecutor(): ThreadPoolTaskExecutor =
+        ThreadPoolTaskExecutor().apply {
+            corePoolSize = 8
+            maxPoolSize = 16
+            queueCapacity = 200
+            setRejectedExecutionHandler(ThreadPoolExecutor.CallerRunsPolicy())
+            setWaitForTasksToCompleteOnShutdown(true)
+            setTaskDecorator(TaskDecorator { runnable -&gt;
+                val map = MDC.getCopyOfContextMap()
+                Runnable {
+                    try {
+                        if (map != null) MDC.setContextMap(map)
+                        runnable.run()
+                    } finally {
+                        MDC.clear()
+                    }
+                }
+            })
+            initialize()
+        }
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Bounded queues prevent OOM crashes during downstream outages, <code>setWaitForTasksToCompleteOnShutdown</code> protects in-flight work on SIGTERM, and <code>TaskDecorator</code> keeps distributed trace IDs intact without ThreadLocal leaks.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"With spring.threads.virtual.enabled=true in Spring Boot 3.2+, how does SimpleAsyncTaskExecutor behave with Virtual Threads vs a bounded ThreadPoolTaskExecutor?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0066-load-testing-k6-and-streaming-responses.html" class="btn btn-secondary">← Previous: Lesson 0066</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0068-automated-cicd-github-actions-docker-testcontainers.html" class="btn btn-primary">Next: Lesson 0068 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0067 (Stage 3: Production Engineering)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0067-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Bounded Queue (200) & CallerRunsPolicy",
+    passed: (/setQueueCapacity\s*\(\s*200\s*\)|queueCapacity\s*=\s*200/.test(code)) && /CallerRunsPolicy/.test(code),
+    error: "Must configure queueCapacity = 200 and ThreadPoolExecutor.CallerRunsPolicy()."
+  });
+  tests.push({
+    name: "Graceful Task Shutdown Configured",
+    passed: /setWaitForTasksToCompleteOnShutdown\s*\(\s*true\s*\)/.test(code),
+    error: "Must enable setWaitForTasksToCompleteOnShutdown(true)."
+  });
+  tests.push({
+    name: "Leak-Free MDC TaskDecorator",
+    passed: /MDC\.getCopyOfContextMap/.test(code) && /MDC\.setContextMap/.test(code) && /MDC\.clear/.test(code),
+    error: "TaskDecorator must call MDC.getCopyOfContextMap(), MDC.setContextMap(...), and MDC.clear() in finally."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

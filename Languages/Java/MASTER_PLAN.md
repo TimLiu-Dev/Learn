@@ -1,10 +1,10 @@
-# Master Curriculum Plan: Java 25 LTS & Spring Boot 4.0 (90 Lessons)
+# Master Curriculum Plan: Java 25 LTS & Spring Boot 4.0 (91 Lessons)
 
-This workspace transitions an Android developer who can read Kotlin into writing, debugging, and architecting production backend Java systems for 2027. Core Java 25, standard utilities, JVM/AOT internals, and Spring Boot 4.0 + Architecture + Spring AI + Kafka form the **Main Track**; DSA Interview Patterns (`0041`–`0053`) and Spark/Flink Big Data (`0071`–`0073`) live in **Demoted Optional Tracks** at the end so they never block backend mastery.
+This workspace transitions an Android developer who can read Kotlin into writing, debugging, and architecting production backend Java systems for 2027. Core Java 25, standard utilities, JVM internals, and Spring Boot 4.0 + Local Project Lab (`projects/springboot4-order-service/`) + Architecture + Security + Kafka form the **Main Track** (`72` entries: `0001` Hub + `71` Core Backend Lessons); Coding Interviews (`0041`–`0053`), Big Data Streaming (`0071`–`0073`), and Native/Polyglot/AI Extensions (`0082`, `0086`, `0084`) live in **3 Optional Tracks** so they never block backend mastery.
 
 ## Recommended Study Sequence
 
-1. **Main Track — Phase 1: Core Java 25 LTS, Kotlin Bridge, Standard Utilities & Native/AOT Runtime (48 entries: `0001`–`0040`, `0074`–`0080`, `0082`)**
+1. **Main Track — Phase 1: Core Java 25 LTS, Kotlin Bridge, Standard Utilities & JVM Tooling (47 entries: `0001`–`0040`, `0074`–`0080`)**
    - `0001`: [Master Plan & Curriculum Hub](lessons/0001-master-plan-and-curriculum.html) ([Reference](reference/0001-master-plan-and-legend.html))
    - `0002`: [The Java Execution Mental Model & Toolchain](lessons/0002-the-java-execution-mental-model.html) ([Reference](reference/0002-jvm-execution-and-toolchain.html))
    - `0074`: [Kotlin-to-Java 25 Mental-Model Bridge](lessons/0074-kotlin-to-java-mental-model-bridge.html) ([Reference](reference/0074-kotlin-to-java-bridge.html)) **NEW**
@@ -26,7 +26,7 @@ This workspace transitions an Android developer who can read Kotlin into writing
    - `0016`: [Production Date/Time (`java.time`) & Financial Math (`BigDecimal`)](lessons/0016-temporal-java-time-and-bigdecimal.html) ([Reference](reference/0016-java-time-and-bigdecimal.html))
    - `0017`: [Generics & Type Erasure](lessons/0017-generics-and-type-erasure.html) ([Reference](reference/0017-generics-and-erasure.html))
    - `0018`: [Generic Wildcards & The PECS Principle](lessons/0018-generic-wildcards-and-pecs.html) ([Reference](reference/0018-wildcards-and-pecs.html))
-   - `0019`: [Collections Framework Internals](lessons/0019-collections-framework-core.html) ([Reference](reference/0019-collections-cheat-sheet.html))
+   - `0019`: [Collections Internals: `HashMap` Treeification, `Set`, Load Factor & `ArrayDeque`](lessons/0019-collections-framework-core.html) ([Reference](reference/0019-collections-cheat-sheet.html))
    - `0020`: [Sequenced Collections & Comparators](lessons/0020-sequenced-collections-and-comparators.html) ([Reference](reference/0020-sequenced-collections-and-sorting.html))
    - `0021`: [Lambdas & Functional Interfaces](lessons/0021-lambdas-and-functional-interfaces.html) ([Reference](reference/0021-functional-interfaces-and-lambdas.html))
    - `0022`: [Method References, `Optional<T>` & Null Contracts](lessons/0022-method-references-and-optional.html) ([Reference](reference/0022-method-references-and-optional.html))
@@ -48,7 +48,6 @@ This workspace transitions an Android developer who can read Kotlin into writing
    - `0034`: [JVM Memory Layout & Heap Generations](lessons/0034-jvm-memory-and-heap-generations.html) ([Reference](reference/0034-jvm-memory-and-heap-generations.html))
    - `0035`: [Garbage Collection: G1GC & Generational ZGC](lessons/0035-garbage-collection-g1-and-zgc.html) ([Reference](reference/0035-garbage-collection-g1-and-zgc.html))
    - `0036`: [HotSpot JIT Compilation, JFR & Profiling](lessons/0036-jit-compilation-jfr-and-profiling.html) ([Reference](reference/0036-jit-jfr-and-profiling.html))
-   - `0082`: [Off-Heap Memory (`java.lang.foreign` FFM API) & Project Leyden AOT Cache (`-XX:AOTCache`)](lessons/0082-ffm-panama-and-leyden-aot-cache.html) ([Reference](reference/0082-ffm-panama-and-leyden-aot.html)) **NEW**
    - `0037`: [ClassLoaders, MethodHandles & Reflection](lessons/0037-classloading-reflection-annotations.html) ([Reference](reference/0037-classloading-reflection-annotations.html))
    - `0038`: [Build Automation: Gradle 9 & Maven BOMs](lessons/0038-build-automation-maven-and-gradle.html) ([Reference](reference/0038-build-automation-maven-and-gradle.html))
    - `0039`: [Unit & Contract Testing: JUnit 5, AssertJ, Mockito & REST Assured](lessons/0039-modern-unit-testing-junit5-mockito.html) ([Reference](reference/0039-unit-testing.html))
@@ -62,29 +61,28 @@ This workspace transitions an Android developer who can read Kotlin into writing
    - `0058`: [Transactions, Isolation, Locking & Flyway Migrations](lessons/0058-transactions-locking-isolation-and-flyway.html) ([Reference](reference/0058-transactions-locking-and-flyway.html))
    - `0059`: [Servlet 6.1 Containers, Filters & Tomcat Virtual Threads](lessons/0059-servlet-spec-web-containers-virtual-threads.html) ([Reference](reference/0059-servlet-and-virtual-threads.html))
 
-3. **Main Track — Phase 3: Spring Boot 4.0, Software Architecture, API Security, Scaling, Spring AI & Kafka (`0060`–`0070`, `0081`, `0083`–`0090`, 20 Lessons)**
+3. **Main Track — Phase 3: Spring Boot 4.0, Local Lab, Architecture, API Security, Scaling & Kafka (`0060`–`0070`, `0081`, `0083`, `0085`, `0087`–`0091`, 19 Lessons)**
    - `0060`: [IoC, Bean Scopes & `BeanPostProcessor` Internals](lessons/0060-ioc-and-bean-lifecycle.html) ([Reference](reference/0060-spring-ioc-basics.html))
    - `0061`: [Spring Boot 4 Modular Starters, Auto-Configuration & Record Properties](lessons/0061-spring-boot-auto-configuration-and-properties.html) ([Reference](reference/0061-auto-configuration-and-properties.html))
+   - `0091`: [Hands-On Local Spring Boot 4.0 Project: Gradle 9, Profiles, `compose.yaml` & `JdbcClient`](lessons/0091-local-spring-boot-4-project-jdbcclient-and-profiles.html) ([Reference](reference/0091-local-spring-boot-4-project-setup.html)) **NEW**
    - `0062`: [REST APIs, Validation, JSpecify & RFC 9457 `ProblemDetail`](lessons/0062-rest-apis-dtos-validation-problemdetail.html) ([Reference](reference/0062-rest-dtos-and-validation.html))
-   - `0086`: [Beyond REST: gRPC (HTTP/2 & Protobuf), OpenAPI 3.1 Contracts & `Spring for GraphQL` (`@BatchMapping`)](lessons/0086-grpc-protobuf-openapi-and-graphql.html) ([Reference](reference/0086-grpc-openapi-and-graphql.html))
-   - `0088`: [Real-Time & Event-Driven HTTP APIs: `SSE` (`SseEmitter`), WebSockets/STOMP & Signed Webhooks](lessons/0088-realtime-apis-sse-websockets-and-webhooks.html) ([Reference](reference/0088-realtime-sse-websockets-webhooks.html)) **NEW**
+   - `0081`: [Spring Boot 4.0 Deep Delta: Jackson 3, JSpecify, Native API Versioning, `RestTestClient`, Quarkus & Javalin](lessons/0081-spring-boot-4-and-modern-web-ecosystem.html) ([Reference](reference/0081-spring-boot-4-and-web-alternatives.html))
    - `0063`: [Spring Data JPA: Projections, Keyset Pagination & OSIV Off](lessons/0063-spring-data-jpa-repositories-transactions.html) ([Reference](reference/0063-data-jpa-and-transactions.html))
    - `0087`: [SQL Profiling (`EXPLAIN ANALYZE`), Index Internals, Read Replicas, Sharding & CAP](lessons/0087-database-profiling-indexes-scaling-and-cap.html) ([Reference](reference/0087-database-profiling-scaling-and-cap.html)) **NEW**
    - `0064`: [Resilient HTTP: `RestClient`, Framework 7 `@Retryable`, Resilience4j & Idempotency](lessons/0064-restclient-resilience4j-and-idempotency.html) ([Reference](reference/0064-restclient-and-resilience4j.html))
    - `0065`: [Multi-Tier Caching: Caffeine (`W-TinyLFU`) & Redis](lessons/0065-caching-architecture-caffeine-and-redis.html) ([Reference](reference/0065-caffeine-and-redis-caching.html))
+   - `0088`: [Real-Time & Event-Driven HTTP APIs: `SSE` (`SseEmitter`), WebSockets/STOMP & Signed Webhooks](lessons/0088-realtime-apis-sse-websockets-and-webhooks.html) ([Reference](reference/0088-realtime-sse-websockets-webhooks.html)) **NEW**
    - `0066`: [Testing Pyramid: `RestTestClient`, `MockMvcTester`, WireMock & Testcontainers](lessons/0066-production-testing-mockmvc-testcontainers.html) ([Reference](reference/0066-testing-and-testcontainers.html))
    - `0083`: [Software Architecture: Modular Monoliths (`Spring Modulith`), Hexagonal Boundaries & `ArchUnit`](lessons/0083-modular-monoliths-hexagonal-and-archunit.html) ([Reference](reference/0083-spring-modulith-and-archunit.html))
    - `0067`: [Spring Security 7 Filter Chains, OAuth2 JWT & Layered Docker](lessons/0067-security-oauth2-jwt-and-containerization.html) ([Reference](reference/0067-security-oauth2-and-docker.html))
    - `0089`: [API Security (OWASP Top 10, BOLA/IDOR, CORS), ABAC/ReBAC, HTTP Caching (`ETag`) & Sunset](lessons/0089-api-security-owasp-cors-caching-and-lifecycle.html) ([Reference](reference/0089-api-security-cors-etag-lifecycle.html)) **NEW**
    - `0068`: [Observability: OpenTelemetry Starter, Micrometer Tracing & MDC](lessons/0068-observability-opentelemetry-and-logging.html) ([Reference](reference/0068-opentelemetry-and-logging.html))
    - `0090`: [Edge Gateways (`Nginx` & `Spring Cloud Gateway`), 12-Factor Secrets, CI/CD, Contract & Load Testing](lessons/0090-edge-gateway-cicd-contract-and-load-testing.html) ([Reference](reference/0090-gateway-cicd-contract-and-load-testing.html)) **NEW**
-   - `0081`: [Spring Boot 4.0 Deep Delta: Jackson 3, JSpecify, Native API Versioning, `RestTestClient`, Quarkus & Javalin](lessons/0081-spring-boot-4-and-modern-web-ecosystem.html) ([Reference](reference/0081-spring-boot-4-and-web-alternatives.html))
-   - `0084`: [Production AI Engineering in Java: `Spring AI`, Structured `record` Outputs, RAG (`PgVector`) & `@Tool` Calling](lessons/0084-spring-ai-llm-rag-and-tool-calling.html) ([Reference](reference/0084-spring-ai-and-rag-patterns.html))
    - `0069`: [Apache Kafka Internals: KRaft, ISR & Idempotent Producers](lessons/0069-apache-kafka-architecture-and-clients.html) ([Reference](reference/0069-kafka-architecture.html))
    - `0070`: [Spring Kafka Async Publishing, Retry/DLT & Transactional Outbox](lessons/0070-spring-kafka-outbox-and-kafka-streams.html) ([Reference](reference/0070-spring-kafka-and-outbox.html))
    - `0085`: [Distributed Coordination & Production Survival: Sagas, `ShedLock`, Rate Limiting, VT Bulkheads & Incident Diagnostics](lessons/0085-sagas-rate-limiting-bulkheads-and-incidents.html) ([Reference](reference/0085-sagas-bulkheads-and-diagnostics.html))
 
-4. **`[Optional Track A]` Coding Interviews & Algorithmic Patterns (`0041`–`0053`, 13 Lessons — Demoted for Post-Backend Interview Prep)**
+4. **`[Optional Track A]` Coding Interviews & Algorithmic Patterns (`0041`–`0053`, 13 Lessons — Post-Backend Interview Prep)**
    - `0041`: [Java Interview Traps, Autoboxing & Fast I/O](lessons/0041-java-interview-traps-autoboxing-io.html) ([Reference](reference/0041-java-interview-traps-cheatsheet.html))
    - `0042`: [Two Pointers & Sliding Window](lessons/0042-arrays-two-pointers-sliding-window.html) ([Reference](reference/0042-two-pointers-sliding-window.html))
    - `0043`: [Prefix Sums, Difference Arrays & String Rolling Hash / KMP](lessons/0043-prefix-sums-difference-arrays-string-hashing.html) ([Reference](reference/0043-prefix-sums-and-string-hashing.html))
@@ -99,7 +97,12 @@ This workspace transitions an Android developer who can read Kotlin into writing
    - `0052`: [Dynamic Programming Mastery](lessons/0052-dynamic-programming-mastery.html) ([Reference](reference/0052-dynamic-programming-patterns.html))
    - `0053`: [Sweep-Line Intervals & Bitmask DP](lessons/0053-intervals-and-bit-manipulation.html) ([Reference](reference/0053-intervals-and-bit-tricks.html))
 
-5. **`[Optional Track B]` Distributed Data & Streaming Engines (`0071`–`0073`, 3 Lessons — Demoted Big Data Track)**
+5. **`[Optional Track B]` Distributed Data & Streaming Engines (`0071`–`0073`, 3 Lessons — Spark & Flink Specialty)**
    - `0071`: [Apache Spark: Catalyst, `Dataset<Row>` & Tungsten](lessons/0071-apache-spark-dataset-jvm-memory.html) ([Reference](reference/0071-spark-dataset-and-memory.html))
    - `0072`: [Apache Flink: Watermarks, `KeyedProcessFunction` & RocksDB](lessons/0072-apache-flink-stateful-stream-processing.html) ([Reference](reference/0072-flink-stateful-processing.html))
    - `0073`: [End-to-End Streaming Capstone (Gateway + Outbox + Kafka + Flink)](lessons/0073-distributed-streaming-capstone.html) ([Reference](reference/0073-capstone-pipeline.html))
+
+6. **`[Optional Track C]` 2027 Native, Polyglot API & AI Extensions (`0082`, `0086`, `0084`, 3 Lessons — FFM, gRPC/GraphQL & Spring AI)**
+   - `0082`: [Off-Heap Memory (`java.lang.foreign` FFM API) & Project Leyden AOT Cache (`-XX:AOTCache`)](lessons/0082-ffm-panama-and-leyden-aot-cache.html) ([Reference](reference/0082-ffm-panama-and-leyden-aot.html)) **NEW**
+   - `0086`: [Beyond REST: gRPC (HTTP/2 & Protobuf), OpenAPI 3.1 Contracts & `Spring for GraphQL` (`@BatchMapping`)](lessons/0086-grpc-protobuf-openapi-and-graphql.html) ([Reference](reference/0086-grpc-openapi-and-graphql.html))
+   - `0084`: [Production AI Engineering in Java: `Spring AI`, Structured `record` Outputs, RAG (`PgVector`) & `@Tool` Calling](lessons/0084-spring-ai-llm-rag-and-tool-calling.html) ([Reference](reference/0084-spring-ai-and-rag-patterns.html))

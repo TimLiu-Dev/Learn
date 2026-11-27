@@ -1,6 +1,6 @@
-# Universal Mid-Tech LeetCode 116 Glossary
+# Universal Mid-Tech LeetCode 126 Glossary
 
-Canonical terminology, precise definitions, and shared vocabulary for algorithmic patterns, complexity boundaries, and runtime mechanics across all 116 lessons.
+Canonical terminology, precise definitions, and shared vocabulary for algorithmic patterns, complexity boundaries, and 2027 ICA / runtime mechanics across all 126 lessons.
 
 > **Rule:** Definitions stay tight (1–2 sentences) capturing what the concept *is* and what to avoid confusing it with.
 
@@ -29,9 +29,19 @@ Canonical terminology, precise definitions, and shared vocabulary for algorithmi
 - **Pre-Order vs. Post-Order Tree DFS**: Top-down DFS (`pre-order`) passes constraints from parent to child (such as `(min, max)` BST bounds or `maxSoFar`), whereas bottom-up DFS (`post-order`) aggregates child return values upward (such as height, diameter, LCA, or max path sum).
 - **Trie (Prefix Tree)**: A multi-way character tree sharing common string prefixes so `insert`, `search`, and `startsWith` execute in `O(L)` time independent of dictionary size `N`. *Keep `isEnd` flags separate from child maps so `"app"` and `"apple"` coexist cleanly.*
 - **Topological Sort (Kahn's BFS)**: Ordering nodes in a Directed Acyclic Graph (DAG) by tracking each node's `indegree` and repeatedly peeling zero-indegree nodes from a FIFO queue. *If fewer than `V` nodes are processed, the graph contains a cycle.*
-- **Union-Find (Disjoint Set Union)**: Tracking connected components and detecting undirected cycles in near-`O(1)` amortized (`O(α(N))`) time using `parent[]` with **path compression** and **union by rank/size**. *Avoid using Union-Find for directed cycle detection where Kahn's BFS or 3-color DFS is required.*
+- **Union-Find (Disjoint Set Union)**: Tracking connected components and entity equivalence classes (`#684`, `#721`) in near-`O(1)` amortized (`O(α(N))`) time using `parent[]` with **path compression** and **union by rank/size**. *Avoid using Union-Find for directed cycle detection where Kahn's BFS or 3-color DFS is required.*
 - **Dijkstra's Algorithm**: Finding shortest paths in graphs with **non-negative** edge weights using a Min-Heap ordered by cumulative distance `(dist, node)`. *Never use standard unweighted BFS when edges have positive weights, and never use Dijkstra with negative edge weights.*
-- **Backtracking (`Choose → Explore → Unchoose`)**: Depth-first decision-tree search that appends a candidate, recurses on remaining choices, and restores mutable state (`removeLast` / `visited[r][c] = false`) upon return. *Sort inputs and skip `nums[i] == nums[i-1]` at the same tree depth when deduplicating combinations.*
+- **Backtracking (`Choose → Explore → Unchoose`)**: Depth-first decision-tree search that appends a candidate, recurses on remaining choices, and restores mutable state (`removeLast` / `visited[r][c] = false`) upon return.
+- **Same-Depth Sibling Deduplication**: In sorted combination backtracking with duplicate input items (`#40`, `#15`), skipping `i > start && nums[i] == nums[i - 1]` prunes duplicate sibling branches at the same tree depth while still permitting duplicate elements down a single root-to-leaf path (`i == start`).
+- **Comparator Inversion for Top-K Tie-Breaking**: In a size-`K` Min-Heap that evicts the *worst* element first (`#692`), sort primary frequency ascending (`a.freq - b.freq`) **and** invert tie-breaking (`b.word.compareTo(a.word)`) so lexicographically larger words sit at the heap top and get evicted before smaller words.
+- **Sub-Box Coordinate Mapping**: Mapping any 2D cell `(r, c)` on a `9 × 9` grid to its `3 × 3` box index `0..8` in `O(1)` via `boxIdx = (r / 3) * 3 + (c / 3)` (`#36`). *Avoid multiplying `(r / 3) + (c / 3)` without `* 3`, which collides distinct boxes.*
 - **Memoization vs. Tabulation**: Top-down DP (`memoization`) caches recursive subproblem results on demand, whereas bottom-up DP (`tabulation`) fills a table iteratively from base cases to enable `O(1)` rolling-variable space compression.
 - **0/1 vs. Unbounded Knapsack**: In `0/1` Knapsack (each item used at most once, e.g., `#416`), iterate capacity **backward** (`target downTo num`) in 1D DP; in Unbounded Knapsack (unlimited reuse, e.g., `#322`), iterate capacity **forward** (`coin..amount`).
 - **Kadane's & Dual-Extremum Reset**: Tracking the optimal subarray ending at index `i` (`max(num, cur + num)`) in `O(N)` time and `O(1)` space; for products (`#152`), track both `curMax` and `curMin` so negative pairs flip sign into a new maximum.
+
+## 2027 Progressive OOP & CodeSignal ICA Mechanics
+
+- **Half-Open Deterministic TTL `[timestamp, timestamp + ttl)`**: In progressive ICA systems (`#0067`), a record written at `timestamp` with duration `ttl` is live strictly while `now < timestamp + ttl` and expired as soon as `now >= timestamp + ttl`. *Never use wall-clock `System.currentTimeMillis()` or background threads inside deterministic ICA tests.*
+- **Before-Image Undo Stack (Delta Rollback)**: Pushing an empty `UndoMap<Key, Entry?>` on `beginTransaction()` and recording the prior entry only on the **first** mutation to each key in that frame, giving `O(1)` transaction start and `O(T)` rollback (`#0067`). *On nested `commit()`, merge into the parent frame with `putIfAbsent` so the parent preserves its earliest pre-parent state.*
+- **Swap-with-Last Deletion**: Removing an arbitrary element from an unsorted `ArrayList` in `O(1)` time by moving `list.last()` into the deleted slot `idx`, updating `indexMap[lastVal] = idx`, and popping the tail (`#380` / `#0068`).
+- **Scoped Entity Snapshot (Backup / Restore)**: Capturing a user's owned metadata (`path -> size`) at backup time so `restoreUser` purges current user-owned files, skips paths claimed by other users in the meantime, and recalculates quota cleanly (`#0126`).

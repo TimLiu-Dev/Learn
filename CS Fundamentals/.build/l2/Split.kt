@@ -18,9 +18,14 @@ fun main() {
     val cents = bill.movePointRight(2).longValueExact()   // 1000
     val base = cents / 3
     val leftover = cents % 3
-    val shares = List(3) { i -> base + if (i < leftover) 1 else 0 }
-    println(shares.map { BigDecimal.valueOf(it, 2) })
-    println(shares.sum())                        // 1000 cents: nothing lost
+    var total = 0L
+    for (i in 1..3) {
+        val c = base + if (i <= leftover) 1 else 0   // the first `leftover` people pay a cent more
+        total += c
+        print("${BigDecimal.valueOf(c, 2)} ")        // c cents, shown with 2 decimals
+    }
+    println()
+    println(BigDecimal.valueOf(total, 2))        // 10.00: nothing lost
 
     // Ties: HALF_EVEN rounds to the even neighbour, HALF_UP always up
     for (s in listOf("2.345", "2.355")) {

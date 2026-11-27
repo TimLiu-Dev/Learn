@@ -41,4 +41,15 @@ fun main() {
     val minChars = ceil(ln(totalLinks) / ln(62.0)).toInt()
     println("base62 chars needed for ${human(totalLinks)} codes: $minChars " +
             "(62^$minChars = ${human(Math.pow(62.0, minChars.toDouble()))})")
+
+    // From rates to machines with Little's law (L28): in flight = arrival rate x time inside.
+    val serverSecPerRedirect = 0.002   // budget: a cache hit is well under 1 ms, a miss adds a DB round trip
+    val missRate = 0.05                // Part 2's prototype measured a 95.7% hit rate
+    val dbSecPerMiss = 0.001           // one indexed lookup across the network
+    val redirectsPerServer = 4_000.0   // a guess until a load test on real hardware replaces it
+    val peakReads = readsPerSec * peakFactor
+    println("in flight at peak: ${human(peakReads * serverSecPerRedirect)} requests")
+    println("DB connections busy at peak: ${human(peakReads * missRate * dbSecPerMiss)}")
+    val servers = ceil(peakReads / redirectsPerServer).toInt()
+    println("app servers for peak: $servers, plus 1 spare = ${servers + 1}")
 }

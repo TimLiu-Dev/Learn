@@ -1,25 +1,24 @@
-# Mission: Systems & Embedded Software Engineering (Junior Android to Senior Systems Architect)
+# Mission: End-to-End Embedded Systems & AOSP Platform Engineering (2027 Roadmap)
 
 ## Why
-Transition from self-taught junior Android application development to an AI-resilient Senior Systems, Embedded Linux & Automotive OS Engineer by 2027, commanding top-of-market compensation ($185k–$320k) and owning the complete silicon-to-cloud stack—both with and without AOSP.
+Stack deterministic bare-metal firmware, real-time operating systems, and Embedded Linux underneath an existing BSEE + commercial Android/Kotlin background (physical fitness console hardware, Unix domain sockets, system services, AOSP IME) to become competitive for Mid-Level Embedded / Android Platform / Robotics / Edge Systems roles by Weeks 20–21, then advance to Senior Systems mastery.
 
 ## Success looks like
-- Build, bring up, and debug bare-metal C firmware on ARM Cortex-M/RISC-V (custom linker scripts, vector tables, DMA, SWD/OpenOCD, logic analyzer waveforms).
-- Architect real-time multi-threaded firmware on FreeRTOS and Zephyr RTOS with zero priority inversion and deterministic deadlines.
-- Write Modern C++20 zero-overhead drivers, lock-free SPSC atomic queues, and production Linux kernel character device drivers (`ioctl`, waitqueues, coherent DMA, sysfs).
-- Engineer **non-AOSP Embedded Linux systems**: POSIX `epoll`/IPC/`signalfd` daemons, non-blocking sockets & SocketCAN, MMU/storage/power-loss safety (`fsync`+`rename`), `udev`/Capabilities, `PREEMPT_RT` + `libgpiod`, Yocto/Buildroot images, `perf`/`ftrace`/`eBPF` profiling, and cryptographically signed A/B OTA updates.
-- Develop Systems Rust (`no_std`, Embassy async, Linux kernel modules) and **Embedded-to-Cloud** pipelines (Protobuf/CBOR, MQTT v5 + mTLS, Go/Rust telemetry ingestion, Docker CI + QEMU/HIL testing).
-- Bridge Android apps and platform via **NDK/JNI**, Binder IPC, Modern C++20/Rust **AIDL HALs**, and SELinux (plus optional Automotive Specialization: **AAOS VHAL**, CAN-FD, ISO 26262, Hypervisors).
-- Ship the Grand Capstone: *Silicon-to-Cloud Heterogeneous Gateway* (Zephyr MCU + Linux SPI Driver + Yocto/OTA + Rust AIDL/HAL + Compose UI + Go/Rust Cloud Telemetry Ingestor + Docker CI).
+- **Prerequisites Refreshed:** Solid fluency in BSEE bench electronics (1.8V/3.3V/5V logic levels, open-drain pull-ups, decoupling, differential pairs, DMM/oscilloscope probing) and Android/Linux IPC (`AF_UNIX` sockets, `SystemService` boundaries, `adb`/`logcat`, AOSP IME IPC).
+- **Phase 1 — Bare-Metal C (`STM32F411CEU6`):** Write zero-HAL register drivers (SPI+DMA `SSD1306` OLED, `BME280`, I2C+EXTI `LSM6DSV16X` into SPSC ring buffer, `EC11` timer quadrature, `FatFs` MicroSD), linker scripts, startup code, and `HardFault` (`CFSR`) decoders verified with `24MHz` logic analyzer & `DSO2512G`.
+- **Phase 2 — Modern C++20/23 & Fieldbuses (`2x STM32F103C8T6`):** Zero-overhead C++ abstractions (`constexpr`, `std::span`, CRTP/concepts, `-fno-exceptions -fno-rtti`), 1 Mbps `bxCAN` (`SN65HVD230`), and half-duplex `RS485` / Modbus RTU (`SP3485`).
+- **Phase 3 — Embedded Rust (`STM32F411` + `ESP32-C3`):** Cross-architecture `no_std` + `embassy-rs` / `esp-hal` async firmware sharing `embedded-hal` v1.0 crates, RISC-V trap handling (`mtvec`/`mcause`), `probe-rs` + `defmt` RTT logging, and `embedded-hal-mock` tests.
+- **Phase 4 — Production RTOS (`nRF54L15-DK` + `ESP32-S3`):** Zephyr RTOS (`west`, `sysbuild`, DeviceTree, BLE GATT, Shell, `native_sim`/Twister) + FreeRTOS SMP (`xTaskCreatePinnedToCore`, `TWAI` CAN, LVGL on `ST7789` TFT via PSRAM DMA) + `INA226`/DMM power profiling. *(Job Search Trigger: Weeks 20–21)*
+- **Phase 5A — Embedded Linux (`Raspberry Pi 4 8GB`):** Pi 4 boot chain vs SPL/TF-A/U-Boot, `.dtbo` Device Tree overlays, out-of-tree Linux I2C char driver (`/dev/telemetry_sensor` vs mainline `ina2xx`), userspace socket daemon, and reproducible Buildroot (+ Yocto stretch) images.
+- **Phase 5B — AOSP 17 Platform (`ROG Flow Z13 Linux` + Cuttlefish):** Build & boot AOSP 17 Cuttlefish, implement `@VintfStability` `vendor.dev.hardware.fitnesstelemetry` AIDL HAL side-by-side in **C++ and Rust**, `init.rc`, `sepolicy`, VINTF, VTS tests, and Kotlin Compose system dashboard.
+- **Part B Senior Gate (Phases 6–8):** `MCUboot` + `TF-M` TrustZone-M + `PSA Crypto` + BLE DFU + ESP32-S3 virtual eFuses; `TIM1` dead-time complementary PWM + closed-loop PID motor control + `INA226` overcurrent cutoff + CAN bus-off recovery; `KiCad` 4-layer carrier PCB + full silicon bring-up report.
 
 ## Constraints
-- **Current Baseline:** Self-taught junior Android developer (Kotlin/Java); zero prior experience with C, C++, Rust, Go, Linux internals, or computer architecture.
-- **Working Memory Budget:** Lessons must be tightly scoped, modular, and provide rapid tangible wins within the Zone of Proximal Development (ZPD).
-- **Hardware & Cloud Budget:** $0 upfront (local macOS `clang`/`c++`/`rustc`/`cargo`/`go` + QEMU emulation); optional $25 hardware kit later (RP2040 / STM32 + USB Logic Analyzer).
+- **Pacing:** ~12–15 focused hours/week alongside full-time engineering work (~32 weeks for Part A; Part B afterward).
+- **Physical Hardware Lab:** Finalized 33-item (37-unit) Taobao hardware kit — Nordic `nRF54L15-DK`, WeAct `STM32F411CEU6`, `ESP32-S3 N16R8`, `ESP32-C3-Zero-M`, 2x `STM32F103C8T6`, `Raspberry Pi 4 (8GB)`, `ZEEWEII DSO2512G`, `24MHz` Logic Analyzer, `Delixi DT9205APRO` DMM, `CP2102`, `CMSIS-DAP`, `ST-LINK V2`, `2x SP3485`, `2x SN65HVD230`, `BME280`, `LSM6DSV16X`, `SSD1306`, `ST7789`, `MicroSD`, `INA226`, `EC11`, `TB6612FNG`, `12GA-N20 6V 300RPM` Hall-encoder motor + wheel/bracket, `2x MB-102` breadboard kits, `HS-02A` soldering + rework kit (`63/37` solder, `KE-150` flux, brass wool, ESD tweezers, `2016` wick), `MacBook Pro M5 Max` (firmware toolchains), and `ROG Flow Z13` running Linux (Buildroot/Yocto/AOSP 17 Cuttlefish).
+- **Engineering Discipline Every Phase:** Host unit tests (Unity/Ceedling, GoogleTest, `cargo test`, `native_sim`/Twister), GitHub Actions CI, GDB/logic-analyzer/scope evidence, and README wiring + pinned version docs.
 
-## Out of scope
-- Legacy 8-bit microcontrollers (Arduino AVR, 8051, PIC).
-- Obsolete pre-C++11 idioms (raw pointers, manual `malloc`, deep class inheritance).
-- Deprecated Android HIDL (Android 13+ standardizes strictly on AIDL HALs).
-- Generic Android app UI tutorials (already mastered) and heavy enterprise Java/Spring Boot boilerplate (prefer Go/Rust for embedded cloud services).
-- Generic LeetCode algorithmic puzzles (focus strictly on systems memory, concurrency, cache, bus protocols, and distributed device telemetry).
+## Out of scope (for Part A Core Gate)
+- Legacy 8-bit microcontrollers (Arduino AVR, 8051, PIC) and deprecated Android HIDL.
+- Heavy enterprise Java/Spring Boot backends.
+- Optional / Post-Gate specializations (preserved in workspace): AAOS VHAL/Hypervisors (`0030`–`0032`), Cloud MQTT/Go Ingestor (`0028b`–`0028c`), and Kernel Rust (`0027`).

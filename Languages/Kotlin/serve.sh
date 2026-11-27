@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Local course server (http://localhost:8000) with hybrid Kotlin execution engine.
+"""Local course server (http://localhost:8000) with hybrid Kotlin 2.4 execution engine.
 - If local kotlinc / JDK is detected (e.g. IntelliJ IDEA, Android Studio, Brew, SDKMAN),
-  runs code locally with zero latency and 100% offline capability.
-- Otherwise proxies POST /api/run -> https://api.kotlinlang.org without browser CORS restrictions."""
+  runs code locally with timeouts, accurate File.kt line numbers, and 100% offline capability.
+- Otherwise proxies POST /api/run -> https://api.kotlinlang.org (2.4.21+) without browser CORS restrictions."""
 import glob
 import http.server
 import json
@@ -17,11 +17,13 @@ import urllib.request
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
 ROOT = os.path.dirname(os.path.abspath(__file__))
+COMPILE_TIMEOUT_SEC = 25
+RUN_TIMEOUT_SEC = 10
 ENDPOINTS = [
-    "https://api.kotlinlang.org/api/2.1.20/compiler/run",
-    "https://api.kotlinlang.org/api/2.0.21/compiler/run",
     "https://api.kotlinlang.org/api/2.4.21/compiler/run",
     "https://api.kotlinlang.org/api/compiler/run",
+    "https://api.kotlinlang.org/api/2.1.20/compiler/run",
+    "https://api.kotlinlang.org/api/2.0.21/compiler/run",
 ]
 
 
@@ -39,12 +41,10 @@ def find_local_toolchain():
     if not kotlinc_bin:
         return None
 
-    # Check for JAVA_HOME
     candidate_java_home = [
         os.environ.get("JAVA_HOME"),
         "/Applications/IntelliJ IDEA.app/Contents/jbr/Contents/Home",
         "/Applications/Android Studio.app/Contents/jbr/Contents/Home",
-        "/Library/Java/JavaVirtualMachines",
     ]
     java_home = next((h for h in candidate_java_home if h and os.path.isdir(h)), None)
 
@@ -59,7 +59,6 @@ def find_local_toolchain():
     if not java_bin:
         return None
 
-    # Find lib directory with standard library & coroutines
     kotlinc_dir = os.path.dirname(os.path.dirname(os.path.abspath(kotlinc_bin)))
     lib_dir = os.path.join(kotlinc_dir, "lib")
     jars = glob.glob(os.path.join(lib_dir, "*.jar")) if os.path.isdir(lib_dir) else []
@@ -74,6 +73,39 @@ def find_local_toolchain():
 
 
 LOCAL_TOOLCHAIN = find_local_toolchain()
+
+
+def parse_jvm_exception(err_stream):
+    """Extract exception fullName, message, and accurate File.kt lineNumber from JVM stderr."""
+    lines = err_stream.splitlines()
+    if not lines:
+        return None
+
+    full_name = None
+    msg = ""
+    for line in lines:
+        m_thread = re.search(r'Exception in thread "[^"]+"\s+([\w\.\$]+)(?::\s*(.*))?', line)
+        if m_thread:
+            full_name = m_thread.group(1)
+            msg = m_thread.group(2) or ""
+            break
+        m_plain = re.match(r'^([\w\.\$]+(?:Exception|Error))(?::\s*(.*))?$', line.strip())
+        if m_plain:
+            full_name = m_plain.group(1)
+            msg = m_plain.group(2) or ""
+            break
+
+    if not full_name:
+        return None
+
+    m_frame = re.search(r'\(File\.kt:(\d+)\)', err_stream)
+    line_num = int(m_frame.group(1)) if m_frame else None
+    trace = [{"fileName": "File.kt", "lineNumber": line_num}] if line_num else []
+    return {
+        "fullName": full_name,
+        "message": msg,
+        "stackTrace": trace,
+    }
 
 
 def run_code_locally(code):
@@ -99,52 +131,68 @@ def run_code_locally(code):
             comp_cmd.extend(["-cp", cp])
         comp_cmd.append(src_file)
 
-        comp = subprocess.run(comp_cmd, env=env, capture_output=True, text=True)
+        try:
+            comp = subprocess.run(comp_cmd, env=env, capture_output=True, text=True, timeout=COMPILE_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            return {
+                "errors": {"File.kt": [{
+                    "severity": "ERROR",
+                    "message": f"Compilation timed out after {COMPILE_TIMEOUT_SEC}s.",
+                    "interval": {"start": {"line": 0, "ch": 0}, "end": {"line": 0, "ch": 0}},
+                }]},
+                "text": "",
+                "exception": None,
+            }
+
         errors = {"File.kt": []}
 
+        for line in comp.stderr.splitlines():
+            m = re.match(r".*File\.kt:(\d+):\d+:\s*(error|warning):\s*(.*)", line)
+            if m:
+                line_no = int(m.group(1)) - 1
+                sev = "ERROR" if m.group(2) == "error" else "WARNING"
+                errors["File.kt"].append({
+                    "severity": sev,
+                    "message": m.group(3),
+                    "interval": {"start": {"line": line_no, "ch": 0}, "end": {"line": line_no, "ch": 0}},
+                })
+            elif comp.returncode != 0 and "error:" in line:
+                errors["File.kt"].append({
+                    "severity": "ERROR",
+                    "message": line.strip(),
+                    "interval": {"start": {"line": 0, "ch": 0}, "end": {"line": 0, "ch": 0}},
+                })
+
         if comp.returncode != 0:
-            for line in comp.stderr.splitlines():
-                m = re.match(r".*File\.kt:(\d+):\d+:\s*(error|warning):\s*(.*)", line)
-                if m:
-                    line_no = int(m.group(1)) - 1
-                    sev = "ERROR" if m.group(2) == "error" else "WARNING"
-                    errors["File.kt"].append({
-                        "severity": sev,
-                        "message": m.group(3),
-                        "interval": {"start": {"line": line_no, "ch": 0}, "end": {"line": line_no, "ch": 0}},
-                    })
-                elif "error:" in line:
-                    errors["File.kt"].append({
-                        "severity": "ERROR",
-                        "message": line.strip(),
-                        "interval": {"start": {"line": 0, "ch": 0}, "end": {"line": 0, "ch": 0}},
-                    })
             return {"errors": errors, "text": "", "exception": None}
 
-        # Find compiled class name
-        class_files = [f[:-6] for f in os.listdir(out_dir) if f.endswith(".class") and not "$" in f]
+        class_files = [f[:-6] for f in os.listdir(out_dir) if f.endswith(".class") and "$" not in f]
         main_class = "FileKt" if "FileKt" in class_files else (class_files[0] if class_files else "FileKt")
 
         run_cp = f"{out_dir}:{cp}" if cp else out_dir
-        run_proc = subprocess.run([tc["java"], "-cp", run_cp, main_class], env=env, capture_output=True, text=True)
+        try:
+            run_proc = subprocess.run(
+                [tc["java"], "-cp", run_cp, main_class],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=RUN_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as te:
+            partial_out = te.stdout if isinstance(te.stdout, str) else (te.stdout.decode("utf-8", "replace") if te.stdout else "")
+            return {
+                "errors": errors,
+                "text": f"<outStream>{partial_out}</outStream>",
+                "exception": {
+                    "fullName": "java.util.concurrent.TimeoutException",
+                    "message": f"Program timed out after {RUN_TIMEOUT_SEC}s — check your loop termination condition for an infinite loop.",
+                    "stackTrace": [],
+                },
+            }
 
         out_stream = run_proc.stdout
         err_stream = run_proc.stderr
-        exc = None
-
-        if run_proc.returncode != 0 and err_stream:
-            lines = err_stream.splitlines()
-            if lines and ("Exception" in lines[0] or "Error" in lines[0]):
-                exc_line = lines[0]
-                m_exc = re.search(r"Exception in thread \"\w+\" ([\w\.]+)(?:: (.*))?", exc_line)
-                if m_exc:
-                    full_name = m_exc.group(1)
-                    msg = m_exc.group(2) or ""
-                    exc = {
-                        "fullName": full_name,
-                        "message": msg,
-                        "stackTrace": [{"fileName": "File.kt", "lineNumber": 1}],
-                    }
+        exc = parse_jvm_exception(err_stream) if (run_proc.returncode != 0 and err_stream) else None
 
         text_payload = f"<outStream>{out_stream}</outStream>"
         if err_stream and not exc:
@@ -165,7 +213,6 @@ class CourseHandler(http.server.SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         payload_bytes = self.rfile.read(length)
 
-        # 1. Try local execution if toolchain is available
         if LOCAL_TOOLCHAIN:
             try:
                 body = json.loads(payload_bytes.decode("utf-8"))
@@ -180,9 +227,8 @@ class CourseHandler(http.server.SimpleHTTPRequestHandler):
                     self.wfile.write(json.dumps(local_result).encode("utf-8"))
                     return
             except Exception:
-                pass  # Fall back to remote proxy if local execution fails unexpectedly
+                pass
 
-        # 2. Remote proxy fallback
         last_err = "Unknown compiler proxy error"
         for url in ENDPOINTS:
             try:
@@ -215,9 +261,9 @@ class CourseHandler(http.server.SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"Serving Idiomatic Kotlin at http://localhost:{PORT}")
     if LOCAL_TOOLCHAIN:
-        print(f"⚡ Local toolchain detected: {LOCAL_TOOLCHAIN['kotlinc']} (offline execution ready)")
+        print(f"⚡ Local toolchain detected: {LOCAL_TOOLCHAIN['kotlinc']} (offline Kotlin 2.4 execution ready)")
     else:
-        print("🌐 Online proxy mode active: forwarding /api/run -> api.kotlinlang.org")
+        print("🌐 Online proxy mode active: forwarding /api/run -> api.kotlinlang.org (Kotlin 2.4.21+)")
     print("Press Ctrl+C to stop.")
     with http.server.ThreadingHTTPServer(("127.0.0.1", PORT), CourseHandler) as httpd:
         httpd.serve_forever()

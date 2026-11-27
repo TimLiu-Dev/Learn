@@ -1,10 +1,10 @@
 # Systems & Embedded Engineering Glossary
 
-Canonical definitions for low-level computer architecture, operating systems, and Android platform engineering.
+Canonical definitions for low-level computer architecture, bench electronics, RTOS, Embedded Linux, and AOSP 17 platform engineering.
 
 ## Terms
 
-### Hardware & Memory Architecture
+### Hardware, Bench & Memory Architecture
 
 **Bit**:
 The fundamental unit of binary information in silicon, physically represented as a high or low voltage state (1 or 0).
@@ -34,9 +34,25 @@ _Avoid_: Dynamic variable, thread-safe marker
 A dedicated hardware subsystem that transfers blocks of data between peripherals and memory over the system bus without CPU core intervention.
 _Avoid_: Hardware copy, auto-transfer
 
+**Open-Drain Pull-Up**:
+A circuit topology (used by I2C) where devices only pull a shared line to GND and rely on an external resistor to VCC to return the line to logic HIGH.
+_Avoid_: Active push-pull driver, internal bias wire
+
+**Configurable Fault Status Register (CFSR)**:
+An ARM Cortex-M System Control Block register (splitting into MMFSR, BFSR, and UFSR) that latches the exact hardware cause of a HardFault or MemManage/Bus/Usage fault.
+_Avoid_: Generic crash code, panic string
+
+**Differential Pair & Bus Termination**:
+A balanced two-wire signaling topology (`CAN_H`/`CAN_L` or `RS485 A`/`B`) whose voltage difference rejects common-mode noise, terminated at both physical bus ends with 120Ω resistors (60Ω total parallel load).
+_Avoid_: Single-ended wire, ground-referenced trace
+
+**Dead-Time Insertion**:
+A hardware timer delay injected between turning off one power transistor and turning on its complementary partner in an H-bridge to prevent destructive shoot-through current.
+_Avoid_: Software sleep gap, PWM duty cap
+
 ---
 
-### Operating Systems & Concurrency
+### Fieldbuses, Operating Systems & Concurrency
 
 **Interrupt Service Routine (ISR)**:
 A hardware-invoked software callback executed by the CPU in response to an asynchronous electrical signal from a peripheral.
@@ -54,37 +70,61 @@ _Avoid_: Process descriptor, thread state
 A real-time concurrency hazard where a high-priority task is blocked waiting for a resource held by a low-priority task, which is itself preempted by a medium task.
 _Avoid_: Starvation, priority deadlock
 
+**Modbus RTU**:
+A deterministic half-duplex serial industrial protocol over RS485 using binary framing, 3.5-character inter-frame silence delimiters, and a 16-bit CRC checksum.
+_Avoid_: ASCII JSON serial, full-duplex stream
+
+**Quadrature Encoder**:
+An incremental rotary sensor outputting two 90°-phase-shifted square waves (A and B) decoded by a hardware timer to measure both pulse count and rotation direction.
+_Avoid_: Analog potentiometer, single-pulse tachometer
+
+**TrustZone-M & TF-M (Trusted Firmware-M)**:
+Arm Cortex-M33 hardware security partitioning separating a Secure processing environment (keys, PSA Crypto, ITS) from a Non-Secure RTOS application.
+_Avoid_: Software sandbox, user-space permissions
+
+**Virtual eFuses**:
+An emulated RAM/flash OTP configuration mode (used during ESP32-S3 development) for testing Secure Boot v2 and flash encryption without permanently burning irreversible silicon fuses.
+_Avoid_: Production fuse burn, soft reset flags
+
 ---
 
-### Linux Kernel & Android Platform
+### Linux Kernel & AOSP 17 Platform
 
 **Character Device**:
-A Linux kernel driver interface exposing hardware as a sequential stream of bytes accessible via standard file operations (`read`, `write`, `ioctl`).
+A Linux kernel driver interface exposing hardware as a sequential stream of bytes accessible via standard file operations (`read`, `write`, `ioctl`, `poll`).
 _Avoid_: Byte driver, raw device
 
 **Flattened Device Tree (FDT)**:
 A hardware description data structure passed from the bootloader to the Linux kernel detailing memory base addresses, clocks, IRQs, and pin multiplexing.
 _Avoid_: Hardware config, board file
 
+**Unix Domain Socket (`AF_UNIX`)**:
+A local kernel-mediated IPC socket operating over filesystem or abstract namespaces without network stack overhead, supporting stream, datagram, and file-descriptor passing.
+_Avoid_: Loopback TCP port, Binder transaction
+
 **Binder IPC**:
 Android's primary inter-process communication mechanism, using a Linux kernel driver (`/dev/binder`) and single-copy `mmap` transactions between processes.
 _Avoid_: Android RPC, intents engine
 
 **AIDL HAL (Hardware Abstraction Layer)**:
-A standardized Android interface defined in Android Interface Definition Language (AIDL) that decouples system framework services from vendor-specific kernel drivers.
+A standardized Android interface defined in Android Interface Definition Language (`@VintfStability`) that decouples framework services from vendor-specific hardware daemons.
 _Avoid_: HIDL, native driver
 
-**Vehicle HAL (VHAL)**:
-The Android Automotive OS (AAOS) interface mediating communication between Android's `CarService` and the vehicle's physical powertrain/body networks.
-_Avoid_: Car HAL, auto driver
+**Cuttlefish & VTS (Vendor Test Suite)**:
+Google's KVM-accelerated virtual Android device platform for x86-64 Linux hosts and its corresponding compliance test suite validating vendor AIDL HAL contracts.
+_Avoid_: Phone app emulator, UI unit test
 
 ---
 
-### Modern Systems Rust & Automotive Engineering
+### Modern Systems Rust & Tooling
 
 **Embassy**:
 A modern async embedded framework for Rust that provides cooperative multitasking on microcontrollers with zero dynamic heap allocation.
 _Avoid_: Embedded Tokio, micro-async
+
+**`probe-rs` & `defmt`**:
+An open-source Rust embedded debugging toolkit and deferred-formatting RTT logger that shifts string formatting off the MCU onto the host PC.
+_Avoid_: Printf over semi-hosting, string heap logger
 
 **CAN-FD (Flexible Data-Rate)**:
 An enhanced in-vehicle serial bus protocol supporting variable bitrates up to 8 Mbps in the data phase and payload sizes up to 64 bytes per frame.
@@ -94,49 +134,9 @@ _Avoid_: Fast CAN, high-speed bus
 A standardized text file defining the bit-level structure, endianness, scaling factor, and physical units of telemetry signals packed inside raw CAN frames.
 _Avoid_: CAN schema, protocol spec
 
-**CarPropertyManager**:
-The client-side Android Automotive OS framework manager that applications use to read, set, and subscribe to vehicle telemetry properties.
-_Avoid_: VehicleManager, car SDK
-
-**ISO 26262**:
-The international functional safety standard for road vehicle electrical and electronic systems, defining risk classification and fault mitigation from QM through ASIL-D.
-_Avoid_: Automotive safety rule, ISO code
-
-**Automotive Safety Integrity Level (ASIL)**:
-A risk classification scheme (QM, ASIL-A, B, C, D) defined by ISO 26262 based on Severity, Exposure, and Controllability to specify requisite safety requirements.
-_Avoid_: Risk level, safety tier
-
-**Freedom From Interference (FFI)**:
-The architectural guarantee that a software component of lower safety criticality (e.g. QM Android) cannot cause failures in a higher safety criticality component (e.g. ASIL-D braking).
-_Avoid_: Software isolation, process sandbox
-
-**VirtIO**:
-A standardized virtualization standard enabling guest operating systems (such as Android) to access shared host hardware devices via zero-copy ring buffers.
-_Avoid_: Virtual driver, VM bridge
-
----
-
-### Non-AOSP Linux, Embedded Cloud & Embedded DevOps
-
 **epoll**:
 A scalable Linux kernel I/O event notification mechanism enabling a single-threaded daemon to monitor thousands of file descriptors (sockets, pipes, `/dev` nodes) in O(1) per ready event.
 _Avoid_: Busy-wait polling, select loop
-
-**Yocto Project**:
-An open-source build framework (powered by BitBake) for compiling reproducible, minimal custom Embedded Linux distributions, kernels, and root filesystems from source layers.
-_Avoid_: Ubuntu desktop distro, manual tarballs
-
-**eBPF (Extended Berkeley Packet Filter)**:
-A sandboxed in-kernel virtual machine allowing safe, zero-overhead tracing of syscalls, scheduler latency, and network packets in production Linux systems without modifying kernel source.
-_Avoid_: Kernel printk debugging, custom kernel fork
-
-**mTLS (Mutual TLS)**:
-A cryptographic handshake protocol where both the cloud broker and the embedded edge device authenticate each other using X.509 certificates before exchanging MQTT telemetry.
-_Avoid_: API key string, plaintext password
-
-**Protobuf (Protocol Buffers)**:
-A strongly-typed, schema-driven binary serialization format (implemented via `nanopb` on MCUs and `prost`/Go structs on gateways/cloud) that minimizes bandwidth and parsing overhead.
-_Avoid_: Verbose JSON, custom ad-hoc strings
 
 **A/B OTA (Over-The-Air) Update**:
 A fail-safe firmware or rootfs update architecture maintaining two redundant flash/disk slots (Active and Inactive) so a failed boot automatically rolls back via hardware watchdog.
@@ -145,7 +145,3 @@ _Avoid_: In-place overwrite, live patching
 **Hardware-in-the-Loop (HIL)**:
 An automated CI testing architecture where compiled firmware or Linux images execute against real target boards or QEMU emulators driven by scripted bus stimuli.
 _Avoid_: Manual bench click-testing, unit-only mocks
-
-**JNI (Java Native Interface)**:
-The binary boundary bridging Kotlin/Java code in Android's ART runtime with native C, C++, or Rust shared libraries (`.so`) compiled via the Android NDK.
-_Avoid_: AIDL HAL, Binder RPC

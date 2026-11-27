@@ -1,7 +1,8 @@
 // Antigravity Senior Java Quiz Engine
 // Supports:
 // 1. new JavaQuiz({ id, questions: [{ question, code?, correctIndex, options: [{ text, explanation }] }] })
-//    Renders multiple-choice code & concept quizzes with full per-option explanations (why correct & why each wrong choice fails).
+//    Renders multiple-choice code & concept quizzes with full per-option explanations (why correct & why each wrong choice fails)
+//    and integrates with localStorage progress tracking while keeping options clickable on revisit for retrieval practice.
 // 2. Legacy checkAnswer(questionId, selectedIdx, correctIdx, explanation)
 // 3. Legacy initQuiz(containerId)
 
@@ -14,9 +15,30 @@ function escapeQuizHtml(str) {
 }
 
 function formatInlineCode(str) {
-  // Escape HTML first, then convert `inline code` to <code>inline code</code>
   const escaped = escapeQuizHtml(str);
   return escaped.replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+
+function getQuizLessonId() {
+  const m = (window.location.pathname || '').match(/\/(\d{4})-[^/]+\.html$/);
+  return m ? m[1] : null;
+}
+
+function readAgyProgress() {
+  try {
+    const raw = window.localStorage.getItem('agy_java_progress_v1');
+    return raw ? JSON.parse(raw) : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function writeAgyProgress(store) {
+  try {
+    window.localStorage.setItem('agy_java_progress_v1', JSON.stringify(store));
+  } catch (_) {
+    // Ignore storage quota / sandbox restrictions
+  }
 }
 
 class JavaQuiz {
@@ -24,13 +46,39 @@ class JavaQuiz {
     this.id = config.id;
     this.questions = config.questions || [];
     this.letters = ['A', 'B', 'C', 'D', 'E', 'F'];
+    this.lessonId = getQuizLessonId();
     this.init();
   }
 
   init() {
     this.container = document.getElementById(this.id);
     if (!this.container) return;
+    if (this.container.dataset.quizHydrated === 'true') return;
+    this.container.dataset.quizHydrated = 'true';
     this.renderAll();
+  }
+
+  isQuestionMastered(qIdx) {
+    if (!this.lessonId) return false;
+    const store = readAgyProgress();
+    const entry = store[this.lessonId];
+    return Boolean(entry && Array.isArray(entry.quizPassed) && entry.quizPassed.includes(qIdx));
+  }
+
+  recordQuestionMastered(qIdx) {
+    if (!this.lessonId || this.lessonId === '0001') return;
+    const store = readAgyProgress();
+    const entry = store[this.lessonId] || { exPassed: [], quizPassed: [], completed: false };
+    if (!Array.isArray(entry.quizPassed)) entry.quizPassed = [];
+    if (!entry.quizPassed.includes(qIdx)) {
+      entry.quizPassed.push(qIdx);
+    }
+    entry.updatedAt = Date.now();
+    store[this.lessonId] = entry;
+    writeAgyProgress(store);
+    if (typeof window.syncLessonCompletionState === 'function') {
+      window.syncLessonCompletionState(true);
+    }
   }
 
   renderAll() {
@@ -45,6 +93,10 @@ class JavaQuiz {
   }
 
   renderQuestionCard(card, q, qIdx) {
+    const mastered = this.isQuestionMastered(qIdx);
+    const masteredBadge = mastered
+      ? `<span class="badge badge-next quiz-mastered-pill" title="Previously answered correctly — try retrieving from memory again!">&check; Mastered</span>`
+      : '';
     const codeBlock = q.code
       ? `<pre class="quiz-code"><code>${escapeQuizHtml(q.code)}</code></pre>`
       : '';
@@ -61,7 +113,10 @@ class JavaQuiz {
     optionsHtml += '</div>';
 
     card.innerHTML = `
-      <div class="quiz-question">${formatInlineCode(q.question)}</div>
+      <div class="quiz-card-header">
+        <div class="quiz-question">${formatInlineCode(q.question)}</div>
+        ${masteredBadge}
+      </div>
       ${codeBlock}
       ${optionsHtml}
       <div class="quiz-feedback" aria-live="polite"></div>
@@ -81,6 +136,10 @@ class JavaQuiz {
     const isCorrect = selectedIdx === correctIdx;
     const buttons = card.querySelectorAll('.quiz-option');
     const feedback = card.querySelector('.quiz-feedback');
+
+    if (isCorrect) {
+      this.recordQuestionMastered(qIdx);
+    }
 
     buttons.forEach((btn, idx) => {
       btn.classList.add('is-locked');

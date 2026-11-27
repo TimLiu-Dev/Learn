@@ -14,7 +14,7 @@ fun main() {
     for (timeout in listOf(0, 3000)) {
         val file = Files.createTempFile("shelf-busy", ".db")
         Db(file, busyTimeoutMs = timeout).use { db ->
-            db.createSchema()
+            db.migrate()
             val pragma = db.read { c -> c.query("PRAGMA busy_timeout") { it.getInt(1) }.single() }
             val busy = AtomicInteger()
             val ok = AtomicInteger()
@@ -29,7 +29,7 @@ fun main() {
 
     println("Connections: 64 virtual threads x 500 book lookups each")
     val file = Files.createTempFile("shelf-pool", ".db")
-    Db(file).use { db -> db.createSchema(); val s = SqliteBookStore(db); repeat(200) { s.add("Book $it", "A", null) } }
+    Db(file).use { db -> db.migrate(); val s = SqliteBookStore(db); repeat(200) { s.add("Book $it", "A", null) } }
     for (poolSize in listOf(0, 4, 8, 16, 0, 4, 8, 16)) {          // twice: the first pass warms up the JIT
         Db(file, poolSize = poolSize).use { db ->
             val store = SqliteBookStore(db)

@@ -1,21 +1,22 @@
 # Mission: Coding Interview Problem Solving (DSA)
 
 ## Why
-Pass the technical coding rounds of software engineering interviews. This means solving unseen LeetCode-style problems within the time limit while clearly explaining the reasoning, the way an interviewer expects.
+Pass the technical coding rounds of software engineering interviews. This means solving unseen algorithmic and practical multi-stage problems within the time limit while clearly explaining the reasoning, the way a 2027 Big Tech interviewer expects.
 
 ## Success looks like
-- Recognize which pattern fits an unseen problem within the first few minutes
-- Solve Medium/Hard problems in 30–40 minutes in Kotlin, Python, or Java with correct time and space complexity
-- Explain the runtime, memory layout, and concurrency trade-offs across all three languages
+- Recognize which pattern fits an unseen problem within the first two minutes
+- Solve Medium/Hard problems in 30–40 minutes with Kotlin as primary live-coding language (and fluent reading/writing across Python and Java) with optimal time and space complexity
+- Audit, debug, and extend unfamiliar or AI-drafted code and multi-part progressive specifications without regressions
+- Explain runtime, memory layout, and concurrency trade-offs across Kotlin, Python, and Java
 - Think out loud in a structured way: clarify, give examples, describe the approach, code, test, state complexity
-- Pass timed mock interviews with high scores on problem solving, code quality, verification, and communication
+- Pass timed mock interviews with Strong Hire scores on problem solving, code quality, verification, and communication
 
 ## Constraints
-- Comprehensive coverage across Kotlin, Python, and Java (code examples, quizzes, exercises)
-- Learn by structural pattern, not random grinding
-- Target: 2027 Big Tech coding interview standards
+- Primary live-coding language: **Kotlin**, with side-by-side trilingual coverage across Kotlin, Python, and Java
+- Learn by structural pattern and invariant, not random grinding
+- Target: 2027 Big Tech coding interview standards (both traditional DSA and AI-era code comprehension / progressive design rounds)
 
 ## Out of scope
-- System design interviews
+- Distributed system design interviews (HLD)
 - Behavioral interviews
 - Competitive programming beyond interview difficulty

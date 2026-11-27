@@ -21,7 +21,7 @@ fun main() {
 
 private fun demo(drain: Int) {
     val file = Files.createTempFile("shelf-stop", ".db")
-    Db(file).use { db -> db.createSchema(); SqliteBookStore(db).add("Dune", "Frank Herbert", 1965) }
+    Db(file).use { db -> db.migrate(); SqliteBookStore(db).add("Dune", "Frank Herbert", 1965) }
     val t0 = System.nanoTime()
     fun at() = "%4d ms".format((System.nanoTime() - t0) / 1_000_000)
     val shelf = Shelf(Config(port = 0, dbFile = file, cacheSize = 0, drainSeconds = drain), Clock.systemUTC(), log = {}) {

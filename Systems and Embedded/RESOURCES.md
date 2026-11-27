@@ -2,41 +2,43 @@
 
 ## Knowledge
 
+### Core Architecture, C/C++/Rust & RTOS
 - [Book: _Computer Systems: A Programmer's Perspective (3rd Edition)_ — R. Bryant & D. O'Hallaron](https://csapp.cs.cmu.edu/)
-  The gold-standard Carnegie Mellon systems textbook. Use for: memory hierarchy, processor architecture, linker mechanics, and virtual memory.
-- [Book: _Embedded Systems: Introduction to ARM Cortex-M Microcontrollers_ — J. Valvano](https://users.ece.utexas.edu/~valvano/)
-  UT Austin EE foundational text. Use for: bare-metal registers, NVIC interrupts, SysTick, and serial bus protocols.
-- [Book: _Mastering the FreeRTOS Real Time Kernel_ — R. Barry](https://www.freertos.org/Documentation/RTOS_book.html)
-  Primary reference by FreeRTOS author. Use for: task scheduling, queue management, mutex priority inheritance, and tickless idle.
-- [Documentation: _Linux Device Drivers & The Linux Kernel Documentation_ — kernel.org](https://docs.kernel.org/)
-  Primary source for kernel internals. Use for: character device drivers, memory barriers, wait queues, and DMA mapping.
+  Gold-standard systems textbook for memory hierarchy, linking, assembly, and virtual memory.
+- [Reference: _ST RM0383 (STM32F411) & RM0008 (STM32F103) Reference Manuals_ — STMicroelectronics](https://www.st.com/resource/en/reference_manual/rm0383-stm32f411xce-advanced-armbased-32bit-mcus-stmicroelectronics.pdf)
+  Primary register-level truth for RCC, GPIO, SPI, I2C, TIM1/quadrature, DMA, and bxCAN.
+- [Reference: _ARM Cortex-M4 Generic User Guide (HardFault / CFSR / SCB)_ — Arm](https://developer.arm.com/documentation/dui0553/latest/)
+  Authoritative specification for exception frame stacking, `CFSR`, `HFSR`, `MMFAR`, and `BFAR`.
+- [Book: _Mastering the FreeRTOS Real Time Kernel_ & _ESP-IDF FreeRTOS SMP Guide_](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/system/freertos_idf.html)
+  Primary references for single-core RTOS primitives, dual-core `xTaskCreatePinnedToCore`, and `TWAI`.
+- [Documentation: _Zephyr Project, nRF Connect SDK (nRF54L15-DK) & MCUboot / TF-M_](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/index.html)
+  Official documentation for `west`, `sysbuild`, DeviceTree, BLE GATT, `native_sim`/Twister, `MCUboot`, and `PSA Crypto`.
+- [Documentation: _The Embedded Rust Book, `embassy.dev`, `esp-hal` & `probe-rs`_](https://probe.rs/docs/)
+  Authoritative guides for `no_std`, `embedded-hal` v1.0, async executors, RISC-V `esp-hal`, and `defmt` RTT debugging.
+
+### Hardware Datasheets, Buses & PCB Design
+- [Datasheets: _Bosch BME280, ST LSM6DSV16X, TI INA226, TI SN65HVD230 & Modbus RTU Over Serial Line_](https://www.modbus.org/docs/Modbus_over_serial_line_V1_02.pdf)
+  Primary sensor/transceiver specs (`WHO_AM_I` registers, compensation formulas, 120Ω termination, 3.5-char silence timing).
+- [Documentation: _KiCad Documentation & OpenOCD User's Guide_](https://docs.kicad.org/)
+  Official references for 4-layer PCB schematic/layout, DFM exports, SWD flashing, and `CPUTAPID` overrides.
+
+### Embedded Linux, AOSP 17 & Cuttlefish
+- [Documentation: _The Linux Kernel Documentation (I2C, Char Devices, hwmon, DMA)_ — kernel.org](https://docs.kernel.org/)
+  Primary kernel API reference alongside Raspberry Pi 4 bootloader/Device Tree docs.
 - [Book: _The Linux Programming Interface_ — M. Kerrisk](https://man7.org/tlpi/)
-  Authoritative POSIX/Linux systems reference. Use for: `epoll`, Unix domain sockets, `shm_open`/`mmap`, signals, and daemon lifecycle.
-- [Documentation: _The Yocto Project Mega-Manual & Mastering Embedded Linux Programming_](https://docs.yoctoproject.org/)
-  Standard specification for custom Embedded Linux builds. Use for: BitBake recipes, meta-layers, Device Tree integration, and RAUC OTA.
-- [Documentation: _Android NDK, AOSP Architecture & AIDL HALs_ — Google](https://source.android.com/docs/core/architecture/aidl-hals)
-  Official specification for modern Android native & HAL layers. Use for: JNI/NDK bridges, AIDL interfaces, backend C++/Rust services, and VINTF manifests.
-- [Book: _Embedded Android_ — K. Yaghmour (O'Reilly)](https://www.oreilly.com/library/view/embedded-android/9781449327958/)
-  Foundational text on AOSP plumbing. Use for: Android init, Zygote, Binder driver, and filesystem layouts.
-- [Documentation: _Android Automotive OS (AAOS) Architecture & VHAL_ — Google](https://source.android.com/docs/automotive/vhal)
-  Official specification for connected car systems. Use for: CarPropertyManager, Vehicle HAL properties, and cluster display integration.
-- [Documentation: _The Embedded Rust Book & Embassy Async Framework_ — rust-lang.org & embassy.dev](https://docs.rust-embedded.org/book/)
-  Authoritative guide to bare-metal Rust. Use for: `no_std`, peripheral access crates (PAC), and async embedded runtimes.
-- [Documentation: _Eclipse Mosquitto / MQTT v5 Spec, Protocol Buffers & MCUboot_](https://docs.mcuboot.com/)
-  Core references for embedded cloud and OTA engineering. Use for: mTLS device identity, `nanopb`/`prost`, and signed A/B firmware rollback.
+  Authoritative POSIX reference for `AF_UNIX` sockets, `epoll`, `shm_open`/`mmap`, signals, and daemons.
+- [Documentation: _The Buildroot User Manual & Yocto Project Mega-Manual_](https://buildroot.org/docs.html)
+  Primary guides for reproducible custom Embedded Linux images (`meta-raspberrypi` for Yocto stretch).
+- [Documentation: _AOSP Architecture, AIDL HALs, Cuttlefish & VTS_ — Google](https://source.android.com/docs/core/architecture/aidl-hals)
+  Official specification for AOSP builds, Cuttlefish virtual devices, `@VintfStability` C++/Rust AIDL HALs, `sepolicy`, and VTS.
+
+### Optional / Extended Tracks (Preserved)
+- [Documentation: _Android Automotive OS (AAOS) & VHAL_ — Google](https://source.android.com/docs/automotive/vhal)
+- [Documentation: _Eclipse Mosquitto / MQTT v5 & TimescaleDB_](https://mosquitto.org/documentation/)
 
 ## Wisdom (Communities)
-
-- [r/embedded](https://reddit.com/r/embedded)
-  High-signal community of professional firmware and systems engineers. Use for: real-world hardware triage, schematic reviews, and career guidance.
-- [Embedded.fm Podcast & Community](https://embedded.fm/)
-  Long-running practitioner discussions. Use for: real-world embedded trade-offs, engineering ethics, and systems culture.
-- [AOSP Building Google Group](https://groups.google.com/g/android-building)
-  The direct venue for engineers compiling and customizing Android OS. Use for: build issues, device trees, and Treble HAL troubleshooting.
-- [Rust Embedded Matrix Channel (#rust-embedded:matrix.org)](https://matrix.to/#/#rust-embedded:matrix.org)
-  Active community of engineers running Rust on bare-metal silicon. Use for: driver crates, PAC debugging, and async runtime questions.
-- [Yocto Project Mailing Lists & Matrix](https://www.yoctoproject.org/community/mailing-lists/)
-  Practitioner forum for custom Embedded Linux BSPs, BitBake recipe debugging, and OTA integration.
-
-## Gaps
-- Interactive CAN-FD automotive bus capture datasets: generated simulated DBC/frame test vectors inside `./labs/` for local macOS verification without physical hardware.
+- [r/embedded](https://reddit.com/r/embedded) — Hardware triage, schematic/PCB reviews, and firmware career advice.
+- [Nordic DevZone](https://devzone.nordicsemi.com/) — Official Q&A for `nRF54L15-DK`, nRF Connect SDK, MCUboot, and TF-M.
+- [ESP32 Forum & `esp-rs` Matrix](https://esp32.com/) — Practical help for `ESP32-S3`/`C3`, PSRAM constraints, and `esp-hal`.
+- [Rust Embedded Matrix (`#rust-embedded:matrix.org`)](https://matrix.to/#/#rust-embedded:matrix.org) — `probe-rs`, `defmt`, and `embassy` troubleshooting.
+- [AOSP Building Google Group](https://groups.google.com/g/android-building) — AOSP builds, Cuttlefish, SELinux, and AIDL HALs.

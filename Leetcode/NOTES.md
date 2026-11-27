@@ -1,29 +1,23 @@
 # Teaching Notes
 
-## User preferences (stated in the first session, 2026-10-18)
-- Teach one pattern per session: explain the idea, walk through one example, then the user solves 2–3 problems alone.
-- Primary target language updated to trilingual (Kotlin, Python, Java) in 2026-11-07; confirm user's preferred primary interview language at Session 0.
-- Give hints step by step (nudge → direction → key insight → pseudocode). Give the full solution only if the user explicitly asks.
-- After every solution, the user states its time and space complexity.
-- Review each solution for correctness, edge cases, and cleaner or more idiomatic approaches.
-- The user explains the approach out loud (in chat) before coding, as in a real interview.
-- Bring back problems from earlier patterns (spaced review).
-- Toward the end: timed mock interviews, with feedback on both the solution and the communication.
+## User preferences
+- **Primary live-interview language:** **Kotlin** (confirmed 2026-11-26), with full trilingual side-by-side reference in **Kotlin, Python, and Java**.
+- **Session structure (`/teach` loop):**
+  1. **Spaced warm-up (5–10 min):** Recall from memory 2 concepts/templates from ~1 and ~3–7 sessions back.
+  2. **Concept & Walkthrough (10–15 min):** Read the HTML lesson's *Idea*, *Pattern Templates*, and *Walkthrough*, step through the interactive visualizer, and answer the 3-question *Quick Check*.
+  3. **Live Interview Practice (25–35 min):** Pick **2–3 Core problems** (keep *Stretch* problems for spaced review or company-specific loops). Explain clarifying questions, examples, and approach in chat *before* coding; state time and space complexity after coding.
+- **Hint protocol:** Give hints step by step (nudge → direction → key insight → pseudocode). Reveal full solutions only when explicitly asked.
+- **Code review focus:** Correctness, boundary edge cases, Kotlin idioms (`IntArray`, `ArrayDeque`, null-safety, overflow avoidance), and JVM/Python trade-offs.
+- **Checkpoints & Mocks:** Unlabeled mixed diagnostic checkpoints run after Sessions 8 (Checkpoint A), 15 (Checkpoint B), 25 (Checkpoint C), and 35 (Checkpoint D) inside `lessons/0037-unlabeled-checkpoints.html`, followed by 2027 Progressive Specs & Bug-Hunt (`0038`) and 45-Minute Mock Rehearsals (`0039`).
 
-## Updated preferences (2026-11-07)
-- Target: End-to-end Big Tech coding interview mastery for 2027.
-- Language scope expanded to trilingual: Kotlin, Python, and Java comprehensively across lessons, code examples, quizzes, and exercises.
-- Comprehensive Masterlist created at `reference/masterlist.html` serving as a full legend for all lessons and patterns.
-- Curriculum expanded to include 2027 Big Tech essentials: Data Structure Design (LRU/LFU/Rate Limiter), Range Query Trees (Segment/Fenwick Trees), Bitwise Tries, 0-1 BFS, and Concurrency/Thread-Safe DSA in Kotlin and Java.
-- All 38 lesson files (Sessions 0 to 37: `lessons/0001` through `lessons/0038`) are fully generated and linked, featuring synchronized language tabs, step-by-step walkthroughs, quizzes with character-balanced choices, and problem hints.
-- Updated 2026-11-15 after benchmarking against `roadmap.sh/leetcode` & DSA tracks: added Sessions 31–35 (`0032` Matrix Traversal & In-Place Simulation, `0033` Math, Geometry & Randomized Algorithms, `0034` String Algorithms: Palindromes, KMP & Parsing, `0035` Advanced Graphs II: MST & Eulerian Paths, `0036` Divide & Conquer, Quickselect & Boyer-Moore), moved Checkpoints/Mocks to `0037`–`0038`, added Segment Tree (`0027`), Bellman-Ford (`0021`), Quickselect note (`0013`), Interval/Regex DP (`0025`), Product/Encode-Decode (`0002`), and removed duplicate problems in `0038`.
-- Interactive in-browser runnable code practice (`assets/practice.js` powered by Skulpt) allows live code execution, test verification, standard output capture, 3-tier progressive hint reveals, and final solution drawers in Kotlin, Python, and Java.
-- Quizzes updated with per-choice explanations (`data-why="..."`), visual indicators, and expandable `<details>` breakdown explaining why the chosen answer is right/wrong and why each distractor is flawed.
+## Curriculum Architecture (39 Lessons: Sessions 0–38)
+- Lesson filenames are 1-indexed (`0001` = Session 0, `0002` = Session 1, …, `0039` = Session 38).
+- **Core Track vs. Track B (Specialized):** Five specialized lower-frequency modules (`0016` Bitwise Trie section, `0021` Dijkstra/Bellman-Ford/Floyd-Warshall, `0026` Bitmask DP, `0027` Segment/Fenwick Trees, `0035` MST/Eulerian/Bridges) are badged **Track B · Specialized** so learners on a tight timeline can prioritize High/Medium-frequency rounds (including Phase 6 LRU/Rate Limiter/Concurrency and Phase 7 Matrix/Strings/Quickselect) first.
+- **In-Browser Runner & Workspace Components (`assets/`):**
+  - `assets/practice.js`: Lazy-loads **Pyodide (CPython 3.12 WebAssembly)** on first `▶ Run Tests` click with isolated `data-setup` harnesses, plus a **📋 Kotlin Stub** generator that copies clean Kotlin class/method signatures without revealing solutions.
+  - `assets/progress.js`: Shared top navigation bar across `index.html`, `reference/*.html`, and `lessons/*.html` with `localStorage` session mastery tracking, automatic `1/3/7`-back spaced-review surfacing on `index.html`, interview countdown timer (`25m`/`35m`/`45m`), `Auto/Dark/Light` theme switcher, and 1-click `Copy` buttons on code blocks.
+- **Local Environment Note:** `python3` (3.14), `javac` (JDK 26), and JetBrains `kotlin-compiler.jar` (`/Applications/IntelliJ IDEA.app/Contents/plugins/Kotlin/kotlinc/lib/kotlin-compiler.jar`) are all available locally.
 
-## Working notes
-- The roadmap lives at `reference/roadmap.html`. On 2026-10-18 the user replied "build all of phase 0 and 1" without commenting on it, so treat it as accepted for now.
-- The user hasn't yet answered the questions about timeline, prior level, target companies, or coding environment. Ask again at the start of the first teaching session.
-- Lesson file numbers are offset by one from session numbers across all 38 files: `0001` is Session 0, `0002` is Session 1, …, `0038` is Session 37.
-- Updated 2026-11-21: Fixed `0026` orphaned `canPartition` DOM block & wrong trace math, fixed `0018`/`0019`/`0021` templates & imports, fixed `0003` YouTube link, repaired spaced-review warm-ups across `0013`–`0036`, escaped unescaped `<` and markdown backticks across all HTMLs, upgraded `assets/practice.js` to unpack `class Solution` & type shims cleanly, activated `assets/trace.js` visualizers, expanded 1-test widgets, and added high-ROI FAANG additions (Vertical Order Traversal, Sliding Window Max, Difference Array/2D Prefix, Find Peak/First-Last Position, Copy Random Pointer, Max Path Sum, BST Iterator, Merge k Sorted Lists, Bitwise Trie & Bitmask DP templates, Randomized Quickselect template, Time-Based KV/Snapshot Array, Web Crawler Multithreaded, Rapid Diagnosis/Bug-Hunt drills, and 2-Medium Meta Mock Sprint).
-- Spacing plan: start each session with a warm-up problem from a pattern learned about 1, 3, or 7 sessions earlier. Unlabeled mixed checkpoints follow Sessions 8, 15, and 25 (Checkpoints A, B, C) plus Session 36.
-- Environment: `kotlinc` is not installed on this machine (Java 26 is). Ask whether the user wants to solve on leetcode.com, which supports Kotlin, or to install Kotlin locally for running tests.
+## Curriculum Build History (Pre-Session 0)
+- **2026-10-18 → 2026-11-21:** Built initial 38-session trilingual HTML curriculum aligned with NeetCode 150, Blind/Grind 75, and `roadmap.sh/leetcode`, with synchronized tabs (`assets/tabs.js`), per-choice retrieval quizzes (`assets/quiz.js`), hint ladders (`assets/hints.js`), and trace steppers (`assets/trace.js`).
+- **2026-11-26 (2027 End-to-End Audit & Complete Upgrade):** Replaced dead Skulpt CDN/harness with lazy-loaded **Pyodide (Python 3.12 WASM)** + isolated `data-setup` drivers (`39/39` verified) + one-click Kotlin stub copier; built root hub (`index.html`), searchable HTML glossary (`reference/glossary.html`), and `assets/progress.js`; expanded `trace.js` visualizers to `39/39` lessons; enforced exact `0`-spread word-count parity across all `117/117` MCQs; verified `79/79` Kotlin classes under `kotlinc` and `83/83` Java classes under `javac`; fixed duplicate `.why` quiz CSS, explicit `[data-theme="dark"]` tokens, `0021` Kotlin `!in`, 5 dead YouTube links, raw LaTeX/escaped entities, `0018` true 0-1 BFS walkthrough (*Minimum Obstacle Removal*), `0004` trilingual templates, same-lesson duplicates (`0020`, `0022`), `1/3/7` spaced warm-ups, Core vs. Stretch splits, `[Premium]` inline specs + free mirror links, Checkpoints A–D (`0037`), Session 37 (`0038-practical-progressive-and-bug-hunt.html`), and modernized toolkits for JDK 21/25, Kotlin 2.x, and Python 3.12+.

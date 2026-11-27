@@ -1,6 +1,5 @@
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.util.ArrayList;
 import java.util.List;
 
 public class Split {
@@ -20,15 +19,14 @@ public class Split {
         long cents = bill.movePointRight(2).longValueExact();    // 1000
         long base = cents / 3;
         long leftover = cents % 3;
-        List<BigDecimal> shares = new ArrayList<>();
         long total = 0;
-        for (int i = 0; i < 3; i++) {
-            long c = base + (i < leftover ? 1 : 0);
-            shares.add(BigDecimal.valueOf(c, 2));
+        for (int i = 1; i <= 3; i++) {
+            long c = base + (i <= leftover ? 1 : 0);       // the first `leftover` people pay a cent more
             total += c;
+            System.out.print(BigDecimal.valueOf(c, 2) + " ");   // c cents, shown with 2 decimals
         }
-        System.out.println(shares);
-        System.out.println(total);                               // 1000 cents: nothing lost
+        System.out.println();
+        System.out.println(BigDecimal.valueOf(total, 2));        // 10.00: nothing lost
 
         // Ties: HALF_EVEN rounds to the even neighbour, HALF_UP always up
         for (String s : List.of("2.345", "2.355")) {

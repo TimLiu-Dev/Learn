@@ -1,24 +1,21 @@
-# Mission: Master Modern Android Development (Kotlin & KMP, 2027 Standards)
+# Mission: Master Modern Android & KMP Engineering (2027 Standards)
 
 ## Why
-Transition from a junior Android developer into a high-impact, senior-ready Modern Android Engineer capable of architecting and shipping production-grade, offline-first Android and Kotlin Multiplatform (KMP) apps using 2027 industry standards.
+Transition from a junior Android developer into a high-impact, senior-ready Modern Android & Kotlin Multiplatform Engineer capable of architecting, verifying, and shipping production-grade, offline-first mobile apps at top-tier product companies.
 
 ## Success looks like
-- Confidently architect Android apps using Multi-Module Clean Architecture, Unidirectional Data Flow (UDF), and Jetpack Compose.
-- Master reactive programming with Kotlin 2.x, Coroutines, and Flow with robust error handling and lifecycle awareness.
-- Implement production-grade networking (Ktor/Retrofit + kotlinx.serialization), local persistence (Room + DataStore), and background synchronization (WorkManager).
-- Satisfy 2027 platform mandates and production trust requirements: 16 KB page alignment, Android 17 adaptive/resizable layouts, Predictive Back, Credential Manager (Passkeys), Play Integrity, screenshot regression tests, and `ApplicationExitInfo` observability.
-- Architect Kotlin Multiplatform (KMP) shared domain/data modules (Ktor, Room KMP, Koin) and evaluate Compose Multiplatform & On-Device AI (Gemini Nano) tradeoffs.
-- Lead brownfield View-to-Compose migrations (`ComposeView`/`AndroidView`), architect Media3 (`ExoPlayer`) & `CameraX` pipelines, build Jetpack Glance widgets & Android 16/17 Live Updates, and design multi-module feature flag & analytics systems.
-- Ship an end-to-end, resume-worthy capstone app ("Aether Portfolio") featuring real-time data, offline caching, biometrics, 85%+ automated test coverage, Baseline Profiles, and CI/CD.
-- Confidently tackle Android System Design and technical interviews at top-tier product companies.
+- Confidently architect multi-module Android apps using Clean Architecture boundaries, Unidirectional Data Flow (MVI), Jetpack Compose, `TextFieldState` + localization/RTL, and Navigation 3 adaptive scenes.
+- Master reactive concurrency with Kotlin 2.x (K2), Coroutines, and Flow (`StateFlow`, `SharedFlow`, `WhileSubscribed(5_000)`, Turbine testing) and safe domain modeling (`sealed interface`, `@JvmInline value class` minor-unit money).
+- Engineer resilient data layers: Ktor/Retrofit + `kotlinx.serialization`, Room KSP + verified migrations (`MigrationTestHelper`), Typed DataStore, Offline-First SSOT, and `WorkManager` / typed Foreground Services.
+- Satisfy all 2027 Play Store & security mandates: 16 KB ELF page alignment, Android 17 resizability, Predictive Back, Credential Manager (Passkeys), Play Integrity, Roborazzi screenshot diffs, and `ApplicationExitInfo` forensics.
+- Share domain/data/UI across Android and iOS with Kotlin Multiplatform (Ktor, Room KMP, Koin, SKIE) and Compose Multiplatform (`UIKitView`, `composeResources`), integrate Android AICore (Gemini Nano), and lead brownfield `ComposeView`/`AndroidView` migrations.
+- Ship the 9-module "Aether" Capstone app end-to-end, defend architectural tradeoffs in Senior System Design interviews, and optionally master Play Billing 7+ subscriptions & GraphQL (Apollo Kotlin 4) / gRPC.
 
 ## Constraints
-- Focus exclusively on modern idiomatic Kotlin 2.x and Jetpack Compose (no legacy XML View system except for interoperability awareness).
-- Industry adoption standard: adhere strictly to Google's official "Now in Android" architectural patterns, Version Catalogs, KSP, and Dagger Hilt (with Koin/manual DI for KMP `:shared` modules).
-- Each lesson must deliver actionable code examples, interactive exercises, and deliberate practice.
+- Focus on idiomatic Kotlin 2.x, Jetpack Compose, and KMP/CMP (with XML/Fragment coverage scoped strictly to brownfield migration interop).
+- Adhere to Google's "Now in Android" multi-module standards, Version Catalogs, `build-logic` convention plugins, KSP, and Dagger Hilt / Koin.
+- Pair fast in-browser retrieval exercises with real K2 compiler & unit-test verification inside `./playground/` and stateful `/teach` sessions.
 
 ## Out of scope
-- Legacy Java for Android development.
-- Obsolete libraries (RxJava, Gson, AsyncTask, synthetic bindings, Data Binding, Loaders, `EncryptedSharedPreferences`).
-- Non-Kotlin cross-platform wrappers (Flutter, React Native) — this workspace is dedicated to native Android and Kotlin-first Multiplatform (KMP/CMP) excellence.
+- Legacy Java Android development and obsolete libraries (RxJava, Gson, `AsyncTask`, Data Binding, `EncryptedSharedPreferences`).
+- Non-Kotlin cross-platform wrappers (Flutter, React Native).

@@ -1,0 +1,126 @@
+
+<!-- ═════════════════════════ PART 5 (v7) ═════════════════════════ -->
+<div class="part-label">Part 5</div>
+<div class="part-head" id="p6" data-title="Part 5"><h2>Evolving the API without breaking clients</h2><span class="t">~35 min</span></div>
+
+<p>The day Shelf v1 ships, its API stops being yours alone. Say an Android app reads <code>GET /books/{id}</code>. Version 1.0 of that app is now installed on phones you don't control, and it keeps calling Shelf until each owner updates it. Android's own docs say that "some users enable background updates", but "other users might need to be reminded to install updates" (<a href="https://developer.android.com/guide/playcore/in-app-updates">Android: in-app updates</a>). So every old app version you ever shipped is a client you must keep working, for months or years. This part is about changing Shelf without breaking them.</p>
+
+<h3>Tolerant readers, strict input</h3>
+<p>Martin Fowler's <a href="https://martinfowler.com/bliki/TolerantReader.html">Tolerant Reader</a> (2011) starts from Postel's law, "be conservative in what you do, be liberal in what you accept from others", and recommends: "be as tolerant as possible when reading data from a service". For JSON, that means: read the fields you need and ignore the rest. Here's an app's v1.0 parser meeting three versions of the server: unchanged, with an <code>isbn</code> field added, and with <code>author</code> renamed to <code>authors</code>:</p>
+<div class="pair">
+  <figure class="kotlin"><figcaption>KOTLIN · Readers.kt</figcaption>
+<!--CODE:l45/evolve/Readers.kt--></figure>
+  <figure class="java"><figcaption>JAVA · Readers.java</figcaption>
+<!--CODE:l45/evolve/Readers.java--></figure>
+</div>
+<div class="pair">
+<pre class="out"><!--OUT:captures/readers_kt.txt--></pre>
+<pre class="out"><!--OUT:captures/readers_jv.txt--></pre>
+</div>
+<p>Three things to read off that output. A <b>strict</b> client breaks the moment the server <em>adds</em> a field, even though nothing it uses changed. A <b>tolerant</b> client shrugs off the addition. And no reader survives a <b>rename</b>: the field it needs is gone. Kotlin's non-null <code>author</code> made the failure loud; Java needed <code>requireNonNull</code> in the record, because without it Jackson would quietly have built a book whose author is <code>null</code>, and the app would have crashed later, somewhere else.</p>
+<p>Now look at Shelf from the other side. Part 2 made Shelf <em>strict about its input</em>: an unknown key in a request body is a 400 (quiz p2-4). That's a trade-off, not a rule:</p>
+<ul>
+  <li><b>For strict input:</b> a typo such as <code>"yaer": 1965</code> is rejected, instead of silently saving a book with no year. Clients learn about their mistakes on the first request.</li>
+  <li><b>Against it:</b> a newer client that sends a field the server doesn't know yet gets a 400. That happens during a rolling deploy, when old and new servers run side by side, and after a rollback to the previous server (L59). Many public APIs ignore unknown request fields for exactly this reason.</li>
+</ul>
+<p>Shelf keeps strict input, and accepts the consequence: when a request gains a field, the server that understands it must be fully deployed before any client sends it. Responses go the other way. Clients must read them tolerantly, because the server will keep adding fields.</p>
+
+<h3>Changes that are safe, and changes that break</h3>
+<p>Google's API guidelines put the rule in one sentence: "Existing client code must not be broken by a service updating to a new minor or patch release" (<a href="https://google.aip.dev/180">AIP-180: Backwards compatibility</a>). New components "may be added to existing APIs in the same major version"; but "Removing a component is a backwards incompatible change", and renaming is "semantically equivalent to" remove and add.</p>
+<div class="table-scroll"><table class="cmds">
+  <tr><th>Change</th><th>Old clients</th><th>So…</th></tr>
+  <tr><td>Add a field to a response</td><td>Tolerant readers ignore it</td><td>Safe: just do it</td></tr>
+  <tr><td>Add an endpoint</td><td>Never call it</td><td>Safe</td></tr>
+  <tr><td>Add an <em>optional</em> request field with a default</td><td>Don't send it, get the old behaviour</td><td>Safe, once every server understands it</td></tr>
+  <tr><td>Remove or rename a field, or change its type</td><td>Fail to parse, or read <code>null</code></td><td>Breaking</td></tr>
+  <tr><td>Make an optional request field required</td><td>Get 400s</td><td>Breaking</td></tr>
+  <tr><td>Change what a field <em>means</em></td><td>Parse fine, show wrong data</td><td>Breaking, and the worst kind</td></tr>
+</table></div>
+<p>The last row deserves its own rule: <b>never repurpose a field</b>. If <code>year</code> started meaning "year of this edition" instead of "year first published", every old client would keep working and keep showing the wrong year, with no error anywhere. AIP-180 covers it too: APIs "must not change visible behavior or semantics in ways that are likely to break reasonable user code". Add <code>editionYear</code> instead, and leave <code>year</code> alone.</p>
+<p>A <b>new version</b> (<code>/v2/books</code>, say) is for breaking changes only, and it's expensive: you now run, test and secure two APIs until the last old client is gone. Additive changes need no new version at all. That's the same idea as SemVer's major version (L25), applied to a network API.</p>
+
+<h3>Retiring an endpoint politely</h3>
+<p>Sometimes something really must go. HTTP has two headers for saying so in advance. RFC 9745's <code>Deprecation</code> header "allows a server to communicate to a client application that the resource in the context of the message will be or has been deprecated"; its value is a date, written as <code>@</code> plus Unix seconds (<a href="https://www.rfc-editor.org/rfc/rfc9745.html">RFC 9745</a>, 2025). RFC 8594's <code>Sunset</code> header "indicates that a URI is likely to become unresponsive at a specified point in the future", as an ordinary HTTP-date (<a href="https://www.rfc-editor.org/rfc/rfc8594.html">RFC 8594</a>). RFC 9745 ties them together: the sunset "MUST NOT be earlier than" the deprecation, and "for historical reasons the Sunset HTTP header field uses a different data format for date".</p>
+<pre class="out">Deprecation: @1798761600                    (2027-01-01T00:00:00Z)
+Sunset: Sat, 01 Jan 2028 00:00:00 GMT
+Link: &lt;https://shelf.example.com/docs/changes#member-loans&gt;; rel="deprecation"</pre>
+<p>Two things the headers don't do. They don't change behaviour: "The act of deprecation does not change any behavior of the resource" (RFC 9745 §5). And nobody is obliged to read them: RFC 9745 calls them "only a hint", and says clients "should always be implemented in ways that allow them to function without deprecation-related information". So before you switch an endpoint off, count who still calls it. L46's access log, one JSON line per request, answers that with one <code>jq</code> command. Exercise 5 retires a real Shelf endpoint this way.</p>
+
+<h3>Two kinds of "contract test"</h3>
+<p>Part 3's <code>StoreContract</code> is one kind: <b>one test suite, run against every implementation of an interface you own</b>, so the memory fake can't drift away from SQLite. It protects Shelf from itself. It says nothing about Shelf's <em>clients</em>.</p>
+<p>The other kind is the <b>consumer-driven contract test</b>. The Pact project defines contract testing as "a technique for testing an integration point by checking each application in isolation to ensure the messages it sends or receives conform to a shared understanding that is documented in a 'contract'", and Pact itself as "a code-first consumer-driven contract testing tool" (<a href="https://docs.pact.io/">Pact docs</a>). The consumer (the app team) writes down what it actually reads. The provider (Shelf) runs those expectations in its own build. If a Shelf change would break the app, Shelf's build goes red, before anything ships.</p>
+<p>You don't need Pact to get the idea. Here is the app's expectations as plain data, checked against the real Shelf over HTTP. Only the fields the app reads are listed, with their JSON types; extra fields are fine:</p>
+<figure class="kotlin"><figcaption>KOTLIN · test/ClientContractTest.kt (dropped into Shelf v1)</figcaption>
+<!--CODE:l45/evolve/ClientContractTest.kt--></figure>
+<p>The first time I ran it, it failed, and the failure was the point:</p>
+<pre class="err"><!--OUT:captures/kt_client_red.txt--></pre>
+<p>I had written the "app's" loan fixture from memory, with a <code>due</code> date. Shelf has never sent one: a loan has <code>loaned</code> and an optional <code>returned</code>. In real life that red test is the conversation you want to have <em>before</em> the app ships: either the app stops expecting <code>due</code>, or Shelf adds it (an additive change). Here the fixture was wrong, so it now reads <code>loaned</code>, and all three pass. Pact adds what this hand-made version lacks: the consumer's tests <em>generate</em> the fixture, a broker shares it between teams, and requests and states ("given a member with one loan") are recorded too.</p>
+<p class="note">This file is Kotlin only: the capstone's Java slice (see the final) covers lending beneath the HTTP layer, so it has no server to test. The Java version would be the same test with <code>HttpClient</code> and a Jackson <code>JsonNode</code>.</p>
+
+<div class="auto">
+  <strong>What Kotlin does for you.</strong>
+  <ul>
+    <li>A non-null <code>val author: String</code> makes a missing field a parse error. Java's record accepts <code>null</code>, so the check is <code>Objects.requireNonNull</code> in a compact constructor, written by hand (L5, L7).</li>
+    <li><code>Json { ignoreUnknownKeys = true }</code> vs Jackson's builder: opposite defaults again. kotlinx is strict unless told otherwise; Jackson 3 is tolerant unless told otherwise (L32).</li>
+    <li><code>when (e) { JsonNull -&gt; …; is JsonObject -&gt; … }</code> over the sealed <code>JsonElement</code> is exhaustive; Jackson's <code>JsonNode</code> answers with <code>isTextual()</code>, <code>isNumber()</code> and friends.</li>
+    <li><code>mapNotNull</code> turns "check each field, keep the problems" into one expression.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <div class="label">Exercise 5: retire an endpoint without breaking anyone</div>
+  <p><code>GET /members/{id}/loans</code> should become a filter on the loans collection: <code>GET /loans?member={id}</code>. Old apps still call the old route.</p>
+  <ol>
+    <li>Add <code>GET /loans?member={id}</code>: 200 with the same list, 400 without <code>member</code>, 404 for an unknown member.</li>
+    <li>Keep the old route working, byte for byte, and make it send <code>Deprecation</code> (from 1 January 2027), <code>Sunset</code> (1 January 2028) and a <code>Link</code> with <code>rel="deprecation"</code>.</li>
+    <li>Write <code>DeprecationTest</code>: both routes return the same body, only the old one carries the headers, and the successor rejects bad input. Then add <code>ClientContractTest</code> and run everything.</li>
+    <li>On paper: what would you measure before 1 January 2028, and who would you tell?</li>
+  </ol>
+  <details class="solution"><summary>Reference solution</summary>
+    <figure class="kotlin"><figcaption>KOTLIN · http/Routes.kt (changed and added)</figcaption>
+<pre><code class="language-kotlin"><!--OUT:evolve/Routes_v1_1.kt@62-73--></code></pre>
+<pre><code class="language-kotlin"><!--OUT:evolve/Routes_v1_1.kt@100-106--></code></pre></figure>
+    <figure class="kotlin"><figcaption>KOTLIN · test/DeprecationTest.kt</figcaption>
+<!--CODE:l45/evolve/DeprecationTest.kt--></figure>
+<pre class="out"><!--OUT:captures/kt_evolve_green.txt--></pre>
+    <p>The old route's body is untouched, so old apps see no difference; only clients that read headers notice. For step 4: count calls to the old path per day in the access log, split by client or app version if you log it, and only switch it off when that count reaches zero or the remaining callers have been told. Tell them in the release notes, in the app itself (an "update available" prompt), and in the API changelog the <code>Link</code> points at. On the sunset date, answer 410 Gone (RFC 9110, L44) rather than 404, so a straggler learns the route is gone for good.</p>
+  </details>
+</div>
+
+<!--PRACTICE:l45/practice/p6-->
+
+<h3>Check</h3>
+<div class="quiz" data-id="p6-1" data-group="Part 5 · API evolution" data-answer="0">
+  <p class="q">Which change can ship without a new API version?</p>
+  <div class="opts"><button>Add an optional response field</button><button>Rename the title response field</button><button>Make the year field required</button><button>Reuse year for edition year</button></div>
+  <p class="why">Adding is backwards compatible: tolerant readers ignore fields they don't know. Renaming removes a field, a newly required field turns old requests into 400s, and a repurposed field silently shows wrong data (AIP-180).</p>
+  <ol class="whyopts"><li>Old clients ignore a field they don't read, so an addition breaks nobody.</li><li>A rename removes <code>title</code>, so every old parser that needs it fails.</li><li>Old clients don't send it, so every one of their requests becomes a 400.</li><li>Old clients parse it fine and show the wrong year: a breaking change with no error.</li></ol>
+</div>
+<div class="quiz" data-id="p6-2" data-group="Part 5 · API evolution" data-answer="3">
+  <p class="q">A response carries <code>Deprecation: @1798761600</code>. What does that tell the client?</p>
+  <div class="opts"><button>The endpoint now returns 410</button><button>Clients must stop calling immediately</button><button>The response body is stale</button><button>The endpoint still works normally</button></div>
+  <p class="why">RFC 9745 §5: "The act of deprecation does not change any behavior of the resource." It's an advance warning; <code>Sunset</code> says when the endpoint may stop answering.</p>
+  <ol class="whyopts"><li>410 is what the endpoint might answer <em>after</em> its sunset, not while it's merely deprecated.</li><li>Deprecation is "only a hint". Clients may keep calling until the sunset date.</li><li>The header is about the endpoint's future, not the freshness of this body.</li><li>Deprecation changes no behaviour: it announces that the endpoint will go, at a later date.</li></ol>
+</div>
+<div class="quiz" data-id="p6-3" data-group="Part 5 · API evolution" data-answer="1">
+  <p class="q">In a consumer-driven contract test, who writes down the expectations?</p>
+  <div class="opts"><button>The team running the API</button><button>The team calling the API</button><button>The database schema migration tool</button><button>The load balancer health check</button></div>
+  <p class="why">The consumer records what it really reads; the provider runs those expectations in its own build. Shelf's <code>StoreContract</code> is the other kind: one suite the provider writes for its own implementations.</p>
+  <ol class="whyopts"><li>That's the provider. Its own tests can't know which fields each client actually reads.</li><li>The consumer knows what it parses, so it writes the contract, and the provider's build checks it.</li><li>Migrations change the schema. They say nothing about what an app expects from responses.</li><li>A health check asks "is the server up?", not "does it still send what the app reads?"</li></ol>
+</div>
+<div class="quiz" data-id="p6-4" data-group="Part 5 · API evolution" data-answer="2">
+  <div class="q"><p>Kotlin. One body with an extra key, read strictly and tolerantly. What does this print?</p>
+<!--CODE:l45/cq/Tolerant.kt--></div>
+  <div class="opts"><button><code>true Dune</code></button><button><code>true null</code></button><button><code>false Dune</code></button><button><code>false null</code></button></div>
+  <p class="why">The default <code>Json</code> rejects the unknown <code>isbn</code>, so <code>runCatching</code> holds a failure. <code>ignoreUnknownKeys = true</code> skips it and reads the title. The same body, two readers, opposite outcomes.</p>
+  <ol class="whyopts"><li>kotlinx's default instance is strict: an unknown key makes the decode fail.</li><li>The strict decode fails, and the tolerant one succeeds, so neither half is right.</li><li>The strict reader fails on <code>isbn</code>; the tolerant one ignores it and reads <code>Dune</code>.</li><li>The tolerant reader succeeds, so <code>getOrNull()</code> returns a book whose title is <code>Dune</code>.</li></ol>
+</div>
+<div class="quiz" data-id="p6-5" data-group="Part 5 · API evolution" data-answer="1">
+  <div class="q"><p>Java. A <code>Sunset</code> value written with the JDK's built-in RFC 1123 formatter. What does this print?</p>
+<!--CODE:l45/cq/SunsetDate.java--></div>
+  <div class="opts"><button><code>Mon, 01 Mar 2027 00:00:00 GMT</code></button><button><code>Mon, 1 Mar 2027 00:00:00 GMT</code></button><button><code>Mon, 1 Mar 2027 00:00:00 Z</code></button><button><code>2027-03-01T00:00:00Z</code></button></div>
+  <p class="why"><code>RFC_1123_DATE_TIME</code> prints the day of month with one or two digits, so the 1st is <code>1</code>. HTTP's IMF-fixdate requires <code>day = 2DIGIT</code> (RFC 9110 §5.6.7), so use a pattern with <code>dd</code>, as in the practice.</p>
+  <ol class="whyopts"><li>That's the IMF-fixdate HTTP wants, but this formatter doesn't pad the day to two digits.</li><li>The formatter's day field has one or two digits, and offset zero prints as <code>GMT</code>.</li><li>The RFC 1123 formatter prints a zero offset as <code>GMT</code>, not <code>Z</code>.</li><li>That's ISO-8601, what <code>Instant.toString()</code> gives, not the RFC 1123 format.</li></ol>
+</div>
+
+<label class="done"><input type="checkbox" class="part-done" data-part="p6"> Part 5 done</label>

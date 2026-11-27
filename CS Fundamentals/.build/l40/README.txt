@@ -30,3 +30,11 @@ v6 additions (2026-11):
                            it sets HOME to L40W/home, so no personal git config is read)
   release/Toggle.kt/.java  feature-flag example, output in captures/toggle_out.txt (run with ../bin/run.sh)
   practice/{p1,p2,rel,p3}  in-page practices; cq/ code-quiz snippets. Verify: python3 ../bin/pg_check.py ../l40
+
+v7 additions (2026-11):
+  ai/before, ai/after      the "AI diff of a test file" for Part 1's "Working with AI as a senior" (rate change 25 -> 30;
+                           the AI also dropped the cap, weakened one test, @Disabled another, added a non-existent dependency).
+                           ai/RunTests.kt is a tiny reflective runner used to check which tests pass (kotlinc + junit-jupiter-api 6.0.1).
+  scripts/ai_demo.sh       bash scripts/ai_demo.sh WORKDIR ai > captures/ai_out.txt
+  Trims: SemVer details -> recap pointing at L25; changelog shortened; practice/rel (next version) cut;
+         Part 2's autosquash practice (p2) labelled optional.

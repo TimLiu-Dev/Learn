@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0042: Kafka Production Operations (Manual Offsets, Cooperative Rebalancing, Lag &amp; Compaction)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 2 • Phase 9: Event-Driven Architecture, Apache Kafka &amp; Production Broker Ops</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 25 LTS</span>
+        <span class="badge badge-kotlin">Kotlin 2.2+</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0042 • Stage 2 • Phase 9</span>
+    <h1 style="margin-top: 8px;">Kafka Production Operations: Manual Offsets, Cooperative Rebalancing, Consumer Lag &amp; Log Compaction</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: The most common Kafka outage in Spring Boot production is not a crashed broker—it is an <strong>infinite Consumer Rebalance Storm</strong> triggered when a batch takes longer than <code>max.poll.interval.ms</code>, or silent data loss from <code>enable-auto-commit=true</code>! Master <strong><code>AckMode.MANUAL_IMMEDIATE</code></strong>, <strong><code>CooperativeStickyAssignor</code></strong> incremental rebalancing, tuning <code>max.poll.records</code>, monitoring <strong>Consumer Lag</strong>, and <strong>Log Compaction + Tombstones</strong>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://docs.spring.io/spring-kafka/reference/kafka/receiving-messages/message-listener-container.html#committing-offsets" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring for Apache Kafka: Committing Offsets &amp; AckMode</a> and <a href="https://kafka.apache.org/documentation/#design_compactionbasics" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Apache Kafka Docs: Log Compaction &amp; Cooperative Rebalancing</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Android Mental Model Bridge</div>
+    <p style="margin-bottom: 0;">
+      Think of Kafka consumer offsets like a bookmark in an audiobook: with <code>enable-auto-commit=true</code>, a timer advances the bookmark every 5 seconds even if your code hasn't finished saving the chapter! With <strong><code>AckMode.MANUAL_IMMEDIATE</code></strong>, you only call <code>ack.acknowledge()</code> *after* PostgreSQL commits cleanly.
+    </p>
+  </div>
+
+  <h2>1. Four Kafka Operational Rules That Prevent 2 AM Pager Storms</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>Disable Auto-Commit &amp; Use <code>AckMode.MANUAL_IMMEDIATE</code>:</strong> Set <code>spring.kafka.consumer.enable-auto-commit=false</code> and <code>spring.kafka.listener.ack-mode=MANUAL_IMMEDIATE</code> (or Spring Kafka's default <code>BATCH</code>), calling <code>Acknowledgment.acknowledge()</code> only after durable DB writes succeed. Know <code>auto-offset-reset=earliest</code> vs. <code>latest</code> for brand-new consumer groups!</li>
+    <li><strong>Stop Infinite Rebalance Loops (<code>max.poll.interval.ms</code> &amp; <code>max.poll.records</code>):</strong> If <code>poll()</code> fetches 500 records and each record takes 1 second to call a slow API (500s total > default <code>300s</code> <code>max.poll.interval.ms</code>), the broker declares the pod dead, kicks it out of the group, reassigns the partitions to another pod—which then also times out in an endless loop! Fix: lower <code>max.poll.records</code> (e.g. <code>50</code>) and size <code>max.poll.interval.ms</code> realistically.</li>
+    <li><strong><code>CooperativeStickyAssignor</code> Incremental Rebalancing:</strong> Legacy eager rebalancers stop *every* pod across the whole consumer group whenever one pod deploys. Setting <code>partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor</code> moves only affected partitions while healthy pods keep consuming uninterrupted.</li>
+    <li><strong>Log Compaction (<code>cleanup.policy=compact</code>) &amp; Tombstones:</strong> Time-based retention deletes old events after 7 days. Compacted topics keep the *latest* value per message key forever (ideal for reference data replication like <code>products.catalog</code>), and publishing a record with a <code>null</code> payload (<strong>Tombstone</strong>) deletes that key cleanly.</li>
+  </ul>
+
+  <h3>1. Anatomy of a max.poll.interval.ms Rebalance Death Spiral</h3>
+  <div style="background:#090d13; border:1px solid var(--border-color); border-radius:var(--radius-sm); padding:16px; font-family:var(--font-mono); font-size:13px; color:#7ee787; margin:16px 0;">
+1. Pod A polls 500 records (default max.poll.records=500)
+2. Downstream HTTP call slows to 800ms/msg ==&gt; Batch takes 400s (&gt; 300s max.poll.interval.ms!)
+3. Broker declares Pod A dead, revokes partitions, rejects Pod A's offset commit!
+4. Pod B receives the exact same 500 unacked records ==&gt; Takes 400s ==&gt; INFINITE REBALANCE STORM!
+FIX: Set max.poll.records=50 + CooperativeStickyAssignor + bounded HTTP timeouts!
+  </div>
+
+  <h3>2. Topic Retention Policy Matrix: Delete vs. Log Compaction</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Cleanup Policy</th>
+        <th>What Kafka Retains</th>
+        <th>Ideal Domain Use Case</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>cleanup.policy=delete</code></td>
+        <td>All immutable events within time/size window (e.g., 7 days)</td>
+        <td>Fact streams: <code>orders.placed</code>, <code>payments.captured</code>, audit trails</td>
+      </tr>
+      <tr>
+        <td><code>cleanup.policy=compact</code></td>
+        <td>Latest record value per message key (<code>null</code> value = Tombstone delete)</td>
+        <td>Entity state snapshots: <code>fx.exchange-rates</code>, <code>catalog.products</code></td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Always monitor <code>kafka_consumergroup_lag</code> (latest broker offset minus committed consumer offset) in Prometheus—rising lag is your earliest warning that consumers cannot keep pace with producer throughput.
+  </p>
+
+  <h2>2. Production Implementation (Java 25 vs Kotlin 2.2+)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Safe Consumer Properties &amp; Manual Offset Acknowledgment Listener</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code># application.yml — Rebalance-Safe Manual Ack Kafka Consumer
+# spring:
+#   kafka:
+#     consumer:
+#       enable-auto-commit: false
+#       auto-offset-reset: earliest
+#       max-poll-records: 50
+#       properties:
+#         partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+#         max.poll.interval.ms: 300000
+#     listener:
+#       ack-mode: MANUAL_IMMEDIATE
+
+package com.nexus.kafka;
+
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Component;
+
+@Component
+public class SettlementConsumer {
+    private final SettlementService service;
+
+    public SettlementConsumer(SettlementService service) { this.service = service; }
+
+    @KafkaListener(topics = "payments.settled", groupId = "ledger-writers")
+    public void onMessage(String payload, Acknowledgment ack) {
+        service.applyIdempotently(payload); // Durable DB commit first!
+        ack.acknowledge();                  // Commit Kafka offset only AFTER DB succeeds
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.nexus.kafka
+
+import org.springframework.kafka.annotation.KafkaListener
+import org.springframework.kafka.support.Acknowledgment
+import org.springframework.stereotype.Component
+
+@Component
+class SettlementConsumer(private val service: SettlementService) {
+
+    @KafkaListener(topics = ["payments.settled"], groupId = "ledger-writers")
+    fun onMessage(payload: String, ack: Acknowledgment) {
+        service.applyIdempotently(payload) // Durable DB commit first!
+        ack.acknowledge()                  // Commit Kafka offset only AFTER DB succeeds
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to test your Kafka production operations mastery.</p>
+
+  <div class="quiz-card" id="q0042_1" data-explanation="Each poll() fetches up to max.poll.records (default 500). If processing 500 records sequentially takes longer than max.poll.interval.ms (default 5 minutes), the broker evicts the consumer and triggers a rebalance storm across the group.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Your Kafka consumer pulls 500 records per poll, and each record takes 800ms (400s total). Every 5 minutes, the consumer group endlessly rebalances without committing offsets. Why?</div>
+    <div class="quiz-code-snippet"><pre><code>// 500 records * 0.8s = 400s &gt; max.poll.interval.ms (300,000ms default)</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Exceeding max.poll.interval.ms causes the broker to evict the consumer, replaying the uncommitted batch endlessly.">
+        Processing time exceeded max.poll.interval.ms, causing the broker to evict the consumer and trigger rebalance loops.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Log compaction happens asynchronously on broker background threads and does not trigger consumer evictions.">
+        Kafka log compaction deleted the topic partitions while the Spring Boot consumer was actively reading records.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. CooperativeStickyAssignor optimizes partition handoffs and never causes 5-minute batch timeouts.">
+        CooperativeStickyAssignor requires every Kafka consumer thread to finish batches within five hundred milliseconds.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Avro schema lookups are cached locally after the first message and do not stall for 400 seconds.">
+        Confluent Schema Registry forced the JVM to recompile Avro schemas after every single consumed message.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0042_2" data-explanation="Eager partition assignors revoke all partitions from every consumer during a rolling deploy (Stop-The-World pause). CooperativeStickyAssignor incrementally revokes and reassigns only the partitions moving to/from restarting pods.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">Why do production Spring Kafka clusters configure <code>CooperativeStickyAssignor</code> instead of legacy eager partition assignors?</div>
+    <div class="quiz-code-snippet"><pre><code>spring.kafka.consumer.properties.partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Partition ordering still depends strictly on the producer message key hash.">
+        It guarantees global chronological ordering across all partitions without requiring a producer message key.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Cooperative rebalancing avoids stop-the-world pauses so unaffected partitions keep processing during deploys.">
+        It performs incremental rebalances without halting healthy pods on unaffected partitions during rolling deployments.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Broker replication durability is governed by acks=all and min.insync.replicas, not the assignor.">
+        It automatically raises Kafka broker replication factor to three across every AWS availability zone.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Assignors manage partition ownership and never disable offset tracking.">
+        It eliminates consumer offset storage in __consumer_offsets by keeping partition state in Redis RAM.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0042_3" data-explanation="In a log-compacted topic (cleanup.policy=compact), Kafka keeps the latest value per key. To delete a key permanently from the compacted log (e.g. a deleted product), producers publish a Tombstone record: the key with a null payload.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">On a Kafka topic configured with <code>cleanup.policy=compact</code> (e.g. syncing product catalog state), how do you tell Kafka and downstream consumers to delete a key?</div>
+    <div class="quiz-code-snippet"><pre><code>// Product SKU-999 was permanently removed from the catalog...</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Kafka topics are immutable append-only logs; you cannot send SQL DELETE commands to a broker.">
+        Send a SQL DELETE statement over JDBC directly to the broker's internal __consumer_offsets log.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Calling ack.acknowledge() only advances a consumer group's read cursor; it never removes broker records.">
+        Call ack.acknowledge() twice from the Spring @KafkaListener consumer container thread.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Publishing a Tombstone (the key paired with a null value) triggers compaction removal.">
+        Publish a Tombstone record carrying that key with a null value payload to the topic.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Reducing max.poll.records controls consumer batch size, not broker log compaction.">
+        Lower max.poll.records to zero so the Kafka broker sweeps expired keys on the next poll.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Configure a rebalance-safe Spring Kafka listener config in YAML (<code>enable-auto-commit: false</code>, <code>ack-mode: MANUAL_IMMEDIATE</code>, <code>CooperativeStickyAssignor</code>, and bounded <code>max-poll-records</code>) and acknowledge offsets only *after* persistence succeeds.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0042-lab"
+       data-starter-java="// 1. Configure YAML properties in comments or config block:
+//    enable-auto-commit: false
+//    ack-mode: MANUAL_IMMEDIATE
+//    partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+// 2. Complete onEvent to persist first, then call ack.acknowledge()
+
+@KafkaListener(topics = &quot;orders.placed&quot;, groupId = &quot;billing&quot;)
+public void onEvent(String payload, Acknowledgment ack) {
+    // TODO: Call ledgerService.save(payload) then ack.acknowledge()
+}"
+       data-starter-kotlin="// 1. Configure YAML properties in comments or config block:
+//    enable-auto-commit: false
+//    ack-mode: MANUAL_IMMEDIATE
+//    partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+// 2. Complete onEvent to persist first, then call ack.acknowledge()
+
+@KafkaListener(topics = [&quot;orders.placed&quot;], groupId = &quot;billing&quot;)
+fun onEvent(payload: String, ack: Acknowledgment) {
+    // TODO: Call ledgerService.save(payload) then ack.acknowledge()
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0042</span>
+        <span class="practice-title">Manual Ack &amp; Cooperative Rebalancing Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0042-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Include <code>enable-auto-commit: false</code>, <code>ack-mode: MANUAL_IMMEDIATE</code>, and <code>CooperativeStickyAssignor</code> (as config properties/comments) AND complete <code>onEvent</code> so it saves via <code>ledgerService.save(payload)</code> before calling <code>ack.acknowledge()</code>.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">// 1. Configure YAML properties in comments or config block:
+//    enable-auto-commit: false
+//    ack-mode: MANUAL_IMMEDIATE
+//    partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+// 2. Complete onEvent to persist first, then call ack.acknowledge()
+
+@KafkaListener(topics = &quot;orders.placed&quot;, groupId = &quot;billing&quot;)
+public void onEvent(String payload, Acknowledgment ack) {
+    // TODO: Call ledgerService.save(payload) then ack.acknowledge()
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Consumer &amp; Listener Config</div>
+        <div>Include <code>enable-auto-commit: false</code>, <code>ack-mode: MANUAL_IMMEDIATE</code>, and <code>CooperativeStickyAssignor</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Persist Before Offset Commit</div>
+        <div>Call <code>ledgerService.save(payload);</code> first so DB failures prevent committing the Kafka offset.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Acknowledge Offset</div>
+        <div>Call <code>ack.acknowledge();</code> right after <code>ledgerService.save(payload);</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 25 Implementation:</div>
+      <pre class="solution-code"><code>// enable-auto-commit: false
+// ack-mode: MANUAL_IMMEDIATE
+// partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+
+@KafkaListener(topics = "orders.placed", groupId = "billing")
+public void onEvent(String payload, Acknowledgment ack) {
+    ledgerService.save(payload);
+    ack.acknowledge();
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>// enable-auto-commit: false
+// ack-mode: MANUAL_IMMEDIATE
+// partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+
+@KafkaListener(topics = ["orders.placed"], groupId = "billing")
+fun onEvent(payload: String, ack: Acknowledgment) {
+    ledgerService.save(payload)
+    ack.acknowledge()
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Manual offset commits guarantee at-least-once processing only after durable persistence succeeds, while <code>CooperativeStickyAssignor</code> eliminates stop-the-world pauses during rolling deployments.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"How do you investigate rising Kafka consumer lag in Grafana when CPU on your consumer pods is only at 20%?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0041-kafka-schema-registry-and-exactly-once.html" class="btn btn-secondary">← Previous: Lesson 0041</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0043-spring-security-filter-chain-architecture.html" class="btn btn-primary">Next: Lesson 0043 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0042 (Stage 2: Senior Core)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0042-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Manual Ack & Cooperative Sticky Config",
+    passed: /enable-auto-commit:\s*false/.test(code) && /MANUAL_IMMEDIATE/.test(code) && /CooperativeStickyAssignor/.test(code),
+    error: "Must include enable-auto-commit: false, MANUAL_IMMEDIATE, and CooperativeStickyAssignor."
+  });
+  tests.push({
+    name: "Durable Persistence Before Offset Commit",
+    passed: /ledgerService\.save\s*\(\s*payload\s*\)/.test(code),
+    error: "Must call ledgerService.save(payload) before acknowledging."
+  });
+  tests.push({
+    name: "Explicit Acknowledgment.acknowledge()",
+    passed: /ack\.acknowledge\s*\(\s*\)/.test(code),
+    error: "Must invoke ack.acknowledge() after ledgerService.save(payload)."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

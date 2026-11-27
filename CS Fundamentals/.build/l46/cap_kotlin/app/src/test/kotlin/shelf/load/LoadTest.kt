@@ -49,7 +49,7 @@ class Result(val p50: Double, val p95: Double, val p99: Double, val rps: Int, va
 
 fun run(config: Config): Result {
     val file = Files.createTempFile("shelf-load", ".db")
-    Db(file).use { db -> db.createSchema(); val s = SqliteBookStore(db); repeat(BOOKS) { s.add("Book ${it + 1}", "Author ${it % 20}", 1950 + it % 70) } }
+    Db(file).use { db -> db.migrate(); val s = SqliteBookStore(db); repeat(BOOKS) { s.add("Book ${it + 1}", "Author ${it % 20}", 1950 + it % 70) } }
     var slow: SlowBookStore? = null
     val shelf = Shelf(config.copy(port = 0, dbFile = file), Clock.systemUTC(), log = {}) { SlowBookStore(it, DB_DELAY_MS).also { s -> slow = s } }.start()
     val base = "http://127.0.0.1:${shelf.port}"

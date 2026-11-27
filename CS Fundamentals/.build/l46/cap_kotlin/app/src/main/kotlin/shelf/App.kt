@@ -36,7 +36,7 @@ class Shelf(
 
     private val executor = Executors.newVirtualThreadPerTaskExecutor()     // one virtual thread per request (L28)
     private val server = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), config.port), 0)
-    private val db = Db(config.dbFile, config.poolSize, config.busyTimeoutMs).also { it.createSchema() }
+    private val db = Db(config.dbFile, config.poolSize, config.busyTimeoutMs).also { it.migrate() }
     private val metrics = Metrics()
 
     init {

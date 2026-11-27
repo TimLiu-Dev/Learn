@@ -21,18 +21,18 @@ class Assertion(val credentialId: String, val clientDataJSON: ByteArray, val aut
 
 // The authenticator (the phone's password manager, a security key): private keys never leave it.
 class Authenticator {
-    private val keys = HashMap<String, Pair<String, PrivateKey>>()     // credential id -> (RP ID, private key)
+    private val keys = HashMap<String, PrivateKey>()   // credential id -> private key (scoped to one RP ID)
     private var signCount = 0
     fun register(rpId: String): Pair<String, ByteArray> {
         val pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()   // COSE alg -8, L33's signature
         val id = b64.encodeToString(ByteArray(16).also { SecureRandom().nextBytes(it) })
-        keys[id] = rpId to pair.private
+        keys[id] = pair.private
         return id to pair.public.encoded                               // the server gets only the public half
     }
     // authenticatorData = SHA-256(RP ID) ‖ flags ‖ signCount; the signature covers it and SHA-256(clientDataJSON).
     fun get(id: String, rpId: String, clientDataJSON: ByteArray): Assertion {
         val authData = ByteBuffer.allocate(37).put(sha256(rpId.toByteArray())).put(0x05).putInt(++signCount).array()  // flags: UP + UV
-        val sig = Signature.getInstance("Ed25519").run { initSign(keys.getValue(id).second); update(authData + sha256(clientDataJSON)); sign() }
+        val sig = Signature.getInstance("Ed25519").run { initSign(keys.getValue(id)); update(authData + sha256(clientDataJSON)); sign() }
         return Assertion(id, clientDataJSON, authData, sig)
     }
 }

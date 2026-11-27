@@ -1,4 +1,4 @@
-// A toy 8-bit computer: 4 registers, 256 bytes for code AND data.
+// A toy 8-bit computer: 4 registers, 256 bytes for code AND data, and a stack pointer (Part 4).
 // Each instruction is 2 bytes: [op:4 | rd:2 | rs:2] [value or address]
 const val HLT = 0x0
 const val LDI = 0x1
@@ -8,6 +8,9 @@ const val ADD = 0x4
 const val SUB = 0x5
 const val JMP = 0x6
 const val JZ = 0x7
+const val CALL = 0x8                                     // Part 4: push the return address, jump
+const val RET = 0x9                                      // Part 4: pop the return address into pc
+const val STACK_LIMIT = 0xF0                             // the stack may use F0..FF: 16 return addresses
 
 fun hex(x: Int) = "%02X".format(x)
 
@@ -23,6 +26,8 @@ fun disassemble(b0: Int, b1: Int): String {
         SUB -> "SUB R$rd, R$rs"
         JMP -> "JMP ${hex(b1)}"
         JZ -> "JZ  R$rd, ${hex(b1)}"
+        CALL -> "CALL ${hex(b1)}"
+        RET -> "RET"
         else -> "???"
     }
 }
@@ -31,6 +36,7 @@ class Cpu(program: IntArray) {
     val mem = IntArray(256)
     val reg = IntArray(4)
     var pc = 0
+    var sp = 0x00                                        // empty stack; the first push goes to FF
     var halted = false
     var steps = 0
 
@@ -55,6 +61,17 @@ class Cpu(program: IntArray) {
             SUB -> reg[rd] = (reg[rd] - reg[rs]) and 0xFF
             JMP -> pc = b1
             JZ -> if (reg[rd] == 0) pc = b1                  // isZero8, then a mux picks the next pc
+            CALL -> {
+                check(sp != STACK_LIMIT) { "stack overflow at ${hex((pc - 2) and 0xFF)}: SP=${hex(sp)}" }
+                sp = (sp - 1) and 0xFF                       // the stack grows down
+                mem[sp] = pc                                 // pc already points past the CALL: the return address
+                pc = b1
+            }
+            RET -> {
+                check(sp != 0x00) { "stack underflow at ${hex((pc - 2) and 0xFF)}" }
+                pc = mem[sp]                                 // pop the return address
+                sp = (sp + 1) and 0xFF
+            }
             else -> error("unknown opcode ${hex(op)} at ${hex((pc - 2) and 0xFF)}")
         }
         steps++

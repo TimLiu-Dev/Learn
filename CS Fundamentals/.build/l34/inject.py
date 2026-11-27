@@ -37,6 +37,7 @@ DEMOS = {
     "groupby": ("lib", "groupby.sql"),
     "bare": ("lib", "bare.sql"),
     "subqueries": ("lib", "subqueries.sql"),
+    "views": ("scratch", "views.sql"),
     "window": ("lib", "window.sql"),
     "alias": ("lib", "alias.sql"),
     "ex1": ("scratch", "ex1.sql"),

@@ -1,20 +1,50 @@
 /**
- * Mid-Tech LeetCode 110 Masterclass — Shared Runtime Engine
+ * Mid-Tech LeetCode 126 Masterclass — Shared Runtime Engine (2027 Edition)
  *
  * Includes:
  * 1. High-DPI Vector Whiteboard & Sketchpad
  * 2. Multi-Approach & Tri-Language Code Viewer with Clipboard Copy
  * 3. Runnable Tri-Language Practice Arena (Kotlin, Python, Java)
  *    - Supports Standard functions, ListNode, TreeNode, Graph Node, and OOP Design Classes
+ *    - Cold Interview Timer (15m/25m/35m) + Debug Broken PR Mode + Cold vs Assisted Mastery
  *    - 3 Progressive Hints + Gated Model Reveal + Infinite-Loop Guard
- * 4. 4-Question Diagnostic Code Quiz Engine with Per-Option Right/Wrong Explanations
- * 5. 48-Hour Spaced-Repetition Recall Tracker
+ * 4. 4-Question Diagnostic Code Quiz Engine with localStorage Persistence & Explanations
+ * 5. 48-Hour Spaced-Repetition Recall Tracker + Canonical 126 Study-Order Navigation
  */
 
 (function(global) {
   'use strict';
 
   var LessonRuntime = {};
+
+  var SAFE_HTML_TAGS = { code:1, strong:1, em:1, b:1, i:1, br:1, span:1, ul:1, ol:1, li:1, p:1, sub:1, sup:1, a:1 };
+  function escapeHtmlExact(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+  function sanitizeRichHtml(str) {
+    if (str == null) return '';
+    var s = String(str);
+    // Protect legitimate formatting tags while escaping generics like <Int>, <Pair<String, String>>, and raw < comparisons
+    var saved = [];
+    s = s.replace(/<\s*(\/?)\s*([a-zA-Z0-9]+)(\s+[^<>]*?)?\s*(\/?)>/g, function(full, slash, tag, attrs, selfClose) {
+      var low = tag.toLowerCase();
+      if (SAFE_HTML_TAGS[low]) {
+        var idx = saved.length;
+        saved.push(full);
+        return '\x00TAG' + idx + '\x00';
+      }
+      return full.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    });
+    s = s.replace(/</g, '&lt;');
+    s = s.replace(/\x00TAG(\d+)\x00/g, function(_, idx) { return saved[Number(idx)]; });
+    return s;
+  }
+  LessonRuntime._escapeHtmlExact = escapeHtmlExact;
+  LessonRuntime._sanitizeRichHtml = sanitizeRichHtml;
 
   // =========================================================================
   // 1. HIGH-DPI VECTOR WHITEBOARD ENGINE
@@ -830,6 +860,15 @@
       else { this.push(idxOrVal); }
       return true;
     });
+    __addProto(__arrProto, 'addAll', function(col) {
+      var items = __iter(col);
+      for (var i = 0; i < items.length; i++) this.push(items[i]);
+      return items.length > 0;
+    });
+    __addProto(__arrProto, 'extend', function(col) {
+      var items = __iter(col);
+      for (var i = 0; i < items.length; i++) this.push(items[i]);
+    });
     __addProto(__arrProto, 'get', function(i) { return this[i]; });
     __addProto(__arrProto, 'set', function(i, v) { this[i] = v; return v; });
     __addProto(__arrProto, 'removeAt', function(i) { return this.splice(i, 1)[0]; });
@@ -854,6 +893,7 @@
     __addProto(__arrProto, 'toTypedArray', function() { return this.slice(); });
     __addProto(__arrProto, 'toArray', function() { return this.slice(); });
     __addProto(__arrProto, 'toList', function() { return this.slice(); });
+    __addProto(__arrProto, 'toMutableList', function() { return this.slice(); });
     __addProto(__arrProto, 'getKey', function() { return this[0]; });
     __addProto(__arrProto, 'getValue', function() { return this[1]; });
     __addProto(__arrProto, 'count', function(val) {
@@ -863,7 +903,9 @@
     });
     __addProto(__arrProto, 'joinToString', function(sep) { return this.join(sep === undefined ? ', ' : sep); });
     __addProto(__arrProto, 'sortWith', function(cmp) { return this.sort(cmp); });
-    __addProto(__arrProto, 'sorted', function() { return this.slice().sort(function(a, b) { return a - b; }); });
+    __addProto(__arrProto, 'sorted', function() {
+      return this.slice().sort(function(a, b) { return typeof a === 'number' ? a - b : (a < b ? -1 : (a > b ? 1 : 0)); });
+    });
     __addProto(__arrProto, 'reversed', function() { return this.slice().reverse(); });
     __addProto(__arrProto, 'reversedArray', function() { return this.slice().reverse(); });
     __addProto(__arrProto, 'copyOf', function() { return this.slice(); });
@@ -884,6 +926,8 @@
     __addProto(__strProto, 'isNotEmpty', function() { return this.length > 0; });
     __addProto(__strProto, 'reversed', function() { return this.split('').reverse().join(''); });
     __addProto(__strProto, 'find', function(sub, start) { return this.indexOf(sub, start || 0); });
+    __addProto(__strProto, 'compareTo', function(other) { var s = String(this), o = String(other); return s < o ? -1 : (s > o ? 1 : 0); });
+    __addProto(Object.getPrototypeOf(0), 'compareTo', function(other) { var n = Number(this), o = Number(other); return n < o ? -1 : (n > o ? 1 : 0); });
     if (!Object.getOwnPropertyDescriptor(__strProto, 'lastIndex')) {
       Object.defineProperty(__strProto, 'lastIndex', { get: function() { return this.length - 1; }, enumerable: false, configurable: true });
     }
@@ -1047,7 +1091,7 @@
           if (prop === '_map') return target;
           if (prop === 'keys') return function() { return Array.from(target.keys()); };
           if (prop === 'values') return function() { return Array.from(target.values()); };
-          if (prop === 'items') return function() { return Array.from(target.entries()); };
+          if (prop === 'items' || prop === 'entries') return function() { return Array.from(target.entries()); };
           if (prop === 'get') return function(k, d) { var nk = Array.isArray(k) ? JSON.stringify(k) : k; return target.has(nk) ? target.get(nk) : d; };
           if (prop === 'has') return function(k) { var nk = Array.isArray(k) ? JSON.stringify(k) : k; return target.has(nk); };
           if (prop === 'put' || prop === 'set') return function(k, v) { var nk = Array.isArray(k) ? JSON.stringify(k) : k; target.set(nk, v); return v; };
@@ -1146,6 +1190,8 @@
       IntArray: IntArray, BooleanArray: BooleanArray, CharArray: CharArray, DoubleArray: DoubleArray,
       __ArrayInit: __ArrayInit, __Pair: __Pair, __Triple: __Triple,
       __Character: __Character, __Arrays: __Arrays, __Collections: __Collections,
+      Arrays: __Arrays, Collections: __Collections,
+      __py_list: function(x) { return x === undefined ? [] : __iter(x).slice(); },
       ListNode: ListNode, TreeNode: TreeNode, GraphNode: GraphNode,
       ord: __ord, chr: __chr,
       tuple: function(arr) { return Array.isArray(arr) ? JSON.stringify(arr) : String(arr); },
@@ -1298,7 +1344,7 @@
               else if (rawF[fk] === '}') fDepth--;
               fk++;
             }
-            fParts.push('String(' + rawF.slice(fi + 1, fk - 1) + ')');
+            fParts.push('String(' + rawF.slice(fi + 1, fk - 1).replace(/\bself\./g, 'this.') + ')');
             fi = fk;
           } else {
             litBuf += rawF[fi++];
@@ -1311,6 +1357,43 @@
         out += fParts.length === 1 ? fParts[0] : ('(' + fParts.join(' + ') + ')');
         i = fj + 1;
         continue;
+      }
+      if (!isPython && ch === '"') {
+        var kj = i + 1;
+        while (kj < code.length && code[kj] !== '"') {
+          if (code[kj] === '\\') kj += 2; else kj++;
+        }
+        var rawK = code.slice(i + 1, kj);
+        if (/\$(\{[^{}]+\}|[A-Za-z_]\w*)/.test(rawK)) {
+          var kParts = [], ki = 0, kLit = '';
+          while (ki < rawK.length) {
+            if (rawK[ki] === '\\' && rawK[ki + 1] === '$') { kLit += '$'; ki += 2; continue; }
+            if (rawK[ki] === '$' && rawK[ki + 1] === '{') {
+              var ke = rawK.indexOf('}', ki + 2);
+              if (ke !== -1) {
+                if (kLit) { literals.push(JSON.stringify(kLit)); kParts.push('__STR_' + (literals.length - 1) + '__'); kLit = ''; }
+                kParts.push('String(' + rawK.slice(ki + 2, ke) + ')');
+                ki = ke + 1;
+                continue;
+              }
+            }
+            var km = rawK.slice(ki).match(/^\$([A-Za-z_]\w*)/);
+            if (km) {
+              if (kLit) { literals.push(JSON.stringify(kLit)); kParts.push('__STR_' + (literals.length - 1) + '__'); kLit = ''; }
+              kParts.push('String(' + km[1] + ')');
+              ki += km[0].length;
+              continue;
+            }
+            kLit += rawK[ki++];
+          }
+          if (kLit || kParts.length === 0) {
+            literals.push(JSON.stringify(kLit));
+            kParts.push('__STR_' + (literals.length - 1) + '__');
+          }
+          out += kParts.length === 1 ? kParts[0] : ('(' + kParts.join(' + ') + ')');
+          i = kj + 1;
+          continue;
+        }
       }
       if (ch === '"' || ch === "'") {
         var q = ch;
@@ -1515,10 +1598,21 @@
     // Strip nested generic types EARLY so PriorityQueue<Pair<Int, Int>>, TrieNode, etc. match cleanly
     js = stripGenericTypes(js);
 
-    // Java 2D array literal `= {{0, 1}, {1, 0}}`
+    // Java 2D & 1D array literals `= {{0, 1}, {1, 0}}` or `String[] PAD = {"a", "b"};`
     js = js.replace(/=\s*\{\s*(\{[^{}]*\}(?:\s*,\s*\{[^{}]*\})*)\s*\}/g, function(_, inner) {
       return '= [' + inner.replace(/\{([^{}]*)\}/g, '[$1]') + ']';
     });
+    js = js.replace(/(\[\s*\]\s+\w+\s*=\s*)\{([^{};]*)\}/g, '$1[$2]');
+
+    function normalizeKtBlockReturn(rawBlock) {
+      var bLines = rawBlock.trim().split('\n');
+      var lastLine = bLines[bLines.length - 1].trim();
+      if (lastLine && !/^return\b/.test(lastLine)) {
+        lastLine = lastLine.replace(/^if\s*\(([^()]+)\)\s*([^\n{};]+?)\s+else\s+([^\n{};]+)$/, '($1 ? $2 : $3)');
+        bLines[bLines.length - 1] = 'return (' + lastLine + ');';
+      }
+      return bLines.join('\n');
+    }
 
     // Kotlin PriorityQueue { a, b -> ... } (must run BEFORE general arrow lambda scanner!)
     var pqM;
@@ -1527,15 +1621,9 @@
       var pqClose = findMatchingBrace(js, pqOpen);
       var pqInner = js.slice(pqOpen + 1, pqClose).trim();
       var pqArr = pqInner.match(/^\s*(\w+)\s*,\s*(\w+)\s*->\s*([\s\S]+)$/);
-      var pqRep;
-      if (pqArr) {
-        var bLines = pqArr[3].trim().split('\n');
-        var lastLine = bLines[bLines.length - 1].trim();
-        if (lastLine && !/^return\b/.test(lastLine)) bLines[bLines.length - 1] = 'return ' + lastLine;
-        pqRep = 'new __PriorityQueue(function(' + pqArr[1] + ', ' + pqArr[2] + ') {\n' + bLines.join('\n') + '\n})';
-      } else {
-        pqRep = 'new __PriorityQueue(function(a, b) { ' + pqInner + ' })';
-      }
+      var pqRep = pqArr
+        ? 'new __PriorityQueue(function(' + pqArr[1] + ', ' + pqArr[2] + ') {\n' + normalizeKtBlockReturn(pqArr[3]) + '\n})'
+        : 'new __PriorityQueue(function(a, b) {\n' + normalizeKtBlockReturn(pqInner) + '\n})';
       js = js.slice(0, pqM.index) + pqRep + js.slice(pqClose + 1);
     }
 
@@ -1564,8 +1652,8 @@
       var swInner = js.slice(swOpen + 1, swClose).trim();
       var swArr = swInner.match(/^\s*(\w+)\s*,\s*(\w+)\s*->\s*([\s\S]+)$/);
       var swRep = swArr
-        ? '.sort(function(' + swArr[1] + ', ' + swArr[2] + ') { return (' + swArr[3].trim() + '); })'
-        : '.sort(function(a, b) { return (' + swInner + '); })';
+        ? '.sort(function(' + swArr[1] + ', ' + swArr[2] + ') {\n' + normalizeKtBlockReturn(swArr[3]) + '\n})'
+        : '.sort(function(a, b) {\n' + normalizeKtBlockReturn(swInner) + '\n})';
       js = js.slice(0, swM.index) + swRep + js.slice(swClose + 1);
     }
     var fltM;
@@ -1840,6 +1928,8 @@
     js = js.replace(/\(\s*((?:left|l|low)\s*\+\s*(?:right|r|high))\s*\)\s*\/\s*2\b/g, 'Math.floor(($1) / 2)');
     js = js.replace(/\(\s*(p\s*\+\s*k\s*-\s*1)\s*\)\s*\/\s*k\b/g, 'Math.floor(($1) / k)');
     js = js.replace(/\b(mid|len)\s*\/\s*(\w+)/g, 'Math.floor($1 / $2)');
+    js = js.replace(/\(\s*(r|c|row|col|rem)\s*\/\s*(\d+|\w+)\s*\)/g, 'Math.trunc($1 / $2)');
+    js = js.replace(/\b(rem)\s*\/\s*(\b\w+\b)/g, 'Math.trunc($1 / $2)');
     js = js.replace(/\b(sum|total|carry|rem)\s*\/\s*10\b/g, 'Math.floor($1 / 10)');
     js = js.replace(/(\w+)\s*\/=\s*10\b/g, '$1 = Math.floor($1 / 10)');
     js = js.replace(/(\w+)\s*\/=\s*(\w+)/g, '$1 = Math.trunc($1 / $2)');
@@ -1863,7 +1953,7 @@
     js = js.replace(/\b(?:val|var)\s*\(([^)]+)\)\s*=/g, 'var [$1] =');
 
     // Java/Kotlin variable declarations (safe against `.val` and `? val :`)
-    js = js.replace(/\b(?:private|public|protected|final)\s+/g, '');
+    js = js.replace(/\b(?:private|public|protected|final|static)\s+/g, '');
     var extraClasses = Object.keys(definedClasses).length ? ('|' + Object.keys(definedClasses).join('|')) : '';
     var typePattern = '(?:val|var|boolean|int|long|double|float|char|String|Integer|Boolean|Double|ListNode|TreeNode|Node|List|ArrayList|Map|HashMap|TreeMap|LinkedHashMap|NavigableMap|ConcurrentHashMap|ConcurrentSkipListMap|Set|HashSet|TreeSet|LinkedHashSet|Deque|ArrayDeque|Queue|PriorityQueue|Stack|StringBuilder|ValueEntry|Map\\.Entry|Random' + extraClasses + ')(?:\\[\\])*';
     js = js.replace(new RegExp('(^|[^\\w.])' + typePattern + '\\s+(\\w+)\\s*=', 'g'), '$1var $2 =');
@@ -1960,9 +2050,9 @@
     js = js.replace(/\.keys\b(?!\()/g, '.keys()');
     js = js.replace(/\.size\(\)/g, '.size');
     js = js.replace(/\.length\(\)/g, '.length');
-    js = js.replace(/([\w.\[\]]+)\.equals\(([^)]+)\)/g, '$1 === $2');
+    js = js.replace(/([\w.\[\]]+)\.equals\(([^)]+)\)/g, '(($1) === ($2))');
     js = js.replace(/\bsubstring\(/g, 'slice(');
-    var jvmOp = '(?:\\([^()]+\\)|\\b[\\w.]+(?:\\[[^\\]]+\\])?)';
+    var jvmOp = '(?:\\([^()]*\\([^()]*\\)[^()]*\\)|\\([^()]+\\)|\\b[\\w.]+(?:\\[[^\\]]+\\])?)';
     js = js.replace(new RegExp('(' + jvmOp + ')\\s+xor\\s+(' + jvmOp + ')', 'g'), '(($1) ^ ($2))');
     js = js.replace(new RegExp('(' + jvmOp + ')\\s+and\\s+(' + jvmOp + ')', 'g'), '(($1) & ($2))');
     js = js.replace(new RegExp('(' + jvmOp + ')\\s+or\\s+(' + jvmOp + ')', 'g'), '(($1) | ($2))');
@@ -2227,7 +2317,10 @@
           return s;
         }
         var jsClass = '(function() {\nfunction ' + clsName + '(' + ctorParams.join(', ') + ') {\n';
-        jsClass += 'var self = this;\n' + fixReservedCalls(initBody) + '\n';
+        jsClass += 'var self = this;\n';
+        fieldNames.forEach(function(fn) {
+          if (ctorParams.indexOf(fn) === -1) jsClass += 'var ' + fn + ';\n';
+        });
         methods.filter(function(m) { return m.name !== '__ctor'; }).forEach(function(m) {
           var mJs = transformJVMBody((m.defaults ? m.defaults.join('\n') + '\n' : '') + m.body, true, definedClasses);
           fieldNames.forEach(function(fn) {
@@ -2240,6 +2333,7 @@
           jsClass += 'this[' + JSON.stringify(m.name) + '] = function(' + m.params.join(', ') + ') {\n' + mJs + '\n};\n';
           jsClass += 'var ' + alias + ' = this[' + JSON.stringify(m.name) + '];\n';
         });
+        jsClass += fixReservedCalls(initBody) + '\n';
         jsClass += '}\nreturn ' + clsName + ';\n})()';
         return { isOOP: true, className: clsName, code: unmaskStrings(jsClass, masked.literals) };
       }
@@ -2346,14 +2440,14 @@
         var lvT = lv.trim();
         var itemArg = (lvT.indexOf(',') !== -1 || lvT[0] === '[') ? ('__lc_i') : lvT;
         var destruct = (lvT.indexOf(',') !== -1 || lvT[0] === '[') ? ('var ' + (lvT[0] === '[' ? lvT : '[' + lvT + ']') + ' = __lc_i; ') : '';
-        return '__iter(' + transformPyExpr(itE, helperClasses) + ').filter(function(' + itemArg + '){ ' + destruct + 'return (' + transformPyExpr(condE, helperClasses) + '); }).map(function(' + itemArg + '){ ' + destruct + 'return (' + transformPyExpr(outE, helperClasses) + '); })';
+        return '__iter(' + transformPyExpr(itE, helperClasses) + ').filter((' + itemArg + ') => { ' + destruct + 'return (' + transformPyExpr(condE, helperClasses) + '); }).map((' + itemArg + ') => { ' + destruct + 'return (' + transformPyExpr(outE, helperClasses) + '); })';
       });
     e = e.replace(new RegExp('\\[\\s*(' + lcBodyPat + ')\\s+for\\s+(.+?)\\s+in\\s+(' + lcBodyPat + ')\\s*\\]', 'g'),
       function(_, outE, lv, itE) {
         var lvT = lv.trim();
         var itemArg = (lvT.indexOf(',') !== -1 || lvT[0] === '[') ? ('__lc_i') : lvT;
         var destruct = (lvT.indexOf(',') !== -1 || lvT[0] === '[') ? ('var ' + (lvT[0] === '[' ? lvT : '[' + lvT + ']') + ' = __lc_i; ') : '';
-        return '__iter(' + transformPyExpr(itE, helperClasses) + ').map(function(' + itemArg + '){ ' + destruct + 'return (' + transformPyExpr(outE, helperClasses) + '); })';
+        return '__iter(' + transformPyExpr(itE, helperClasses) + ').map((' + itemArg + ') => { ' + destruct + 'return (' + transformPyExpr(outE, helperClasses) + '); })';
       });
 
     // Python ternary `A if COND else B` (after comprehensions expanded `' for '`)
@@ -2422,7 +2516,7 @@
         li++;
       }
       var lamBody = e.slice(bStart, li).trim();
-      e = e.slice(0, lStart) + 'function(' + lamM[1].trim() + ') { return (' + lamBody + '); }' + e.slice(li);
+      e = e.slice(0, lStart) + '((' + lamM[1].trim() + ') => (' + lamBody + '))' + e.slice(li);
     }
 
     e = e.replace(/\bcollections\.defaultdict\((?:list|int|set|dict)\)/g, function(m) {
@@ -2443,7 +2537,7 @@
     e = e.replace(/\bCounter\(/g, '__py_Counter(');
     e = e.replace(/\bdeque\(/g, 'new __ArrayDeque(');
     e = e.replace(/\bset\(/g, '__py_set(');
-    e = e.replace(/\blist\(/g, '__iter(');
+    e = e.replace(/\blist\(/g, '__py_list(');
     e = e.replace(/\bheapq\./g, '__heapq.');
     e = e.replace(/\bbisect\.bisect_left\(/g, '__bisect.bisect_left(');
     e = e.replace(/\bbisect\.bisect_right\(/g, '__bisect.bisect_right(');
@@ -2484,7 +2578,7 @@
           else if (ai === 1 && !isMethod) keyArg = args[ai];
         }
         var repS = isMethod
-          ? ('.sort(function(__a, __b){ var __fn=' + keyArg + '; var __ka=__fn?__fn(__a):__a, __kb=__fn?__fn(__b):__b; var __c=__ka<__kb?-1:(__ka>__kb?1:0); return ' + revArg + '?-__c:__c; })')
+          ? ('.sort((__a, __b) => { var __fn=' + keyArg + '; var __ka=__fn?__fn(__a):__a, __kb=__fn?__fn(__b):__b; var __c=0; if(Array.isArray(__ka)&&Array.isArray(__kb)){ for(var __i=0;__i<Math.min(__ka.length,__kb.length);__i++){ if(__ka[__i]!==__kb[__i]){ __c=__ka[__i]<__kb[__i]?-1:1; break; } } if(__c===0) __c=__ka.length-__kb.length; } else { __c=__ka<__kb?-1:(__ka>__kb?1:0); } return ' + revArg + '?-__c:__c; })')
           : ('__py_sorted(' + colArg + ', ' + keyArg + ', ' + revArg + ')');
         str = str.slice(0, idxS) + repS + str.slice(clP + 1);
         idxS = str.indexOf(tok, idxS + repS.length);
@@ -2917,6 +3011,22 @@
     var rawArgs = normalizeInputArgs(tc.input);
     var args = rawArgs.slice();
 
+    var origNodeOids = new Set();
+    function collectInputOids(rootNode) {
+      if (!rootNode) return;
+      var q = [rootNode];
+      while (q.length > 0 && origNodeOids.size < 10000) {
+        var cur = q.shift();
+        if (!cur || !cur._oid || origNodeOids.has(cur._oid)) continue;
+        origNodeOids.add(cur._oid);
+        if (cur.next) q.push(cur.next);
+        if (cur.random) q.push(cur.random);
+        if (Array.isArray(cur.neighbors)) {
+          for (var ni = 0; ni < cur.neighbors.length; ni++) q.push(cur.neighbors[ni]);
+        }
+      }
+    }
+
     // Auto-marshal ListNode / TreeNode / GraphNode based on config.ioType
     var io = config.ioType || '';
     if (io === 'list') {
@@ -2950,28 +3060,48 @@
       args = [root, findTreeNode(root, args[1]), findTreeNode(root, args[2])];
     } else if (io === 'random_list') {
       args[0] = toRandomList(args[0]);
+      collectInputOids(args[0]);
     } else if (io === 'graph') {
       args[0] = toGraph(args[0]);
+      collectInputOids(args[0]);
     }
 
     var actual = fn.apply(null, args);
 
-    if (actual === undefined && args.length > 0 && tc.expected !== undefined && tc.expected !== null) {
+    var IN_PLACE_METHODS = {
+      moveZeroes: 1, merge: 1, rotate: 1, solve: 1, reorderList: 1,
+      reverseString: 1, setZeroes: 1, sortColors: 1
+    };
+    var allowInPlace = Boolean(config.inPlace || IN_PLACE_METHODS[config.methodName]);
+    if (actual === undefined && allowInPlace && args.length > 0 && tc.expected !== undefined && tc.expected !== null) {
       actual = args[0];
     }
 
     // Unmarshal output back to JSON array
     if (io === 'list' || io === 'list_head_n' || io === 'list_array') {
-      if (actual === null || actual instanceof ListNode) actual = fromListNode(actual);
+      if (actual === null || (actual && actual instanceof ListNode)) actual = fromListNode(actual);
     } else if (io === 'list_intersect') {
       actual = actual ? actual.val : null;
-    } else if (io === 'tree' && (actual === null || actual instanceof TreeNode)) {
+    } else if (io === 'tree' && (actual === null || (actual && actual instanceof TreeNode))) {
       if (Array.isArray(tc.expected)) actual = fromTreeNode(actual);
     } else if (io === 'tree_lca') {
       actual = actual ? actual.val : null;
     } else if (io === 'random_list') {
+      if (actual === undefined) return { actual: undefined, argsDisplay: rawArgs };
+      var chkR = actual, seenR = new Set();
+      while (chkR && !seenR.has(chkR)) {
+        if (origNodeOids.has(chkR._oid) || (chkR.random && origNodeOids.has(chkR.random._oid))) {
+          throw new Error('Deep copy violation: returned list still references original input Node(s)');
+        }
+        seenR.add(chkR);
+        chkR = chkR.next;
+      }
       actual = fromRandomList(actual);
     } else if (io === 'graph') {
+      if (actual === undefined) return { actual: undefined, argsDisplay: rawArgs };
+      if (actual && origNodeOids.has(actual._oid)) {
+        throw new Error('Deep copy violation: returned graph still references original input Node');
+      }
       actual = fromGraph(actual);
     }
 
@@ -2980,8 +3110,10 @@
 
   LessonRuntime._compareResult = function(actual, tc, config) {
     if (tc.isCustom) return true;
+    if (actual === undefined) return false;
     if (typeof config.comparator === 'function') return config.comparator(actual, tc.expected, tc);
-    if (tc.validCourseOrder && Array.isArray(actual)) {
+    if (tc.validCourseOrder) {
+      if (!Array.isArray(actual)) return false;
       if (tc.expectCycle) return actual.length === 0;
       var numCourses = tc.input[0], prereqs = tc.input[1];
       if (actual.length !== numCourses) return false;
@@ -2995,10 +3127,11 @@
     if (Array.isArray(tc.expectedOneOf)) {
       return tc.expectedOneOf.some(function(opt) { return JSON.stringify(actual) === JSON.stringify(opt); });
     }
-    if (typeof tc.expectedCount === 'number' && Array.isArray(actual)) {
-      return actual.length === tc.expectedCount;
+    if (typeof tc.expectedCount === 'number' && tc.expected === undefined) {
+      return Array.isArray(actual) && actual.length === tc.expectedCount;
     }
-    if (tc.weightedPick && Array.isArray(actual)) {
+    if (tc.weightedPick) {
+      if (!Array.isArray(actual)) return false;
       var weights = tc.weightedPick.weights || [];
       var picks = actual.slice(1);
       if (picks.length === 0) return false;
@@ -3011,14 +3144,35 @@
       }
       return true;
     }
-    if (tc.unordered && Array.isArray(actual) && Array.isArray(tc.expected)) {
-      var norm = function(arr) {
+    if (tc.accountsMerge) {
+      if (!Array.isArray(actual) || !Array.isArray(tc.expected) || actual.length !== tc.expected.length) return false;
+      var normAcc = function(arr) {
+        return arr.map(function(row) {
+          return Array.isArray(row) ? JSON.stringify(row) : String(row);
+        }).sort();
+      };
+      return JSON.stringify(normAcc(actual)) === JSON.stringify(normAcc(tc.expected));
+    }
+    if (tc.unorderedInner && Array.isArray(actual) && Array.isArray(tc.expected)) {
+      if (actual.length !== tc.expected.length) return false;
+      var sortInner = function(a, b) {
+        if (typeof a === 'number' && typeof b === 'number') return a - b;
+        return String(a) < String(b) ? -1 : (String(a) > String(b) ? 1 : 0);
+      };
+      var normBoth = function(arr) {
         return arr.map(function(x) {
-          if (Array.isArray(x)) return JSON.stringify(x.slice().sort());
+          if (Array.isArray(x)) return JSON.stringify(x.slice().sort(sortInner));
           return JSON.stringify(x);
         }).sort();
       };
-      return JSON.stringify(norm(actual)) === JSON.stringify(norm(tc.expected));
+      return JSON.stringify(normBoth(actual)) === JSON.stringify(normBoth(tc.expected));
+    }
+    if (tc.unordered && Array.isArray(actual) && Array.isArray(tc.expected)) {
+      if (actual.length !== tc.expected.length) return false;
+      var normOuter = function(arr) {
+        return arr.map(function(x) { return JSON.stringify(x); }).sort();
+      };
+      return JSON.stringify(normOuter(actual)) === JSON.stringify(normOuter(tc.expected));
     }
     if (typeof actual === 'number' && typeof tc.expected === 'number') {
       return Math.abs(actual - tc.expected) < 1e-4;
@@ -3090,15 +3244,155 @@
       };
 
       var currentHintStep = 0;
+      var usedModelReveal = false;
+      var inDebugMode = false;
+
+      // Inject Cold Interview Timer + Debug Broken PR Mode bar above editor if in browser DOM
+      var coldTargetSec = 25 * 60;
+      if (LessonRuntime.CURRICULUM_MAP && LessonRuntime.CURRICULUM_MAP[Number(problemId)]) {
+        var pMeta = LessonRuntime.CURRICULUM_MAP[Number(problemId)];
+        coldTargetSec = pMeta.diff === 'Easy' ? 15 * 60 : (pMeta.diff === 'Hard' ? 35 * 60 : 25 * 60);
+      }
+      var timerSecLeft = coldTargetSec;
+      var timerInterval = null;
+
+      function formatMMSS(sec) {
+        var abs = Math.abs(sec);
+        var m = Math.floor(abs / 60);
+        var s = abs % 60;
+        return (sec < 0 ? '+' : '') + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+      }
+
+      function buildBuggyChallenge(sol, lang) {
+        if (!sol) return sol;
+        var rules = [
+          [/<=(\s*(?:right|r|high|n\b|target))/, '<$1'],
+          [/<(\s*(?:nums\.size|nums\.length|len\(|n\s*-\s*1))/, '<=$1'],
+          [/\bi\s*\+\s*1\b/, 'i'],
+          [/\bmid\s*\+\s*1\b/, 'mid'],
+          [/\bmid\s*-\s*1\b/, 'mid'],
+          [/\+\s*1\b/, '+ 0'],
+          [/!seen\.add\(/, 'seen.add('],
+          [/==\s*null\b/, '!= null'],
+          [/\bis\s+None\b/, 'is not None'],
+          [/\bTrue\b/, 'False'],
+          [/\btrue\b/, 'false'],
+          [/\b0\b/, '1']
+        ];
+        for (var ri = 0; ri < rules.length; ri++) {
+          if (rules[ri][0].test(sol)) {
+            var mutated = sol.replace(rules[ri][0], rules[ri][1]);
+            if (mutated !== sol) {
+              var cmt = lang === 'python'
+                ? '# 🐛 DEBUG CHALLENGE: Spot and fix the subtle regression bug in this PR!\n'
+                : '// 🐛 DEBUG CHALLENGE: Spot and fix the subtle regression bug in this PR!\n';
+              return cmt + mutated;
+            }
+          }
+        }
+        return sol;
+      }
+
+      if (textarea && textarea.parentNode && textarea.parentNode.insertBefore && !document.getElementById('cold-timer-bar')) {
+        try {
+          var timerBar = document.createElement('div');
+          timerBar.id = 'cold-timer-bar';
+          timerBar.className = 'flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 mb-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono';
+          timerBar.innerHTML =
+            "<div class='flex items-center gap-2'>" +
+              "<span class='text-slate-400'>⏱ Cold Solve Target:</span>" +
+              "<span id='cold-timer-display' class='px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-emerald-400 font-bold'>" + formatMMSS(timerSecLeft) + "</span>" +
+              "<button type='button' id='cold-timer-toggle' class='px-2.5 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 font-semibold'>Start Timer</button>" +
+              "<button type='button' id='cold-timer-reset' class='px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 text-slate-400'>Reset</button>" +
+            "</div>" +
+            "<div class='flex items-center gap-2'>" +
+              "<span id='mastery-mode-pill' class='px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-800/60 text-emerald-300 text-[11px]'>★ Cold Attempt Eligible</span>" +
+              "<button type='button' id='debug-pr-btn' class='px-2.5 py-1 rounded bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-300 font-semibold' title='2027 Interview Drill: Load a subtly broken implementation to diagnose and fix'>🐛 Debug Broken PR</button>" +
+            "</div>";
+          textarea.parentNode.insertBefore(timerBar, textarea.parentNode.firstChild);
+
+          var tDisp = document.getElementById('cold-timer-display');
+          var tBtn = document.getElementById('cold-timer-toggle');
+          var tRst = document.getElementById('cold-timer-reset');
+          var dBtn = document.getElementById('debug-pr-btn');
+          if (tBtn) {
+            tBtn.addEventListener('click', function() {
+              if (timerInterval) {
+                clearInterval(timerInterval); timerInterval = null;
+                tBtn.innerText = 'Resume';
+              } else {
+                tBtn.innerText = 'Pause';
+                timerInterval = setInterval(function() {
+                  timerSecLeft--;
+                  if (tDisp) {
+                    tDisp.innerText = formatMMSS(timerSecLeft);
+                    tDisp.className = timerSecLeft < 0
+                      ? 'px-2 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 font-bold'
+                      : (timerSecLeft <= 180 ? 'px-2 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 font-bold' : 'px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-emerald-400 font-bold');
+                  }
+                }, 1000);
+              }
+            });
+          }
+          if (tRst) {
+            tRst.addEventListener('click', function() {
+              if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+              timerSecLeft = coldTargetSec;
+              if (tDisp) {
+                tDisp.innerText = formatMMSS(timerSecLeft);
+                tDisp.className = 'px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-emerald-400 font-bold';
+              }
+              if (tBtn) tBtn.innerText = 'Start Timer';
+            });
+          }
+          if (dBtn) {
+            dBtn.addEventListener('click', function() {
+              if (confirm('Load a subtly broken PR in ' + currentLang.toUpperCase() + ' to practice 2027 code-reading & bug-fixing?')) {
+                inDebugMode = true;
+                updateMasteryEligibilityPill();
+                var buggy = (config.buggySolutions && config.buggySolutions[currentLang]) || buildBuggyChallenge(config.modelSolutions[currentLang], currentLang);
+                textarea.value = buggy;
+              }
+            });
+          }
+        } catch (_) {}
+      }
+
+      function updateMasteryEligibilityPill() {
+        var pill = document.getElementById('mastery-mode-pill');
+        if (!pill) return;
+        if (usedModelReveal) {
+          pill.className = 'px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300 text-[11px]';
+          pill.innerText = 'Assisted Mode (Solution Viewed)';
+        } else if (inDebugMode) {
+          pill.className = 'px-2 py-0.5 rounded bg-amber-950/60 border border-amber-700/60 text-amber-300 text-[11px]';
+          pill.innerText = '🐛 Debug PR Mode';
+        } else if (currentHintStep > 0) {
+          pill.className = 'px-2 py-0.5 rounded bg-cyan-950/60 border border-cyan-800/60 text-cyan-300 text-[11px]';
+          pill.innerText = 'Hint-Assisted (' + currentHintStep + ' used)';
+        } else {
+          pill.className = 'px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-800/60 text-emerald-300 text-[11px]';
+          pill.innerText = '★ Cold Attempt Eligible';
+        }
+      }
+
+      var origResetStub = window.resetPracticeStub;
+      window.resetPracticeStub = function() {
+        inDebugMode = false;
+        origResetStub();
+        updateMasteryEligibilityPill();
+      };
+
       window.revealNextHint = function() {
         if (currentHintStep < config.hints.length) {
           currentHintStep++;
+          updateMasteryEligibilityPill();
           var hintContainer = document.getElementById('practice-hints-container');
           if (hintContainer) {
             hintContainer.classList.remove('hidden');
             var card = document.createElement('div');
             card.className = "p-3.5 rounded-xl bg-slate-950 border border-indigo-900/50 text-xs font-mono space-y-1 animate-subtle";
-            card.innerHTML = "<div class='text-indigo-400 font-bold uppercase text-[10px]'>💡 Progressive Hint " + currentHintStep + " of " + config.hints.length + ":</div><p class='text-slate-300 leading-relaxed'>" + config.hints[currentHintStep - 1] + "</p>";
+            card.innerHTML = "<div class='text-indigo-400 font-bold uppercase text-[10px]'>💡 Progressive Hint " + currentHintStep + " of " + config.hints.length + ":</div><p class='text-slate-300 leading-relaxed'>" + sanitizeRichHtml(config.hints[currentHintStep - 1]) + "</p>";
             hintContainer.appendChild(card);
           }
           var hintBtn = document.getElementById('practice-hint-btn');
@@ -3118,6 +3412,8 @@
         var box = document.getElementById('practice-model-box');
         if (!box) return;
         if (box.classList.contains('hidden')) {
+          usedModelReveal = true;
+          updateMasteryEligibilityPill();
           box.classList.remove('hidden');
           var pre = document.getElementById('practice-model-code');
           if (pre) pre.innerText = config.modelSolutions[currentLang] || '';
@@ -3128,6 +3424,8 @@
 
       window.loadModelIntoEditor = function() {
         if (confirm("Replace editor code with the official model solution?")) {
+          usedModelReveal = true;
+          updateMasteryEligibilityPill();
           var sol = config.modelSolutions[currentLang] || '';
           textarea.value = sol;
           localStorage.setItem(storageKey + currentLang, sol);
@@ -3154,7 +3452,7 @@
             statusText.className = "text-red-400 font-bold text-xs";
             statusText.innerText = "Compile / Syntax Error";
           }
-          output.innerHTML = "<div class='p-3 rounded-lg bg-red-950/60 border border-red-800 text-red-200 text-xs font-mono'><strong>Error:</strong> " + err.message + "</div>";
+          output.innerHTML = "<div class='p-3 rounded-lg bg-red-950/60 border border-red-800 text-red-200 text-xs font-mono'><strong>Error:</strong> " + escapeHtmlExact(err.message) + "</div>";
           return;
         }
 
@@ -3197,12 +3495,13 @@
                     ? "<span class='px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-800 text-emerald-300 font-bold'>PASS ✓</span>"
                     : "<span class='px-2 py-0.5 rounded bg-red-950/80 border border-red-800 text-red-300 font-bold'>FAIL ✗</span>"));
 
-          var inputStr = argsDisplay.map(function(a) { return JSON.stringify(a); }).join(', ');
-          var expectedStr = tc.isCustom ? 'User Input'
+          var inputStr = escapeHtmlExact(argsDisplay.map(function(a) { return JSON.stringify(a); }).join(', '));
+          var expectedStr = escapeHtmlExact(tc.isCustom ? 'User Input'
             : (tc.expectedOneOf ? ('any of ' + JSON.stringify(tc.expectedOneOf))
-            : (typeof tc.expectedCount === 'number' ? ('array of length ' + tc.expectedCount)
-            : JSON.stringify(tc.expected)));
-          var actualStr = error ? ('Exception: ' + error) : JSON.stringify(actual);
+            : (tc.weightedPick ? ('valid weighted distribution over ' + JSON.stringify(tc.weightedPick.weights))
+            : (typeof tc.expectedCount === 'number' && tc.expected === undefined ? ('array of length ' + tc.expectedCount)
+            : JSON.stringify(tc.expected)))));
+          var actualStr = escapeHtmlExact(error ? ('Exception: ' + error) : (actual === undefined ? 'undefined (no return value)' : JSON.stringify(actual)));
 
           resultsHtml += "<div class='p-3 rounded-xl bg-slate-900 border " + (passed ? 'border-slate-800' : 'border-red-900/60') + " space-y-1.5 text-xs font-mono'>" +
             "<div class='flex items-center justify-between'>" +
@@ -3217,12 +3516,17 @@
 
         var elapsedMs = Math.round((performance.now() - startTime) * 10) / 10;
         if (allPassed) {
+          if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+          var isColdWin = !usedModelReveal && !inDebugMode && currentHintStep === 0;
           try {
             var solvedRaw = localStorage.getItem('lc110_solved_' + problemId);
             var solvedObj = solvedRaw ? JSON.parse(solvedRaw) : { langs: [] };
             if (!Array.isArray(solvedObj.langs)) solvedObj.langs = [];
             if (solvedObj.langs.indexOf(currentLang) === -1) solvedObj.langs.push(currentLang);
             solvedObj.at = Date.now();
+            if (isColdWin) solvedObj.cold = true;
+            else if (!solvedObj.cold) solvedObj.assisted = true;
+            if (inDebugMode) solvedObj.debugFixed = true;
             localStorage.setItem('lc110_solved_' + problemId, JSON.stringify(solvedObj));
             var recallKey = 'lc103_problem_' + problemId + '_recall';
             if (!localStorage.getItem(recallKey)) {
@@ -3233,7 +3537,7 @@
           if (dot) dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse";
           if (statusText) {
             statusText.className = "text-emerald-400 font-bold text-xs";
-            statusText.innerText = "All " + testCases.length + " Test Cases Passed (" + elapsedMs + "ms)";
+            statusText.innerText = "All " + testCases.length + " Test Cases Passed (" + elapsedMs + "ms)" + (isColdWin ? " • ★ Cold Solve Recorded!" : (inDebugMode ? " • 🐛 PR Bug Fixed!" : " • Assisted Solve"));
           }
         } else {
           if (dot) dot.className = "w-2.5 h-2.5 rounded-full bg-red-400";
@@ -3258,7 +3562,7 @@
   };
 
   // =========================================================================
-  // 4. FOUR-QUESTION DIAGNOSTIC CODE QUIZ ENGINE
+  // 4. FOUR-QUESTION DIAGNOSTIC CODE QUIZ ENGINE (Persistent + Escaped)
   // =========================================================================
   LessonRuntime.Quiz = {
     init: function(config) {
@@ -3266,31 +3570,73 @@
       if (!container) return;
       var questions = config.questions || [];
       var solvedSet = {};
+      var savedChoices = {};
+
+      function resolveQuizPid() {
+        var qPid = config.problemId || LessonRuntime._currentProblemId;
+        if (!qPid && typeof window !== 'undefined' && window.location && window.location.pathname) {
+          var mPid = window.location.pathname.match(/(\d{4})-/);
+          if (mPid) qPid = mPid[1];
+        }
+        return qPid;
+      }
+
+      var quizPid = resolveQuizPid();
+      try {
+        if (quizPid) {
+          var rawSaved = localStorage.getItem('lc110_quiz_' + quizPid);
+          if (rawSaved) {
+            var parsedSaved = JSON.parse(rawSaved);
+            if (parsedSaved && parsedSaved.choices) savedChoices = parsedSaved.choices;
+            else if (parsedSaved && parsedSaved.passed) {
+              for (var qi = 0; qi < questions.length; qi++) {
+                var cOpt = (questions[qi].options || []).find(function(o) { return o.isCorrect; });
+                if (cOpt) savedChoices[qi + 1] = cOpt.id;
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      function persistQuizProgress() {
+        try {
+          var qPid = resolveQuizPid();
+          if (!qPid) return;
+          var passedAll = Object.keys(solvedSet).length >= questions.length && questions.length > 0;
+          localStorage.setItem('lc110_quiz_' + qPid, JSON.stringify({
+            passed: passedAll,
+            score: Object.keys(solvedSet).length,
+            total: questions.length,
+            choices: savedChoices,
+            at: Date.now()
+          }));
+        } catch (_) {}
+      }
 
       function render() {
-        var html = '';
+        var html = "<div class='flex items-center justify-end mb-2'><button type='button' onclick='window.resetQuizProgress()' class='text-[11px] font-mono text-slate-500 hover:text-slate-300 underline'>Reset Quiz Answers</button></div>";
         for (var qIdx = 0; qIdx < questions.length; qIdx++) {
           var q = questions[qIdx];
           var qNum = qIdx + 1;
           var codeSnippetHtml = q.codeSnippet
-            ? "<pre class='p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-cyan-300 overflow-x-auto leading-relaxed'>" + q.codeSnippet + "</pre>"
+            ? "<pre class='p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-cyan-300 overflow-x-auto leading-relaxed'>" + escapeHtmlExact(q.codeSnippet) + "</pre>"
             : "";
 
           var optionsHtml = '';
           for (var oIdx = 0; oIdx < q.options.length; oIdx++) {
             var opt = q.options[oIdx];
-            optionsHtml += "<button onclick='window.checkQuizChoice(" + qNum + ", \"" + opt.id + "\")' id='quiz-opt-" + qNum + "-" + opt.id + "' class='w-full text-left p-3.5 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 text-slate-300 text-xs font-mono transition-all flex items-start gap-3 leading-relaxed'>" +
+            optionsHtml += "<button onclick='window.checkQuizChoice(" + qNum + ", \"" + opt.id + "\", true)' id='quiz-opt-" + qNum + "-" + opt.id + "' class='w-full text-left p-3.5 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 text-slate-300 text-xs font-mono transition-all flex items-start gap-3 leading-relaxed'>" +
               "<span class='px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400 font-bold uppercase text-[11px]'>" + opt.id + "</span>" +
-              "<span class='flex-1'>" + opt.text + "</span>" +
+              "<span class='flex-1'>" + sanitizeRichHtml(opt.text) + "</span>" +
             "</button>";
           }
 
           html += "<div class='p-6 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4 shadow-xl' id='quiz-card-" + qNum + "'>" +
             "<div class='flex items-center justify-between text-xs font-mono'>" +
               "<span class='text-emerald-400 font-bold uppercase tracking-wider'>Diagnostic Check " + qNum + " of " + questions.length + "</span>" +
-              "<span class='text-slate-500'>" + (q.category || 'Concept Check') + "</span>" +
+              "<span class='text-slate-500'>" + sanitizeRichHtml(q.category || 'Concept Check') + "</span>" +
             "</div>" +
-            "<h3 class='text-sm sm:text-base font-bold text-white leading-relaxed'>" + q.prompt + "</h3>" +
+            "<h3 class='text-sm sm:text-base font-bold text-white leading-relaxed'>" + sanitizeRichHtml(q.prompt) + "</h3>" +
             codeSnippetHtml +
             "<div class='space-y-2.5 pt-1'>" + optionsHtml + "</div>" +
             "<div id='quiz-feedback-" + qNum + "' class='hidden p-4 rounded-xl text-xs font-mono leading-relaxed space-y-2'></div>" +
@@ -3299,7 +3645,17 @@
         container.innerHTML = html;
       }
 
-      window.checkQuizChoice = function(qNum, selectedId) {
+      window.resetQuizProgress = function() {
+        solvedSet = {};
+        savedChoices = {};
+        try {
+          var qPid = resolveQuizPid();
+          if (qPid) localStorage.removeItem('lc110_quiz_' + qPid);
+        } catch (_) {}
+        render();
+      };
+
+      window.checkQuizChoice = function(qNum, selectedId, shouldPersist) {
         var q = questions[qNum - 1];
         if (!q) return;
         var selectedOpt = null;
@@ -3319,26 +3675,18 @@
         var chosenBtn = document.getElementById('quiz-opt-' + qNum + '-' + selectedId);
         if (selectedOpt && selectedOpt.isCorrect) {
           solvedSet[qNum] = true;
-          try {
-            var qPid = config.problemId || LessonRuntime._currentProblemId;
-            if (!qPid && typeof window !== 'undefined' && window.location) {
-              var mPid = window.location.pathname.match(/(\d{4})-/);
-              if (mPid) qPid = mPid[1];
-            }
-            if (qPid && Object.keys(solvedSet).length >= questions.length && questions.length > 0) {
-              localStorage.setItem('lc110_quiz_' + qPid, JSON.stringify({ passed: true, score: questions.length, total: questions.length, at: Date.now() }));
-            }
-          } catch (e) {}
+          savedChoices[qNum] = selectedId;
+          if (shouldPersist !== false) persistQuizProgress();
           if (chosenBtn) {
             chosenBtn.className = "w-full text-left p-3.5 rounded-xl bg-emerald-950/60 border-2 border-emerald-500 text-emerald-200 text-xs font-mono transition-all flex items-start gap-3 leading-relaxed shadow-lg shadow-emerald-500/20";
           }
           feedbackBox.className = "p-4 rounded-xl text-xs font-mono leading-relaxed bg-emerald-950/60 border border-emerald-800 text-emerald-200 space-y-2.5";
           feedbackBox.innerHTML = "<div class='flex items-center gap-2 font-bold text-emerald-300 uppercase text-[11px]'>" +
             "<span>✅</span> Correct! Choice " + selectedId + " is optimal</div>" +
-            "<p class='text-slate-200'>" + selectedOpt.whyRight + "</p>" +
+            "<p class='text-slate-200'>" + sanitizeRichHtml(selectedOpt.whyRight) + "</p>" +
             (q.allExplanations ? "<div class='pt-2 border-t border-emerald-900/60 text-slate-300 space-y-1'>" +
               "<span class='text-[10px] uppercase font-bold text-emerald-400 block'>Why the other 3 choices fail:</span>" +
-              q.allExplanations + "</div>" : "");
+              sanitizeRichHtml(q.allExplanations) + "</div>" : "");
           feedbackBox.classList.remove('hidden');
         } else {
           if (chosenBtn) {
@@ -3347,7 +3695,7 @@
           feedbackBox.className = "p-4 rounded-xl text-xs font-mono leading-relaxed bg-red-950/60 border border-red-800 text-red-200 space-y-2";
           feedbackBox.innerHTML = "<div class='flex items-center gap-2 font-bold text-red-300 uppercase text-[11px]'>" +
             "<span>❌</span> Choice " + selectedId + " is incorrect</div>" +
-            "<p class='text-slate-200'>" + (selectedOpt ? selectedOpt.whyWrong : 'Incorrect selection.') + "</p>" +
+            "<p class='text-slate-200'>" + sanitizeRichHtml(selectedOpt ? selectedOpt.whyWrong : 'Incorrect selection.') + "</p>" +
             "<div class='pt-2 flex items-center justify-between text-[11px]'>" +
               "<span class='text-slate-400'>Click another option to try again, or:</span>" +
               "<button onclick='window.revealFullQuizAnswer(" + qNum + ")' class='text-indigo-400 hover:text-indigo-300 underline font-semibold'>Reveal Full Solution Breakdown ↗</button>" +
@@ -3372,13 +3720,16 @@
         feedbackBox.className = "p-4 rounded-xl text-xs font-mono leading-relaxed bg-slate-950 border border-slate-800 text-slate-200 space-y-2.5";
         feedbackBox.innerHTML = "<div class='flex items-center gap-2 font-bold text-emerald-400 uppercase text-[11px]'>" +
           "<span>💡</span> Solution Breakdown: Choice " + (correctOpt ? correctOpt.id : '') + " is correct</div>" +
-          "<p class='text-slate-300'>" + (correctOpt ? correctOpt.whyRight : '') + "</p>" +
+          "<p class='text-slate-300'>" + sanitizeRichHtml(correctOpt ? correctOpt.whyRight : '') + "</p>" +
           (q.allExplanations ? "<div class='pt-2 border-t border-slate-800 text-slate-300 space-y-1'>" +
             "<span class='text-[10px] uppercase font-bold text-slate-400 block'>Why the other 3 choices fail:</span>" +
-            q.allExplanations + "</div>" : "");
+            sanitizeRichHtml(q.allExplanations) + "</div>" : "");
       };
 
       render();
+      Object.keys(savedChoices).forEach(function(k) {
+        window.checkQuizChoice(Number(k), savedChoices[k], false);
+      });
     }
   };
 
@@ -3434,6 +3785,250 @@
       setInterval(update, 1000);
     }
   };
+
+  // =========================================================================
+  // 6. CANONICAL 126 CURRICULUM MANIFEST, STUDY-ORDER NAV & COPY BUTTONS
+  // =========================================================================
+  LessonRuntime.CURRICULUM = [
+    { num: 1, title: "Contains Duplicate", lc: 217, pass: "1", diff: "Easy", file: "0001-lc217-contains-duplicate.html" },
+    { num: 2, title: "Two Sum", lc: 1, pass: "1", diff: "Easy", file: "0002-lc1-two-sum.html" },
+    { num: 3, title: "Merge Strings Alternately", lc: 1768, pass: "1", diff: "Easy", file: "0003-lc1768-merge-strings-alternately.html", optional: true },
+    { num: 4, title: "Move Zeroes", lc: 283, pass: "1", diff: "Easy", file: "0004-lc283-move-zeroes.html" },
+    { num: 5, title: "Valid Palindrome", lc: 125, pass: "1", diff: "Easy", file: "0005-lc125-valid-palindrome.html" },
+    { num: 6, title: "Best Time to Buy and Sell Stock", lc: 121, pass: "1", diff: "Easy", file: "0006-lc121-best-time-to-buy-and-sell-stock.html" },
+    { num: 7, title: "Maximum Average Subarray I", lc: 643, pass: "1", diff: "Easy", file: "0007-lc643-maximum-average-subarray-i.html" },
+    { num: 8, title: "Find Pivot Index", lc: 724, pass: "1", diff: "Easy", file: "0008-lc724-find-pivot-index.html" },
+    { num: 9, title: "Valid Parentheses", lc: 20, pass: "1", diff: "Easy", file: "0009-lc20-valid-parentheses.html" },
+    { num: 10, title: "Number of Recent Calls", lc: 933, pass: "1", diff: "Easy", file: "0010-lc933-number-of-recent-calls.html" },
+    { num: 11, title: "Reverse Linked List", lc: 206, pass: "1", diff: "Easy", file: "0011-lc206-reverse-linked-list.html" },
+    { num: 12, title: "Merge Two Sorted Lists", lc: 21, pass: "1", diff: "Easy", file: "0012-lc21-merge-two-sorted-lists.html" },
+    { num: 13, title: "Linked List Cycle", lc: 141, pass: "1", diff: "Easy", file: "0013-lc141-linked-list-cycle.html" },
+    { num: 14, title: "Intersection of Two Linked Lists", lc: 160, pass: "1", diff: "Easy", file: "0014-lc160-intersection-of-two-linked-lists.html" },
+    { num: 15, title: "Binary Search", lc: 704, pass: "1", diff: "Easy", file: "0015-lc704-binary-search.html" },
+    { num: 16, title: "Invert Binary Tree", lc: 226, pass: "1", diff: "Easy", file: "0016-lc226-invert-binary-tree.html" },
+    { num: 17, title: "Maximum Depth of Binary Tree", lc: 104, pass: "1", diff: "Easy", file: "0017-lc104-maximum-depth-of-binary-tree.html" },
+    { num: 18, title: "Diameter of Binary Tree", lc: 543, pass: "1", diff: "Easy", file: "0018-lc543-diameter-of-binary-tree.html" },
+    { num: 19, title: "Climbing Stairs", lc: 70, pass: "1", diff: "Easy", file: "0019-lc70-climbing-stairs.html" },
+    { num: 20, title: "Single Number", lc: 136, pass: "1", diff: "Easy", file: "0020-lc136-single-number.html", optional: true },
+    { num: 21, title: "Number of 1 Bits", lc: 191, pass: "1", diff: "Easy", file: "0021-lc191-number-of-1-bits.html", optional: true },
+    { num: 22, title: "Counting Bits", lc: 338, pass: "1", diff: "Easy", file: "0022-lc338-counting-bits.html", optional: true },
+    { num: 23, title: "Group Anagrams", lc: 49, pass: "2A", diff: "Medium", file: "0023-lc49-group-anagrams.html" },
+    { num: 24, title: "String Compression", lc: 443, pass: "2A", diff: "Medium", file: "0024-lc443-string-compression.html" },
+    { num: 25, title: "Container With Most Water", lc: 11, pass: "2A", diff: "Medium", file: "0025-lc11-container-with-most-water.html" },
+    { num: 26, title: "Longest Substring Without Repeating Characters", lc: 3, pass: "2A", diff: "Medium", file: "0026-lc3-longest-substring-without-repeating-characters.html" },
+    { num: 27, title: "Max Consecutive Ones III", lc: 1004, pass: "2A", diff: "Medium", file: "0027-lc1004-max-consecutive-ones-iii.html" },
+    { num: 28, title: "Min Stack", lc: 155, pass: "2A", diff: "Medium", file: "0028-lc155-min-stack.html" },
+    { num: 29, title: "Asteroid Collision", lc: 735, pass: "2A", diff: "Medium", file: "0029-lc735-asteroid-collision.html" },
+    { num: 30, title: "Daily Temperatures", lc: 739, pass: "2A", diff: "Medium", file: "0030-lc739-daily-temperatures.html" },
+    { num: 31, title: "Simple Bank System", lc: 2043, pass: "2A", diff: "Medium", file: "0031-lc2043-simple-bank-system.html" },
+    { num: 32, title: "Design Hit Counter", lc: 362, pass: "2A", diff: "Medium", file: "0032-lc362-design-hit-counter.html" },
+    { num: 33, title: "Design Underground System", lc: 1396, pass: "2A", diff: "Medium", file: "0033-lc1396-design-underground-system.html" },
+    { num: 34, title: "Remove Nth Node From End of List", lc: 19, pass: "2A", diff: "Medium", file: "0034-lc19-remove-nth-node-from-end-of-list.html" },
+    { num: 35, title: "Copy List with Random Pointer", lc: 138, pass: "2A", diff: "Medium", file: "0035-lc138-copy-list-with-random-pointer.html" },
+    { num: 36, title: "Search a 2D Matrix", lc: 74, pass: "2A", diff: "Medium", file: "0036-lc74-search-a-2d-matrix.html" },
+    { num: 37, title: "Find Minimum in Rotated Sorted Array", lc: 153, pass: "2A", diff: "Medium", file: "0037-lc153-find-minimum-in-rotated-sorted-array.html" },
+    { num: 38, title: "Find Peak Element", lc: 162, pass: "2A", diff: "Medium", file: "0038-lc162-find-peak-element.html" },
+    { num: 39, title: "Binary Tree Level Order Traversal", lc: 102, pass: "2A", diff: "Medium", file: "0039-lc102-binary-tree-level-order-traversal.html" },
+    { num: 40, title: "Binary Tree Right Side View", lc: 199, pass: "2A", diff: "Medium", file: "0040-lc199-binary-tree-right-side-view.html" },
+    { num: 41, title: "Count Good Nodes in Binary Tree", lc: 1448, pass: "2A", diff: "Medium", file: "0041-lc1448-count-good-nodes-in-binary-tree.html" },
+    { num: 42, title: "Implement Trie (Prefix Tree)", lc: 208, pass: "2A", diff: "Medium", file: "0042-lc208-implement-trie-prefix-tree.html" },
+    { num: 43, title: "Kth Largest Element in an Array", lc: 215, pass: "2A", diff: "Medium", file: "0043-lc215-kth-largest-element-in-an-array.html" },
+    { num: 44, title: "K Closest Points to Origin", lc: 973, pass: "2A", diff: "Medium", file: "0044-lc973-k-closest-points-to-origin.html" },
+    { num: 45, title: "Top K Frequent Elements", lc: 347, pass: "2A", diff: "Medium", file: "0045-lc347-top-k-frequent-elements.html" },
+    { num: 46, title: "Merge Intervals", lc: 56, pass: "2A", diff: "Medium", file: "0046-lc56-merge-intervals.html" },
+    { num: 47, title: "Insert Interval", lc: 57, pass: "2A", diff: "Medium", file: "0047-lc57-insert-interval.html" },
+    { num: 48, title: "Subsets", lc: 78, pass: "2A", diff: "Medium", file: "0048-lc78-subsets.html" },
+    { num: 49, title: "Permutations", lc: 46, pass: "2A", diff: "Medium", file: "0049-lc46-permutations.html" },
+    { num: 50, title: "Spiral Matrix", lc: 54, pass: "2A", diff: "Medium", file: "0050-lc54-spiral-matrix.html" },
+    { num: 51, title: "Number of Islands", lc: 200, pass: "2A", diff: "Medium", file: "0051-lc200-number-of-islands.html" },
+    { num: 52, title: "Rotting Oranges", lc: 994, pass: "2A", diff: "Medium", file: "0052-lc994-rotting-oranges.html" },
+    { num: 53, title: "Keys and Rooms", lc: 841, pass: "2A", diff: "Medium", file: "0053-lc841-keys-and-rooms.html", optional: true },
+    { num: 54, title: "Number of Provinces", lc: 547, pass: "2A", diff: "Medium", file: "0054-lc547-number-of-provinces.html" },
+    { num: 55, title: "House Robber", lc: 198, pass: "2A", diff: "Medium", file: "0055-lc198-house-robber.html" },
+    { num: 56, title: "Unique Paths", lc: 62, pass: "2A", diff: "Medium", file: "0056-lc62-unique-paths.html" },
+    { num: 57, title: "Coin Change", lc: 322, pass: "2A", diff: "Medium", file: "0057-lc322-coin-change.html" },
+    { num: 58, title: "Product of Array Except Self", lc: 238, pass: "2B", diff: "Medium", file: "0058-lc238-product-of-array-except-self.html" },
+    { num: 59, title: "Longest Consecutive Sequence", lc: 128, pass: "2B", diff: "Medium", file: "0059-lc128-longest-consecutive-sequence.html" },
+    { num: 60, title: "3Sum", lc: 15, pass: "2B", diff: "Medium", file: "0060-lc15-3sum.html" },
+    { num: 61, title: "Longest Repeating Character Replacement", lc: 424, pass: "2B", diff: "Medium", file: "0061-lc424-longest-repeating-character-replacement.html" },
+    { num: 62, title: "Subarray Sum Equals K", lc: 560, pass: "2B", diff: "Medium", file: "0062-lc560-subarray-sum-equals-k.html" },
+    { num: 63, title: "Decode String", lc: 394, pass: "2B", diff: "Medium", file: "0063-lc394-decode-string.html" },
+    { num: 64, title: "Basic Calculator II", lc: 227, pass: "2B", diff: "Medium", file: "0064-lc227-basic-calculator-ii.html" },
+    { num: 65, title: "Car Fleet", lc: 853, pass: "2B", diff: "Medium", file: "0065-lc853-car-fleet.html", optional: true },
+    { num: 66, title: "Time Based Key-Value Store", lc: 981, pass: "2B", diff: "Medium", file: "0066-lc981-time-based-key-value-store.html" },
+    { num: 67, title: "In-Memory Key-Value Store with TTL", lc: "Custom", pass: "2B", diff: "Medium", file: "0067-custom-in-memory-kv-store-ttl.html" },
+    { num: 68, title: "Insert Delete GetRandom O(1)", lc: 380, pass: "2B", diff: "Medium", file: "0068-lc380-insert-delete-getrandom-o1.html" },
+    { num: 69, title: "LRU Cache", lc: 146, pass: "2B", diff: "Medium", file: "0069-lc146-lru-cache.html" },
+    { num: 70, title: "Search in Rotated Sorted Array", lc: 33, pass: "2B", diff: "Medium", file: "0070-lc33-search-in-rotated-sorted-array.html" },
+    { num: 71, title: "Koko Eating Bananas", lc: 875, pass: "2B", diff: "Medium", file: "0071-lc875-koko-eating-bananas.html" },
+    { num: 72, title: "Validate Binary Search Tree", lc: 98, pass: "2B", diff: "Medium", file: "0072-lc98-validate-binary-search-tree.html" },
+    { num: 73, title: "Lowest Common Ancestor of a Binary Tree", lc: 236, pass: "2B", diff: "Medium", file: "0073-lc236-lowest-common-ancestor-of-a-binary-tree.html" },
+    { num: 74, title: "Design Add and Search Words Data Structure", lc: 211, pass: "2B", diff: "Medium", file: "0074-lc211-design-add-and-search-words-data-structure.html" },
+    { num: 75, title: "Meeting Rooms II", lc: 253, pass: "2B", diff: "Medium", file: "0075-lc253-meeting-rooms-ii.html" },
+    { num: 76, title: "Non-overlapping Intervals", lc: 435, pass: "2B", diff: "Medium", file: "0076-lc435-non-overlapping-intervals.html" },
+    { num: 77, title: "Minimum Number of Arrows to Burst Balloons", lc: 452, pass: "2B", diff: "Medium", file: "0077-lc452-minimum-number-of-arrows-to-burst-balloons.html", optional: true },
+    { num: 78, title: "Combination Sum", lc: 39, pass: "2B", diff: "Medium", file: "0078-lc39-combination-sum.html" },
+    { num: 79, title: "Generate Parentheses", lc: 22, pass: "2B", diff: "Medium", file: "0079-lc22-generate-parentheses.html" },
+    { num: 80, title: "Pacific Atlantic Water Flow", lc: 417, pass: "2B", diff: "Medium", file: "0080-lc417-pacific-atlantic-water-flow.html" },
+    { num: 81, title: "Surrounded Regions", lc: 130, pass: "2B", diff: "Medium", file: "0081-lc130-surrounded-regions.html" },
+    { num: 82, title: "Clone Graph", lc: 133, pass: "2B", diff: "Medium", file: "0082-lc133-clone-graph.html" },
+    { num: 83, title: "Course Schedule", lc: 207, pass: "2B", diff: "Medium", file: "0083-lc207-course-schedule.html" },
+    { num: 84, title: "Course Schedule II", lc: 210, pass: "2B", diff: "Medium", file: "0084-lc210-course-schedule-ii.html" },
+    { num: 85, title: "Redundant Connection", lc: 684, pass: "2B", diff: "Medium", file: "0085-lc684-redundant-connection.html" },
+    { num: 86, title: "Network Delay Time", lc: 743, pass: "2B", diff: "Medium", file: "0086-lc743-network-delay-time.html" },
+    { num: 87, title: "Word Break", lc: 139, pass: "2B", diff: "Medium", file: "0087-lc139-word-break.html" },
+    { num: 88, title: "Longest Increasing Subsequence", lc: 300, pass: "2B", diff: "Medium", file: "0088-lc300-longest-increasing-subsequence.html" },
+    { num: 89, title: "Longest Common Subsequence", lc: 1143, pass: "2B", diff: "Medium", file: "0089-lc1143-longest-common-subsequence.html" },
+    { num: 90, title: "Trapping Rain Water", lc: 42, pass: "3", diff: "Hard", file: "0090-lc42-trapping-rain-water.html" },
+    { num: 91, title: "Minimum Window Substring", lc: 76, pass: "3", diff: "Hard", file: "0091-lc76-minimum-window-substring.html" },
+    { num: 92, title: "Sliding Window Maximum", lc: 239, pass: "3", diff: "Hard", file: "0092-lc239-sliding-window-maximum.html" },
+    { num: 93, title: "Design In-Memory File System", lc: 588, pass: "3", diff: "Hard", file: "0093-lc588-design-in-memory-file-system.html" },
+    { num: 94, title: "Merge k Sorted Lists", lc: 23, pass: "3", diff: "Hard", file: "0094-lc23-merge-k-sorted-lists.html" },
+    { num: 95, title: "Binary Tree Maximum Path Sum", lc: 124, pass: "3", diff: "Hard", file: "0095-lc124-binary-tree-maximum-path-sum.html" },
+    { num: 96, title: "Find Median from Data Stream", lc: 295, pass: "3", diff: "Hard", file: "0096-lc295-find-median-from-data-stream.html" },
+    { num: 97, title: "Merge Sorted Array", lc: 88, pass: "1", diff: "Easy", file: "0097-lc88-merge-sorted-array.html" },
+    { num: 98, title: "Logger Rate Limiter", lc: 359, pass: "1", diff: "Easy", file: "0098-lc359-logger-rate-limiter.html" },
+    { num: 99, title: "Maximum Subarray", lc: 53, pass: "2A", diff: "Medium", file: "0099-lc53-maximum-subarray.html" },
+    { num: 100, title: "Rotate Image", lc: 48, pass: "2A", diff: "Medium", file: "0100-lc48-rotate-image.html" },
+    { num: 101, title: "Word Search", lc: 79, pass: "2B", diff: "Medium", file: "0101-lc79-word-search.html" },
+    { num: 102, title: "Evaluate Division", lc: 399, pass: "2B", diff: "Medium", file: "0102-lc399-evaluate-division.html" },
+    { num: 103, title: "Longest Palindromic Substring", lc: 5, pass: "2B", diff: "Medium", file: "0103-lc5-longest-palindromic-substring.html" },
+    { num: 104, title: "Encode and Decode Strings", lc: 271, pass: "2A", diff: "Medium", file: "0104-lc271-encode-and-decode-strings.html" },
+    { num: 105, title: "Kth Smallest Element in a BST", lc: 230, pass: "2A", diff: "Medium", file: "0105-lc230-kth-smallest-element-in-a-bst.html" },
+    { num: 106, title: "Construct Binary Tree from Preorder and Inorder Traversal", lc: 105, pass: "2B", diff: "Medium", file: "0106-lc105-construct-binary-tree-from-preorder-and-inorder-traversal.html" },
+    { num: 107, title: "Task Scheduler", lc: 621, pass: "2B", diff: "Medium", file: "0107-lc621-task-scheduler.html" },
+    { num: 108, title: "Jump Game", lc: 55, pass: "2A", diff: "Medium", file: "0108-lc55-jump-game.html" },
+    { num: 109, title: "Partition Equal Subset Sum", lc: 416, pass: "2B", diff: "Medium", file: "0109-lc416-partition-equal-subset-sum.html" },
+    { num: 110, title: "Decode Ways", lc: 91, pass: "2B", diff: "Medium", file: "0110-lc91-decode-ways.html" },
+    { num: 111, title: "Random Pick with Weight", lc: 528, pass: "2B", diff: "Medium", file: "0111-lc528-random-pick-with-weight.html" },
+    { num: 112, title: "Find First and Last Position of Element in Sorted Array", lc: 34, pass: "2A", diff: "Medium", file: "0112-lc34-find-first-and-last-position-of-element-in-sorted-array.html" },
+    { num: 113, title: "Add Two Numbers", lc: 2, pass: "2A", diff: "Medium", file: "0113-lc2-add-two-numbers.html" },
+    { num: 114, title: "Reorder List", lc: 143, pass: "2B", diff: "Medium", file: "0114-lc143-reorder-list.html" },
+    { num: 115, title: "Maximum Product Subarray", lc: 152, pass: "2B", diff: "Medium", file: "0115-lc152-maximum-product-subarray.html" },
+    { num: 116, title: "Shortest Path in Binary Matrix", lc: 1091, pass: "2B", diff: "Medium", file: "0116-lc1091-shortest-path-in-binary-matrix.html" },
+    { num: 117, title: "Valid Anagram", lc: 242, pass: "1", diff: "Easy", file: "0117-lc242-valid-anagram.html" },
+    { num: 118, title: "Meeting Rooms", lc: 252, pass: "1", diff: "Easy", file: "0118-lc252-meeting-rooms.html" },
+    { num: 119, title: "Flood Fill", lc: 733, pass: "1", diff: "Easy", file: "0119-lc733-flood-fill.html" },
+    { num: 120, title: "Kth Largest Element in a Stream", lc: 703, pass: "1", diff: "Easy", file: "0120-lc703-kth-largest-element-in-a-stream.html" },
+    { num: 121, title: "Combination Sum II", lc: 40, pass: "2B", diff: "Medium", file: "0121-lc40-combination-sum-ii.html" },
+    { num: 122, title: "Letter Combinations of a Phone Number", lc: 17, pass: "2A", diff: "Medium", file: "0122-lc17-letter-combinations-of-a-phone-number.html" },
+    { num: 123, title: "Accounts Merge", lc: 721, pass: "2B", diff: "Medium", file: "0123-lc721-accounts-merge.html" },
+    { num: 124, title: "Valid Sudoku", lc: 36, pass: "2A", diff: "Medium", file: "0124-lc36-valid-sudoku.html" },
+    { num: 125, title: "Top K Frequent Words", lc: 692, pass: "2B", diff: "Medium", file: "0125-lc692-top-k-frequent-words.html" },
+    { num: 126, title: "Cloud Storage System (4-Stage ICA)", lc: "ICA", pass: "2B", diff: "Medium", file: "0126-custom-cloud-storage-ica.html" }
+  ];
+
+  LessonRuntime.CURRICULUM_MAP = {};
+  LessonRuntime.CURRICULUM.forEach(function(p) { LessonRuntime.CURRICULUM_MAP[p.num] = p; });
+
+  var PASS_RANK = { '1': 1, '2A': 2, '2B': 3, '3': 4 };
+  LessonRuntime.STUDY_ORDER = LessonRuntime.CURRICULUM.slice().sort(function(a, b) {
+    var ao = a.optional ? 1 : 0, bo = b.optional ? 1 : 0;
+    if (ao !== bo) return ao - bo;
+    var ar = PASS_RANK[a.pass] || 9, br = PASS_RANK[b.pass] || 9;
+    if (ar !== br) return ar - br;
+    return a.num - b.num;
+  });
+
+  LessonRuntime.StudyNav = {
+    init: function() {
+      if (typeof window === 'undefined' || !window.location || !window.location.pathname) return;
+      var m = window.location.pathname.match(/(\d{4})-[^/]+\.html$/);
+      if (!m) return;
+      var curNum = parseInt(m[1], 10);
+      var studyIdx = -1;
+      for (var i = 0; i < LessonRuntime.STUDY_ORDER.length; i++) {
+        if (LessonRuntime.STUDY_ORDER[i].num === curNum) { studyIdx = i; break; }
+      }
+      if (studyIdx === -1) return;
+      var cur = LessonRuntime.STUDY_ORDER[studyIdx];
+      var prevP = studyIdx > 0 ? LessonRuntime.STUDY_ORDER[studyIdx - 1] : null;
+      var nextP = studyIdx < LessonRuntime.STUDY_ORDER.length - 1 ? LessonRuntime.STUDY_ORDER[studyIdx + 1] : null;
+
+      var sameTrack = LessonRuntime.STUDY_ORDER.filter(function(p) {
+        return cur.optional ? Boolean(p.optional) : (!p.optional && p.pass === cur.pass);
+      });
+      var posInTrack = sameTrack.indexOf(cur) + 1;
+      var trackText = cur.optional
+        ? ('Optional Track • ' + posInTrack + ' of ' + sameTrack.length)
+        : ('Pass ' + cur.pass + ' Study Order • ' + posInTrack + ' of ' + sameTrack.length + ' (Core ' + (studyIdx + 1) + '/119)');
+
+      // Inject sleek Study-Order Prev / Next bar right below <header>
+      try {
+        var header = document.querySelector('header');
+        if (header && header.parentNode && !document.getElementById('study-order-bar')) {
+          var bar = document.createElement('div');
+          bar.id = 'study-order-bar';
+          bar.className = 'bg-slate-900/90 border-b border-slate-800 px-4 py-2 text-xs font-mono no-print';
+          var prevHtml = prevP
+            ? "<a href='" + prevP.file + "' class='study-nav-pill px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 hover:text-emerald-400'>← Prev in Pass: #" + String(prevP.num).padStart(4, '0') + " (" + escapeHtmlExact(prevP.title) + ")</a>"
+            : "<a href='../master-plan.html' class='study-nav-pill px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-800 text-slate-400 hover:text-white'>← Master Plan Hub</a>";
+          var nextHtml = nextP
+            ? "<a href='" + nextP.file + "' class='study-nav-pill px-3 py-1 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 font-bold hover:bg-emerald-500 hover:text-slate-950'>Next in Study Order: #" + String(nextP.num).padStart(4, '0') + " (" + escapeHtmlExact(nextP.title) + ") →</a>"
+            : "<a href='../master-plan.html' class='study-nav-pill px-3 py-1 rounded-lg bg-emerald-500 text-slate-950 font-bold'>🎉 Curriculum Complete → Hub</a>";
+
+          bar.innerHTML = "<div class='max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2'>" +
+            "<div class='flex items-center gap-2'>" +
+              prevHtml +
+              "<span class='px-2.5 py-0.5 rounded-full bg-slate-950 border border-slate-800 text-cyan-300 hidden md:inline-block'>" + trackText + "</span>" +
+            "</div>" +
+            "<div class='flex items-center gap-2'>" +
+              "<a href='../reference/pattern-reference.html' class='px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 hover:text-emerald-300 hidden sm:inline-block'>Cheat Sheet</a>" +
+              "<button type='button' onclick='window.jumpRandomInterleaved()' class='px-2.5 py-1 rounded-lg bg-indigo-950/70 border border-indigo-700/50 text-indigo-300 hover:bg-indigo-900/70 hidden lg:inline-block' title='Interleaved Practice: Jump to a random solved or Core problem'>🎲 Interleave</button>" +
+              nextHtml +
+            "</div>" +
+          "</div>";
+          header.parentNode.insertBefore(bar, header.nextSibling);
+        }
+
+        window.jumpRandomInterleaved = function() {
+          var corePool = LessonRuntime.STUDY_ORDER.filter(function(p) { return !p.optional && p.num !== curNum; });
+          var solvedPool = corePool.filter(function(p) {
+            try { return Boolean(localStorage.getItem('lc110_solved_' + String(p.num).padStart(4, '0'))); } catch (_) { return false; }
+          });
+          var pool = solvedPool.length >= 3 ? solvedPool : corePool;
+          var pick = pool[Math.floor(Math.random() * pool.length)];
+          if (pick) window.location.href = pick.file;
+        };
+
+        // Inject Copy Code buttons onto any Section 5 <pre> code blocks that lack one
+        var sec5 = document.getElementById('section-5');
+        if (sec5 && sec5.querySelectorAll) {
+          var pres = sec5.querySelectorAll('pre');
+          for (var pi = 0; pi < pres.length; pi++) {
+            var preEl = pres[pi];
+            if (preEl.id === 'practice-model-code') continue;
+            if (document.getElementById('copy-text')) break; // Template v1 already has top Copy button
+            if (preEl.parentNode && preEl.parentNode.style) {
+              preEl.parentNode.style.position = 'relative';
+              var cBtn = document.createElement('button');
+              cBtn.type = 'button';
+              cBtn.className = 'no-print px-2.5 py-1 rounded bg-slate-800/90 hover:bg-slate-700 border border-slate-700 text-[11px] font-mono text-slate-300';
+              cBtn.style.cssText = 'position:absolute;top:10px;right:12px;z-index:5;';
+              cBtn.innerText = '📋 Copy';
+              (function(targetPre, btn) {
+                btn.addEventListener('click', function() {
+                  if (navigator.clipboard) {
+                    navigator.clipboard.writeText(targetPre.innerText).then(function() {
+                      btn.innerText = '✓ Copied!';
+                      setTimeout(function() { btn.innerText = '📋 Copy'; }, 1800);
+                    });
+                  }
+                });
+              })(preEl, cBtn);
+              preEl.parentNode.insertBefore(cBtn, preEl);
+            }
+          }
+        }
+      } catch (_) {}
+    }
+  };
+
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('DOMContentLoaded', function() {
+      LessonRuntime.StudyNav.init();
+    });
+  }
 
   if (typeof global.updateRecallBadge !== 'function') {
     global.updateRecallBadge = function() {};

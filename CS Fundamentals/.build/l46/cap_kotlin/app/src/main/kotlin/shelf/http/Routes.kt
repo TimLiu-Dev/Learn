@@ -94,4 +94,15 @@ fun Router.opsRoutes(dbUp: () -> Boolean, metricsText: () -> String) {
         ok(Health(if (up) "UP" else "DOWN", if (up) "UP" else "DOWN"), if (up) 200 else 503)
     }
     get("/metrics") { Response(200, metricsText(), "text/plain; version=0.0.4") }
+
+    // Liveness: can this process still answer at all? It never checks the database, so a database
+    // blip can't make the orchestrator restart every instance at once (L59).
+    get("/live") { ok(mapOf("status" to "UP")) }
+
+    // Readiness: should the load balancer send me traffic? Only if the database answers.
+    // (/health above stays for existing callers: removing it would break them, L45 Part 5.)
+    get("/ready") {
+        val up = dbUp()
+        ok(Health(if (up) "UP" else "DOWN", if (up) "UP" else "DOWN"), if (up) 200 else 503)
+    }
 }

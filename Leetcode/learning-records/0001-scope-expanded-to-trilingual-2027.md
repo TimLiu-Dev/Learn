@@ -1,3 +1,3 @@
-# Scope Expanded to Trilingual 2027 Big Tech Preparation
+# Scope Set to Kotlin-Primary Trilingual 2027 Preparation
 
-The scope shifted from a single-language (Kotlin) curriculum to a trilingual standard covering Kotlin, Python, and Java comprehensively, targeting 2027 Big Tech hiring bars. Future lessons and exercises must now provide parallel solutions, comparative runtime/memory models, and language-specific interview pitfalls (such as primitive unboxing, thread safety, and GIL vs JVM semantics).
+The learner selected **Kotlin** as their primary live-interview coding language while keeping **Python** and **Java** side-by-side across templates, walkthroughs, and solutions for 2027 Big Tech interviews. During live `/teach` sessions, default to Kotlin for coding reviews and idioms while highlighting key JVM/Python runtime contrasts when relevant.

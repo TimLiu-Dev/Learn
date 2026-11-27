@@ -14,4 +14,4 @@ The learner has successfully generated the 8 foundational stages (Lessons 0001�
 7. **Stage 7 (Lessons 0030–0032):** JVM memory layout (Stack, Heap, Metaspace, Code Cache), G1 & Java 21 Generational ZGC mechanics, ClassLoader parent delegation & Reflection.
 8. **Stage 8 (Lessons 0033–0035):** Build automation with Maven & Gradle, modern unit testing with JUnit 5 + AssertJ + Mockito, JPMS modular architecture, and the complete distributed enterprise capstone.
 
-**Status:** 35 / 35 Lessons Completed (100%). Full fluency achieved.
+**Historical Note:** Superseded by [0009-audit-and-readiness-reset.md](0009-audit-and-readiness-reset.md) and [0014-pre-study-audit-and-end-to-end-upgrade.md](0014-pre-study-audit-and-end-to-end-upgrade.md); active learner study begins at Lesson `0002`.

@@ -63,29 +63,8 @@ class Db(file: Path, poolSize: Int = 0, busyTimeoutMs: Int = 3000) : AutoCloseab
         pool?.forEach { it.close() }
     }
 
-    fun createSchema() = transaction { c -> c.createStatement().use { st -> SCHEMA.forEach(st::executeUpdate) } }
-
-    companion object {
-        val SCHEMA = listOf(
-            "CREATE TABLE IF NOT EXISTS authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
-            """CREATE TABLE IF NOT EXISTS books (
-                 id        INTEGER PRIMARY KEY,
-                 title     TEXT NOT NULL,
-                 author_id INTEGER NOT NULL REFERENCES authors(id),
-                 year      INTEGER CHECK (year BETWEEN 1400 AND 2100))""",
-            "CREATE TABLE IF NOT EXISTS members (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE)",
-            """CREATE TABLE IF NOT EXISTS loans (
-                 id        INTEGER PRIMARY KEY,
-                 book_id   INTEGER NOT NULL REFERENCES books(id),
-                 member_id INTEGER NOT NULL REFERENCES members(id),
-                 loaned    TEXT NOT NULL,
-                 returned  TEXT)""",
-            // At most one open loan per book: the database itself refuses a double loan (L36).
-            "CREATE UNIQUE INDEX IF NOT EXISTS one_open_loan_per_book ON loans(book_id) WHERE returned IS NULL",
-            "CREATE INDEX IF NOT EXISTS loans_by_member ON loans(member_id)",
-            "CREATE INDEX IF NOT EXISTS books_by_author ON books(author_id)",   // ?author= filter (Part 3)
-        )
-    }
+    /** Brings the schema up to date: applies Shelf's pending migrations, in order (L59). */
+    fun migrate(): List<Migration> = read { c -> Migrator.migrate(c, SHELF_MIGRATIONS) }
 }
 
 // Small JDBC helpers: every value goes through a ? placeholder, never string concatenation (L33).

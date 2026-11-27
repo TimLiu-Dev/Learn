@@ -1,58 +1,22 @@
 # Teaching Notes
 
-- Learner relies on AI to write code and can't write it alone, so every lesson needs a **write-from-blank** exercise as well as refactors. Recall beats recognition.
-- Little or no Java: don't use Java as the explanation. Show it only when it shows what the compiler generates (e.g. data class `equals`/`copy`, `companion` → static).
-- Frame "Java written in Kotlin" as **AI/Java-flavoured Kotlin**: the patterns AI tools and Java-trained habits produce.
-- Exercises go in Kotlin Playground (no local kotlinc installed). Learner pastes answers back for review.
-- Never give solutions unless asked. Give hints, in steps, as questions where possible.
-- Context: Android first, learning Spring Boot, KMP, and DSA coding interviews (LeetCode/HackerRank in Kotlin, standard library collections, time/space complexity).
-- Exercises: Native in-browser code editor with Tab/Enter indentation + "Copy Code", "Playground ↗", and "Model Answer" tab. 100% offline and works opening HTML directly via file:// without any localhost server. Learner runs code in local IDE or Kotlin Playground.
-- Format: one concept per lesson; each section ends with a mixed (interleaved) review.
-- Open each lesson with 2–3 retrieval questions from earlier lessons (spacing).
+## Learner Profile & Teaching Rules
+- Learner relies on AI to write code and wants full blank-page independence: every teaching lesson includes an **Interactive Concept Lab**, a **Blank-Page Syntax Blueprint**, a **write-from-blank** exercise (`ex1`), and an **AI/Java refactor** exercise (`ex2`). Recall beats recognition.
+- Little or no Java: never use Java as the prerequisite explanation. Mention JVM bytecode only when explaining compiler behavior (e.g. `value class` boxing, `@JvmOverloads`, Spring `all-open`).
+- Pillar Priority Order: **1. Android (Jetpack Compose)** → **2. DSA Coding Interviews** → **3. Spring Boot Backend** → **4. KMP (Optional)**.
+- Never give exercise solutions unprompted in chat; give Socratic hints in small steps.
+- Every lesson opens with spaced-retrieval prompts strictly from *prior* lessons (`.recall`).
 
-## Workspace conventions (for the teacher)
-- Components: `assets/style.css` (all pages) and `assets/lesson.js` (quiz widget + JetBrains Kotlin Playground embed). Markup contract is documented at the top of `lesson.js`. `lessons/0001-…` is the template for new lessons.
-- `code.kt-run` = runnable/editable, `code.kt-show` = highlight-only. Escape `<` `>` `&` inside them.
-- Native editor works completely offline directly from disk (`file://`). No localhost server required.
-- Verify every runnable block before shipping: `python3 -I tools/check_kt.py lessons/<file>.html`.
-- Glossary: Created `GLOSSARY.md` following canonical format with domain clustering across Core, Android, KMP, Spring Boot, and DSA.
+## Workspace & Execution Conventions
+- **Local Server (`./serve.sh` or `python3 serve.sh`)**: Serves `http://localhost:8000` and compiles/runs code 100% offline via the local IntelliJ `kotlinc-jvm 2.4.0` toolchain (with `25s` compile / `10s` run timeouts and accurate `File.kt` stack line numbers), falling back to JetBrains' `2.4.21+` compiler API if needed.
+- **Persistence (`assets/lesson.js`)**: Automatically persists exercise code drafts, solved badges, quiz selections, checklist checkboxes, and lesson completions in `localStorage` (`kt_course_v1_*`), hydrating the live progress bar on `index.html`.
+- **Verification**: Run `python3 -I tools/check_kt.py lessons/<file>.html` to verify runnable blocks before shipping changes.
+- **`learning-records/` Hygiene**: Keep `learning-records/` strictly for learner-demonstrated insights and ZPD milestones (`0001`, `0002`, and future study milestones). Course construction/QA changelogs live below in `NOTES.md`.
 
-## Progress
-- 2026-10-18: Sections 1 and 2 built (lessons 0001–0012, reference/foundations.html, reference/null-safety.html).
-- Master plan expanded to include Generics (Section 9), Coroutines & Flow (Section 10), and Capstones & KMP (Section 11) to provide complete coverage of the Kotlin language across Android, KMP, Spring Boot, and DSA Coding Interviews.
-- 2026-11-06: Created master plan HTML page (`lessons/0000-master-plan.html`) serving as the first page of the lessons with a complete backlog legend, and updated `index.html` with synchronized backlog badges and navigation.
-- 2026-11-06: Built Calibration Diagnostic 0.1 (`lessons/0000-diagnostic.html`), Section 3 (Functions: 0013–0017), Section 4 (Classes & Domain Modeling: 0018–0025), Section 5 (Lambdas & Functional Kotlin: 0026–0029), Section 6 (Scope Functions: 0030–0033), Section 7 (Collections & DSA Data Structures: 0034–0040), Section 8 (Delegation: 0041–0044), Section 9 (Generics & Type System: 0045–0048), Section 10 (Coroutines & Flow: 0049–0054), and Section 11 (Capstones & Smell Audits: 0055–0061).
-- 2026-11-06 (Triple-Check & Pillars Expansion): Added 4 dedicated Production Pillar Playbooks (`reference/android.html`, `reference/spring-boot.html`, `reference/kmp.html`, `reference/dsa-patterns.html`), expanded Lesson 0037 with bitwise infix operators (`shl`/`shr`/`and`/`or`/`xor`/`inv`) and 2D matrix representations, enriched Lessons 0057, 0058, 0060 with modern framework mechanics (Compose state, `@field:` use-site targets, KMP library stack), added `GLOSSARY.md`, and enriched `RESOURCES.md` with official Spring, Android, KMP, and DSA sources.
-- 2026-11-07 (Senior Developer Audit & Phase 1 Repairs): Fixed `assets/answers.js` (converted 125 entries from broken JS template literals with 29 `${...}` syntax/reference bombs to pure JSON encoding), repaired all 28 non-clickable `<ol type="A">` quizzes, escaped all vanished HTML generics (`<String>`, `<out T>`, `<reified T>`, etc.) across 67 HTML files, stripped pre-solved solutions from all 11 leaked exercises, added 12 new Senior quizzes to Capstones `0057–0060`, de-duplicated `0022`/`0053`/`0057` ViewModel exercises, added value-class boxing rules (`0024`) and `runCatching` + `CancellationException` warnings (`0055`), removed offline-blocking Google Fonts import and duplicate `0000-master-plan.html`, and queued Section-by-Section Senior expansion + Section 12 (Testing).
-
-## Session 0006 (2026-11-12) · Full QA Pass & roadmap.sh/kotlin (2027) Audit
-- Audited all 66 lessons (`0000`–`0065`), 16 reference sheets, `index.html`, `assets/lesson.js`, and all 133 `assets/answers.js` entries.
-- Fixed 19 model-answer drifts, 5 leaked refactor starters (`0038-ex2`, `0062-ex2`, `0063-ex2`, `0064-ex2`, `0065-ex2`), 13 length-skewed quiz questions, 36+ mismatched hints across `0017`–`0058`, missing `.source` (28 lessons) and `.ask` (40 lessons) blocks, broken quotes in `0009`, stripped templates in `0000`, `lesson.js` `/reference/` path fallback, and stale `"coming soon"`/`"Claude"` links.
-- Added Kotlin 2.2–2.4 callouts (`0027` non-local `break`/`continue`, `0053` explicit backing fields, `0060` + `reference/kmp.html` `kotlin.time.Clock`/`Instant` + `kotlin.uuid.Uuid`), marked `0058` Optional Backend Track, and expanded `reference/delegation.html`, `reference/generics.html`, and `reference/coroutines-flow.html`.
-- Post-edit verification (`kotlinc-jvm 2.3.10`): `133/133` model answers compile + run + match `expectedOutput` (with `0051-ex2` verified deterministic over 5 runs); `0` broken HTML/links/skewed quizzes/missing `.source`/`.ask`/solution leaks.
-- See `learning-records/0006-roadmap-audit-and-full-qa.md` for full verification stats and `roadmap.sh/kotlin` Add/Defer/Lighten recommendations.
-
-## Session 0007 (2026-11-12 / 2026-11-14) · Section 13 Expansion (`0066–0070`), Staff Internals & Full Quiz Expansion
-- Built Section `13 · Modern Kotlin 2.2–2.4, Production Flow & Android Tooling (2027 Track)` in response to the `roadmap.sh/kotlin` 2027 audit:
-  - `lessons/0066-modern-kotlin-dsls-recursion.html` (`13.1`: `when` guards, non-local `break`/`continue`, Context Parameters, Explicit Backing Fields, `@DslMarker`, `fun interface`, `tailrec`, `DeepRecursiveFunction`)
-  - `lessons/0067-android-flow-concurrency-patterns.html` (`13.2`: `callbackFlow` + `awaitClose`, `stateIn(WhileSubscribed(5_000))`, `flatMapLatest`, `Mutex.withLock`)
-  - `lessons/0068-gradle-kts-serialization-interop.html` (`13.3`: `build.gradle.kts`, `libs.versions.toml`, `kotlinx.serialization`, `@JvmOverloads`, `@JvmName`, `@JvmStatic`, `@Throws`)
-  - `lessons/0069-contracts-r8-binary-compat.html` (`13.4`: Staff Internals — Kotlin Contracts `callsInPlace` & `returns(true) implies`, `@PublishedApi internal`, binary compatibility, and Android R8 shrinking/obfuscation)
-  - `lessons/0070-review-2027-android-mastery.html` (`13.R`: cumulative quiz + offline-sync capstone lab + 4-bug PR hunt)
-  - `reference/modern-kotlin-tooling.html` (17th reference cheat sheet, including Contracts, `@PublishedApi`, and R8 rules)
-- Expanded all 49 lessons that previously had only 1–2 quizzes (`0000`, `0013`–`0056`, `0062`–`0065`) by adding 91 balanced Senior-level quizzes so every single lesson (`0000`–`0070`) has `>= 3` quizzes, and fixed the partial starter leak in `0054-ex2`.
-- Wired `0065 -> 0066 -> 0067 -> 0068 -> 0069 -> 0070 -> ../index.html`, updated `index.html`, `CURRICULUM.md`, `RESOURCES.md`, `GLOSSARY.md`, and added 10 verified model answers (`0066-ex1`..`0070-ex2`) to `assets/answers.js` (71 lessons, 143 total exercises).
-- See `learning-records/0007-section13-modern-kotlin-modules.md` for details and post-edit verification counts.
-
-## Session 0008 (2026-11-21) · 2027 Senior Kotlin Audit, New Modules (`0071–0072`) & Blank-Page Authoring Upgrades
-- Kept all 4 Pillars intact (including Spring Boot Backend `0058` as a full Capstone).
-- Added 2 new 2027 Senior Kotlin & Android modules in Section 13:
-  - `lessons/0071-compose-compiler-runtime-kotlin.html` (`13.5`: Compose Compiler & Kotlin Runtime Mental Model — `@Immutable`/`@Stable`, Strong Skipping Mode `===` vs `==`, lambda closure capture, `rememberUpdatedState`, and `snapshotFlow`)
-  - `lessons/0072-multi-module-explicit-api-di.html` (`13.6`: Multi-Module Architecture, `explicitApi()` & Pure-Kotlin DI — `internal` module boundaries, `kotlin { explicitApi() }`, `api` vs `implementation`, and scoped `AppGraph` + assisted `fun interface` factories)
-  - Wired `0069 -> 0071 -> 0072 -> 0070 -> ../index.html` and updated `0070-review-2027-android-mastery.html` (`R13`), `reference/android.html`, and `reference/modern-kotlin-tooling.html`.
-- Upgraded all teaching lessons across the entire course (`0001`–`0072`) for the learner's *"can read some Kotlin, unable to write it"* profile:
-  - Added tailored **Blank-Page Syntax Blueprints** (`.callout.blueprint`) to all 59 teaching lessons (`0001`–`0072`).
-  - Added 40 live runnable `<code class="kt-run">` **Interactive Concept Labs** across Sections 3–11 (`0013`–`0060`) so every teaching lesson in the course has runnable concept examples before exercises.
-  - Populated `expectedOutput` on all 46 previously unchecked `-ex1` ("Write from blank") exercises in `assets/answers.js`, and upgraded `assets/lesson.js` to detect unmodified starter code so clicking **▶ Run & Check** on an untouched starter never awards a false green pass.
-  - Added `debounce`/`distinctUntilChanged`/`flatMapLatest` and `.stateIn(WhileSubscribed(5_000))` explanations to `0052` and `0053` before `0054` (`10.R`), expanded all Review lessons (`R3`–`R13`) to `>= 4` recall prompts and `>= 4` quizzes, and rebalanced all 17 length-skewed quizzes.
-- See `learning-records/0008-senior-2027-expansion-and-blank-page-upgrade.md` for full verification metrics (73 lessons, 147 verified exercises, 253 balanced quizzes).
+## Course Build & QA Changelog (Archived from Pre-Study Setup)
+- **2026-10-18 – 2026-11-21 (Pre-Launch Build Sessions)**: Authored Sections `0`–`13`, 4 Production Pillar Playbooks, 13 Language Reference Sheets, `GLOSSARY.md`, `RESOURCES.md`, Blank-Page Syntax Blueprints, Interactive Concept Labs, and length-balanced quizzes.
+- **2026-11-24 (Final Pre-Study End-to-End Audit & Upgrade)**:
+  - Upgraded `serve.sh` (process timeouts, exact `File.kt` runtime line numbers, Kotlin `2.4.21` endpoint priority) and `assets/lesson.js` (`localStorage` draft/quiz/completion persistence, `index.html` progress dashboard, `file://` helper banner, comment-stripped assertion detection).
+  - Added `0073-dsa-strings-chars-dp.html` (`7.6`: `Char` arithmetic, `buildString`, memoized DP) and `0074-dsa-trees-graphs-backtracking.html` (`7.7`: `TreeNode?` DFS/BFS, adjacency lists, Kahn's cycle detection, backtracking snapshot rule).
+  - Split `0066` into live runnable Kotlin 2.2–2.4 syntax (`13.1` `0066`: `when` guards, Context Parameters, Explicit Backing Fields) and `13.2` `0075-dsls-sam-deep-recursion.html` (`@DslMarker`, `fun interface` SAM, `tailrec`, `DeepRecursiveFunction`).
+  - Sequenced **Section 11 (Testing)** before **Section 12 (Four-Pillar Capstones)**, ordered Capstones as **Android → DSA → Spring Boot → KMP [Optional]**, marked `0060` (KMP) and `0069` (Staff SDK Internals) as `[Optional]`, added the fast-track calibration rubric to `0000-diagnostic.html`, fixed all HTML generic escaping/backticks/recalls, and verified **76 lessons / 153 exercises / 262 quizzes** end-to-end on `kotlinc-jvm 2.4.0`.

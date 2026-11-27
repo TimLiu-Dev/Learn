@@ -1,6 +1,6 @@
 # Kotlin Glossary
 
-Canonical definitions for the idiomatic Kotlin workspace covering language core, Android, Kotlin Multiplatform, Spring Boot, and DSA coding interviews.
+Canonical definitions for the idiomatic Kotlin workspace covering language core, Android, DSA coding interviews, Spring Boot, and Kotlin Multiplatform. *(Note for `/teach`: this glossary defines consistent course-wide terminology; consult `./learning-records/` and lesson progress to determine which concepts the learner has personally completed.)*
 
 ## Core Language & Type System
 
@@ -137,3 +137,11 @@ _Avoid_: Accidental `public` exposure of internal implementation classes or sile
 **Assisted Factory (`fun interface` DI Factory)**:
 A single-abstract-method factory interface pre-bound to long-lived singletons in a Dependency Injection graph while accepting caller-supplied runtime arguments (such as screen navigation IDs).
 _Avoid_: Passing runtime navigation IDs through global mutable singletons
+
+**Context Parameter (`context(logger: Logger)`)**:
+A Kotlin 2.4 named ambient parameter declaration that supplies scoped capabilities via `with(ctx) { ... }` without occupying the function's extension receiver (`this`).
+_Avoid_: Legacy unnamed context receivers or threading cross-cutting loggers through every helper signature
+
+**Explicit Backing Field (`field = ...`)**:
+A Kotlin 2.4 property declaration (`val state: StateFlow<S> field = MutableStateFlow(...)`) that exposes a read-only public type to external callers while smart-narrowing to the mutable backing type inside private class scope.
+_Avoid_: Duplicate `_state` / `state` backing property pairs in modern Kotlin 2.4 codebases

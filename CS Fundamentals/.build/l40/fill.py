@@ -107,6 +107,9 @@ for key, a, b in [("clean_amend", "=== AMEND", "=== FIXUP"), ("clean_fixup", "==
                   ("clean_cherry", "=== CHERRY", None)]:
     S[key] = term(sec("clean_out.txt", a, b))
 S["bisect"] = term([l for l in load("bisect_out.txt") if l.strip()])
+# ---- Part 1 (v7): an AI diff that weakens the tests ----
+S["ai_stat"] = term(sec("ai_out.txt", "=== STAT", "=== DIFF"))
+S["ai_diff"] = raw(drop_cmd(sec("ai_out.txt", "=== DIFF")))
 # ---- Part "rel": branching and releases ----
 S["rel_tag"] = term(sec("release_out.txt", "=== TAG", "=== TRUNK"))
 S["rel_trunk"] = term(sec("release_out.txt", "=== TRUNK", "=== HOTFIX"))

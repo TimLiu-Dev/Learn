@@ -8,7 +8,7 @@ class SqliteStoreTest : StoreContract() {
     private val file: Path = Files.createTempFile("shelf-test", ".db")
 
     override fun newStores(): Triple<BookStore, MemberStore, LoanStore> {
-        val db = Db(file).also { it.createSchema() }
+        val db = Db(file).also { it.migrate() }
         return Triple(SqliteBookStore(db), SqliteMemberStore(db), SqliteLoanStore(db))
     }
 

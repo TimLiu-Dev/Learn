@@ -54,5 +54,14 @@ Rules: `.build/rules/v7-rules.md` (all), `v7-new.md` (L58, L59, electives) and `
 
 STARTED (2026-11-21) wave 1, agent ids for SendMessage resume: B1 a4c9aad144c35c3e5 · B2 a07417ef251d1079b · B3 a53a9afc2eb8520c4 · B4 aa6fed1503de9c3a1 · B5 a5242edb00f617868 · B6 a0edb5da4892b0303 · B7 aad075a35d3880d88 · B8 a9f874206bce5bb16 · B9 a0bcaf5d7d5d6411f · B10 a7023f5741fd71a24 · B11 af91904e3f6132a6c · B12 ada0d6135567c7102
 STARTED wave 2a: N1 a403e3816fe7302c3 · N2 ab3a97564899d8177 · P1 a8834c5031abf6812 · P2 a206c75670101b764 · P3 ae44402d4051e5abb · P4 aea2cde2e05664b00
-PENDING: P5 P6 P7 (start as wave-1 finishes), then electives X1–X14
-DONE:
+STARTED P5 ad7a42301d81b9e43
+STARTED P6 a2350d844e423a53f
+STARTED P7 a98e0d2fad8f47e7f
+STARTED X1 aba24405d2b7b50f2
+STARTED X2 a35b53627ce7d416f
+STARTED X3 a8dc938070441cab9
+STARTED X4 a50b6b18d72890b4b
+STARTED X5 a2089138ebc19d13d
+PENDING: electives X6–X14
+DONE: B11 B3 B4 B2 B1 B10 B6 B8
+- 2026-11-21: all 18 (wave 1 + 2a) paused by weekly limit; resumed 2026-11-25 via SendMessage.

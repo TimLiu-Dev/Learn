@@ -1,14 +1,32 @@
 /* Shared Interactive Components for CS Foundations & LeetCode Prerequisites
    Provides:
    1. Polyglot Code Tab Switcher (switchTab)
-   2. Standard Retrieval Quiz Engine (checkAnswer + data-correct support)
-   3. Two-Part Code Complexity Quiz Engine (selectComplexityChoice, checkComplexityQuiz)
-   4. Spot & Fix the Bug Code Drill Engine (selectBugLine, selectBugFix, checkBugDrill)
-   5. Active Fill-in-the-Code Evaluator (checkCodeFill, resetCodeFill)
-   6. Active Fill-in-the-Trace-Table Evaluator (checkTraceTable, revealTraceTable)
+   2. Standard Retrieval Quiz Engine (checkAnswer + resetQuizCard)
+   3. Two-Part Code Complexity Quiz Engine (selectComplexityChoice, checkComplexityQuiz, resetComplexityQuiz)
+   4. Spot & Fix the Bug Code Drill Engine (selectBugLine, selectBugFix, checkBugDrill, resetBugDrill)
+   5. Active Fill-in-the-Code Evaluator (checkCodeFill, resetCodeFill, revealCodeFill)
+   6. Active Fill-in-the-Trace-Table Evaluator (checkTraceTable, revealTraceTable, resetTraceTable)
    7. Hint Toggle Helper (toggleHint)
-   8. Keyboard Enter Listener for Auto-Checking Labs
+   8. Shared Progress Sync (localStorage), Drill Tracker & /teach Prompt Copy Bar
 */
+
+const PROGRESS_STORAGE_KEY = 'lc_prereq_checklist_v2';
+
+function readProgressMap() {
+  try {
+    return JSON.parse(localStorage.getItem(PROGRESS_STORAGE_KEY) || '{}');
+  } catch (e) {
+    return {};
+  }
+}
+
+function writeProgressMap(map) {
+  try {
+    localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(map));
+  } catch (e) {
+    console.warn('Could not persist progress', e);
+  }
+}
 
 function switchTab(evt, tabId) {
   const container = evt.currentTarget.closest('.code-tabs');
@@ -52,11 +70,13 @@ function checkAnswer(qKey, selectedIdx) {
   if (fb) {
     fb.style.display = 'block';
     if (isCorrect) {
+      card.dataset.solved = '1';
       fb.innerHTML = `<span style="color: var(--success); font-weight: 600;">&check; Correct!</span> ${explanation}`;
     } else {
       fb.innerHTML = `<span style="color: #ef4444; font-weight: 600;">&cross; Not quite.</span> ${explanation}`;
     }
   }
+  updateLessonDrillCounter();
 }
 
 /* 3. Two-Part Code Complexity Quiz ("What's the Time & Auxiliary Space Big O?") */
@@ -109,11 +129,25 @@ function checkComplexityQuiz(quizId) {
     fb.style.display = 'block';
     const exp = card.dataset.explanation || '';
     if (bothOk) {
+      card.dataset.solved = '1';
       fb.innerHTML = `<span style="color: var(--success); font-weight: 600;">&check; Spot on! Both Time and Auxiliary Space match.</span> ${exp}`;
     } else {
       fb.innerHTML = `<span style="color: #ef4444; font-weight: 600;">&cross; Check the highlighted bounds above.</span> ${exp}`;
     }
   }
+  updateLessonDrillCounter();
+}
+
+function resetComplexityQuiz(quizId) {
+  const card = document.getElementById(quizId);
+  if (!card) return;
+  delete card.dataset.timeSelected;
+  delete card.dataset.spaceSelected;
+  delete card.dataset.solved;
+  card.querySelectorAll('.quiz-btn').forEach(btn => btn.classList.remove('selected', 'correct', 'incorrect'));
+  const fb = card.querySelector('.quiz-feedback');
+  if (fb) fb.style.display = 'none';
+  updateLessonDrillCounter();
 }
 
 /* 4. Spot & Fix the Bug Code Drill */
@@ -174,19 +208,35 @@ function checkBugDrill(drillId) {
     fb.style.display = 'block';
     const exp = card.dataset.explanation || '';
     if (ok) {
+      card.dataset.solved = '1';
       fb.innerHTML = `<span style="color: var(--success); font-weight: 600;">&check; Bug isolated and patched! (Line ${expectedLine})</span> ${exp}`;
     } else {
       fb.innerHTML = `<span style="color: #ef4444; font-weight: 600;">&cross; Review Line ${expectedLine} and the highlighted fix.</span> ${exp}`;
     }
   }
+  updateLessonDrillCounter();
+}
+
+function resetBugDrill(drillId) {
+  const card = document.getElementById(drillId);
+  if (!card) return;
+  delete card.dataset.selectedLine;
+  delete card.dataset.selectedFix;
+  delete card.dataset.solved;
+  card.querySelectorAll('.bug-line').forEach(r => r.classList.remove('selected', 'correct-line', 'wrong-line'));
+  card.querySelectorAll('.fix-options .quiz-btn').forEach(b => b.classList.remove('selected', 'correct', 'incorrect'));
+  const fb = card.querySelector('.quiz-feedback');
+  if (fb) fb.style.display = 'none';
+  updateLessonDrillCounter();
 }
 
 /* 5. Active Fill-in-the-Code Evaluator */
 function normalizeCode(str) {
   return String(str || '')
     .trim()
-    .replace(/\s+/g, '')
-    .replace(/;$/, '');
+    .replace(/;$/, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*([^a-zA-Z0-9_\s])\s*/g, '$1');
 }
 
 function checkCodeFill(labId) {
@@ -215,22 +265,26 @@ function checkCodeFill(labId) {
     const successMsg = card.dataset.success || 'All test cases passed!';
     const failHint = card.dataset.fail || 'One or more blanks do not match expected logic. Check red fields or toggle Hint.';
     if (allPass) {
+      card.dataset.solved = '1';
       fb.innerHTML = `<span style="color: var(--success); font-weight: 600;">&check; ACCEPTED (${passedCount}/${blanks.length} blanks verified)!</span> ${successMsg}`;
     } else {
       fb.innerHTML = `<span style="color: #ef4444; font-weight: 600;">&cross; Wrong Answer / Compile Check (${passedCount}/${blanks.length} blanks valid).</span> ${failHint}`;
     }
   }
+  updateLessonDrillCounter();
 }
 
 function resetCodeFill(labId) {
   const card = document.getElementById(labId);
   if (!card) return;
+  delete card.dataset.solved;
   card.querySelectorAll('.code-blank').forEach(input => {
     input.value = '';
     input.classList.remove('pass', 'fail');
   });
   const fb = card.querySelector('.quiz-feedback');
   if (fb) fb.style.display = 'none';
+  updateLessonDrillCounter();
 }
 
 function decodeHtmlEntityText(str) {
@@ -281,11 +335,13 @@ function checkTraceTable(tableId) {
   if (fb) {
     fb.style.display = 'block';
     if (passed === inputs.length) {
+      card.dataset.solved = '1';
       fb.innerHTML = `<span style="color: var(--success); font-weight: 600;">&check; Perfect Dry-Run! (${passed}/${inputs.length} state cells verified).</span> ${card.dataset.explanation || ''}`;
     } else {
       fb.innerHTML = `<span style="color: #ef4444; font-weight: 600;">&cross; ${passed}/${inputs.length} cells match.</span> Re-trace the red cells step-by-step before checking again.`;
     }
   }
+  updateLessonDrillCounter();
 }
 
 function revealTraceTable(tableId) {
@@ -300,14 +356,137 @@ function revealTraceTable(tableId) {
   checkTraceTable(tableId);
 }
 
+function resetTraceTable(tableId) {
+  const card = document.getElementById(tableId);
+  if (!card) return;
+  delete card.dataset.solved;
+  card.querySelectorAll('.trace-input').forEach(inp => {
+    inp.value = '';
+    inp.classList.remove('pass', 'fail');
+  });
+  const fb = card.querySelector('.quiz-feedback');
+  if (fb) fb.style.display = 'none';
+  updateLessonDrillCounter();
+}
+
 function toggleHint(hintId) {
   const el = document.getElementById(hintId);
   if (!el) return;
   el.style.display = (el.style.display === 'block') ? 'none' : 'block';
 }
 
-/* 8. Enter Key Listener for Instant Feedback on Inputs */
+/* 8. Spaced-Review Reset Enhancer, Drill Counter & Lesson Completion Bar */
+function getCurrentLessonNum() {
+  const path = (typeof window !== 'undefined' && window.location && window.location.pathname) || '';
+  const m = path.match(/\/lessons\/00(\d{2})-/);
+  return m ? m[1] : null;
+}
+
+function updateLessonDrillCounter() {
+  const counterEl = document.getElementById('lesson-drill-counter');
+  if (!counterEl) return;
+  const allCards = document.querySelectorAll('.practice-card, .quiz-card');
+  let solved = 0;
+  allCards.forEach(c => { if (c.dataset.solved === '1') solved++; });
+  counterEl.innerText = `${solved} / ${allCards.length} drills verified in this session`;
+}
+
+function mountSpacedReviewButtons() {
+  document.querySelectorAll('.practice-card').forEach(card => {
+    if (!card.id) return;
+    if (card.dataset.timeCorrect !== undefined) {
+      const btnWrap = card.querySelector('button.btn-action')?.parentElement;
+      if (btnWrap && !btnWrap.querySelector('.auto-reset-btn')) {
+        const b = document.createElement('button');
+        b.className = 'btn-secondary auto-reset-btn';
+        b.style.marginLeft = '0.5rem';
+        b.innerText = 'Reset';
+        b.onclick = () => resetComplexityQuiz(card.id);
+        btnWrap.appendChild(b);
+      }
+    } else if (card.dataset.bugLine !== undefined) {
+      const btnWrap = card.querySelector('button.btn-action')?.parentElement;
+      if (btnWrap && !btnWrap.querySelector('.auto-reset-btn')) {
+        const b = document.createElement('button');
+        b.className = 'btn-secondary auto-reset-btn';
+        b.style.marginLeft = '0.5rem';
+        b.innerText = 'Reset';
+        b.onclick = () => resetBugDrill(card.id);
+        btnWrap.appendChild(b);
+      }
+    } else if (card.querySelector('.trace-input')) {
+      const btnWrap = card.querySelector('button.btn-action')?.parentElement;
+      if (btnWrap && !btnWrap.querySelector('.auto-reset-btn')) {
+        const b = document.createElement('button');
+        b.className = 'btn-secondary auto-reset-btn';
+        b.innerText = 'Reset';
+        b.onclick = () => resetTraceTable(card.id);
+        btnWrap.appendChild(b);
+      }
+    }
+  });
+}
+
+function mountLessonCheckinBar() {
+  const lessonNum = getCurrentLessonNum();
+  if (!lessonNum) return;
+  const footer = document.querySelector('footer');
+  if (!footer) return;
+
+  const checkId = 'c' + lessonNum;
+  const bar = document.createElement('div');
+  bar.className = 'lesson-checkin-bar';
+  bar.id = 'lesson-checkin-bar';
+
+  function renderBar() {
+    const state = readProgressMap();
+    const done = !!state[checkId];
+    bar.classList.toggle('is-complete', done);
+    const h1Text = (document.querySelector('h1')?.innerText || '').trim();
+    bar.innerHTML = `
+      <div>
+        <div style="font-weight: 700; font-size: 0.96rem;">
+          ${done ? '&#10003; Lesson ' + lessonNum + ' Completed (Synced to Master Plan)' : 'Lesson ' + lessonNum + ' Mastery Gate'}
+        </div>
+        <div id="lesson-drill-counter" style="font-size: 0.84rem; color: var(--text-secondary); margin-top: 0.15rem;"></div>
+      </div>
+      <div style="display: flex; gap: 0.6rem; flex-wrap: wrap;">
+        <button type="button" class="btn-secondary" id="copy-teach-btn" title="Copy check-in message for your AI teacher">
+          Copy /teach Check-In
+        </button>
+        <button type="button" class="btn-complete ${done ? 'done' : ''}" id="toggle-complete-btn">
+          ${done ? '&#10003; Completed' : 'Mark Lesson ' + lessonNum + ' Complete'}
+        </button>
+      </div>
+    `;
+    updateLessonDrillCounter();
+
+    bar.querySelector('#toggle-complete-btn').onclick = () => {
+      const cur = readProgressMap();
+      cur[checkId] = !cur[checkId];
+      writeProgressMap(cur);
+      renderBar();
+    };
+
+    bar.querySelector('#copy-teach-btn').onclick = (ev) => {
+      const msg = `/teach Finished Lesson ${lessonNum} (${h1Text}) — quiz me with a 2-minute 2027 oral follow-up and log my learning record!`;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(msg).then(() => {
+          ev.currentTarget.innerText = 'Copied to Clipboard!';
+          setTimeout(() => { ev.currentTarget.innerText = 'Copy /teach Check-In'; }, 2000);
+        });
+      }
+    };
+  }
+
+  footer.parentNode.insertBefore(bar, footer);
+  renderBar();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  mountSpacedReviewButtons();
+  mountLessonCheckinBar();
+
   document.addEventListener('keydown', (evt) => {
     if (evt.key === 'Enter') {
       const active = document.activeElement;

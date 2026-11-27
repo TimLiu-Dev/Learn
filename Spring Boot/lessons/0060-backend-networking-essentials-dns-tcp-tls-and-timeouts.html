@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0060: Backend Networking Essentials (DNS, TCP Keep-Alive, Timeouts, TLS SSL Bundles &amp; L4/L7 Load Balancers)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 3 • Phase 14: PostgreSQL Internals, Linux Container Diagnostics &amp; Backend Networking</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 25 LTS</span>
+        <span class="badge badge-kotlin">Kotlin 2.2+</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0060 • Stage 3 • Phase 14</span>
+    <h1 style="margin-top: 8px;">Backend Networking Essentials: DNS, TCP Keep-Alive Pools, Timeouts, TLS SSL Bundles &amp; L4 vs. L7 Load Balancers</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: You do not need to memorize BGP routing tables to be a Senior Spring Boot Engineer, but you <em>must</em> understand the network hop between your Spring Boot pod and downstream databases or APIs. When production slows down at 2 AM, 80% of network incidents boil down to five things: <strong>missing <code>connectTimeout</code> / <code>readTimeout</code></strong>, <strong>TCP ephemeral port exhaustion (no Keep-Alive connection pool)</strong>, <strong>stale JVM DNS caching</strong>, <strong>TLS certificate failures (fixed cleanly with Spring Boot SSL Bundles)</strong>, and <strong>L4 vs. L7 load-balancing mismatches</strong>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://docs.spring.io/spring-boot/reference/features/ssl.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring Boot Reference: SSL Bundles</a> and <a href="https://docs.spring.io/spring-boot/reference/io/rest-client.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Spring Boot Reference: HTTP Client Configuration &amp; Timeouts</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Android Mental Model Bridge</div>
+    <p style="margin-bottom: 0;">
+      On Android, <code>OkHttpClient</code> gives you a shared TCP/TLS connection pool, sane 10-second timeouts, and system CA certificates out of the box. On a Spring Boot server, creating a fresh <code>HttpClient</code> per request or leaving timeouts unbounded will exhaust Linux ephemeral ports (<code>TIME_WAIT</code>) and hang every Virtual Thread or Tomcat worker until the pod locks up!
+    </p>
+  </div>
+
+  <h2>1. The 5 Networking Rules Every Senior Spring Boot Engineer Knows</h2>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>Always Set Explicit <code>connectTimeout</code> and <code>readTimeout</code>:</strong> <code>connectTimeout</code> (e.g., 2s) bounds the TCP 3-way handshake; <code>readTimeout</code> (e.g., 5s) bounds how long your thread waits between response packets. Never leave either infinite.</li>
+    <li><strong>Reuse Connections via HTTP Keep-Alive Pools:</strong> Each brand-new HTTPS socket pays a TCP handshake + TLS 1.3 handshake (~30–100ms) and occupies an ephemeral port in <code>TIME_WAIT</code> for 60s after closing. Use a single singleton <code>RestClient</code> backed by a pooled <code>HttpClient</code> (Apache HttpComponents 5 or Jetty) so Keep-Alive sockets are reused.</li>
+    <li><strong>Spring Boot SSL Bundles (<code>spring.ssl.bundle.*</code>):</strong> When calling internal HTTPS services signed by a private enterprise CA (avoiding the dreaded <code>PKIX path building failed</code> error), never disable certificate verification! Configure a PEM/JKS truststore declaratively via <code>spring.ssl.bundle.pem.*</code> and wire it into <code>RestClientSsl</code>.</li>
+    <li><strong>JVM DNS Caching (<code>networkaddress.cache.ttl</code>):</strong> Cloud load balancers (AWS ALB, RDS) rotate IPs frequently. Ensure your JVM does not cache DNS records forever (set <code>-Dsun.net.inetaddr.ttl=30</code> or configure <code>java.security</code> DNS TTL to 30s).</li>
+    <li><strong>L4 (TCP) vs. L7 (HTTP) Load Balancers + CLI Triage:</strong> An <strong>L4 NLB</strong> balances raw TCP connections (breaks HTTP/2 multiplexing across pods—one persistent gRPC connection sticks to a single pod!). An <strong>L7 ALB / Nginx</strong> terminates TLS and balances individual HTTP requests. Keep three CLI tools in your muscle memory: <code>curl -v https://...</code> (TLS + headers), <code>dig +short api.internal</code> (DNS), and <code>nc -zv db-host 5432</code> (raw TCP reachability).</li>
+  </ul>
+
+  <h3>1. Anatomy of an Outbound HTTPS Request &amp; Where Timeouts Apply</h3>
+  <div style="background:#090d13; border:1px solid var(--border-color); border-radius:var(--radius-sm); padding:16px; font-family:var(--font-mono); font-size:13px; color:#7ee787; margin:16px 0;">
+[ RestClient ] ──► 1. DNS Lookup (JVM TTL=30s) ──► 2. TCP SYN/ACK + TLS 1.3 (connectTimeout = 2s)
+                                                          │
+[ Reuse Keep-Alive Socket Pool ] ◄────────────────────────┴──► 3. Wait for Response Bytes (readTimeout = 5s)
+  </div>
+
+  <h3>2. Network Timeout &amp; Pooling Checklist Across Stack Layers</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Critical Setting</th>
+        <th>Failure If Left at Default</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Outbound <code>RestClient</code></strong></td>
+        <td><code>connectTimeout=2s</code>, <code>readTimeout=5s</code></td>
+        <td>Infinite socket read blocks Virtual Threads &amp; upstream callers</td>
+      </tr>
+      <tr>
+        <td><strong>Connection Pool Idle TTL</strong></td>
+        <td>Keep-Alive idle &lt; Cloud NAT / ALB idle timeout (e.g., 45s &lt; 60s)</td>
+        <td>Intermittent <code>Connection reset by peer</code> on half-closed sockets!</td>
+      </tr>
+      <tr>
+        <td><strong>JVM DNS Cache</strong></td>
+        <td><code>networkaddress.cache.ttl=30</code></td>
+        <td>Pods keep calling stale RDS/ALB IP after Multi-AZ failover</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Always ensure your client HTTP pool's idle eviction timeout (e.g., 45 seconds) is <strong>shorter</strong> than the upstream load balancer's idle timeout (typically 60 seconds on AWS ALB), eliminating sporadic <code>SocketException: Connection reset</code> errors when reusing stale idle connections.
+  </p>
+
+  <h2>2. Production Implementation (Java 25 vs Kotlin 2.2+)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Pooled, Timeout-Bounded RestClient with Spring Boot SSL Bundle</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code># application.yml — Spring Boot 3.1+/4.0 Declarative SSL Bundle
+# spring:
+#   ssl:
+#     bundle:
+#       pem:
+#         internal-ca:
+#           truststore:
+#             certificate: "classpath:certs/internal-ca.pem"
+
+package com.nexus.networking;
+
+import org.springframework.boot.autoconfigure.ssl.SslBundles;
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.client.RestClient;
+
+import java.time.Duration;
+
+@Configuration
+public class NetworkClientConfig {
+
+    @Bean
+    RestClient ledgerRestClient(RestClient.Builder builder, SslBundles sslBundles) {
+        var settings = ClientHttpRequestFactorySettings.defaults()
+            .withConnectTimeout(Duration.ofSeconds(2))
+            .withReadTimeout(Duration.ofSeconds(5))
+            .withSslBundle(sslBundles.getBundle("internal-ca"));
+
+        var requestFactory = ClientHttpRequestFactoryBuilder.detect().build(settings);
+
+        return builder
+            .baseUrl("https://ledger.internal:8443")
+            .requestFactory(requestFactory)
+            .build();
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.nexus.networking
+
+import org.springframework.boot.autoconfigure.ssl.SslBundles
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.web.client.RestClient
+import java.time.Duration
+
+@Configuration
+class NetworkClientConfig {
+
+    @Bean
+    fun ledgerRestClient(builder: RestClient.Builder, sslBundles: SslBundles): RestClient {
+        val settings = ClientHttpRequestFactorySettings.defaults()
+            .withConnectTimeout(Duration.ofSeconds(2))
+            .withReadTimeout(Duration.ofSeconds(5))
+            .withSslBundle(sslBundles.getBundle("internal-ca"))
+
+        val requestFactory = ClientHttpRequestFactoryBuilder.detect().build(settings)
+
+        return builder
+            .baseUrl("https://ledger.internal:8443")
+            .requestFactory(requestFactory)
+            .build()
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to verify your backend networking intuition.</p>
+
+  <div class="quiz-card" id="q0060_1" data-explanation="Creating a new HttpClient per request disables Keep-Alive connection reuse, forcing a full TCP + TLS handshake per call and leaving closed sockets in Linux TIME_WAIT state until ephemeral ports (32768-60999) are exhausted.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Under 2,000 outbound RPS, your Spring Boot pod logs <code>Cannot assign requested address</code> because thousands of sockets sit in <code>TIME_WAIT</code>. What caused this?</div>
+    <div class="quiz-code-snippet"><pre><code>// Executed inside a controller on every incoming HTTP request:
+var client = HttpClient.newBuilder().build(); // ❌ No singleton pool!</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Building a fresh HttpClient per request prevents Keep-Alive socket reuse and exhausts Linux ephemeral ports in TIME_WAIT.">
+        Instantiating a new HttpClient per call prevents Keep-Alive reuse and exhausts ephemeral ports in TIME_WAIT.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Spring Boot SSL Bundles configure TLS certificates and do not leak Linux ephemeral TCP ports.">
+        Using Spring Boot SSL Bundles forces the Linux kernel to double the TCP TIME_WAIT socket hold duration.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. DNS TTL caching affects IP staleness when targets rotate, not local TIME_WAIT ephemeral port exhaustion.">
+        Setting the JVM DNS cache TTL to thirty seconds prevents Tomcat from accepting new client connections.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. L7 Application Load Balancers terminate HTTP cleanly and do not cause client ephemeral port leaks.">
+        Routing outbound HTTP requests through an L7 load balancer prevents PostgreSQL from reusing HikariCP connections.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0060_2" data-explanation="When an internal microservice uses a private enterprise CA, the default JVM cacerts truststore rejects it with PKIX path building failed. Spring Boot SSL Bundles let you load PEM/JKS truststores via application.yml without insecurely trusting all certificates.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">Your service throws <code>SSLHandshakeException: PKIX path building failed</code> when calling an internal TLS service signed by your company's private CA. What is the senior Spring Boot fix?</div>
+    <div class="quiz-code-snippet"><pre><code>spring.ssl.bundle.pem.corp-ca.truststore.certificate=classpath:certs/corp-ca.pem</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Disabling X.509 hostname and certificate verification exposes internal traffic to trivial Man-in-the-Middle attacks.">
+        Install a custom X509TrustManager that blindly trusts every TLS certificate presented on the network.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Configuring a declarative Spring Boot SSL Bundle supplies the private CA certificate cleanly to RestClient.">
+        Declare a Spring Boot SSL Bundle containing the private CA PEM truststore and attach it to RestClient.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Lowering readTimeout only makes failing TLS connections fail faster; it cannot fix missing CA trust.">
+        Lower the HttpClient readTimeout property to 100 milliseconds so failed TLS handshakes retry immediately.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Switching from L7 to L4 load balancing passes TLS straight through and still fails CA trust.">
+        Switch your cluster load balancer from L7 HTTP mode to L4 TCP passthrough mode.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0060_3" data-explanation="An L4 Network Load Balancer routes one TCP connection to one backend pod. Because HTTP/2 multiplexes thousands of requests over a single persistent TCP connection, all traffic sticks to one pod! L7 load balancers inspect HTTP/2 frames and balance per-request.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">You scale an internal HTTP/2 (or gRPC) service from 1 pod to 5 pods behind an <strong>L4 TCP Load Balancer</strong>, yet 100% of traffic still hits a single pod. Why?</div>
+    <div class="quiz-code-snippet"><pre><code>[ Client ] ═══( 1 persistent HTTP/2 TCP socket )═══► [ L4 NLB ] ───► [ Pod #1 (100% CPU!) ]</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Kubernetes CoreDNS returns pod/service records cleanly; the stickiness happens at the persistent L4 TCP socket.">
+        Kubernetes CoreDNS permanently caches only the first pod IP address for every HTTP/2 client forever.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Virtual threads execute concurrent HTTP/2 streams easily; the imbalance is caused by L4 TCP pinning.">
+        Java 25 Virtual Threads pin HTTP/2 requests to a single Kubernetes pod during TLS 1.3 negotiation.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! L4 balances per TCP connection, so persistent HTTP/2 multiplexed sockets stick to one pod unless you use L7.">
+        L4 balances per TCP connection, pinning persistent multiplexed HTTP/2 streams onto one pod instead of per-request L7.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Tomcat handles HTTP/2 on port 8080/8443 without forcing requests to pod #1.">
+        Embedded Tomcat rejects HTTP/2 frames unless server.shutdown is explicitly set to immediate mode.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Configure a production-safe <code>RestClient</code> using <code>ClientHttpRequestFactorySettings</code> with a <code>2s</code> connect timeout, <code>5s</code> read timeout, and the <code>"internal-ca"</code> Spring Boot SSL Bundle.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0060-lab"
+       data-starter-java="package com.nexus.networking;
+
+import org.springframework.boot.autoconfigure.ssl.SslBundles;
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings;
+import org.springframework.web.client.RestClient;
+import java.time.Duration;
+
+public class SecureClientFactory {
+    public static RestClient create(RestClient.Builder builder, SslBundles sslBundles) {
+        // TODO 1: Build ClientHttpRequestFactorySettings.defaults() with
+        //         withConnectTimeout(Duration.ofSeconds(2)),
+        //         withReadTimeout(Duration.ofSeconds(5)),
+        //         and withSslBundle(sslBundles.getBundle(&quot;internal-ca&quot;))
+        // TODO 2: Build requestFactory via ClientHttpRequestFactoryBuilder.detect().build(settings)
+        // TODO 3: Return builder.baseUrl(&quot;https://ledger.internal&quot;).requestFactory(requestFactory).build()
+        return null;
+    }
+}"
+       data-starter-kotlin="package com.nexus.networking
+
+import org.springframework.boot.autoconfigure.ssl.SslBundles
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings
+import org.springframework.web.client.RestClient
+import java.time.Duration
+
+object SecureClientFactory {
+    fun create(builder: RestClient.Builder, sslBundles: SslBundles): RestClient {
+        // TODO 1: Build ClientHttpRequestFactorySettings.defaults() with
+        //         withConnectTimeout(Duration.ofSeconds(2)),
+        //         withReadTimeout(Duration.ofSeconds(5)),
+        //         and withSslBundle(sslBundles.getBundle(&quot;internal-ca&quot;))
+        // TODO 2: Build requestFactory via ClientHttpRequestFactoryBuilder.detect().build(settings)
+        // TODO 3: Return builder.baseUrl(&quot;https://ledger.internal&quot;).requestFactory(requestFactory).build()
+        throw NotImplementedError()
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0060</span>
+        <span class="practice-title">Timeout-Bounded &amp; SSL-Bundle RestClient Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0060-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Configure <code>ClientHttpRequestFactorySettings.defaults()</code> with <code>withConnectTimeout(Duration.ofSeconds(2))</code>, <code>withReadTimeout(Duration.ofSeconds(5))</code>, and <code>withSslBundle(sslBundles.getBundle("internal-ca"))</code>, then attach the built factory to <code>builder.baseUrl("https://ledger.internal").requestFactory(requestFactory).build()</code>.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.nexus.networking;
+
+import org.springframework.boot.autoconfigure.ssl.SslBundles;
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings;
+import org.springframework.web.client.RestClient;
+import java.time.Duration;
+
+public class SecureClientFactory {
+    public static RestClient create(RestClient.Builder builder, SslBundles sslBundles) {
+        // TODO 1: Build ClientHttpRequestFactorySettings.defaults() with
+        //         withConnectTimeout(Duration.ofSeconds(2)),
+        //         withReadTimeout(Duration.ofSeconds(5)),
+        //         and withSslBundle(sslBundles.getBundle(&quot;internal-ca&quot;))
+        // TODO 2: Build requestFactory via ClientHttpRequestFactoryBuilder.detect().build(settings)
+        // TODO 3: Return builder.baseUrl(&quot;https://ledger.internal&quot;).requestFactory(requestFactory).build()
+        return null;
+    }
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Configure Timeouts &amp; SSL Bundle</div>
+        <div>Chain <code>.withConnectTimeout(Duration.ofSeconds(2)).withReadTimeout(Duration.ofSeconds(5)).withSslBundle(sslBundles.getBundle("internal-ca"))</code> on <code>ClientHttpRequestFactorySettings.defaults()</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Auto-Detect Pooled Client Factory</div>
+        <div>Call <code>ClientHttpRequestFactoryBuilder.detect().build(settings)</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Build RestClient</div>
+        <div>Return <code>builder.baseUrl("https://ledger.internal").requestFactory(requestFactory).build()</code>.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 25 Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.networking;
+
+import org.springframework.boot.autoconfigure.ssl.SslBundles;
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings;
+import org.springframework.web.client.RestClient;
+import java.time.Duration;
+
+public class SecureClientFactory {
+    public static RestClient create(RestClient.Builder builder, SslBundles sslBundles) {
+        var settings = ClientHttpRequestFactorySettings.defaults()
+            .withConnectTimeout(Duration.ofSeconds(2))
+            .withReadTimeout(Duration.ofSeconds(5))
+            .withSslBundle(sslBundles.getBundle("internal-ca"));
+        var requestFactory = ClientHttpRequestFactoryBuilder.detect().build(settings);
+        return builder
+            .baseUrl("https://ledger.internal")
+            .requestFactory(requestFactory)
+            .build();
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.networking
+
+import org.springframework.boot.autoconfigure.ssl.SslBundles
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings
+import org.springframework.web.client.RestClient
+import java.time.Duration
+
+object SecureClientFactory {
+    fun create(builder: RestClient.Builder, sslBundles: SslBundles): RestClient {
+        val settings = ClientHttpRequestFactorySettings.defaults()
+            .withConnectTimeout(Duration.ofSeconds(2))
+            .withReadTimeout(Duration.ofSeconds(5))
+            .withSslBundle(sslBundles.getBundle("internal-ca"))
+        val requestFactory = ClientHttpRequestFactoryBuilder.detect().build(settings)
+        return builder
+            .baseUrl("https://ledger.internal")
+            .requestFactory(requestFactory)
+            .build()
+    }
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Binding a singleton <code>RestClient</code> with bounded connect/read timeouts and a declarative Spring Boot SSL Bundle gives you Keep-Alive connection reuse, fast failure on network blackholes, and zero-hack private CA trust.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"How does Spring Boot's SSL Bundle hot-reload rotate an expiring mTLS or CA certificate without restarting the Kubernetes pod?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0059-linux-and-container-diagnostics-for-java-backends.html" class="btn btn-secondary">← Previous: Lesson 0059</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0061-spring-boot-actuator-health-probes-and-metrics.html" class="btn btn-primary">Next: Lesson 0061 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0060 (Stage 3: Production Engineering)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0060-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Connect & Read Timeouts Configured",
+    passed: /withConnectTimeout\s*\(/.test(code) && /withReadTimeout\s*\(/.test(code),
+    error: "Must set both withConnectTimeout(...) and withReadTimeout(...)."
+  });
+  tests.push({
+    name: "Spring SSL Bundle 'internal-ca' Attached",
+    passed: /withSslBundle\s*\(\s*sslBundles\.getBundle\s*\(\s*["']internal-ca["']\s*\)\s*\)/.test(code),
+    error: "Must attach sslBundles.getBundle(\"internal-ca\") via withSslBundle(...)."
+  });
+  tests.push({
+    name: "Factory Wired into RestClient.Builder",
+    passed: /ClientHttpRequestFactoryBuilder\.detect\s*\(\s*\)\.build/.test(code) && /\.requestFactory\s*\(/.test(code),
+    error: "Must build the requestFactory via ClientHttpRequestFactoryBuilder.detect().build(settings) and pass it to builder.requestFactory(...)."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

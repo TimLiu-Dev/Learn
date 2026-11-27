@@ -1,44 +1,38 @@
 # Learner Notes & Working Preferences
 
-- **Learner Profile:** Self-taught software engineer with strong software fluency, treating this curriculum as a formal, rigorous Computer Science major education.
+- **Current Learning State (CRITICAL FOR `/teach` ZPD):**
+  - **Completed Lessons:** `0 / 16` — Learner has **not started Lesson 01 yet**; curriculum was audited and expanded end-to-end so the learner can begin cleanly at `lessons/0001-how-computers-execute-code.html`.
+  - **Next Active Lesson:** **Lesson 01** (`lessons/0001-how-computers-execute-code.html`).
+- **Learner Profile:** Self-taught software engineer with strong software fluency, treating this curriculum as a formal, rigorous Computer Science major education from ground zero.
 - **Pedagogical Standard: "Deep CS Edition":**
-  - **Zero Hand-Waving:** Never introduce an abstraction (e.g. Hash Maps, dynamic arrays, recursion, stack frames) as a black box. Always explain the underlying machine mechanics: CPU registers, ALU operations, memory buses, cache lines, heap vs. stack, hash functions, and bucket arrays.
-  - **Comprehensive & Verbose Explanations:** Deep explanatory prose, physical diagrams, line-by-line CPU state traces, and mathematical derivations without artificial truncation.
-  - **ELI5 ("Explain Like I'm 5") Section for Every Concept:** Every single core concept and subtopic includes a dedicated ELI5 callout pairing deep CS rigor with a vivid, physical everyday analogy (e.g. mailboxes, cafeteria trays, odometer roll-overs).
-  - **Interactive Verification & Active Practice:** Every lesson features interactive hardware/data structure simulators, active Fill-in-the-Code evaluators (with Hints and Show Solution), Spot-the-Bug interactive code drills, or active Trace-Table evaluators, paired with strict retrieval practice quizzes with word-count-balanced options and detailed mechanical explanations.
-- **Languages:**
-  - Primary code: Kotlin
-  - Additional read-along languages: Python and Java
-- **Critical Conceptual Anchors:**
-  1. **Physical Memory Reality:** RAM layout, contiguous blocks, pointer math, bus latency, and 64-byte cache hierarchy.
-  2. **Data Structure Internals:** Hash functions, modulo compression, bucket arrays, separate chaining collision handling, dynamic array geometric doubling, binary heap array indexing.
-  3. **The "Hidden Big O" Trap in Standard Libraries:** Auditing built-in library methods (e.g., Kotlin `contains()`, `removeAt(0)`, string immutability, `IntArray` identity hashing).
-  4. **Logarithmic Intuition (`log n`):** The "Halving Game" as the inverse of exponential doubling, decision tree depths.
-  5. **Call Stack vs. Heap Memory:** Stack frames, recursion depth (`StackOverflowError` limits), and auxiliary space accounting.
-- **Interview Dynamics Stance:**
-  - Modern 2027 technical interviews require candidates to clarify bounds, verbalize brute force upfront (20–40s) to establish comprehension and pinpoint the algorithmic bottleneck, defend invariants aloud, gain consensus, and code only the optimal solution.
-- **Curriculum Architecture (11 Core Modules + 3 Prerequisites = 14 Lessons):**
-  - **Prerequisites (Pre-01, Pre-02 & Pre-03):**
-    - Pre-01 (`0000a`): Code vs. Algorithms, compilation/JVM bytecode to CPU Fetch-Decode-Execute, compiled vs. Python constant factors, best vs. worst case, halving loops, nested loop multiplication, 2 Code Complexity quizzes, and Fill-in-the-Code pair loop.
-    - Pre-02 (`0000b`): Bits & Bytes, Two's Complement signed bounds (`0x7FFFFFFF`), int vs. float division & `Double` precision, value vs. reference passing, Hex `0x1000`, ASCII offsets (`ch - 'a'`), negative modulo `.mod()` bug hunt, and ASCII fill-in lab.
-    - Pre-03 (`0000c`): Bitwise ALU operators (`and`, `or`, `xor`, `shl`, `shr`, `ushr`), interactive 8-bit ALU simulator, parity & power-of-2 bitmasks, ceiling division `(a + b - 1) / b`, arithmetic/geometric series, `2^10`/`2^20` bounds, Euclidean GCD, `O(sqrt(n))` primality, negative parity bug hunt, and bit/math fill-in lab.
-  - **Core Lessons 01–09 (with 05b & 07b Bridges):**
-    - Lesson 01 (`0001`): RAM Layout, 64-byte cache lines, separate-chaining simulator, hashability & `IntArray` key trap, load factor rehashing, disguised `ArrayList.contains` `O(n²)` bug drill.
-    - Lesson 02 (`0002`): Asymptotics (`O`/`Ω`/`Θ`), Worst vs. Average vs. Amortized, `O(√n)`, `O(n·2ⁿ)` leaf copies, log base invariance, multi-variable bounds, amortized sliding window, Code Complexity Quizzes.
-    - Lesson 03 (`0003`): 10⁷ safe / 10⁸ hard CPU ceiling simulator, MLE memory math, language constant factors, 32-bit overflow (`a.toLong() * b`), `abs(Int.MIN_VALUE)`, modulo `10^9 + 7`, safe-midpoint lab, overflow bug drill.
-    - Lesson 04 (`0004`): 45-minute interview choreography, senior scripts, 2027 AI-era invariant defense & follow-up pivots, `firstDuplicatePair` hygiene showcase (no Two Sum spoiler), single-lookup null-safe Kotlin lab, skipped-clarification bug drill.
-    - Lesson 05 (`0005`): Tabular dry-running (pointers + HashMap states), invariant decision rules (`<` vs `<=`), `left = mid` infinite-loop trap, active trace table lab, off-by-one binary search bug drill.
-    - Lesson 05b (`0005b`): Subarray vs. Subsequence vs. Subset, prompt-to-pattern signals, `String`/`StringBuilder` internals, interactive Prefix Sum `O(1)` range calculator, string concat bug hunt, Prefix Sum lab, and 2027 Study Playbook.
-    - Lesson 06 (`0006`): Online Judge platform mechanics, Run vs. Submit, `Unit` in-place problems, `println` TLE trap, default imports, all 6 verdicts, Two Sum lab, stateful-field bug drill.
-    - Lesson 07 (`0007`): `IntArray` vs `ArrayList`, geometric doubling simulator, 2D matrix & `contentEquals` traps, `HashSet`, `IntArray(26)`, `ArrayDeque`, `ListNode?`/`TreeNode?` backticks, Guided Bridge Labs for LC #217 & #242.
-    - Lesson 07b (`0007b`): Binary Min/Max Heap array indexing (`2i+1`, `2i+2`), interactive heap simulator, why Top-K uses Min-Heap, Tree/BST vocabulary, Adjacency List vs. Matrix, 2D Grid 4-dir offsets, cyclic BFS `visited` MLE bug hunt, Top-K Heap lab.
-    - Lesson 08 (`0008`): Hardware Call Stack mechanics, interactive frame push/unwind visualizer, chain `O(n)` vs tree `O(2ⁿ)` recursion, `fib(n)` `O(n)` stack depth, memoization preview, JVM `n = 10^5` `StackOverflowError` limit, unwind trace table, Guided Bridge Lab for LC #104.
-    - Lesson 09 (`0009`): Sorting internals (Merge Sort, Dual-Pivot Quicksort, TimSort), interactive two-half merge stepper, `Ω(n log n)` decision-tree proof, Sort Stability, `O(n + k)` Counting Sort, overflow-safe `compareBy<IntArray>` bug hunt & lab.
-- **Shared Interactive Engine:**
-  - `assets/components.js`: Single shared JS engine handling polyglot tabs, retrieval quizzes, 2-part complexity evaluators, clickable bug line drills, fill-in-the-code verification (with Hint & Show Solution), active trace tables, and hints.
-- **Reference Library & Canonical Glossary:**
-  - `reference/kotlin-leetcode-syntax.html`: Print-ready cheat sheet covering Kotlin (primary) with Python/Java equivalents for arrays, loops, strings, ASCII math, collections, deques, heaps, sorting, bitwise, prefix sums, 2D grid dirs, and safe math.
-  - `reference/big-o-and-complexity.html`: Hierarchy, 10⁷ rule, multi-variable bounds, amortized loops, standard library costs.
-  - `reference/interview-protocol-scripts.html`: 45-min senior script, edge-case gauntlet, recovery lines.
-  - `reference/data-structures-and-hashmaps.html`: RAM architecture, polyglot null-safe lookup cheat sheet, dynamic array doubling, Binary Heap & Graph Adjacency List rows.
-  - `reference/glossary.html` & `GLOSSARY.md`: Formal definitions and avoid-aliases for core CS terms.
+  - **Zero Hand-Waving:** Never introduce an abstraction (Hash Maps, dynamic arrays, heaps, recursion, sorting) as a black box. Always explain the underlying machine mechanics: CPU registers, ALU operations, memory buses, 64-byte cache lines, Call Stack vs. Heap, hash functions, and bucket arrays.
+  - **Comprehensive Explanations + ELI5 Analogies:** Pair formal CS derivations and state traces with vivid everyday ELI5 callouts.
+  - **Active Verification & Desirable Difficulty:** Every lesson includes interactive simulators, Spot & Fix the Bug code drills, Fill-in-the-Code labs (with Hint & Show Solution), or active Trace Tables, plus word-balanced retrieval quizzes.
+- **Languages & Runtime (2027 Verified):**
+  - Primary implementation language: **Kotlin 2.x** (matching LeetCode's Kotlin 2.x / OpenJDK 25 runtime, including `mod()`, `digitToInt()`, `lowercaseChar()`, `0..<n`, `ArrayDeque`, `compareBy`).
+  - Secondary read-along languages: **Python** and **Java**.
+- **2027 Interview Dynamics Stance:**
+  - Modern 2027 technical loops test two complementary modes:
+    1. **Zero-AI / Supervised Problem Solving & Multi-Part Mutations:** Clarify constraints, verbalize brute force in 30s, isolate the bottleneck, secure consensus, write clean optimal code, manually dry-run via trace tables, and pivot smoothly on Part 2 constraint twists (streaming, `O(1)` memory, thread safety).
+    2. **Code-Critique & AI-Assisted Debugging Rounds:** Audit unfamiliar or AI-drafted code for disguised `O(n²)` library calls, 32-bit overflow, off-by-one invariants, and cyclic MLEs, backed by adversarial edge-case test design.
+- **Unified 16-Lesson Curriculum Architecture (`0001` – `0016`):**
+  - **Stage A — Hardware, Memory & Complexity Foundations (`01` – `05`):**
+    - `0001`: Code vs. Algorithms, JVM/CPU Fetch-Decode-Execute, constant factors, elementary steps, `0..<n` vs `until`, loop scaling, 2 Complexity Quizzes, pair-loop lab.
+    - `0002`: Bits & Bytes, Two's Complement (`0x7FFFFFFF`, `abs(Int.MIN_VALUE)`), truncated vs. float division, value vs. heap reference, Hex `0x1000`, ASCII `ch - 'a'`, `.mod()` bug hunt & ASCII lab.
+    - `0003`: Von Neumann hierarchy, 64-byte cache lines, `O(1)` index math vs. `O(n)` scan, Gauss `n(n-1)/2`, Hash Table modulo compression & separate chaining simulator, `IntArray` hash-key trap, disguised `ArrayList.contains` bug hunt.
+    - `0004`: Asymptotics (`O`/`Ω`/`Θ`), worst/average/amortized, `O(√n)` & `O(n·2ⁿ)` classes, `log₂ n` Halving Game simulator, hidden stdlib Big O, multi-variable & sliding-window amortization, Stack vs. Heap space.
+    - `0005`: `10^7` safe / `10^8` hard CPU ceiling simulator, MLE memory math, 32-bit multiplication overflow (`a.toLong() * b`), modulo `10^9 + 7`, safe-midpoint lab & overflow bug drill.
+  - **Stage B — 2027 Interview Protocol, Dry-Running & Prompt Literacy (`06` – `08`):**
+    - `0006`: 45-minute 6-stage choreography, clarifying matrix, 3-sentence bottleneck pivot, 2027 Dual-Mode Playbook (Multi-Part Mutations + AI/Code-Critique Auditing), single-lookup null-safe Kotlin lab.
+    - `0007`: Deterministic state-machine dry-running, `<` vs `<=` loop invariants, binary search `left = mid` infinite-loop trap, 6-point edge-case gauntlet, active trace table lab, LC #704 & #167 bridges.
+    - `0008`: Subarray vs. Subsequence vs. Subset, prompt-to-pattern signals, UTF-16 `String` vs. `StringBuilder`, interactive `O(1)` Prefix Sum range calculator, string concat bug hunt, 2027 spaced-repetition playbook, LC #303 bridge.
+  - **Stage C — First LeetCode Milestone & Discrete Math / Bitwise (`09` – `10`):**
+    - `0009`: Online Judge harness (`class Solution`, no `main()`), Kotlin 2.x / OpenJDK 25 notes, Run vs. Submit, all 6 verdicts, stateful-field bug drill, and conquering **LeetCode #1 Two Sum** from scratch.
+    - `0010`: CPU bitwise ALU simulator (`and`, `or`, `xor`, `shl`, `shr`, `ushr`), negative-safe parity `(x and 1) == 1`, power-of-2 `n and (n - 1)` mask, ceiling division `(a + b - 1) / b`, arithmetic/geometric series, Euclidean GCD, `O(√n)` primality, LC #136 & #231 bridges.
+  - **Stage D — Complete Data Structures, Traversals & Optimization Toolkit (`11` – `16`):**
+    - `0011`: `IntArray` vs `ArrayList` geometric doubling simulator, Kotlin swap & hashable `Pair(r, c)`, `HashSet` vs `TreeMap` (`O(log n)` ordered) vs `IntArray(26)`, `ArrayDeque` ring buffer (`removeLastOrNull` #20 guard), `ListNode?` backticks, **Dummy Sentinel Head (`ListNode(0)`)** & `nextTemp` reversal (#206), guided labs for **LC #217 & #242**.
+    - `0012`: Binary Min/Max Heap array indexing (`2i+1`, `2i+2`), Top-K Min-Heap gatekeeper pattern, Binary Tree vs. BST invariants, Adjacency List (`O(V+E)`) vs. Matrix (`O(V²)`), 2D grid 4-dir offsets, cyclic BFS `visited` MLE bug hunt, **LC #215** lab.
+    - `0013`: Hardware Call Stack push/unwind visualizer, chain `O(n)` vs. tree `O(2ⁿ)` recursion, `fib(n)` `O(n)` stack space & memoization preview, JVM `n = 10^5` `StackOverflowError` limit, **Backtracking Shared-Heap State (`choose → explore → unchoose` + `ArrayList(path)` leaf copy)**, unwind trace table, **LC #104** lab.
+    - `0014`: Merge Sort, Dual-Pivot Quicksort & TimSort internals, two-half merge stepper, `Ω(n log n)` decision-tree proof, Sort Stability, `O(n + k)` Counting Sort, overflow-safe `compareBy<IntArray>` comparators, **LC #88 & #56** bridges.
+    - `0015`: Monotonic `firstTrue` boundary binary search (`while (left < right)`, `right = mid`), Pre/In/Post-Order Tree DFS (sorted BST law), Level-Order BFS `val levelSize = q.size` wave snapshot, `nr in grid.indices` bounds, **LC #278, #35 & #102** bridges.
+    - `0016`: Same-direction Read/Write in-place pointers (#283 Move Zeroes), Greedy running-min (#121) vs. Coin Change counterexample test, Top-Down Memoization (`IntArray(n + 1) { -1 }` collapsing `O(2ⁿ) -> O(n)`), **LC #70 Climbing Stairs** lab.

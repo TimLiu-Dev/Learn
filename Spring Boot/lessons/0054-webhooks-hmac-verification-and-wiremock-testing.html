@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0054: Inbound Webhooks (HMAC-SHA256 &amp; Replay Defense) &amp; Outbound WireMock Contract Testing</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 2 • Phase 12: Enterprise Architecture: Spring Modulith 2, Sagas, Webhooks &amp; System Design</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 25 LTS</span>
+        <span class="badge badge-kotlin">Kotlin 2.2+</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0054 • Stage 2 • Phase 12</span>
+    <h1 style="margin-top: 8px;">Inbound Webhooks (HMAC-SHA256 &amp; Replay Defense) &amp; Outbound HTTP Contract Testing with WireMock</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: In Lesson 0027 you used Testcontainers to test real PostgreSQL, Redis, and Kafka. But how do you test outbound <code>RestClient</code> / <code>@HttpExchange</code> calls to Stripe, Adyen, or Twilio without hitting live external servers in CI? And how do you securely receive asynchronous <strong>inbound Webhooks</strong> from payment providers without falling victim to spoofed POST requests, timing attacks, or replay attacks? Master <strong>WireMock</strong> contract testing and <strong>constant-time HMAC-SHA256 webhook verification</strong>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://wiremock.org/docs/spring-boot/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">WireMock Official Spring Boot Integration Guide</a> and <a href="https://docs.stripe.com/webhooks/signatures" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Stripe Engineering: Webhook HMAC Signature &amp; Replay Prevention</a>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">💡 Android Mental Model Bridge</div>
+    <p style="margin-bottom: 0;">
+      On Android, you test Retrofit interfaces against OkHttp's <code>MockWebServer</code> to simulate <code>HTTP 429</code>, <code>503</code>, and socket timeouts. On a Spring Boot backend, <strong>WireMock</strong> (<code>@EnableWireMock</code>) is the industrial-strength counterpart for testing outbound <code>RestClient</code> and Resilience4j circuit breakers against real localhost TCP sockets!
+    </p>
+  </div>
+
+  <h2>1. Securing Inbound Webhooks: Raw Bytes, HMAC-SHA256 &amp; Constant-Time Comparison</h2>
+  <p>
+    When a user completes a mobile Apple Pay or Google Pay checkout, Stripe or Adyen notifies your backend asynchronously via an HTTP <code>POST /webhooks/payments</code> request. Since this endpoint is reachable on the public internet without a user's JWT, attackers will try to POST fake <code>"payment_intent.succeeded"</code> JSON payloads! Senior engineers enforce four strict defenses:
+  </p>
+  <ul style="margin: 0 0 16px 24px; line-height: 1.8;">
+    <li><strong>Bind the Raw <code>byte[]</code> or <code>String</code> Payload:</strong> Never bind the webhook request directly to a Java Record/DTO before verifying the signature—Jackson re-serializing an object alters whitespace and key ordering, invalidating the cryptographic hash!</li>
+    <li><strong>Replay Window Enforcement:</strong> Verify the signed timestamp header (e.g., <code>t=1732150000</code>) is within 5 minutes (<code>300</code> seconds) of <code>Instant.now()</code>, then compute <code>HMAC-SHA256(secret, timestamp + "." + rawPayload)</code>.</li>
+    <li><strong>Constant-Time Comparison (<code>MessageDigest.isEqual</code>):</strong> Never compare signatures with <code>String.equals()</code>, which short-circuits on the first mismatched byte and leaks signature bytes via nanosecond timing side-channels! Always use <code>MessageDigest.isEqual(expectedBytes, providedBytes)</code>.</li>
+    <li><strong>Event Idempotency + Fast <code>200 OK</code>:</strong> Deduplicate the provider's <code>event_id</code> in Redis/PostgreSQL because webhook providers retry on network timeouts.</li>
+  </ul>
+
+  <h2>2. Testing Outbound <code>RestClient</code> with WireMock</h2>
+  <p>
+    Unit-mocking a Java interface with Mockito completely skips HTTP serialization, header propagation, status-code error handlers, and timeout configuration. With <code>@EnableWireMock</code> (from <code>wiremock-spring-boot</code>), WireMock spins up a real local HTTP server on a dynamic port and injects <code>${wiremock.server.baseUrl}</code> into your Spring properties so you can verify exact wire-level JSON, retry backoff, and <code>503 Service Unavailable</code> circuit-breaker fallbacks.
+  </p>
+
+  <h2>3. Production Implementation (Java 21/25 vs Kotlin 2.x)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Constant-Time HMAC-SHA256 Webhook Verifier &amp; WireMock Integration Test</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.nexus.webhooks;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.util.HexFormat;
+
+public class WebhookSignatureVerifier {
+    private static final long MAX_AGE_SECONDS = 300L;
+
+    public static boolean verifyHmac(String secret, String rawBody, long timestampEpochSec, String headerHexSig) {
+        long age = Math.abs(Instant.now().getEpochSecond() - timestampEpochSec);
+        if (age &gt; MAX_AGE_SECONDS) {
+            return false; // Reject replay attack outside 5-minute window
+        }
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            String signedPayload = timestampEpochSec + "." + rawBody;
+            byte[] computedHex = HexFormat.of().formatHex(
+                mac.doFinal(signedPayload.getBytes(StandardCharsets.UTF_8))
+            ).getBytes(StandardCharsets.UTF_8);
+            byte[] providedHex = headerHexSig.getBytes(StandardCharsets.UTF_8);
+
+            // Constant-time comparison prevents timing side-channel attacks!
+            return MessageDigest.isEqual(computedHex, providedHex);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.nexus.webhooks
+
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.time.Instant
+import java.util.HexFormat
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import kotlin.math.abs
+
+object WebhookSignatureVerifier {
+    private const val MAX_AGE_SECONDS = 300L
+
+    fun verifyHmac(secret: String, rawBody: String, timestampEpochSec: Long, headerHexSig: String): Boolean {
+        val age = abs(Instant.now().epochSecond - timestampEpochSec)
+        if (age &gt; MAX_AGE_SECONDS) return false
+
+        return runCatching {
+            val mac = Mac.getInstance("HmacSHA256").apply {
+                init(SecretKeySpec(secret.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
+            }
+            val signedPayload = "$timestampEpochSec.$rawBody"
+            val computedHex = HexFormat.of().formatHex(
+                mac.doFinal(signedPayload.toByteArray(StandardCharsets.UTF_8))
+            ).toByteArray(StandardCharsets.UTF_8)
+            val providedHex = headerHexSig.toByteArray(StandardCharsets.UTF_8)
+
+            MessageDigest.isEqual(computedHex, providedHex)
+        }.getOrDefault(false)
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">Click an option to test your understanding of webhook cryptography and outbound HTTP contract testing.</p>
+
+  <div class="quiz-card" id="q0054_1" data-explanation="Webhook HMAC signatures are computed over the exact raw UTF-8 request body bytes transmitted over the wire. Deserializing into a DTO and re-serializing with ObjectMapper alters whitespace or key ordering, causing valid signatures to fail verification.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Why must a webhook <code>@PostMapping</code> verify the HMAC signature against the raw request body (<code>@RequestBody String rawPayload</code>) rather than re-serializing a parsed DTO?</div>
+    <div class="quiz-code-snippet"><pre><code>@PostMapping("/webhooks/stripe")
+public ResponseEntity&lt;Void&gt; handle(@RequestBody String rawJson,
+                                   @RequestHeader("Stripe-Signature") String sig)</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Any whitespace or property order change during DTO re-serialization alters the SHA-256 digest completely.">
+        Re-serializing a parsed DTO alters key order or whitespace, breaking the cryptographic SHA-256 digest match.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Jackson can deserialize any valid JSON payload; the issue is byte-level cryptographic hash integrity.">
+        Jackson ObjectMapper cannot deserialize JSON payloads sent by third-party payment webhook providers.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Spring Security permits raw String or DTO bodies equally depending on your filter chain rules.">
+        Spring Security blocks @RequestBody DTO parameters whenever a request arrives without a Bearer JWT.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. javax.crypto.Mac operates on any byte[] array regardless of how those bytes were produced.">
+        Java's javax.crypto.Mac API throws an exception if the input byte array originates from Jackson.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0054_2" data-explanation="String.equals() returns false on the first mismatched character, allowing an attacker to measure response time deltas and guess an HMAC signature byte-by-byte. MessageDigest.isEqual() compares every byte in constant time.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">Why do senior security engineers use <code>MessageDigest.isEqual(a, b)</code> instead of <code>expectedSig.equals(headerSig)</code> when validating webhook HMAC digests?</div>
+    <div class="quiz-code-snippet"><pre><code>// ❌ if (computedHex.equals(headerHex)) ...
+// ✅ if (MessageDigest.isEqual(computedBytes, headerBytes)) ...</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Java String.equals() compares strings of any length without throwing exceptions.">
+        String.equals() throws an IndexOutOfBoundsException when comparing 64-character hexadecimal SHA-256 strings.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! MessageDigest.isEqual runs in constant time so attackers cannot infer signature bytes via timing attacks.">
+        MessageDigest.isEqual compares all bytes in constant time, preventing byte-by-byte timing side-channel attacks.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Both methods compare bytes in memory; neither contacts an external KMS or CA.">
+        MessageDigest.isEqual automatically validates the webhook sender's TLS certificate against AWS KMS.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. Constant-time comparison intentionally inspects all bytes rather than exiting early for speed.">
+        MessageDigest.isEqual short-circuits on the first byte to make signature verification 10x faster.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0054_3" data-explanation="Mocking a Java client interface with Mockito never exercises your RestClient configuration, Jackson serialization, HTTP headers, timeout settings, or Resilience4j status-code error handling. WireMock tests the real HTTP stack over localhost.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">What critical production bugs does a <strong>WireMock</strong> test catch that a Mockito mock of your <code>PaymentGatewayClient</code> interface completely misses?</div>
+    <div class="quiz-code-snippet"><pre><code>stubFor(post(urlEqualTo("/v1/charges"))
+    .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "2")));</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. PostgreSQL schema migrations are tested via Testcontainers and Flyway, not WireMock.">
+        WireMock verifies that Flyway SQL migrations execute cleanly against PostgreSQL read replicas.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. WireMock is a local stub HTTP server and does not test live internet DNS routing.">
+        WireMock validates live production credentials against Stripe's actual production billing servers.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! WireMock exercises the real HTTP wire serialization, headers, read timeouts, and 4xx/5xx error decoders.">
+        WireMock exercises real HTTP wire serialization, headers, socket timeouts, and 429/503 error handling.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Incorrect. CGLIB bean creation is a Spring IoC concern unrelated to outbound HTTP contract stubbing.">
+        WireMock detects whether Kotlin JPA entities are missing the all-open compiler plugin at build time.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Complete the webhook verification guard: reject timestamps older than <code>300</code> seconds, compute the <code>HmacSHA256</code> signature, and compare digests in constant time using <code>MessageDigest.isEqual(...)</code>.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0054-lab"
+       data-starter-java="package com.nexus.webhooks;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+
+public class WebhookGuard {
+    public static boolean isValid(long ageSeconds, byte[] expectedSig, byte[] providedSig) {
+        // TODO 1: Return false if ageSeconds &gt; 300
+        // TODO 2: Compare expectedSig and providedSig in constant time using MessageDigest.isEqual(...)
+        return false;
+    }
+}"
+       data-starter-kotlin="package com.nexus.webhooks
+
+import java.security.MessageDigest
+
+object WebhookGuard {
+    fun isValid(ageSeconds: Long, expectedSig: ByteArray, providedSig: ByteArray): Boolean {
+        // TODO 1: Return false if ageSeconds &gt; 300
+        // TODO 2: Compare expectedSig and providedSig in constant time using MessageDigest.isEqual(...)
+        return false
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0054</span>
+        <span class="practice-title">Constant-Time Webhook Replay &amp; Signature Guard Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.x</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0054-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Implement <code>isValid(long ageSeconds, byte[] expectedSig, byte[] providedSig)</code> so it rejects any webhook where <code>ageSeconds &gt; 300</code> (or negative) and uses <code>MessageDigest.isEqual(expectedSig, providedSig)</code> for constant-time signature verification.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.nexus.webhooks;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+
+public class WebhookGuard {
+    public static boolean isValid(long ageSeconds, byte[] expectedSig, byte[] providedSig) {
+        // TODO 1: Return false if ageSeconds &gt; 300
+        // TODO 2: Compare expectedSig and providedSig in constant time using MessageDigest.isEqual(...)
+        return false;
+    }
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Replay Window Check</div>
+        <div>Check <code>if (ageSeconds &gt; 300) return false;</code> (or combine with <code>ageSeconds &lt;= 300</code>).</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Constant-Time Digest Verification</div>
+        <div>Call <code>MessageDigest.isEqual(expectedSig, providedSig)</code>.</div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Single-Expression Guard</div>
+        <div><code>return ageSeconds &gt;= 0 &amp;&amp; ageSeconds &lt;= 300 &amp;&amp; MessageDigest.isEqual(expectedSig, providedSig);</code></div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 25 Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.webhooks;
+
+import java.security.MessageDigest;
+
+public class WebhookGuard {
+    public static boolean isValid(long ageSeconds, byte[] expectedSig, byte[] providedSig) {
+        if (ageSeconds &lt; 0 || ageSeconds &gt; 300) {
+            return false;
+        }
+        return MessageDigest.isEqual(expectedSig, providedSig);
+    }
+}</code></pre>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.x Implementation:</div>
+      <pre class="solution-code"><code>package com.nexus.webhooks
+
+import java.security.MessageDigest
+
+object WebhookGuard {
+    fun isValid(ageSeconds: Long, expectedSig: ByteArray, providedSig: ByteArray): Boolean {
+        if (ageSeconds &lt; 0 || ageSeconds &gt; 300) {
+            return false
+        }
+        return MessageDigest.isEqual(expectedSig, providedSig)
+    }
+}</code></pre>
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Combining a strict 300-second timestamp window with constant-time <code>MessageDigest.isEqual</code> blocks both captured replay requests and timing side-channel signature forgery.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Ask me: <em>"Why should an inbound payment webhook endpoint acknowledge with HTTP 200 immediately after recording the event in an inbox table rather than calling slow downstream APIs synchronously?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0053-distributed-sagas-orchestration-vs-choreography.html" class="btn btn-secondary">← Previous: Lesson 0053</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0055-backend-system-design-playbook-and-sizing.html" class="btn btn-primary">Next: Lesson 0055 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0054 (Stage 2: Senior Core)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0054-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "300-Second Replay Window Guard",
+    passed: /300/.test(code) && /ageSeconds/.test(code),
+    error: "Must enforce the 300-second maximum age window on ageSeconds."
+  });
+  tests.push({
+    name: "Constant-Time MessageDigest.isEqual Verification",
+    passed: /MessageDigest\.isEqual\s*\(\s*expectedSig\s*,\s*providedSig\s*\)/.test(code),
+    error: "Must verify signatures in constant time using MessageDigest.isEqual(expectedSig, providedSig)."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

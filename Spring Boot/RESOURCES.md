@@ -1,33 +1,35 @@
-# Spring Boot (Java & Kotlin) Resources
+# Spring Boot (Java 25 LTS & Kotlin 2.2+) Official Resources
 
-## Knowledge
+## Primary Documentation (2027 Stack Baseline)
 
-- [Spring Boot Official Reference Documentation](https://docs.spring.io/spring-boot/reference/)
-  Official source of truth for configuration properties, auto-configuration mechanisms, starters, actuator endpoints, and runtime lifecycle. Use for verifying behavior and exact property keys.
-- [Spring Framework Core Reference](https://docs.spring.io/spring-framework/reference/core.html)
-  Primary reference for Inversion of Control (IoC), ApplicationContext, bean lifecycles, and Spring Expression Language (SpEL). Use for foundational architectural principles.
+- [Spring Boot 4 Official Reference Documentation](https://docs.spring.io/spring-boot/reference/)
+  Authoritative source for Spring Boot 4.2 starters (`spring-boot-starter-webmvc`, `spring-boot-starter-opentelemetry`, `spring-boot-docker-compose`), structured logging, CDS/AOT packaging, and Actuator probes.
+- [Spring Framework 7 Core & WebMvc Reference](https://docs.spring.io/spring-framework/reference/)
+  Authoritative reference for IoC/DI, JSpecify `@NullMarked` nullability contracts, native API versioning (`ApiVersionConfigurer`), `@ImportHttpServices`, `@EnableResilientMethods`, and `RestTestClient`.
+- [Spring Security 7 Reference](https://docs.spring.io/spring-security/reference/)
+  Authoritative guide for `SecurityFilterChain`, OAuth2 Resource Servers, PKCE, native WebAuthn Passkeys (`http.webAuthn(...)`), mTLS, `@PreAuthorize` method security, and `Argon2PasswordEncoder`.
+- [OpenJDK JDK 25 LTS Documentation](https://openjdk.org/projects/jdk/25/)
+  Official specifications for Virtual Threads monitor unmounting (JEP 491), `ScopedValue` (JEP 506), Compact Object Headers (JEP 519), Project Leyden AOT Cache, and Generational ZGC.
 - [High-Performance Java Persistence — Vlad Mihalcea](https://vladmihalcea.com/)
-  The industry gold standard for Hibernate and Spring Data JPA internals. Use for query optimization, entity relationship pitfalls (e.g. N+1 queries, `@ManyToOne` vs `@ManyToMany`), and transaction management.
+  Industry gold standard for Hibernate ORM, PostgreSQL MVCC/locking, N+1 prevention, and HikariCP sizing.
 - [Official Kotlin Documentation for Spring](https://kotlinlang.org/docs/jvm-spring-boot-restful.html)
-  Authoritative guide on using Kotlin with Spring Boot. Use for Kotlin-specific idioms, data class entity considerations, null-safety mappings, and coroutines in Spring WebFlux / MVC.
+  Authoritative guide on Kotlin 2.2+ with Spring Boot, compiler plugins (`plugin.spring`, `plugin.jpa`), JSpecify null-safety, and Coroutines.
 - [Testcontainers Official Guides](https://testcontainers.com/guides/)
-  Modern standard for integration testing with real disposable databases and message brokers in Docker. Use for integration test architecture.
+  Modern standard for integration testing against real disposable PostgreSQL 17, Redis 7, Kafka, and LocalStack containers via `@ServiceConnection`.
 - [Use The Index, Luke! — Markus Winand](https://use-the-index-luke.com/)
-  The industry benchmark for relational database indexing, execution plan mechanics (`EXPLAIN`), and SQL performance for developers.
-- [The Twelve-Factor App](https://12factor.net/)
-  The foundational architectural principles for building cloud-native, containerized, stateless backend services.
-- [Spring Boot Kubernetes Guide](https://docs.spring.io/spring-boot/reference/deployment/cloud.html#cloud-deployment.kubernetes)
-  Official documentation on Kubernetes container lifecycle, liveness/readiness probes, and graceful shutdown.
-- [RFC 7807 / RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457.html)
-  Industry standard HTTP error specification natively adopted in Spring Boot 3. Use for REST API error modeling.
+  Benchmark reference for PostgreSQL B-Tree indexes, `EXPLAIN (ANALYZE, BUFFERS)`, and keyset pagination (`SEEK` method).
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457.html)
+  IETF standard HTTP error envelope natively supported via Spring's `ProblemDetail`.
+- [Spring AI Reference Documentation](https://docs.spring.io/spring-ai/reference/)
+  Official reference for `ChatClient`, Structured Output, `pgvector` RAG Advisors, `@Tool`, and Stateless Streamable-HTTP MCP servers (`@McpTool`).
 
-## Wisdom (Communities)
+## Practitioner Communities
 
-- [Spring Boot Discussions on GitHub](https://github.com/spring-projects/spring-boot/discussions)
-  High-signal interactions with the Spring engineering team and ecosystem contributors. Use for design discussions, edge cases, and upcoming framework shifts.
+- [Spring Boot Discussions & Release Notes](https://github.com/spring-projects/spring-boot/wiki)
+  Official Spring Boot 4.x migration guides, release notes, and engineering discussions.
 - [r/java](https://www.reddit.com/r/java/)
-  Moderated subreddit focused on modern Java (JDK 21/25, JVM internals, performance, ecosystem news). Use for language evolution insights.
+  High-signal discussions on JDK 25 LTS, Project Loom, Project Leyden, JSpecify, and JVM profiling.
 - [r/springboot](https://www.reddit.com/r/springboot/)
-  Focused community for Spring Boot backend developers. Use for architecture reviews, library comparisons, and production troubleshooting.
+  Practitioner community for Spring Boot architecture, testing, and production troubleshooting.
 - [Kotlinlang Public Slack (#spring channel)](https://slack.kotlinlang.org/)
-  Active practitioner community discussing Kotlin backend architecture and Spring Boot integration patterns. Use for idiomatic Kotlin advice.
+  Active community for idiomatic Kotlin + Spring Boot 4 patterns.

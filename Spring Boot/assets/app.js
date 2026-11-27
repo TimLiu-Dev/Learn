@@ -1,8 +1,8 @@
 /**
  * Spring Boot Mastery Course Engine (2027 Senior Backend Engineer)
  * Universal Interactive Engine:
- * - Dual Language Switching (Java 21 / Kotlin 2.x) across snippets and editors
- * - Interactive Code Quiz System with deep per-option explanations
+ * - Dual Language Switching (Java 25 LTS / Kotlin 2.x) across snippets and editors
+ * - Interactive Code Quiz System with deep per-option explanations & reload persistence
  * - In-Browser Test Runner & Execution Simulator with multi-assertion console
  * - Progressive Hints Drawer (3 levels: Nudge -> Syntax -> Key Snippet)
  * - Final Solution Drawer (Drop-in Java & Kotlin code + Architectural Breakdown)
@@ -21,8 +21,24 @@
   // Current global language: 'java' or 'kotlin'
   let currentLanguage = localStorage.getItem(GLOBAL_LANG_KEY) || 'java';
 
-  // --- 1. Global Language Switching (Java vs Kotlin) ---
+  // Safe HTML formatter: escapes generic type parameters like <String, T> so innerHTML never swallows them,
+  // while preserving intentional inline formatting tags (<code>, <strong>, <em>, <br>) and converting `backticks`.
+  function formatSafeInlineHtml(str) {
+    if (!str) return '';
+    const escaped = String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    const restoredTags = escaped.replace(
+      /&lt;(\/?(?:code|strong|em|b|i|br)\s*\/?)&gt;/gi,
+      '<$1>'
+    );
+    return restoredTags.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  }
+
+  // --- 1. Global Language Switching (Java 25 vs Kotlin 2.x) ---
   function initLanguageTabs() {
+    injectHeaderLanguageToggle();
     applyLanguage(currentLanguage);
 
     document.addEventListener('click', (e) => {
@@ -38,8 +54,27 @@
     });
   }
 
+  function injectHeaderLanguageToggle() {
+    const headerMeta = document.querySelector('.site-header .header-meta');
+    if (!headerMeta || headerMeta.querySelector('.global-lang-switch')) return;
+    // Replace static Java/Kotlin badges in lesson headers with clickable global language switches
+    const javaBadge = headerMeta.querySelector('.badge-java');
+    const kotlinBadge = headerMeta.querySelector('.badge-kotlin');
+    if (javaBadge && kotlinBadge && document.querySelector('.code-box, .practice-container')) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'tab-group global-lang-switch';
+      wrapper.title = 'Switch preferred language across all lessons';
+      wrapper.innerHTML = `
+        <button type="button" class="code-tab-btn java-tab" data-lang="java">Java 25</button>
+        <button type="button" class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.x</button>
+      `;
+      javaBadge.replaceWith(wrapper);
+      kotlinBadge.remove();
+    }
+  }
+
   function applyLanguage(lang) {
-    // 1. Update snippet tab buttons
+    // 1. Update snippet & header tab buttons
     document.querySelectorAll('.code-tab-btn').forEach((btn) => {
       const isTarget = btn.dataset.lang === lang;
       btn.classList.toggle('active', isTarget);
@@ -53,7 +88,7 @@
       });
     });
 
-    // 3. Update lab editors to match if user hasn't explicitly overridden
+    // 3. Update lab editors to match if user hasn't explicitly locked a separate language
     document.querySelectorAll('.practice-container').forEach((container) => {
       const practiceId = container.dataset.practiceId;
       const langBtn = container.querySelector(`.practice-lang-btn[data-lang="${lang}"]`);
@@ -79,21 +114,22 @@
       if (!textarea || !practiceId) return;
 
       // Initialize lab language (default to global preference)
-      let labLang = currentLanguage;
-      switchPracticeLanguage(container, practiceId, labLang, false);
+      switchPracticeLanguage(container, practiceId, currentLanguage, false);
 
-      // Lab Language Switch Buttons
+      // Lab Language Switch Buttons (also sync global preference for smooth multi-lesson study)
       container.querySelectorAll('.practice-lang-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
           const targetLang = btn.dataset.lang;
           if (targetLang) {
-            container.dataset.userLockedLang = 'true';
+            currentLanguage = targetLang;
+            localStorage.setItem(GLOBAL_LANG_KEY, targetLang);
+            applyLanguage(targetLang);
             switchPracticeLanguage(container, practiceId, targetLang, true);
           }
         });
       });
 
-      // Handle Tab key inside editor
+      // Handle Tab key and Ctrl/Cmd+Enter inside editor
       textarea.addEventListener('keydown', function (e) {
         if (e.key === 'Tab') {
           e.preventDefault();
@@ -157,6 +193,27 @@
         });
       }
     });
+
+    // Allow clicking status badge in lesson lab header to manually toggle completion (e.g. when solved in IntelliJ IDEA)
+    document.querySelectorAll('[data-progress-badge]').forEach((badge) => {
+      badge.style.cursor = 'pointer';
+      badge.title = 'Click to toggle completion status (or pass the automated lab)';
+      badge.addEventListener('click', () => {
+        const id = badge.dataset.progressBadge;
+        if (!id) return;
+        const record = JSON.parse(localStorage.getItem(PROGRESS_STORAGE_KEY) || '{}');
+        const currentlyDone = Boolean(record[id]) || localStorage.getItem('sb_mastery_done_' + id) === 'true';
+        if (currentlyDone) {
+          delete record[id];
+          localStorage.setItem('sb_mastery_done_' + id, 'false');
+        } else {
+          record[id] = true;
+          localStorage.setItem('sb_mastery_done_' + id, 'true');
+        }
+        localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(record));
+        updateProgressUI();
+      });
+    });
   }
 
   function switchPracticeLanguage(container, practiceId, lang, focusEditor) {
@@ -188,22 +245,31 @@
     }
   }
 
-  // Strip starter instruction comments and TODO lines so untouched starter templates never auto-pass
+  // Strip starter instruction comments (including SQL '--') and TODO lines so untouched starter templates never auto-pass
   function stripStarterComments(rawCode, starterCode) {
     if (!rawCode) return '';
     const starterCommentLines = new Set(
       (starterCode || '')
         .split(/\r?\n/)
         .map((l) => l.trim())
-        .filter((l) => l.startsWith('//') || l.startsWith('#') || l.startsWith('<!--') || l.startsWith('/*') || l.startsWith('*'))
+        .filter((l) =>
+          l.startsWith('//') ||
+          l.startsWith('#') ||
+          l.startsWith('--') ||
+          l.startsWith('<!--') ||
+          l.startsWith('/*') ||
+          l.startsWith('*')
+        )
     );
     return rawCode
       .split(/\r?\n/)
       .map((line) => {
         const trimmed = line.trim();
         if (starterCommentLines.has(trimmed)) return '';
-        if (/^(?:\/\/|#|<!--|\*).*TODO/i.test(trimmed)) return '';
-        return line.replace(/(?:\/\/|#)\s*TODO.*$/i, '').replace(/<!--\s*TODO[\s\S]*?-->/gi, '');
+        if (/^(?:\/\/|#|--|<!--|\*).*TODO/i.test(trimmed)) return '';
+        return line
+          .replace(/(?:\/\/|#|--)\s*TODO.*$/i, '')
+          .replace(/<!--\s*TODO[\s\S]*?-->/gi, '');
       })
       .join('\n');
   }
@@ -212,11 +278,13 @@
   function executePracticeVerification(practiceId, code, lang, consoleEl, container) {
     if (!consoleEl) return;
 
+    const runtimeLabel = lang === 'kotlin' ? 'KOTLIN 2.x • SPRING BOOT 4.2' : 'JAVA 25 LTS • SPRING BOOT 4.2';
+
     consoleEl.className = 'test-console visible';
     consoleEl.innerHTML = `
       <div class="console-title">
-        <span>RUNNING TEST SUITE • [${practiceId}] • ${lang.toUpperCase()}</span>
-        <span>JUnit 5 / AssertJ Simulator</span>
+        <span>RUNNING TEST SUITE • [${escapeHtml(practiceId)}] • ${runtimeLabel}</span>
+        <span>JUnit / AssertJ Simulator</span>
       </div>
       <div class="test-line info">Compiling and running assertions on candidate implementation...</div>
     `;
@@ -240,11 +308,10 @@
       testResults = defaultFallbackTests(cleanCode);
     }
 
-    // Render results line by line with slight terminal delay simulation
     let allPassed = true;
     let renderedHtml = `
       <div class="console-title">
-        <span>TEST SUITE OUTPUT • ${lang.toUpperCase()} 21+</span>
+        <span>TEST SUITE OUTPUT • ${runtimeLabel}</span>
         <span>${new Date().toLocaleTimeString()}</span>
       </div>
     `;
@@ -261,8 +328,8 @@
         renderedHtml += `
           <div class="test-line fail">
             [FAIL] Test ${idx + 1}: ${escapeHtml(t.name)}
-            ${t.error ? `<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↳ <strong>Issue:</strong> ${t.error}` : ''}
-            ${t.hint ? `<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↳ <strong>Fix Nudge:</strong> ${t.hint}` : ''}
+            ${t.error ? `<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↳ <strong>Issue:</strong> ${formatSafeInlineHtml(t.error)}` : ''}
+            ${t.hint ? `<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↳ <strong>Fix Nudge:</strong> ${formatSafeInlineHtml(t.hint)}` : ''}
           </div>
         `;
       }
@@ -319,6 +386,9 @@
         if (isDone) {
           el.className = 'badge badge-status completed';
           el.textContent = 'Completed ✓';
+        } else {
+          el.className = 'badge badge-status';
+          el.textContent = 'To Do';
         }
       });
     } catch (e) {
@@ -326,10 +396,27 @@
     }
   }
 
-  // --- 4. Interactive Code Quiz System with Per-Option Feedback ---
+  // --- 4. Interactive Code Quiz System with Per-Option Feedback & Reload Persistence ---
+  function renderQuizCorrectState(btn, feedbackEl, fullExplanation) {
+    const optionReason = btn.dataset.reason || 'Correct analysis.';
+    btn.classList.add('correct');
+    if (feedbackEl) {
+      feedbackEl.className = 'quiz-feedback visible success';
+      feedbackEl.innerHTML = `
+        <div style="font-weight: 700; margin-bottom: 6px;">✓ Correct!</div>
+        <div>${formatSafeInlineHtml(optionReason)}</div>
+        ${fullExplanation ? `<div class="quiz-explanation-box"><strong>Architectural Rationale:</strong><br>${formatSafeInlineHtml(fullExplanation)}</div>` : ''}
+      `;
+    }
+  }
+
   function initCodeQuizzes() {
-    // Restore saved quiz completions
-    const quizRecord = JSON.parse(localStorage.getItem(QUIZ_STORAGE_KEY) || '{}');
+    let quizRecord = {};
+    try {
+      quizRecord = JSON.parse(localStorage.getItem(QUIZ_STORAGE_KEY) || '{}');
+    } catch (e) {
+      quizRecord = {};
+    }
 
     document.querySelectorAll('.quiz-card').forEach((card) => {
       const quizId = card.id;
@@ -337,50 +424,52 @@
 
       const feedbackEl = card.querySelector('.quiz-feedback');
       const allButtons = card.querySelectorAll('.quiz-opt-btn');
+      const fullExplanation = card.dataset.explanation || '';
+
+      // Restore previously answered quiz state on reload
+      if (quizRecord[quizId]) {
+        allButtons.forEach((btn) => {
+          const isCorrect = btn.dataset.isCorrect === 'true' || btn.classList.contains('target-correct');
+          if (isCorrect) {
+            renderQuizCorrectState(btn, feedbackEl, fullExplanation);
+          }
+        });
+      }
 
       allButtons.forEach((btn) => {
         btn.addEventListener('click', () => {
           const isCorrect = btn.dataset.isCorrect === 'true' || btn.classList.contains('target-correct');
           const optionReason = btn.dataset.reason || (isCorrect ? 'Correct analysis.' : 'Incorrect assessment.');
-          const fullExplanation = card.dataset.explanation || '';
 
-          // Reset other buttons state visually but keep clickable so user can explore
           allButtons.forEach((b) => b.classList.remove('correct', 'incorrect'));
 
           if (isCorrect) {
-            btn.classList.add('correct');
-            feedbackEl.className = 'quiz-feedback visible success';
-            feedbackEl.innerHTML = `
-              <div style="font-weight: 700; margin-bottom: 6px;">✓ Correct!</div>
-              <div>${optionReason}</div>
-              ${fullExplanation ? `<div class="quiz-explanation-box"><strong>Architectural Rationale:</strong><br>${fullExplanation}</div>` : ''}
-            `;
-            // Save completion
+            renderQuizCorrectState(btn, feedbackEl, fullExplanation);
             quizRecord[quizId] = true;
             localStorage.setItem(QUIZ_STORAGE_KEY, JSON.stringify(quizRecord));
           } else {
             btn.classList.add('incorrect');
-            feedbackEl.className = 'quiz-feedback visible error';
-            feedbackEl.innerHTML = `
-              <div style="font-weight: 700; margin-bottom: 6px;">✗ Incorrect</div>
-              <div>${optionReason}</div>
-              <div style="margin-top: 6px; font-size: 13px; color: var(--text-muted);">
-                Tip: Analyze the code snippet carefully or try another option to inspect why it's chosen!
-              </div>
-            `;
+            if (feedbackEl) {
+              feedbackEl.className = 'quiz-feedback visible error';
+              feedbackEl.innerHTML = `
+                <div style="font-weight: 700; margin-bottom: 6px;">✗ Incorrect</div>
+                <div>${formatSafeInlineHtml(optionReason)}</div>
+                <div style="margin-top: 6px; font-size: 13px; color: var(--text-muted);">
+                  Tip: Analyze the code snippet carefully or try another option to inspect why it's chosen!
+                </div>
+              `;
+            }
           }
         });
       });
     });
   }
 
-  // Helper
   function escapeHtml(str) {
     if (!str) return '';
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  // DOM Ready initialization
   document.addEventListener('DOMContentLoaded', () => {
     initLanguageTabs();
     initCodePractices();
@@ -388,6 +477,5 @@
     updateProgressUI();
   });
 
-  // Global validator registry
   window.practiceValidators = window.practiceValidators || {};
 })();

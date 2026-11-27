@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0035: Distributed Rate Limiting: Token Bucket with Redis &amp; Bucket4j</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 2 • Phase 7: High-Performance Distributed Caching, Redis Internals &amp; Rate Limiting</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 25 LTS</span>
+        <span class="badge badge-kotlin">Kotlin 2.2+</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0035 • Stage 2 • Phase 7</span>
+    <h1 style="margin-top: 8px;">Distributed Rate Limiting: Token Bucket with Redis &amp; Bucket4j</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Protect your APIs from credential stuffing, scraping, and runaway mobile retry loops. Implement the <strong>Token Bucket</strong> algorithm using <strong>Bucket4j</strong> and Redis, inspect <code>ConsumptionProbe</code> remaining tokens, and emit RFC-compliant <code>HTTP 429 Too Many Requests</code> with exact <code>Retry-After</code> headers.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authority: <a href="https://bucket4j.com/" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Bucket4j: Distributed Token-Bucket Rate Limiting Reference</a>.
+    </p>
+  </div>
+
+  <h2>1. Why Rate Limiting Is Essential for Mobile Backends</h2>
+  <p>
+    A single mobile app release with a buggy retry loop—or an automated credential-stuffing botnet—can fire 50,000 requests per minute at your login or checkout endpoints. Without distributed rate limiting shared in Redis across all Kubernetes pods, HikariCP starves and every legitimate user suffers timeouts.
+  </p>
+
+  <h2>2. The Token Bucket Algorithm &amp; <code>ConsumptionProbe</code></h2>
+  <div style="background:#090d13; border:1px solid var(--border-color); border-radius:var(--radius-sm); padding:16px; font-family:var(--font-mono); font-size:13px; color:#7ee787; margin:16px 0;">
+Bucket Concept:
+- Capacity: 50 tokens max (allows short mobile bursts)
+- Refill Rate: 50 tokens replenished greedily over 60 seconds
+- Request Check: ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+  ├─ probe.isConsumed() == true  ──► 200 OK (X-Rate-Limit-Remaining: probe.getRemainingTokens())
+  └─ probe.isConsumed() == false ──► 429 Too Many Requests (Retry-After: nanosToWait / 1_000_000_000)
+  </div>
+  <p>
+    <strong>Single-Node vs. Multi-Pod Production:</strong> In local tests, a <code>ConcurrentHashMap&lt;String, Bucket&gt;</code> demonstrates token mechanics; in multi-pod production, back Bucket4j with <code>LettuceBasedProxyManager</code> on Redis so a client hitting 5 pods shares one atomic Redis bucket!
+  </p>
+
+  <h2>3. Production Dual Rate Limiter with Bucket4j &amp; <code>Retry-After</code></h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Bucket4j Bandwidth + ConsumptionProbe + Retry-After Calculation</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.2+</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.ecommerce.ratelimit;
+
+import io.github.bucket4j.*;
+import org.springframework.stereotype.Service;
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class RateLimiterService {
+
+    public record RateDecision(boolean allowed, long remainingTokens, long retryAfterSeconds) {}
+
+    // In multi-pod production, swap ConcurrentHashMap for Bucket4j LettuceBasedProxyManager (Redis)!
+    private final Map&lt;String, Bucket&gt; buckets = new ConcurrentHashMap&lt;&gt;();
+
+    public RateDecision evaluate(String clientKey) {
+        Bucket bucket = buckets.computeIfAbsent(clientKey, this::createBucket);
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+        if (probe.isConsumed()) {
+            return new RateDecision(true, probe.getRemainingTokens(), 0L);
+        }
+        long waitSeconds = Math.max(1L, TimeUnit.NANOSECONDS.toSeconds(probe.getNanosToWaitForRefill()));
+        return new RateDecision(false, 0L, waitSeconds);
+    }
+
+    private Bucket createBucket(String key) {
+        Bandwidth limit = Bandwidth.builder()
+            .capacity(50)
+            .refillGreedy(50, Duration.ofMinutes(1))
+            .build();
+        return Bucket.builder().addLimit(limit).build();
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.ecommerce.ratelimit
+
+import io.github.bucket4j.*
+import org.springframework.stereotype.Service
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+
+@Service
+class RateLimiterService {
+
+    data class RateDecision(val allowed: Boolean, val remainingTokens: Long, val retryAfterSeconds: Long)
+
+    private val buckets = ConcurrentHashMap&lt;String, Bucket&gt;()
+
+    fun evaluate(clientKey: String): RateDecision {
+        val bucket = buckets.computeIfAbsent(clientKey) { createBucket() }
+        val probe = bucket.tryConsumeAndReturnRemaining(1)
+        if (probe.isConsumed) {
+            return RateDecision(true, probe.remainingTokens, 0L)
+        }
+        val waitSeconds = maxOf(1L, TimeUnit.NANOSECONDS.toSeconds(probe.nanosToWaitForRefill))
+        return RateDecision(false, 0L, waitSeconds)
+    }
+
+    private fun createBucket(): Bucket {
+        val limit = Bandwidth.builder()
+            .capacity(50)
+            .refillGreedy(50, Duration.ofMinutes(1))
+            .build()
+        return Bucket.builder().addLimit(limit).build()
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis.
+  </p>
+
+  <div class="quiz-card" id="q0035_1" data-explanation="RFC 6585 defines HTTP 429 Too Many Requests. Pairing it with the Retry-After: &lt;seconds&gt; header tells mobile OkHttp/Retrofit clients how long to back off before retrying.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Which HTTP status code and header standard informs clients that their rate limit was exceeded?</div>
+    <div class="quiz-code-snippet"><pre><code>HTTP/1.1 ???
+???: 30</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="401 is for authentication failure; the user may be fully authenticated when rate limited.">
+        HTTP 401 Unauthorized with a WWW-Authenticate header requiring login
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="500 indicates server crash and encourages client retries, worsening the overload.">
+        HTTP 500 Internal Server Error instructing the client to retry immediately
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="204 is a success code without response body.">
+        HTTP 204 No Content with a Location header
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="RFC 6585 specifies 429 Too Many Requests and Retry-After header indicating how long to wait.">
+        HTTP 429 Too Many Requests with a Retry-After header indicating wait seconds
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0035_2" data-explanation="Fixed Window counters allow 2x traffic spikes right across window boundaries (e.g., at 12:00:59 and 12:01:00). Token Bucket caps bursts strictly at bucket capacity while replenishing tokens smoothly over time.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">How does the Token Bucket algorithm handle bursts of traffic differently from a naive Fixed Window counter?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Both algorithms run on the server/Redis cluster.">
+        Fixed window stores all tokens on the client Android device memory
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Rate limiting is in-memory; it does not restart databases.">
+        Token bucket requires restarting the PostgreSQL database every minute
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Fixed window suffers from boundary doubling (2x traffic at window edges); Token bucket caps bursts at capacity and refills smoothly.">
+        Token bucket permits bursts up to capacity while smoothly replenishing tokens over time
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Rate limiting does not perform payload encryption.">
+        Fixed window encrypts incoming payloads using AES hardware keys
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0035_3" data-explanation="Partitioning rate-limit keys in Redis by authenticated userId (or client IP on public endpoints) isolates tenants so one abusive client only drains their own bucket.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">Why must distributed rate-limit keys in Redis be scoped by User ID, API Key, or client IP?</div>
+    <div class="quiz-code-snippet"><pre><code>String key = "rate:limit:" + principalOrIp;</code></pre></div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Rate keys are tenant identifiers, not cable latency metrics.">
+        To allow Tomcat to calculate total network cable latency
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Partitioning buckets per user/IP prevents a single noisy neighbor from starving every other user.">
+        To isolate buckets per user so one noisy client never blocks others
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Flyway executes SQL scripts; it does not use Redis rate keys.">
+        To format the database schema into Flyway versioned scripts
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Jackson serialization is unrelated to rate limit keys.">
+        To instruct Jackson to serialize strings into uppercase letters
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Build a production Bucket4j rate-limit policy and <code>ConsumptionProbe</code> evaluator returning exact <code>Retry-After</code> wait seconds.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0035-lab"
+       data-starter-java="package com.example.ratelimit;
+
+import io.github.bucket4j.*;
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+
+public class ApiRateLimiter {
+    public static Bucket buildBucket(long capacity) {
+        // TODO 1: Build Bandwidth with .capacity(capacity) and .refillGreedy(capacity, Duration.ofMinutes(1))
+        // TODO 2: Return Bucket.builder().addLimit(limit).build()
+        return null;
+    }
+
+    public static long checkRetryAfterSeconds(Bucket bucket) {
+        // TODO 3: Call bucket.tryConsumeAndReturnRemaining(1)
+        // Return 0L if consumed, else TimeUnit.NANOSECONDS.toSeconds(probe.getNanosToWaitForRefill())
+        return -1L;
+    }
+}"
+       data-starter-kotlin="package com.example.ratelimit
+
+import io.github.bucket4j.*
+import java.time.Duration
+import java.util.concurrent.TimeUnit
+
+object ApiRateLimiter {
+    fun buildBucket(capacity: Long): Bucket {
+        // TODO 1: Build Bandwidth with .capacity(capacity) and .refillGreedy(capacity, Duration.ofMinutes(1))
+        // TODO 2: Return Bucket.builder().addLimit(limit).build()
+        TODO()
+    }
+
+    fun checkRetryAfterSeconds(bucket: Bucket): Long {
+        // TODO 3: Call bucket.tryConsumeAndReturnRemaining(1)
+        // Return 0L if isConsumed, else TimeUnit.NANOSECONDS.toSeconds(probe.nanosToWaitForRefill)
+        return -1L
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0035</span>
+        <span class="practice-title">Bucket4j Token Bucket &amp; Retry-After Probe Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.2+</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0035-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p><strong>Goal:</strong> Complete <code>ApiRateLimiter</code>:</p>
+      <ul style="margin-left: 20px; line-height: 1.7;">
+        <li>In <code>buildBucket</code>: configure <code>Bandwidth.builder().capacity(capacity).refillGreedy(capacity, Duration.ofMinutes(1)).build()</code> and return <code>Bucket.builder().addLimit(limit).build()</code>.</li>
+        <li>In <code>checkRetryAfterSeconds</code>: call <code>bucket.tryConsumeAndReturnRemaining(1)</code>; return <code>0L</code> when consumed, or convert <code>getNanosToWaitForRefill()</code> to seconds when rejected.</li>
+      </ul>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.ratelimit;
+
+import io.github.bucket4j.*;
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+
+public class ApiRateLimiter {
+    public static Bucket buildBucket(long capacity) {
+        // TODO 1: Build Bandwidth with .capacity(capacity) and .refillGreedy(capacity, Duration.ofMinutes(1))
+        // TODO 2: Return Bucket.builder().addLimit(limit).build()
+        return null;
+    }
+
+    public static long checkRetryAfterSeconds(Bucket bucket) {
+        // TODO 3: Call bucket.tryConsumeAndReturnRemaining(1)
+        // Return 0L if consumed, else TimeUnit.NANOSECONDS.toSeconds(probe.getNanosToWaitForRefill())
+        return -1L;
+    }
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Greedy Token Refill</div>
+        <div><code>Bandwidth limit = Bandwidth.builder().capacity(capacity).refillGreedy(capacity, Duration.ofMinutes(1)).build();</code></div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Probe Consumption</div>
+        <div><code>ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);</code></div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Retry-After Seconds</div>
+        <div><code>return probe.isConsumed() ? 0L : TimeUnit.NANOSECONDS.toSeconds(probe.getNanosToWaitForRefill());</code></div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 25 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.ratelimit;
+
+import io.github.bucket4j.*;
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+
+public class ApiRateLimiter {
+    public static Bucket buildBucket(long capacity) {
+        Bandwidth limit = Bandwidth.builder()
+            .capacity(capacity)
+            .refillGreedy(capacity, Duration.ofMinutes(1))
+            .build();
+        return Bucket.builder().addLimit(limit).build();
+    }
+
+    public static long checkRetryAfterSeconds(Bucket bucket) {
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+        if (probe.isConsumed()) {
+            return 0L;
+        }
+        return TimeUnit.NANOSECONDS.toSeconds(probe.getNanosToWaitForRefill());
+    }
+}</code></pre>
+
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.2+ Implementation:</div>
+      <pre class="solution-code"><code>package com.example.ratelimit
+
+import io.github.bucket4j.*
+import java.time.Duration
+import java.util.concurrent.TimeUnit
+
+object ApiRateLimiter {
+    fun buildBucket(capacity: Long): Bucket {
+        val limit = Bandwidth.builder()
+            .capacity(capacity)
+            .refillGreedy(capacity, Duration.ofMinutes(1))
+            .build()
+        return Bucket.builder().addLimit(limit).build()
+    }
+
+    fun checkRetryAfterSeconds(bucket: Bucket): Long {
+        val probe = bucket.tryConsumeAndReturnRemaining(1)
+        return if (probe.isConsumed) {
+            0L
+        } else {
+            TimeUnit.NANOSECONDS.toSeconds(probe.nanosToWaitForRefill)
+        }
+    }
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Using <code>tryConsumeAndReturnRemaining(1)</code> instead of a bare boolean check gives you both remaining token quota headers and exact nanosecond refill wait times for <code>Retry-After</code>.</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"How do you wire Bucket4j's LettuceBasedProxyManager with Redis so 10 stateless Spring Boot pods enforce one shared global rate limit?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0034-multitier-caching-caffeine-and-redis.html" class="btn btn-secondary">← Previous: Lesson 0034</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0036-redis-internals-eviction-serialization-lua-and-streams.html" class="btn btn-primary">Next: Lesson 0036 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0035 (Stage 2: Senior Core)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0035-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Bucket4j Bandwidth Capacity & Greedy Refill",
+    passed: /Bandwidth\.builder\s*\(\s*\)/.test(code) && /\.capacity\s*\(\s*capacity\s*\)/.test(code) && /\.refillGreedy\s*\(\s*capacity/.test(code) && /Bucket\.builder\s*\(\s*\)\.addLimit/.test(code),
+    error: "Must build Bandwidth with .capacity(capacity).refillGreedy(capacity, Duration.ofMinutes(1)) and attach via Bucket.builder().addLimit(...)."
+  });
+  tests.push({
+    name: "ConsumptionProbe Atomic Token Check",
+    passed: /tryConsumeAndReturnRemaining\s*\(\s*1\s*\)/.test(code) && /isConsumed/.test(code),
+    error: "Must call bucket.tryConsumeAndReturnRemaining(1) and inspect probe.isConsumed()."
+  });
+  tests.push({
+    name: "Retry-After Seconds Calculated from Refill Nanos",
+    passed: /(getNanosToWaitForRefill|nanosToWaitForRefill)/.test(code) && /(TimeUnit\.NANOSECONDS\.toSeconds|1_?000_?000_?000)/.test(code),
+    error: "Must convert probe.getNanosToWaitForRefill() to seconds when rate-limited."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>

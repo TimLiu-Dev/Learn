@@ -3,36 +3,37 @@
 ## Knowledge
 
 - [NeetCode Roadmap](https://neetcode.io/roadmap) and [problem data on GitHub](https://github.com/neetcode-gh/leetcode) (`.problemSiteData.json`)
-  NeetCode 150 grouped by pattern, with a free video walkthrough for every problem. Use for: the order of patterns, problem selection, and the user's primary video explanation per pattern.
+  NeetCode 150 grouped by pattern, with free problem mirrors (including LeetCode Premium problems) and video walkthroughs. Use for: pattern order, problem practice, and video explanations.
 - [Tech Interview Handbook: Coding Interview Study Plan](https://www.techinterviewhandbook.org/coding-interview-study-plan/), by Yangshun Tay (author of Blind 75)
-  High/Mid/Low priority tiers per topic, and a 3-month plan at about 11 hours a week. Use for: frequency and priority calls, pacing, and when to start mock interviews (at about 60% through the plan).
+  High/Mid/Low priority tiers per topic, and a 3-month plan at about 11 hours a week. Use for: frequency calls, pacing, and starting mock interviews around Checkpoint C.
 - [Tech Interview Handbook: Algorithms cheatsheets](https://www.techinterviewhandbook.org/algorithms/study-cheatsheet/)
-  Per-topic notes on corner cases, techniques, and essential problems. Use for: edge-case checklists when reviewing the user's code.
+  Per-topic notes on corner cases, techniques, and essential problems. Use for: edge-case checklists when reviewing code.
 - [Tech Interview Handbook: Coding interview techniques](https://www.techinterviewhandbook.org/coding-interview-techniques/)
-  Clarifying questions, the best theoretical time complexity (BTTC), and using examples as tests. Use for: teaching how to communicate during an interview.
+  Clarifying questions, Best Theoretical Time Complexity (BTTC), and using examples as tests. Use for: interview communication rubric.
 - [Grind 75](https://www.techinterviewhandbook.org/grind75)
-  An updated Blind 75 that can be customized by number of weeks. Use for: a second opinion on which problems matter most.
+  Customizable Blind 75 study schedule. Use for: cross-checking high-ROI Medium problems.
 - [Sean Prashad's LeetCode Patterns](https://seanprashad.com/leetcode-patterns/)
-  179 problems tagged by pattern, plus a cheat sheet of the form "if the input is X, consider pattern Y". Use for: building pattern-recognition drills.
-- [NeetCode: Big-O Notation for Coding Interviews](https://www.youtube.com/watch?v=BgLTDT03QtU) (video, about 19 min)
-  Every complexity class you'll meet, explained with interview examples. Use for: Session 0's primary source.
+  Problems tagged by structural pattern and signal. Use for: unlabeled pattern-diagnosis drills (Checkpoints A–D).
+- [NeetCode: Big-O Notation for Coding Interviews](https://www.youtube.com/watch?v=BgLTDT03QtU) (video, ~19 min)
+  Every interview complexity class with concrete examples. Use for: Session 0 primary source.
 - [USACO Guide: Time Complexity](https://usaco.guide/bronze/time-comp)
-  The "about 10⁸ operations per second" rule of thumb and a table of input size n to acceptable complexity. Use for: turning a problem's constraints into a target complexity.
-- [Kotlin docs: Collections overview](https://kotlinlang.org/docs/collections-overview.html)
-  Official reference for List, Set, Map, and ArrayDeque. Use for: the Kotlin toolkit session and code-review idioms.
+  The ~10⁸ operations/sec rule of thumb mapping constraint size `n` to target complexity. Use for: constraint-driven pattern diagnosis.
+- [Kotlin Docs: Collections Overview](https://kotlinlang.org/docs/collections-overview.html) and [Competitive Programming in Kotlin](https://kotlinlang.org/docs/competitive-programming.html)
+  Official Kotlin reference for `IntArray`, `ArrayDeque`, `HashMap`, null-safe idioms, and fast idiomatic transformations. Use for: primary Kotlin interview coding style and code-review idioms.
+- [Oracle JDK 21+ Sequenced Collections (JEP 431)](https://openjdk.org/jeps/431) and [Java Records](https://docs.oracle.com/en/java/javase/21/language/records.html)
+  Modern Java collection methods (`getFirst`, `getLast`, `reversed`) and concise immutable `record` value types. Use for: modernizing Java solutions.
 
 ## Wisdom (Communities)
 
-- [Pramp](https://www.pramp.com/faq) (run by Exponent)
-  Free peer-to-peer mock interviews where you alternate between interviewer and interviewee. Third-party 2026 guides report a free-tier cap of about 5 sessions per month. Use for: practicing with a real person once mock interviews start (Checkpoint C).
+- [Pramp / Exponent Practice](https://www.pramp.com/faq)
+  Free peer-to-peer mock interviews alternating interviewer and interviewee roles. Use for: live verbal practice starting at Checkpoint C.
 - [interviewing.io](https://interviewing.io)
-  Paid anonymous mock interviews with engineers from large tech companies. Use for: final rehearsal close to real interviews, if the budget allows.
+  Anonymous mock interviews (including AI-enabled and traditional formats) with Big Tech engineers. Use for: final dress rehearsals before real loops.
 - [r/leetcode](https://www.reddit.com/r/leetcode/)
-  A large community where people share interview experiences and study plans. Use for: recent reports of what specific companies ask.
+  Active candidate debriefs covering both traditional DSA loops and 2026–2027 AI-assisted / multi-file CoderPad rounds (Meta, Google, Amazon, Stripe). Use for: company-specific round calibration.
 - [LeetCode Discuss](https://leetcode.com/discuss/)
-  Solution discussions for each problem and interview-experience posts. Use for: comparing alternative solutions after you've solved a problem yourself.
+  Per-problem alternative approaches and space/time trade-off discussions. Use for: comparing your Kotlin solution against alternative idioms *after* solving independently.
 
 ## Gaps
 
-- No public, authoritative dataset of interview frequency by topic. LeetCode company tags are paywalled, and community recaps are anecdotal. Frequency markers are expert-judgment proxies (see `reference/roadmap.html`).
-- No dedicated, high-trust resource for Kotlin interview idioms has been found yet.
+- Public company-frequency datasets remain heuristic proxies because official question banks rotate continuously; combine Track A (High/Medium ROI) with recent company debriefs before targeted loops.

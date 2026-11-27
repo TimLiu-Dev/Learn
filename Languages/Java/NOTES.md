@@ -1,19 +1,19 @@
 # Teaching Notes
 
 - **Learner Profile & Target Bar (2027 Roadmap):**
-  - **Junior Android developer** who can read some Kotlin (currently unable to read or write Java from scratch), transitioning to active writing, debugging, and production architecture in **Java 25 LTS** and **Spring Boot 4.0 / Spring Framework 7.0** on Linux production servers.
-  - Needs Kotlin-to-Java grammar & mental-model bridging early (`0074` Ground-Zero Syntax Decoder + 39 Android/Kotlin bridge callouts across core Java and Spring lessons), deliberate coding from scratch, and production debugging intuition rather than passive reading.
-- **Explicit Interactive Lesson Requirements (Mandatory in Every Coding Lesson HTML):**
-  1. **Production Code Examples:** Minimum 3 code blocks per lesson contrasting naive/buggy code (or Kotlin traps), under-the-hood mechanics, and idiomatic Java 25 solutions.
-  2. **Runnable & Checkable In-HTML Code Practices (`assets/workbench.js`):**
-     - 2 interactive workbenches per coding lesson (`#ex-1` Implementation Drill + `#ex-2` Bug-Fix / Refactor Challenge).
-     - **Never pre-solved**: starter code must require genuine edits to pass checks and compile cleanly as realistic buggy code or clean partial stubs where appropriate.
-     - Includes **Run & Check Code** (automated checks + simulated JVM output), **Progressive Hints**, and **Show Final Answer**.
-  3. **Multiple-Choice Code Quizzes (`assets/quiz.js`):**
-     - 3 questions per lesson with balanced option lengths (`wc_spread <= 3`, `cc_spread <= 35`), balanced correct positions (`A`–`D`), and full per-option explanations.
-- **90-Lesson Curriculum Structure (2027 Senior Roadmap Order):**
-  - **Main Track — Phase 1 (`0001` Hub + 47 Lessons: `0002`–`0040`, `0074`–`0080`, `0082`):** Core Java 25 LTS, Kotlin Bridge (`0074`), Packages/Inner Classes/JEP 513 (`0075`), Strings & Regex/ReDoS (`0077`), Collections/Streams & JEP 512/511/485 Gatherers (`0076`), Classic `java.io`/TCP Sockets (`0078`), NIO.2/HTTP, Cryptography/AES-GCM/JEP 510 KDF (`0079`), Markdown Javadoc JEP 467 & SLF4J/Logback (`0080`), JMM, Virtual Threads (JEP 491), `StructuredTaskScope`/`ScopedValue` (JEP 505/506), Generational ZGC, JFR/Async-Profiler, FFM API (`java.lang.foreign` JEP 454, optional awareness) & Project Leyden AOT Cache (`0082`), Gradle 9/Maven, JUnit 5/Mockito/REST Assured, JPMS.
-  - **Main Track — Phase 2 (6 Lessons: `0054`–`0059`):** Enterprise Internals & Persistence (Proxies/AOP, Jackson 3 Type Tokens, JDBC/HikariCP, JPA/Hibernate 7, ACID Locking & Flyway, Servlet 6.1 & Tomcat Virtual Threads).
-  - **Main Track — Phase 3 (20 Lessons: `0060`–`0070`, `0081`, `0083`–`0090`):** Spring Boot 4.0, Framework 7.0 (`@Retryable`, `@ConcurrencyLimit`, API Versioning, `RestTestClient`), gRPC/Protobuf & GraphQL `@BatchMapping` (`0086`), SSE/WebSockets/Signed Webhooks (`0088`), SQL `EXPLAIN ANALYZE`/Indexes/Replicas/CAP (`0087`), `Spring Modulith` + Hexagonal + `ArchUnit` (`0083`), Spring Security 7, OWASP API Top 10/CORS/ABAC/ReBAC/ETag/Sunset (`0089`), Edge Gateways/12-Factor/GitHub Actions/Contract & Load Testing (`0090`), Spring Boot 4 Ecosystem (`0081`), `Spring AI` RAG & `@Tool` Calling (`0084`), Event-Driven Kafka (`0069`–`0070`), and Distributed Sagas, `ShedLock`, Rate Limiting & VT Bulkheads (`0085`).
-  - **`[Optional Track A]` — Coding Interviews & DSA (`0041`–`0053`, 13 Lessons):** Demoted after Backend Mastery for interview prep without blocking core Spring Boot progress.
-  - **`[Optional Track B]` — Distributed Data & Streaming Engines (`0071`–`0073`, 3 Lessons):** Demoted optional specialty track for Apache Spark & Apache Flink.
+  - **Junior Android developer** who can read some Kotlin (starting fresh from zero active Java writing at Lesson `0002`), transitioning to active writing, debugging, and production architecture in **Java 25 LTS** and **Spring Boot 4.0 / Spring Framework 7.0** on Linux production servers.
+  - Uses Ground-Zero Kotlin Bridge (`0074` with zero premature syntax jumps) + 39+ Android/Kotlin bridge callouts across Core Java and Spring lessons, deliberate coding from scratch, and multi-file IDE practice in `projects/springboot4-order-service/`.
+- **Interactive Lesson & UX Capabilities (`assets/workbench.js`, `assets/quiz.js`, `assets/style.css`):**
+  1. **Production Code Examples:** Minimum 3 code blocks per lesson contrasting naive/buggy code (or Kotlin traps), under-the-hood mechanics, and idiomatic Java 25 / Spring Boot 4 solutions.
+  2. **Runnable & Autosaved In-HTML Workbenches (`180` drills across `90` coding lessons):**
+     - 2 interactive workbenches per coding lesson (`#ex-1` Implementation Drill + `#ex-2` Bug-Fix / Refactor Challenge), never pre-solved, with order-independent and variable-name-flexible checks.
+     - Automatically saves draft code, passed drill/quiz state, and lesson completion in `localStorage` (`agy_java_progress_v1`), feeding the live Progress Bar, Track Filters, and **"Start / Resume Next Lesson"** button on Lesson `0001` Hub.
+  3. **Balanced Retrieval Quizzes (`273` questions across `91` lessons):**
+     - 3 questions per lesson (`wc_spread <= 3`, `cc_spread <= 35`) with full per-option explanations; options remain clickable on revisit to support spaced retrieval practice while showing a `✓ Mastered` badge.
+- **91-Lesson Curriculum Structure:**
+  - **Main Track — Phase 1 (`0001` Hub + `46` Core Lessons: `0002`–`0040`, `0074`–`0080`):** Core Java 25 LTS, Ground-Zero Kotlin Bridge (`0074`), OOP/Packages/JEP 513 (`0075`), `HashMap` Treeification & Collections (`0019`), Streams & JEP 511/512/485 Gatherers (`0076`), Regex (`0077`), Classic I/O & Sockets (`0078`), NIO.2/HTTP, JCA/AES-GCM/JEP 510 KDF (`0079`), Markdown Javadoc & SLF4J (`0080`), JMM, Virtual Threads (JEP 491), `StructuredTaskScope` (`--enable-preview` JEP 505) & `ScopedValue` (JEP 506), ZGC, JFR, Gradle 9, JUnit 5.
+  - **Main Track — Phase 2 (`6` Lessons: `0054`–`0059`):** Pure runtime mechanics: JDK/ByteBuddy proxies, Jackson 3 type tokens, JDBC/HikariCP, JPA 3.2 / Hibernate 7 `EntityManager` states, ACID locking + `@Transactional` traps + Flyway, Servlet 6.1 + Tomcat Virtual Threads.
+  - **Main Track — Phase 3 (`19` Lessons: `0060`, `0061`, `0091`, `0062`, `0081`, `0063`, `0087`, `0064`, `0065`, `0088`, `0066`, `0083`, `0067`, `0089`, `0068`, `0090`, `0069`, `0070`, `0085`):** Ordered critical path including Local Gradle + `compose.yaml` + `JdbcClient` Starter Lab (`0091` + `projects/springboot4-order-service/`).
+  - **`[Optional Track A]` (`0041`–`0053`, `13` Lessons):** DSA Coding Interviews.
+  - **`[Optional Track B]` (`0071`–`0073`, `3` Lessons):** Apache Spark & Apache Flink Stateful Streaming.
+  - **`[Optional Track C]` (`0082`, `0086`, `0084`, `3` Lessons):** Off-Heap FFM & Leyden AOT Cache, gRPC/Protobuf & GraphQL `@BatchMapping`, and `Spring AI` RAG & `@Tool` Calling.

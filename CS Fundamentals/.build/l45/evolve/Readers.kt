@@ -6,7 +6,7 @@ import kotlinx.serialization.json.Json
 @Serializable
 data class BookV1(val id: Long, val title: String, val author: String, val year: Int? = null)
 
-val strict = Json { }                              // the kotlinx default: an unknown key is an error
+val strict: Json = Json                            // the default instance: an unknown key is an error
 val tolerant = Json { ignoreUnknownKeys = true }   // a Tolerant Reader: take what you need, ignore the rest
 
 fun read(label: String, reader: Json, body: String) =

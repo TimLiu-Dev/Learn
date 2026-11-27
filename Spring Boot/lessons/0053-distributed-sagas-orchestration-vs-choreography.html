@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 0053: Distributed Sagas: Orchestration vs Choreography &amp; Compensating Transactions</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="container">
+
+  <header class="site-header">
+    <div class="header-top">
+      <a href="../index.html" class="brand">
+        <div class="brand-logo">🍃</div>
+        <div>
+          <div class="brand-title">Spring Boot Mastery</div>
+          <div style="font-size: 12px; color: var(--text-secondary);">Stage 2 • Phase 12: Enterprise Architecture: Spring Modulith 2, Sagas, Webhooks &amp; System Design</div>
+        </div>
+      </a>
+      <div class="header-meta">
+        <span class="badge badge-java">Java 25 LTS</span>
+        <span class="badge badge-kotlin">Kotlin 2.2+</span>
+        <a href="../index.html" class="btn btn-secondary">← Master Plan</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 24px;">
+    <span class="badge badge-spring">Lesson 0053 • Stage 2 • Phase 12</span>
+    <h1 style="margin-top: 8px;">Distributed Sagas: Orchestration vs. Choreography &amp; Compensating Transactions</h1>
+    <p style="color: var(--text-secondary); font-size: 15px;">
+      Target: Across separate microservice databases, Two-Phase Commit (2PC/XA) holds network locks that destroy P99 latency and availability. Master the <strong>Saga Pattern</strong>: sequences of local ACID transactions coordinated via <strong>Choreography</strong> or a state-machine <strong>Orchestrator</strong>, semantic <strong>Compensating Transactions</strong> executed in reverse order on failure, and <strong>Pivot Transactions</strong>.
+    </p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">📖 Primary Source Recommendation</div>
+    <p style="margin-bottom: 0;">
+      Study the official authorities: <a href="https://microservices.io/patterns/data/saga.html" target="_blank" style="color: var(--accent-spring); font-weight: 600;">Chris Richardson: Microservices Saga Pattern</a> and Garcia-Molina &amp; Salem (1987), <em>Sagas</em>.
+    </p>
+  </div>
+
+  <h2>1. Choreography vs. Orchestration Tradeoffs</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>Choreography (Event-Driven)</th>
+        <th>Orchestration (State Machine Coordinator)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Coupling</strong></td>
+        <td>Loose: services only subscribe to domain events.</td>
+        <td>Explicit: orchestrator invokes participant commands.</td>
+      </tr>
+      <tr>
+        <td><strong>Visibility &amp; Debugging</strong></td>
+        <td>Harder on 4+ steps; requires distributed tracing to reconstruct state.</td>
+        <td>High: orchestrator persists exact <code>SagaStatus</code> row in PostgreSQL.</td>
+      </tr>
+      <tr>
+        <td><strong>Best Fit</strong></td>
+        <td>2–3 simple decoupled side effects (e.g., send welcome email).</td>
+        <td>Multi-step financial/fulfillment flows (Reserve Stock → Charge Card → Ship).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>2. Compensating Transactions &amp; The Pivot Step</h2>
+  <p>
+    Because Step 1 (<code>reserveStock</code>) has <em>already committed</em> its local PostgreSQL transaction before Step 2 (<code>chargeCard</code>) runs, you cannot run SQL <code>ROLLBACK</code> across services. Instead, if Step 2 declines, the orchestrator executes an idempotent <strong>Compensating Transaction</strong> in reverse order (<code>releaseStockCompensation</code>) and records terminal status <code>COMPENSATED</code>.
+  </p>
+  <p>
+    Once the <strong>Pivot Transaction</strong> (e.g., capturing non-refundable payment) commits, the saga passes the point of no return: subsequent steps (like generating an invoice PDF) must retry forward until completion rather than compensating backward.
+  </p>
+
+  <h2>3. Production Implementation (Java 25 vs. Kotlin 2.2+)</h2>
+  <div class="code-box">
+    <div class="code-header">
+      <span class="code-title">Stateful Order Saga Orchestrator with Reverse Compensation</span>
+      <div class="tab-group">
+        <button class="code-tab-btn active java-tab" data-lang="java">Java 25</button>
+        <button class="code-tab-btn kotlin-tab" data-lang="kotlin">Kotlin 2.2+</button>
+      </div>
+    </div>
+    <div class="code-pane active" data-lang="java">
+<pre><code>package com.example.saga;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import java.util.UUID;
+
+enum SagaStatus { COMPLETED, COMPENSATED, FAILED }
+
+interface InventoryClient {
+    boolean reserveStock(UUID sagaId, String sku, int quantity);
+    void releaseStockCompensation(UUID sagaId, String sku, int quantity);
+}
+
+interface PaymentClient {
+    boolean processPayment(UUID sagaId, long amountCents);
+}
+
+@Service
+public class OrderSagaOrchestrator {
+    private static final Logger log = LoggerFactory.getLogger(OrderSagaOrchestrator.class);
+    private final InventoryClient inventoryClient;
+    private final PaymentClient paymentClient;
+
+    public OrderSagaOrchestrator(InventoryClient inventoryClient, PaymentClient paymentClient) {
+        this.inventoryClient = inventoryClient;
+        this.paymentClient = paymentClient;
+    }
+
+    public SagaStatus executeOrderSaga(UUID orderId, String sku, int quantity, long amountCents) {
+        UUID sagaId = UUID.randomUUID();
+
+        // Step 1 (Compensatable): Reserve Inventory
+        if (!inventoryClient.reserveStock(sagaId, sku, quantity)) {
+            log.warn("Saga {} aborted at Step 1: out of stock", sagaId);
+            return SagaStatus.FAILED;
+        }
+
+        // Step 2 (Pivot): Capture Payment
+        if (!paymentClient.processPayment(sagaId, amountCents)) {
+            log.warn("Saga {} failed at Step 2: compensating inventory", sagaId);
+            inventoryClient.releaseStockCompensation(sagaId, sku, quantity);
+            return SagaStatus.COMPENSATED;
+        }
+
+        return SagaStatus.COMPLETED;
+    }
+}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="kotlin">
+<pre><code>package com.example.saga
+
+import org.slf4j.LoggerFactory
+import org.springframework.stereotype.Service
+import java.util.UUID
+
+enum class SagaStatus { COMPLETED, COMPENSATED, FAILED }
+
+interface InventoryClient {
+    fun reserveStock(sagaId: UUID, sku: String, quantity: Int): Boolean
+    fun releaseStockCompensation(sagaId: UUID, sku: String, quantity: Int)
+}
+
+interface PaymentClient {
+    fun processPayment(sagaId: UUID, amountCents: Long): Boolean
+}
+
+@Service
+class OrderSagaOrchestrator(
+    private val inventoryClient: InventoryClient,
+    private val paymentClient: PaymentClient
+) {
+    private val log = LoggerFactory.getLogger(OrderSagaOrchestrator::class.java)
+
+    fun executeOrderSaga(orderId: UUID, sku: String, quantity: Int, amountCents: Long): SagaStatus {
+        val sagaId = UUID.randomUUID()
+
+        if (!inventoryClient.reserveStock(sagaId, sku, quantity)) {
+            log.warn("Saga {} aborted at Step 1: out of stock", sagaId)
+            return SagaStatus.FAILED
+        }
+
+        if (!paymentClient.processPayment(sagaId, amountCents)) {
+            log.warn("Saga {} failed at Step 2: compensating inventory", sagaId)
+            inventoryClient.releaseStockCompensation(sagaId, sku, quantity)
+            return SagaStatus.COMPENSATED
+        }
+
+        return SagaStatus.COMPLETED
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Active Recall Checks (3 Questions with Deep Explanations)</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Click an option to see immediate architectural analysis.
+  </p>
+
+  <div class="quiz-card" id="q0053_1" data-explanation="2PC holds cross-network locks until every node prepares and commits, inflating tail latency and turning any slow participant into a cluster-wide outage.">
+    <span class="quiz-badge">Quiz 1 of 3</span>
+    <div class="quiz-prompt">Why is Two-Phase Commit (2PC / XA) avoided across microservices in favor of Sagas?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Cross-network lock holding inflates P99 latency and starves connection pools.">
+        2PC holds cross-network database locks that inflate P99 latency and exhaust connection pools.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="PostgreSQL and MySQL support XA transactions, though XA scales poorly across microservices.">
+        2PC is only supported on Oracle Database and cannot run on PostgreSQL.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="JTA has supported JDBC XA drivers for decades.">
+        Two-phase commit protocols do not support standard Java JDBC drivers.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="2PC coordinates separate DBs, which is why its network locking hurts availability.">
+        2PC requires all microservices to share the exact same physical database instance.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0053_2" data-explanation="Because each Saga step commits immediately to its own local database, undoing it requires a brand-new forward transaction that semantically reverses the business effect.">
+    <span class="quiz-badge">Quiz 2 of 3</span>
+    <div class="quiz-prompt">What is a <strong>Compensating Transaction</strong> in a distributed Saga?</div>
+    <div class="quiz-options">
+          <button class="quiz-opt-btn" data-is-correct="false" data-reason="Local transactions have already committed, so SQL ROLLBACK can no longer undo them.">
+        A database ROLLBACK command that reverts uncommitted WAL segments.
+      </button>
+          <button class="quiz-opt-btn" data-is-correct="false" data-reason="Retrying repeats the failed step forward; compensation undoes earlier steps backward.">
+        An infinite retry loop that resends the failed HTTP request forever.
+      </button>
+          <button class="quiz-opt-btn" data-is-correct="false" data-reason="Compensation refers to state reconciliation, not customer promo credits.">
+        A promotional coupon emailed manually by customer support days later.
+      </button>
+          <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Compensation executes an inverse domain operation (like releasing reserved stock or issuing a refund).">
+        A semantic forward operation that reverses the business effect of an already-committed step.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <div class="quiz-card" id="q0053_3" data-explanation="The Pivot Transaction is the point of no return in a Saga: before it, steps are compensatable; once it commits, downstream steps must complete via forward retries.">
+    <span class="quiz-badge">Quiz 3 of 3</span>
+    <div class="quiz-prompt">What is the <strong>Pivot Transaction</strong> in a Saga workflow?</div>
+    <div class="quiz-options">
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="That is simply saga initialization.">
+        The initial transaction that inserts the STARTED row into the orchestrator table.
+      </button>
+      <button class="quiz-opt-btn target-correct" data-is-correct="true" data-reason="Correct! Once the pivot transaction succeeds, the saga must drive remaining retryable steps forward to completion.">
+        The point of no return after which subsequent steps must complete forward via retries.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Sagas are independent of SQL vs NoSQL storage.">
+        The step that migrates relational rows into MongoDB documents.
+      </button>
+      <button class="quiz-opt-btn" data-is-correct="false" data-reason="Circuit breaker fallbacks are single-hop protections, not multi-step saga pivots.">
+        The local fallback method annotated with Resilience4j @CircuitBreaker.
+      </button>
+    </div>
+    <div class="quiz-feedback"></div>
+  </div>
+
+  <h2>Interactive Practice Lab: In-Browser Verification</h2>
+  <p style="color: var(--text-secondary); margin-bottom: 16px;">
+    Complete the 3-outcome <code>TravelSagaOrchestrator.bookVacation(UUID sagaId)</code> state transitions: abort as <code>FAILED</code> if Step 1 fails, invoke reverse compensation and return <code>COMPENSATED</code> if Step 2 fails, and return <code>COMPLETED</code> when both succeed.
+  </p>
+
+  <div class="practice-container"
+       data-practice-id="lesson-0053-lab"
+       data-starter-java="package com.example.saga;
+
+import java.util.UUID;
+
+enum SagaStatus { COMPLETED, COMPENSATED, FAILED }
+
+interface TravelBookingClient {
+    boolean bookFlight(UUID sagaId);
+    void cancelFlightCompensation(UUID sagaId);
+    boolean bookHotel(UUID sagaId);
+}
+
+public class TravelSagaOrchestrator {
+    private final TravelBookingClient client;
+
+    public TravelSagaOrchestrator(TravelBookingClient client) {
+        this.client = client;
+    }
+
+    public SagaStatus bookVacation(UUID sagaId) {
+        // TODO 1: Call client.bookFlight(sagaId); if false, return SagaStatus.FAILED
+        // TODO 2: Call client.bookHotel(sagaId); if false, call client.cancelFlightCompensation(sagaId) and return SagaStatus.COMPENSATED
+        // TODO 3: Return SagaStatus.COMPLETED
+        return null;
+    }
+}"
+       data-starter-kotlin="package com.example.saga
+
+import java.util.UUID
+
+enum class SagaStatus { COMPLETED, COMPENSATED, FAILED }
+
+interface TravelBookingClient {
+    fun bookFlight(sagaId: UUID): Boolean
+    fun cancelFlightCompensation(sagaId: UUID)
+    fun bookHotel(sagaId: UUID): Boolean
+}
+
+class TravelSagaOrchestrator(private val client: TravelBookingClient) {
+
+    fun bookVacation(sagaId: UUID): SagaStatus {
+        // TODO 1: Call client.bookFlight(sagaId); if false, return SagaStatus.FAILED
+        // TODO 2: Call client.bookHotel(sagaId); if false, call client.cancelFlightCompensation(sagaId) and return SagaStatus.COMPENSATED
+        // TODO 3: Return SagaStatus.COMPLETED
+        TODO()
+    }
+}">
+    <div class="practice-header">
+      <div class="practice-title-box">
+        <span class="practice-tag">Lab 0053</span>
+        <span class="practice-title">Saga Orchestrator &amp; Reverse Compensation State Machine Lab</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div class="practice-lang-toggle">
+          <button class="practice-lang-btn active java" data-lang="java">Java 25</button>
+          <button class="practice-lang-btn kotlin" data-lang="kotlin">Kotlin 2.2+</button>
+        </div>
+        <span class="badge badge-status" data-progress-badge="lesson-0053-lab">To Do</span>
+      </div>
+    </div>
+
+    <div class="practice-instruction">
+      <p>Implement <code>bookVacation(sagaId)</code>: 1) If <code>!client.bookFlight(sagaId)</code>, return <code>SagaStatus.FAILED</code> (no compensation needed since Step 1 never committed). 2) If <code>!client.bookHotel(sagaId)</code>, call <code>client.cancelFlightCompensation(sagaId)</code> and return <code>SagaStatus.COMPENSATED</code>. 3) Otherwise return <code>SagaStatus.COMPLETED</code>.</p>
+    </div>
+
+    <div class="editor-area">
+      <textarea class="editor-textarea" spellcheck="false">package com.example.saga;
+
+import java.util.UUID;
+
+enum SagaStatus { COMPLETED, COMPENSATED, FAILED }
+
+interface TravelBookingClient {
+    boolean bookFlight(UUID sagaId);
+    void cancelFlightCompensation(UUID sagaId);
+    boolean bookHotel(UUID sagaId);
+}
+
+public class TravelSagaOrchestrator {
+    private final TravelBookingClient client;
+
+    public TravelSagaOrchestrator(TravelBookingClient client) {
+        this.client = client;
+    }
+
+    public SagaStatus bookVacation(UUID sagaId) {
+        // TODO 1: Call client.bookFlight(sagaId); if false, return SagaStatus.FAILED
+        // TODO 2: Call client.bookHotel(sagaId); if false, call client.cancelFlightCompensation(sagaId) and return SagaStatus.COMPENSATED
+        // TODO 3: Return SagaStatus.COMPLETED
+        return null;
+    }
+}</textarea>
+    </div>
+
+    <div class="hints-drawer">
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 1: Step 1 Guard</div>
+        <div><code>if (!client.bookFlight(sagaId)) return SagaStatus.FAILED;</code></div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 2: Step 2 Reverse Compensation</div>
+        <div><code>if (!client.bookHotel(sagaId)) { client.cancelFlightCompensation(sagaId); return SagaStatus.COMPENSATED; }</code></div>
+      </div>
+      <div class="hint-step">
+        <div class="hint-step-title">Hint 3: Terminal Success</div>
+        <div>Return <code>SagaStatus.COMPLETED</code> once both steps succeed.</div>
+      </div>
+    </div>
+
+    <div class="solution-drawer">
+      <div class="solution-header">
+        <span>💡 Complete Production Reference Solution</span>
+      </div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-java); margin-bottom: 4px;">Java 25 Implementation:</div>
+      <pre class="solution-code"><code>package com.example.saga;
+
+import java.util.UUID;
+
+enum SagaStatus { COMPLETED, COMPENSATED, FAILED }
+
+interface TravelBookingClient {
+    boolean bookFlight(UUID sagaId);
+    void cancelFlightCompensation(UUID sagaId);
+    boolean bookHotel(UUID sagaId);
+}
+
+public class TravelSagaOrchestrator {
+    private final TravelBookingClient client;
+
+    public TravelSagaOrchestrator(TravelBookingClient client) {
+        this.client = client;
+    }
+
+    public SagaStatus bookVacation(UUID sagaId) {
+        if (!client.bookFlight(sagaId)) {
+            return SagaStatus.FAILED;
+        }
+        if (!client.bookHotel(sagaId)) {
+            client.cancelFlightCompensation(sagaId);
+            return SagaStatus.COMPENSATED;
+        }
+        return SagaStatus.COMPLETED;
+    }
+}</code></pre>
+
+      <div style="font-size: 13px; font-weight: 600; color: var(--accent-kotlin); margin-bottom: 4px;">Kotlin 2.2+ Implementation:</div>
+      <pre class="solution-code"><code>package com.example.saga
+
+import java.util.UUID
+
+enum class SagaStatus { COMPLETED, COMPENSATED, FAILED }
+
+interface TravelBookingClient {
+    fun bookFlight(sagaId: UUID): Boolean
+    fun cancelFlightCompensation(sagaId: UUID)
+    fun bookHotel(sagaId: UUID): Boolean
+}
+
+class TravelSagaOrchestrator(private val client: TravelBookingClient) {
+
+    fun bookVacation(sagaId: UUID): SagaStatus {
+        if (!client.bookFlight(sagaId)) {
+            return SagaStatus.FAILED
+        }
+        if (!client.bookHotel(sagaId)) {
+            client.cancelFlightCompensation(sagaId)
+            return SagaStatus.COMPENSATED
+        }
+        return SagaStatus.COMPLETED
+    }
+}</code></pre>
+
+      <div class="callout tip" style="margin: 12px 0 0 0;">
+        <div class="callout-title">Architectural Breakdown:</div>
+        <p style="margin-bottom: 0; font-size: 14px;">Notice why passing <code>sagaId</code> to every participant and compensation call is critical: if a network timeout triggers a retry, the participant deduplicates on <code>sagaId</code> so a flight is never refunded twice!</p>
+      </div>
+    </div>
+
+    <div class="practice-toolbar">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-hint">Show Hints (3)</button>
+        <button class="btn btn-solution btn-solution">View Final Answer</button>
+        <button class="btn btn-secondary btn-reset">Reset Code</button>
+      </div>
+      <button class="btn btn-primary btn-run">Run &amp; Verify Code (Ctrl+Enter)</button>
+    </div>
+
+    <div class="test-console"></div>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">💬 Have Questions? Ask Your Teacher Agent</div>
+    <p style="margin-bottom: 0;">
+      Test your mental model! Switch to our chat and ask me: <em>"How do you handle a failure inside the compensating transaction itself (e.g., cancelFlightCompensation times out)?"</em>
+    </p>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0052-domain-driven-design-and-spring-modulith.html" class="btn btn-secondary">← Previous: Lesson 0052</a>
+    <a href="../reference/glossary.html" class="btn btn-secondary">Glossary Reference 📖</a>
+    <a href="0054-webhooks-hmac-verification-and-wiremock-testing.html" class="btn btn-primary">Next: Lesson 0054 →</a>
+  </div>
+
+  <footer class="site-footer">
+    <div>Spring Boot Mastery • Lesson 0053 (Stage 2: Senior Core)</div>
+    <div>Target: 2027 Senior Spring Boot Backend Engineer</div>
+  </footer>
+
+</div>
+
+<script src="../assets/app.js"></script>
+<script>
+window.practiceValidators = window.practiceValidators || {};
+window.practiceValidators['lesson-0053-lab'] = function(code, lang) {
+  const tests = [];
+  tests.push({
+    name: "Step 1 Flight Reservation & Early FAILED Abort",
+    passed: /bookFlight\s*\(\s*sagaId\s*\)/.test(code) && /return\s+SagaStatus\.FAILED/.test(code),
+    error: "Must invoke client.bookFlight(sagaId) and return SagaStatus.FAILED when it returns false."
+  });
+  tests.push({
+    name: "Step 2 Failure Triggers Reverse Flight Compensation",
+    passed: /bookHotel\s*\(\s*sagaId\s*\)/.test(code) && /cancelFlightCompensation\s*\(\s*sagaId\s*\)/.test(code) && /return\s+SagaStatus\.COMPENSATED/.test(code),
+    error: "When client.bookHotel(sagaId) fails, must call client.cancelFlightCompensation(sagaId) and return SagaStatus.COMPENSATED."
+  });
+  tests.push({
+    name: "Happy Path Returns SagaStatus.COMPLETED",
+    passed: /return\s+SagaStatus\.COMPLETED/.test(code),
+    error: "Must return SagaStatus.COMPLETED when both saga steps succeed."
+  });
+  return tests;
+};
+</script>
+</body>
+</html>
